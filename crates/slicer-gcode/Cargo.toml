@@ -1,0 +1,13 @@
+[package]
+name = "slicer-gcode"
+description = "G-code generation with exchangeable flavors (Bambu, Marlin, Klipper)."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+[dependencies]
+slicer-core.workspace = true
+slicer-fdm.workspace = true
