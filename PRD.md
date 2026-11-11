@@ -96,7 +96,7 @@ Ein Cargo-Workspace; der Kern kennt weder UI noch Netzwerk noch Dateisystem.
 | `slicer-ui` | Eine UI-Codebasis für Desktop (nativ) und Browser (WASM) |
 
 - **UI-Technik (Empfehlung):** egui + wgpu. Baut nativ für alle drei Betriebssysteme und nach WebAssembly, sodass Desktop-App und Web-UI derselbe Code sind und alles Rust bleibt. Bestätigung in Q5.
-- **Lizenz (Empfehlung):** MIT/Apache-2.0 dual. Bedingung: Clean-Room. Kein Code aus AGPL-Slicern; Algorithmen werden aus Veröffentlichungen, Dokumentation und eigenem Entwurf abgeleitet.
+- **Lizenz (entschieden):** MIT/Apache-2.0 dual. Bedingung: Clean-Room. Kein Code aus AGPL-Slicern; Algorithmen werden aus Veröffentlichungen, Dokumentation und eigenem Entwurf abgeleitet.
 
 ### P0 – Must-Have (Phase 0 und 1: Headless-FDM-MVP)
 
@@ -223,7 +223,7 @@ Zielwerte sind **Hypothesen** und werden nach den ersten Messungen angepasst.
 | Q13 | In welcher Dateiform nimmt der X1C fremden G-Code von der SD-Karte an (reine `.gcode`-Datei oder `.gcode.3mf`-Container), und welche Start-/Endsequenz braucht er mindestens (Aufheizen, Homing, Bettnivellierung)? Die Sequenz muss selbst erarbeitet oder aus eigenen Nutzerprofilen stammen, nicht aus AGPL-Quellen kopiert werden. | Engineering (Versuch am Gerät) | **Ja, für Phase 1** – Zeitbox: wenige Tage |
 | Q14 | Soll für die Hardware-Abnahme von Marlin/Klipper ein günstiger Zweitdrucker beschafft werden, oder reicht Verifikation durch die Community? | Projektinhaber | Nein |
 | Q2 | Polygon-Operationen (Offset, Vereinigung, Schnitt): vorhandenes Rust-Crate oder Eigenbau? Robustheit und Ganzzahl-Koordinaten sind Voraussetzung für G3. | Engineering | **Ja, für Phase 0** – Zeitbox: eine Woche Evaluierung |
-| Q3 | Lizenz endgültig: MIT/Apache-2.0 oder bewusst Copyleft? | Projektinhaber | **Ja, vor erster Veröffentlichung** |
+| Q3 | ~~Lizenz endgültig: MIT/Apache-2.0 oder bewusst Copyleft?~~ **Beantwortet:** MIT oder Apache-2.0 (Doppellizenz). Clean-Room-Regeln stehen in `CONTRIBUTING.md`. | Projektinhaber | Erledigt |
 | Q4 | Was ist an Bambu-Druckern ohne das proprietäre Netzwerk-Plugin möglich (LAN-Modus), und wie stabil ist das angesichts der Firmware- und Autorisierungsänderungen des Herstellers? | Engineering (Recherche) | Ja, für Phase 4 |
 | Q5 | UI-Technik bestätigen: Reicht egui für eine Oberfläche mit sehr vielen Einstellungen, und ist die 3D-Leistung im Browser (WebGPU/WebGL-Fallback) ausreichend? | Engineering | Ja, für Phase 2 – Prototyp |
 | Q6 | Dürfen die mit Orca ausgelieferten Druckerprofile übernommen werden, oder nur der Import von Nutzerprofilen? | Recht/Lizenz | Nein (betrifft R27) |

@@ -4,6 +4,7 @@ description = "Reading and writing model and project formats (STL, 3MF)."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [lints]

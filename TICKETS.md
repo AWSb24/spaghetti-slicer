@@ -7,6 +7,20 @@ Grundlage: [PRD.md](PRD.md), Requirements R1–R13. Referenzdrucker: Bambu Lab X
 
 Summe: 40 Tickets (7 × S, 25 × M, 8 × L), also rechnerisch etwa 5–8 Monate Vollzeit-Äquivalent, ohne Puffer für Nacharbeit. Das ist eine Größenordnung, keine Zusage.
 
+## Stand (2026-11-11)
+
+| Ticket | Stand |
+|---|---|
+| T-001 | Erledigt |
+| T-002 | Erledigt: MIT oder Apache-2.0, Regeln in `CONTRIBUTING.md` |
+| T-003 | Vorläufig: `i_overlay` gewählt und im Einsatz, Vergleich mit Alternativen steht aus |
+| T-004 | Offen, nur am Gerät möglich |
+| T-010, T-011 | Erledigt |
+| T-020 bis T-023, T-030 bis T-036 | Als Prototyp umgesetzt (Schichtung nicht parallel, Naht und Leerwege einfach) |
+| T-041, T-043, T-050 | Als Prototyp umgesetzt (Marlin und Klipper noch identisch) |
+| T-040, T-044 | Teilweise: flache Einstellungen ohne Profilebenen; Zeitschätzung ohne Beschleunigung |
+| Alle übrigen | Offen |
+
 ---
 
 ## Kritischer Pfad
