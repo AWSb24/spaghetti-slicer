@@ -1,12 +1,17 @@
 //! 2D polygon types and operations.
 //!
-//! Boolean operations and offsetting are delegated to the `i_overlay` crate,
-//! which snaps coordinates to an integer grid internally.
+//! Coordinates are `f64` millimetres. Boolean operations and offsetting are
+//! delegated to the `i_overlay` crate, which computes on integers. All
+//! results lie on a fixed grid of [`GRID`] millimetres, so the outcome of an
+//! operation does not depend on where the geometry sits on the bed.
+//!
+//! This module is the only place that touches `i_overlay`.
 
-use std::f64::consts::FRAC_1_SQRT_2;
+use std::f64::consts::{FRAC_1_SQRT_2, FRAC_PI_4};
 
 use i_overlay::core::fill_rule::FillRule;
 use i_overlay::core::overlay_rule::OverlayRule;
+use i_overlay::float::scale::FixedScaleFloatOverlay;
 use i_overlay::float::single::SingleFloatOverlay;
 use i_overlay::mesh::float::outline::offset::OutlineOffset;
 use i_overlay::mesh::float::style::{LineJoin, OutlineStyle};
@@ -20,8 +25,23 @@ pub type Shape = Vec<Contour>;
 /// A set of non-overlapping shapes.
 pub type Shapes = Vec<Shape>;
 
-/// Maximum segment length of rounded corners, relative to the corner radius.
-const ROUND_JOIN_STEP: f64 = 0.2;
+/// Spacing of the grid that results of polygon operations are snapped to:
+/// 10 nanometres.
+pub const GRID: f64 = 1e-5;
+/// Grid units per millimetre.
+const SCALE: f64 = 1e5;
+/// Largest distance between a rounded corner and its polygonal
+/// approximation, in millimetres.
+const ARC_TOLERANCE: f64 = 0.0025;
+
+/// Removes floating-point noise by moving every point onto the grid.
+fn snap(mut shapes: Shapes) -> Shapes {
+    for point in shapes.iter_mut().flatten().flatten() {
+        point[0] = (point[0] * SCALE).round() / SCALE;
+        point[1] = (point[1] * SCALE).round() / SCALE;
+    }
+    shapes
+}
 
 /// Turns arbitrarily oriented, possibly nested loops into shapes using the
 /// even-odd rule.
@@ -29,14 +49,24 @@ pub fn from_loops(loops: &[Contour]) -> Shapes {
     if loops.is_empty() {
         return Vec::new();
     }
-    let none: Vec<Contour> = Vec::new();
-    loops
-        .to_vec()
-        .overlay(&none, OverlayRule::Subject, FillRule::EvenOdd)
+    let (loops, none) = (loops.to_vec(), Vec::<Contour>::new());
+    let (rule, fill) = (OverlayRule::Subject, FillRule::EvenOdd);
+    snap(
+        loops
+            .overlay_with_fixed_scale(&none, rule, fill, SCALE)
+            .unwrap_or_else(|_| loops.overlay(&none, rule, fill)),
+    )
 }
 
+/// Runs a boolean operation on the fixed grid. Geometry too far from the
+/// origin for the fixed grid (several metres) falls back to a grid chosen
+/// from the bounding box.
 fn boolean(a: &Shapes, b: &Shapes, rule: OverlayRule) -> Shapes {
-    a.overlay(b, rule, FillRule::NonZero)
+    let fill = FillRule::NonZero;
+    snap(
+        a.overlay_with_fixed_scale(b, rule, fill, SCALE)
+            .unwrap_or_else(|_| a.overlay(b, rule, fill)),
+    )
 }
 
 /// Area covered by `a` or `b`.
@@ -70,8 +100,17 @@ pub fn offset(shapes: &Shapes, delta: f64) -> Shapes {
     if shapes.is_empty() || delta == 0.0 {
         return shapes.clone();
     }
-    let style = OutlineStyle::new(delta).line_join(LineJoin::Round(ROUND_JOIN_STEP));
-    shapes.outline(&style)
+    // Angle per arc segment that keeps the chord within the tolerance.
+    // Exactly 2 * acos(1 - t); sqrt(2t) is a slightly finer approximation and,
+    // unlike acos, gives the same bits on every platform.
+    let t = (ARC_TOLERANCE / delta.abs()).min(1.0);
+    let step = 2.0 * (2.0 * t).sqrt();
+    let style = OutlineStyle::new(delta).line_join(LineJoin::Round(step.min(FRAC_PI_4)));
+    snap(
+        shapes
+            .outline_fixed_scale(&style, SCALE)
+            .unwrap_or_else(|_| shapes.outline(&style)),
+    )
 }
 
 /// Signed area of a contour: positive when counter-clockwise.
@@ -100,7 +139,10 @@ pub fn area(shapes: &[Shape]) -> f64 {
 
 /// Euclidean distance between two points.
 pub fn distance(a: Point, b: Point) -> f64 {
-    (a[0] - b[0]).hypot(a[1] - b[1])
+    // Not `hypot`: that calls the platform's maths library, whose last bit
+    // may differ between operating systems. `sqrt` is exact everywhere.
+    let (dx, dy) = (a[0] - b[0], a[1] - b[1]);
+    (dx * dx + dy * dy).sqrt()
 }
 
 /// Direction of hatch lines.
@@ -241,6 +283,36 @@ mod tests {
         assert!((area(&difference(&a, &b)) - 50.0).abs() < 1e-3);
         assert!(intersection(&a, &Vec::new()).is_empty());
         assert_eq!(difference(&a, &Vec::new()), a);
+    }
+
+    #[test]
+    fn results_lie_on_the_grid_regardless_of_surroundings() {
+        // The same square, offset next to a far-away second shape, must give
+        // bit-identical coordinates.
+        let run = |far: f64| -> Contour {
+            let shapes = from_loops(&[square(100.0, 100.0, 20.0), square(130.0 + far, 100.0, 1.0)]);
+            let mut big: Contour = offset(&shapes, -0.123457)
+                .into_iter()
+                .flatten()
+                .filter(|c| signed_area(c).abs() > 10.0)
+                .flatten()
+                .collect();
+            big.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+            big
+        };
+        let near = run(0.0);
+        assert_eq!(near.len(), 4);
+        assert_eq!(near, run(50.0));
+        assert_eq!(near, run(1000.0));
+        assert_eq!(near[0], [100.12346, 100.12346]);
+    }
+
+    #[test]
+    fn geometry_beyond_the_fixed_grid_still_works() {
+        let shapes = from_loops(&[square(5.0e6, 5.0e6, 20.0)]);
+        assert!((area(&shapes) - 400.0).abs() < 1.0);
+        assert!((area(&offset(&shapes, -1.0)) - 324.0).abs() < 1.0);
+        assert!((area(&intersection(&shapes, &shapes)) - 400.0).abs() < 1.0);
     }
 
     #[test]

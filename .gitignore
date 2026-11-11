@@ -6,3 +6,5 @@
 Thumbs.db
 .idea/
 .vscode/
+/tools/*/target
+/tools/*/Cargo.lock

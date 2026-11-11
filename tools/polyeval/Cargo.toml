@@ -1,0 +1,14 @@
+[package]
+name = "polyeval"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+clipper2-rs = "0.3.0"
+clipper2-rust = "1.2.0"
+i_overlay = "9.1.0"
+
+# Not part of the main workspace: keeps the evaluated crates out of its lock file.
+[workspace]

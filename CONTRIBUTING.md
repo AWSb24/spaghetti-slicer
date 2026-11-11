@@ -57,7 +57,7 @@ All three must pass. New behaviour needs a test.
 | Area | Source |
 |---|---|
 | Mesh slicing (triangle–plane intersection, chaining by shared edges) | Standard computational geometry, own design |
-| Polygon booleans and offsetting | `i_overlay` crate (MIT OR Apache-2.0) |
+| Polygon booleans and offsetting | `i_overlay` crate (MIT OR Apache-2.0); see `docs/decisions/0001-polygon-library.md` |
 | Hatch infill (scanline with even-odd pairing) | Standard scanline fill, own design |
 | Top/bottom detection (intersection with neighbouring layers) | Own design |
 | Extrusion amount (line width × layer height per millimetre) | Volume conservation, own design |

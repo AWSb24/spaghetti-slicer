@@ -13,7 +13,7 @@ Summe: 40 Tickets (7 × S, 25 × M, 8 × L), also rechnerisch etwa 5–8 Monate 
 |---|---|
 | T-001 | Erledigt |
 | T-002 | Erledigt: MIT oder Apache-2.0, Regeln in `CONTRIBUTING.md` |
-| T-003 | Vorläufig: `i_overlay` gewählt und im Einsatz, Vergleich mit Alternativen steht aus |
+| T-003 | Erledigt: `i_overlay` bestätigt, festes 10-nm-Raster eingeführt, siehe `docs/decisions/0001-polygon-library.md` |
 | T-004 | Offen, nur am Gerät möglich |
 | T-010, T-011 | Erledigt |
 | T-020 bis T-023, T-030 bis T-036 | Als Prototyp umgesetzt (Schichtung nicht parallel, Naht und Leerwege einfach) |
