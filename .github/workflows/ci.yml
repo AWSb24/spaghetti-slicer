@@ -26,7 +26,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Installs the toolchain and components named in rust-toolchain.toml.
       - name: Install Rust toolchain
@@ -46,7 +46,7 @@ jobs:
       - name: Slice reference model
         run: cargo run --release --locked -p slicer-cli -- slice examples/cube_20mm.stl -o cube_20mm.gcode
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: gcode-${{ matrix.os }}
           path: cube_20mm.gcode
@@ -58,7 +58,7 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: gcode
 
