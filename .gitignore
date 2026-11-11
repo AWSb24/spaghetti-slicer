@@ -1,4 +1,6 @@
 /target
+*.gcode
+/preview/
 **/*.rs.bk
 .DS_Store
 Thumbs.db

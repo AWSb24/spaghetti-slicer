@@ -9,5 +9,7 @@ repository.workspace = true
 [lints]
 workspace = true
 [dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
 slicer-core.workspace = true
 slicer-fdm.workspace = true
+slicer-profiles.workspace = true
