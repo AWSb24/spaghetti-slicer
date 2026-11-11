@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: Check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs the toolchain and components named in rust-toolchain.toml.
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Slice reference model
+        run: cargo run --release --locked -p slicer-cli -- slice examples/cube_20mm.stl -o cube_20mm.gcode
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gcode-${{ matrix.os }}
+          path: cube_20mm.gcode
+          if-no-files-found: error
+          retention-days: 7
+
+  identical-output:
+    name: Identical G-code on all platforms
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: gcode
+
+      - name: Compare
+        run: |
+          sha256sum gcode/*/cube_20mm.gcode
+          for other in windows-latest macos-latest; do
+            if ! cmp gcode/gcode-ubuntu-latest/cube_20mm.gcode "gcode/gcode-$other/cube_20mm.gcode"; then
+              echo "::error::G-code from $other differs from ubuntu-latest"
+              diff gcode/gcode-ubuntu-latest/cube_20mm.gcode "gcode/gcode-$other/cube_20mm.gcode" | head -n 40
+              exit 1
+            fi
+          done
