@@ -5,6 +5,7 @@
 pub mod preview;
 
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use slicer_core::polygon::{self, HatchDirection, distance};
 use slicer_core::slice::slice_mesh_reporting;
@@ -187,11 +188,31 @@ pub fn generate_reporting(
         return Err(FdmError::NothingToPrint);
     }
 
+    // The geometry of a layer depends only on the slices, so all cores work
+    // on it. Putting the pieces in printing order depends on where the
+    // previous layer ended and happens one layer after the other.
+    let geometry = parallel_map(slices.len(), |index| layer_work(&slices, index, settings));
     let mut position: Point = [0.0, 0.0];
     let mut thin_layers = Vec::new();
-    let layers = (0..slices.len())
-        .map(|index| {
-            let (paths, thin) = layer_paths(&slices, index, settings, &mut position);
+    let layers = geometry
+        .into_iter()
+        .enumerate()
+        .map(|(index, (work, mut thin))| {
+            let mut paths = Vec::new();
+            for piece in work {
+                match piece {
+                    Work::Loops(loops, kind, min_length) => {
+                        push_loops(loops, kind, min_length, &mut position, &mut paths);
+                    }
+                    Work::Lines(lines, kind, join_distance) => {
+                        push_lines(lines, kind, join_distance, &mut position, &mut paths);
+                    }
+                }
+            }
+            // A layer with material but without any outer wall prints nothing.
+            if !slices[index].is_empty() && paths.iter().all(|p| p.kind != PathKind::OuterWall) {
+                thin = true;
+            }
             if thin {
                 thin_layers.push(index);
             }
@@ -221,21 +242,59 @@ pub fn generate_reporting(
     Ok(Toolpaths { layers })
 }
 
-/// Generates the paths of one layer. The flag tells whether a noticeable
-/// part of the layer is too narrow to be covered by a wall.
-fn layer_paths(
-    slices: &[Shapes],
-    index: usize,
-    settings: &Settings,
-    position: &mut Point,
-) -> (Vec<Path>, bool) {
+/// Geometry of one kind that still has to be put in printing order.
+enum Work {
+    /// Closed loops, their kind and the shortest loop worth printing.
+    Loops(Vec<Contour>, PathKind, f64),
+    /// Line segments, their kind and the distance up to which consecutive
+    /// segments are joined into one path.
+    Lines(Vec<[Point; 2]>, PathKind, f64),
+}
+
+/// Calls `job` for every index below `count` on all available cores and
+/// returns the results in index order.
+fn parallel_map<T: Send>(count: usize, job: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let threads = std::thread::available_parallelism().map_or(1, usize::from);
+    let next = AtomicUsize::new(0);
+    let mut results: Vec<(usize, T)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads.min(count))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        if index >= count {
+                            break done;
+                        }
+                        done.push((index, job(index)));
+                    }
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    });
+    results.sort_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
+}
+
+/// Generates the geometry of one layer in the order it is printed. The flag
+/// tells whether a noticeable part of the layer is too narrow to be covered
+/// by a wall.
+fn layer_work(slices: &[Shapes], index: usize, settings: &Settings) -> (Vec<Work>, bool) {
     let slice = &slices[index];
     let width = settings.line_width;
     let walls = settings.wall_loops as usize;
-    let mut paths = Vec::new();
+    let mut work = Vec::new();
 
     if index == 0 {
-        adhesion_paths(slice, settings, position, &mut paths);
+        adhesion_work(slice, settings, &mut work);
     }
 
     // Walls: centre lines half a width inside the contour, then one width
@@ -249,7 +308,7 @@ fn layer_paths(
     // always lose a little, so only report a noticeable share.
     let total = polygon::area(slice);
     let covered = polygon::area(&polygon::offset(&wall_shapes[0], 0.5 * width));
-    let mut thin = total - covered > (0.02 * total).max(width * width);
+    let thin = total - covered > (0.02 * total).max(width * width);
 
     let mut wall_loops: Vec<Vec<Contour>> = wall_shapes.iter().map(contours).collect();
     while let Some(loops) = wall_loops.pop() {
@@ -258,11 +317,7 @@ fn layer_paths(
         } else {
             PathKind::InnerWall
         };
-        push_loops(loops, kind, width, position, &mut paths);
-    }
-    // A layer with material but without any outer wall prints nothing.
-    if !slice.is_empty() && paths.iter().all(|p| p.kind != PathKind::OuterWall) {
-        thin = true;
+        work.push(Work::Loops(loops, kind, width));
     }
 
     // Infill centre lines stay half a width away from the inner edge of the
@@ -271,7 +326,7 @@ fn layer_paths(
     let inset = (walls as f64 + 0.5 - settings.infill_overlap / 100.0) * width;
     let fill_area = polygon::offset(slice, -inset);
     if fill_area.is_empty() {
-        return (paths, thin);
+        return (work, thin);
     }
     let (solid, sparse) = split_solid_sparse(slices, index, &fill_area, settings);
 
@@ -288,42 +343,30 @@ fn layer_paths(
     let min_length = 0.5 * width;
 
     let solid_lines = polygon::hatch(&solid, width, direction, min_length);
-    push_lines(
-        solid_lines,
-        PathKind::SolidInfill,
-        2.0 * width,
-        position,
-        &mut paths,
-    );
+    work.push(Work::Lines(solid_lines, PathKind::SolidInfill, 2.0 * width));
 
     let density = settings.infill_density / 100.0;
     if density > 0.0 {
         if density >= 1.0 {
             let lines = polygon::hatch(&sparse, width, direction, min_length);
-            push_lines(
-                lines,
-                PathKind::SolidInfill,
-                2.0 * width,
-                position,
-                &mut paths,
-            );
+            work.push(Work::Lines(lines, PathKind::SolidInfill, 2.0 * width));
         } else {
             match settings.infill_pattern {
                 InfillPattern::Rectilinear => {
                     let lines = polygon::hatch(&sparse, width / density, direction, min_length);
-                    push_lines(lines, PathKind::SparseInfill, 0.0, position, &mut paths);
+                    work.push(Work::Lines(lines, PathKind::SparseInfill, 0.0));
                 }
                 InfillPattern::Grid => {
                     // Two directions share the material, so each is half as dense.
                     for d in [direction, other] {
                         let lines = polygon::hatch(&sparse, 2.0 * width / density, d, min_length);
-                        push_lines(lines, PathKind::SparseInfill, 0.0, position, &mut paths);
+                        work.push(Work::Lines(lines, PathKind::SparseInfill, 0.0));
                     }
                 }
             }
         }
     }
-    (paths, thin)
+    (work, thin)
 }
 
 /// Splits the fill area of a layer into the part that needs solid infill
@@ -358,12 +401,7 @@ fn split_solid_sparse(
 }
 
 /// Skirt and brim on the first layer.
-fn adhesion_paths(
-    slice: &Shapes,
-    settings: &Settings,
-    position: &mut Point,
-    paths: &mut Vec<Path>,
-) {
+fn adhesion_work(slice: &Shapes, settings: &Settings, work: &mut Vec<Work>) {
     let width = settings.line_width;
     // Ignore holes: adhesion aids go around the outside only.
     let outlines: Shapes = slice
@@ -383,11 +421,11 @@ fn adhesion_paths(
             &hull,
             skirt_start + (0.5 + k as f64) * width,
         ));
-        push_loops(loops, PathKind::Skirt, width, position, paths);
+        work.push(Work::Loops(loops, PathKind::Skirt, width));
     }
     for k in (0..brim_loops).rev() {
         let loops = outer_contours(&polygon::offset(&outlines, (0.5 + k as f64) * width));
-        push_loops(loops, PathKind::Brim, width, position, paths);
+        work.push(Work::Loops(loops, PathKind::Brim, width));
     }
 }
 
@@ -648,6 +686,14 @@ mod tests {
                 assert!(!in_hole, "infill crosses the hole at {mid:?}");
             }
         }
+    }
+
+    #[test]
+    fn parallel_map_keeps_the_order() {
+        let squares = parallel_map(1000, |i| i * i);
+        assert!(squares.iter().enumerate().all(|(i, &s)| s == i * i));
+        assert_eq!(squares.len(), 1000);
+        assert!(parallel_map(0, |i| i).is_empty());
     }
 
     #[test]
