@@ -43,11 +43,19 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      - name: Fetch real-world models
+        shell: bash
+        run: bash tools/fetch-corpus.sh
+
+      - name: Test real-world models
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --locked -p slicer-cli --test corpus -- --ignored
+
       - name: Slice reference models
         shell: bash
         run: |
           mkdir -p gcode
-          for model in examples/*.stl; do
+          for model in examples/*.stl corpus/3dbenchy/3dbenchy.stl; do
             cargo run --release --locked -p slicer-cli -- slice "$model" -o "gcode/$(basename "${model%.stl}").gcode"
           done
 

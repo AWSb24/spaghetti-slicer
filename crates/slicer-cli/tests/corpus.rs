@@ -473,3 +473,65 @@ fn reference_models_slice_cleanly() {
     }
     assert_eq!(count, 6);
 }
+
+/// Slices the downloaded real-world models. They are not part of the
+/// repository: run `bash tools/fetch-corpus.sh` first, then
+/// `cargo test -p slicer-cli --test corpus -- --ignored`.
+#[test]
+#[ignore = "needs the models fetched by tools/fetch-corpus.sh"]
+fn real_world_models() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/3dbenchy");
+    assert!(dir.is_dir(), "run `bash tools/fetch-corpus.sh` first");
+    let settings = Settings::default();
+    let mut paths: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|e| e == "stl"))
+        .collect();
+    paths.sort();
+    assert_eq!(paths.len(), 21);
+
+    for path in &paths {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let started = std::time::Instant::now();
+        let mesh = slicer_formats::parse_stl(&std::fs::read(path).unwrap())
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let (min, max) = mesh.bounds().unwrap();
+        let mut warnings = Diagnostics::new();
+        let toolpaths = slicer_fdm::generate_reporting(&mesh, &settings, &mut warnings)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let output = slicer_gcode::write_gcode(&toolpaths, &settings).unwrap();
+
+        let expected_layers = ((max[2] - min[2] - settings.first_layer_height + 1e-6)
+            / settings.layer_height)
+            .floor() as usize
+            + 1;
+        assert_eq!(toolpaths.layers.len(), expected_layers, "{name}");
+        for line in output
+            .gcode
+            .lines()
+            .filter(|l| l.starts_with("G0 ") || l.starts_with("G1 "))
+        {
+            let on_bed = [('X', settings.bed_size_x), ('Y', settings.bed_size_y)]
+                .iter()
+                .all(|&(axis, size)| word(line, axis).is_none_or(|v| (0.0..=size).contains(&v)));
+            assert!(on_bed && !line.contains("NaN"), "{name}: bad move '{line}'");
+        }
+        println!(
+            "{name:64} {:>7} tris {:>4} layers {:>6.1} g {:>6} ms  {:?}",
+            mesh.triangles.len(),
+            toolpaths.layers.len(),
+            output.stats.filament_weight_g,
+            started.elapsed().as_millis(),
+            warnings.codes()
+        );
+
+        if name == "3dbenchy.stl" {
+            // 48 mm tall, closed, and nothing in it is thinner than a line.
+            assert_eq!(toolpaths.layers.len(), 240);
+            assert!(warnings.is_empty(), "{:?}", warnings.codes());
+            let grams = output.stats.filament_weight_g;
+            assert!((9.0..14.0).contains(&grams), "{grams} g");
+        }
+    }
+}

@@ -49,6 +49,10 @@ Errors go to stderr with exit code 1. With `--json`, errors and warnings are obj
 cargo run -p slicer-formats --example reference_models -- examples
 ```
 
+## Real-world models
+
+3DBenchy (CC0) and its parts are used as real-world test models. They are not stored in the repository; see [corpus/README.md](corpus/README.md) for sources, license and how to fetch them.
+
 ## Project documents
 
 - Product requirements: [PRD.md](PRD.md) (German)

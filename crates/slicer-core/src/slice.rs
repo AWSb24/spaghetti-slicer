@@ -6,6 +6,12 @@ use crate::diagnostics::{Diagnostic, Diagnostics};
 use crate::mesh::Mesh;
 use crate::polygon::{self, Contour, Point, Shapes};
 
+/// Contours enclosing less than this area (mm²) are dropped from slices.
+/// A printed line is at least a hundred times wider than such a sliver.
+const MIN_CONTOUR_AREA: f64 = 1e-3;
+/// Contour points closer than this (mm) to their predecessor are dropped.
+const MIN_SEGMENT_LENGTH: f64 = 1e-3;
+
 /// One end of a cut segment: the mesh edge it lies on and its position.
 #[derive(Clone, Copy)]
 struct End {
@@ -87,11 +93,12 @@ pub fn slice_mesh_reporting(
             if open > 0 {
                 open_layers.push(index);
             }
-            if oriented {
+            let shapes = if oriented {
                 polygon::from_oriented_loops(&loops)
             } else {
                 polygon::from_loops(&loops)
-            }
+            };
+            polygon::clean(shapes, MIN_CONTOUR_AREA, MIN_SEGMENT_LENGTH)
         })
         .collect();
     if let Some(first) = open_layers.first() {

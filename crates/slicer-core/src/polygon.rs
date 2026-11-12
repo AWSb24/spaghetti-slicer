@@ -129,6 +129,43 @@ pub fn offset(shapes: &Shapes, delta: f64) -> Shapes {
     )
 }
 
+/// Removes debris from shapes: points closer than `min_segment` to their
+/// predecessor, holes smaller than `min_area` and shapes whose outer
+/// contour is smaller than `min_area`.
+///
+/// A cutting plane that grazes a nearly horizontal face produces hundreds
+/// of microscopic slivers. They cannot be printed and make offsetting
+/// extremely slow.
+pub fn clean(shapes: Shapes, min_area: f64, min_segment: f64) -> Shapes {
+    let tidy = |contour: Contour| -> Option<Contour> {
+        let mut kept: Contour = Vec::with_capacity(contour.len());
+        for point in contour {
+            if kept
+                .last()
+                .is_none_or(|&last| distance(last, point) >= min_segment)
+            {
+                kept.push(point);
+            }
+        }
+        while kept.len() > 1 && distance(kept[0], kept[kept.len() - 1]) < min_segment {
+            kept.pop();
+        }
+        (kept.len() >= 3 && signed_area(&kept).abs() >= min_area).then_some(kept)
+    };
+    shapes
+        .into_iter()
+        .filter_map(|shape| {
+            let mut contours = shape.into_iter();
+            let outer = tidy(contours.next()?)?;
+            Some(
+                std::iter::once(outer)
+                    .chain(contours.filter_map(tidy))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
 /// Signed area of a contour: positive when counter-clockwise.
 pub fn signed_area(contour: &[Point]) -> f64 {
     let n = contour.len();
@@ -329,6 +366,30 @@ mod tests {
         assert!((area(&shapes) - 400.0).abs() < 1.0);
         assert!((area(&offset(&shapes, -1.0)) - 324.0).abs() < 1.0);
         assert!((area(&intersection(&shapes, &shapes)) - 400.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn clean_drops_slivers_and_duplicate_points() {
+        let big = vec![
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [10.0, 0.0002], // closer than the minimum segment
+            [10.0, 10.0],
+            [0.0, 10.0],
+            [0.0, 0.0003], // closes onto the first point
+        ];
+        let small_hole = vec![[5.0, 5.0], [5.0, 5.01], [5.01, 5.01]];
+        let real_hole = vec![[2.0, 2.0], [2.0, 4.0], [4.0, 4.0], [4.0, 2.0]];
+        let sliver = vec![[20.0, 0.0], [20.02, 0.0], [20.02, 0.02]];
+        let cleaned = clean(
+            vec![vec![big, small_hole, real_hole.clone()], vec![sliver]],
+            1e-3,
+            1e-3,
+        );
+        assert_eq!(cleaned.len(), 1);
+        assert_eq!(cleaned[0].len(), 2);
+        assert_eq!(cleaned[0][0].len(), 4);
+        assert_eq!(cleaned[0][1], real_hole);
     }
 
     #[test]

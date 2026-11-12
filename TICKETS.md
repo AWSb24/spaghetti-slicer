@@ -17,7 +17,7 @@ Summe: 40 Tickets (7 × S, 25 × M, 8 × L), also rechnerisch etwa 5–8 Monate 
 | T-004 | Offen, nur am Gerät möglich |
 | T-005 | Erledigt: CI auf Linux, Windows, macOS; erster Lauf grün |
 | T-006 | Erledigt: einheitliche Diagnosen mit stabilem Code, Meldung und Kontext; Warnungen werden gesammelt und als JSON ausgegeben |
-| T-007 | Teilweise: 37 erzeugte Modelle als Korpus-Test, sechs Referenzmodelle in `examples/`, defekte Dateien als Test. Offen: Benchy und reale, frei lizenzierte Modelle (Download nötig) |
+| T-007 | Weitgehend erledigt: 37 erzeugte Modelle als Korpus-Test, sechs Referenzmodelle in `examples/`, defekte Dateien als Test, dazu 21 reale Dateien (3DBenchy, CC0) per Abrufskript. Offen: weitere reale Modelle aus anderen Quellen; Ziel 200 ist nicht erreicht |
 | T-046 | Teilweise: CI vergleicht den G-Code aller sechs Referenzmodelle zwischen den drei Plattformen; Sollausgaben im Repo fehlen noch |
 | T-010, T-011 | Erledigt |
 | T-013 | Teilweise: offene Kanten und nicht schließende Konturen werden erkannt und gemeldet; keine Reparatur |
