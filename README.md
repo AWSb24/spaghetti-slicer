@@ -52,6 +52,16 @@ Start the server; it listens on port 8080:
 cargo run --release -p slicer-server
 ```
 
+Or build and run the container image (runs as an unprivileged user, contains the server and the command line tool):
+
+```bash
+docker build -t spaghetti-slicer .
+```
+
+```bash
+docker run --rm -p 8080:8080 -e SPAGHETTI_TOKEN=change-me spaghetti-slicer
+```
+
 Create a job from a model, optionally with a settings file and single overrides. The answer contains the job id:
 
 ```bash

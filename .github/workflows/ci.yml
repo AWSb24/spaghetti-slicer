@@ -85,3 +85,44 @@ jobs:
               exit 1
             fi
           done
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build
+        run: docker build -t spaghetti-slicer .
+
+      - name: Size and user
+        run: |
+          size=$(docker image inspect spaghetti-slicer --format '{{.Size}}')
+          echo "Image size: $size bytes"
+          test "$size" -le 52428800
+          test "$(docker image inspect spaghetti-slicer --format '{{.Config.User}}')" = "65532:65532"
+
+      - name: Slice through the API
+        run: |
+          docker run -d --name slicer -p 8080:8080 spaghetti-slicer
+          for _ in $(seq 30); do curl -fs localhost:8080/health && break; sleep 1; done
+          id=$(curl -fs -F model=@examples/gear_with_hub.stl localhost:8080/v1/jobs | jq -r .id)
+          for _ in $(seq 60); do
+            status=$(curl -fs "localhost:8080/v1/jobs/$id" | jq -r .status)
+            [ "$status" = queued ] || [ "$status" = running ] || break
+            sleep 1
+          done
+          test "$status" = done
+          curl -fs "localhost:8080/v1/jobs/$id/gcode" -o api.gcode
+
+      - name: Same G-code from the command line tool in the image
+        run: |
+          mkdir out && chmod 777 out
+          docker run --rm -v "$PWD/examples:/models:ro" -v "$PWD/out:/out"             --entrypoint /spaghetti-slicer spaghetti-slicer             slice /models/gear_with_hub.stl -o /out/cli.gcode
+          cmp api.gcode out/cli.gcode
+
+      - name: Stops cleanly
+        run: |
+          docker stop slicer
+          docker logs slicer
+          test "$(docker inspect slicer --format '{{.State.ExitCode}}')" = 0
