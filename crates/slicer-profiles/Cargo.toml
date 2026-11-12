@@ -11,4 +11,5 @@ repository.workspace = true
 workspace = true
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
+slicer-core.workspace = true
 toml = "1.2.1"

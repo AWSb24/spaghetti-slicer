@@ -80,6 +80,33 @@ impl fmt::Display for GcodeError {
 
 impl std::error::Error for GcodeError {}
 
+impl slicer_core::Diagnose for GcodeError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::UnknownPlaceholder { .. } => "gcode.unknown_placeholder",
+            Self::UnclosedPlaceholder { .. } => "gcode.unclosed_placeholder",
+        }
+    }
+
+    fn context(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::UnknownPlaceholder {
+                setting,
+                name,
+                line,
+            } => vec![
+                ("setting", (*setting).to_owned()),
+                ("name", name.clone()),
+                ("line", line.to_string()),
+            ],
+            Self::UnclosedPlaceholder { setting, line } => vec![
+                ("setting", (*setting).to_owned()),
+                ("line", line.to_string()),
+            ],
+        }
+    }
+}
+
 fn label(kind: PathKind) -> &'static str {
     match kind {
         PathKind::Skirt => "Skirt",

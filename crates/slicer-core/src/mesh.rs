@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use crate::diagnostics::{Diagnostic, Diagnostics};
+
 /// An indexed triangle mesh. Triangles are expected to be wound
 /// counter-clockwise when seen from outside the solid.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -105,8 +107,62 @@ impl Mesh {
         }
     }
 
+    /// Rotates every vertex around the Z axis by `angle` radians.
+    pub fn rotate_z(&mut self, angle: f64) {
+        let (sin, cos) = angle.sin_cos();
+        for v in &mut self.vertices {
+            (v[0], v[1]) = (v[0] * cos - v[1] * sin, v[0] * sin + v[1] * cos);
+        }
+    }
+
+    /// Rotates every vertex around the X axis by `angle` radians.
+    pub fn rotate_x(&mut self, angle: f64) {
+        let (sin, cos) = angle.sin_cos();
+        for v in &mut self.vertices {
+            (v[1], v[2]) = (v[1] * cos - v[2] * sin, v[1] * sin + v[2] * cos);
+        }
+    }
+
+    /// Appends all triangles of `other`. Vertices are not merged, so the
+    /// result consists of separate shells even where they touch.
+    pub fn merge(&mut self, other: &Mesh) {
+        let offset = self.vertices.len() as u32;
+        self.vertices.extend(&other.vertices);
+        self.triangles
+            .extend(other.triangles.iter().map(|t| t.map(|i| i + offset)));
+    }
+
+    /// Reverses the winding of every triangle, turning the mesh inside out.
+    pub fn flip(&mut self) {
+        for t in &mut self.triangles {
+            t.swap(1, 2);
+        }
+    }
+
+    /// Reports problems that make slicing results unreliable.
+    pub fn check(&self, diagnostics: &mut Diagnostics) {
+        let open_edges = self.open_edge_count();
+        if open_edges > 0 {
+            diagnostics.push(
+                Diagnostic::warning(
+                    "mesh.not_watertight",
+                    format!(
+                        "mesh is not watertight ({open_edges} open or inconsistently oriented edges); affected layers may be incomplete"
+                    ),
+                )
+                .with("open_edges", open_edges),
+            );
+        }
+    }
+
     /// Enclosed volume in mm³. Only meaningful for closed meshes.
     pub fn volume(&self) -> f64 {
+        self.signed_volume().abs()
+    }
+
+    /// Enclosed volume in mm³: positive when triangles face outward,
+    /// negative when the mesh is inside out.
+    pub fn signed_volume(&self) -> f64 {
         let six_v: f64 = self
             .triangles
             .iter()
@@ -117,7 +173,7 @@ impl Mesh {
                     + a[2] * (b[0] * c[1] - b[1] * c[0])
             })
             .sum();
-        (six_v / 6.0).abs()
+        six_v / 6.0
     }
 
     /// Number of triangle edges without a matching neighbour. Zero for a

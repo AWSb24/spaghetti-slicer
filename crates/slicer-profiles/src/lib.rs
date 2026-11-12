@@ -205,6 +205,32 @@ impl fmt::Display for SettingsError {
 
 impl std::error::Error for SettingsError {}
 
+impl slicer_core::Diagnose for SettingsError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Parse(_) => "settings.parse",
+            Self::UnknownKey(_) => "settings.unknown_key",
+            Self::OutOfRange { .. } => "settings.out_of_range",
+        }
+    }
+
+    fn context(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::Parse(_) => Vec::new(),
+            Self::UnknownKey(key) => vec![("key", key.clone())],
+            Self::OutOfRange {
+                key,
+                value,
+                allowed,
+            } => vec![
+                ("key", (*key).to_owned()),
+                ("value", value.to_string()),
+                ("allowed", allowed.clone()),
+            ],
+        }
+    }
+}
+
 fn range(key: &'static str, value: f64, min: f64, max: f64) -> Result<(), SettingsError> {
     if value.is_finite() && value >= min && value <= max {
         Ok(())

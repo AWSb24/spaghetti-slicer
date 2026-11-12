@@ -58,6 +58,22 @@ pub fn from_loops(loops: &[Contour]) -> Shapes {
     )
 }
 
+/// Unites loops whose direction is meaningful: counter-clockwise loops add
+/// material, clockwise loops inside them cut holes. Unlike [`from_loops`],
+/// overlapping counter-clockwise loops merge instead of cancelling out.
+pub fn from_oriented_loops(loops: &[Contour]) -> Shapes {
+    if loops.is_empty() {
+        return Vec::new();
+    }
+    let (loops, none) = (loops.to_vec(), Vec::<Contour>::new());
+    let (rule, fill) = (OverlayRule::Subject, FillRule::NonZero);
+    snap(
+        loops
+            .overlay_with_fixed_scale(&none, rule, fill, SCALE)
+            .unwrap_or_else(|_| loops.overlay(&none, rule, fill)),
+    )
+}
+
 /// Runs a boolean operation on the fixed grid. Geometry too far from the
 /// origin for the fixed grid (several metres) falls back to a grid chosen
 /// from the bounding box.

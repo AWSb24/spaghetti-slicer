@@ -11,3 +11,4 @@ repository.workspace = true
 workspace = true
 [dependencies]
 i_overlay = "9.1.0"
+serde = { version = "1.0.229", features = ["derive"] }

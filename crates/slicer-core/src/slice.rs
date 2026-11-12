@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use crate::diagnostics::{Diagnostic, Diagnostics};
 use crate::mesh::Mesh;
 use crate::polygon::{self, Contour, Point, Shapes};
 
@@ -23,6 +24,15 @@ fn edge_key(a: u32, b: u32) -> u64 {
 /// always yield closed contours. Chains that do not close (holes in the
 /// mesh) are dropped.
 pub fn slice_mesh(mesh: &Mesh, heights: &[f64]) -> Vec<Shapes> {
+    slice_mesh_reporting(mesh, heights, &mut Diagnostics::new())
+}
+
+/// Like [`slice_mesh`], and reports layers in which contours did not close.
+pub fn slice_mesh_reporting(
+    mesh: &Mesh,
+    heights: &[f64],
+    diagnostics: &mut Diagnostics,
+) -> Vec<Shapes> {
     let mut segments: Vec<Vec<[End; 2]>> = vec![Vec::new(); heights.len()];
 
     for tri in &mesh.triangles {
@@ -46,8 +56,12 @@ pub fn slice_mesh(mesh: &Mesh, heights: &[f64]) -> Vec<Shapes> {
                     continue;
                 }
                 let t = (z - p[2]) / (q[2] - p[2]);
+                // With outward-facing triangles, walking from the edge that
+                // goes down through the plane to the one that comes up keeps
+                // the solid on the left.
+                let rises = mesh.vertices[i as usize][2] <= z;
                 if count < 2 {
-                    ends[count] = Some(End {
+                    ends[usize::from(rises)] = Some(End {
                         edge: edge_key(i, j),
                         point: [p[0] + t * (q[0] - p[0]), p[1] + t * (q[1] - p[1])],
                     });
@@ -60,14 +74,47 @@ pub fn slice_mesh(mesh: &Mesh, heights: &[f64]) -> Vec<Shapes> {
         }
     }
 
-    segments
+    // A consistently oriented mesh tells inside from outside, so overlapping
+    // shells can be united. Otherwise fall back to counting crossings, which
+    // tolerates flipped triangles but turns overlaps into holes.
+    let oriented = mesh.open_edge_count() == 0;
+    let mut open_layers = Vec::new();
+    let slices = segments
         .iter()
-        .map(|layer| polygon::from_loops(&chain_segments(layer)))
-        .collect()
+        .enumerate()
+        .map(|(index, layer)| {
+            let (loops, open) = chain_segments(layer);
+            if open > 0 {
+                open_layers.push(index);
+            }
+            if oriented {
+                polygon::from_oriented_loops(&loops)
+            } else {
+                polygon::from_loops(&loops)
+            }
+        })
+        .collect();
+    if let Some(first) = open_layers.first() {
+        diagnostics.push(
+            Diagnostic::warning(
+                "slicing.open_contours",
+                format!(
+                    "{} of {} layers have contours that do not close and were dropped (first: layer {})",
+                    open_layers.len(),
+                    heights.len(),
+                    first + 1
+                ),
+            )
+            .with("layers", open_layers.len())
+            .with("first_layer", first + 1),
+        );
+    }
+    slices
 }
 
-/// Joins segments that share mesh edges into closed loops.
-fn chain_segments(segments: &[[End; 2]]) -> Vec<Contour> {
+/// Joins segments that share mesh edges into closed loops. Also returns the
+/// number of chains that did not close.
+fn chain_segments(segments: &[[End; 2]]) -> (Vec<Contour>, usize) {
     let mut by_edge: HashMap<u64, Vec<usize>> = HashMap::new();
     for (index, segment) in segments.iter().enumerate() {
         for end in segment {
@@ -77,6 +124,7 @@ fn chain_segments(segments: &[[End; 2]]) -> Vec<Contour> {
 
     let mut used = vec![false; segments.len()];
     let mut loops = Vec::new();
+    let mut open = 0;
     for start in 0..segments.len() {
         if used[start] {
             continue;
@@ -85,6 +133,9 @@ fn chain_segments(segments: &[[End; 2]]) -> Vec<Contour> {
         let origin = segments[start][0].edge;
         let mut contour = vec![segments[start][0].point];
         let mut current = segments[start][1];
+        // Counts segments walked in their natural direction minus those
+        // walked backwards.
+        let mut forward: i64 = 1;
         let closed = loop {
             if current.edge == origin {
                 break true;
@@ -97,16 +148,23 @@ fn chain_segments(segments: &[[End; 2]]) -> Vec<Contour> {
             used[next] = true;
             let segment = segments[next];
             current = if segment[0].edge == current.edge {
+                forward += 1;
                 segment[1]
             } else {
+                forward -= 1;
                 segment[0]
             };
         };
-        if closed && contour.len() >= 3 {
+        if forward < 0 {
+            contour.reverse();
+        }
+        if !closed {
+            open += 1;
+        } else if contour.len() >= 3 {
             loops.push(contour);
         }
     }
-    loops
+    (loops, open)
 }
 
 #[cfg(test)]
@@ -143,7 +201,46 @@ mod tests {
     fn open_mesh_does_not_panic() {
         let mut mesh = Mesh::cuboid(10.0, 10.0, 10.0);
         mesh.triangles.remove(4);
+        let mut diagnostics = Diagnostics::new();
+        let layers = slice_mesh_reporting(&mesh, &[2.0, 5.0], &mut diagnostics);
+        assert_eq!(layers.len(), 2);
+        assert_eq!(diagnostics.codes(), ["slicing.open_contours"]);
+        assert_eq!(diagnostics.as_slice()[0].context["layers"], "2");
+    }
+
+    #[test]
+    fn overlapping_shells_are_united() {
+        // Two boxes overlapping by half: the shared part must stay solid.
+        let mut mesh = Mesh::cuboid(10.0, 10.0, 10.0);
+        let mut other = Mesh::cuboid(10.0, 10.0, 10.0);
+        other.translate([5.0, 0.0, 0.0]);
+        mesh.merge(&other);
         let layers = slice_mesh(&mesh, &[5.0]);
-        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].len(), 1);
+        assert!((area(&layers[0]) - 150.0).abs() < 1e-3);
+
+        // Turning the whole mesh inside out must not change the result.
+        mesh.flip();
+        let flipped = slice_mesh(&mesh, &[5.0]);
+        assert!((area(&flipped[0]) - 150.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn holes_survive_in_oriented_meshes() {
+        let mesh = crate::primitives::tube(10.0, 6.0, 5.0, 64);
+        let layers = slice_mesh(&mesh, &[2.5]);
+        assert_eq!(layers[0].len(), 1);
+        assert_eq!(layers[0][0].len(), 2);
+        let expected = std::f64::consts::PI * (100.0 - 36.0);
+        assert!((area(&layers[0]) - expected).abs() < 0.01 * expected);
+    }
+
+    #[test]
+    fn closed_mesh_reports_nothing() {
+        let mut diagnostics = Diagnostics::new();
+        slice_mesh_reporting(&Mesh::cuboid(10.0, 10.0, 10.0), &[5.0], &mut diagnostics);
+        assert!(diagnostics.is_empty());
+        Mesh::cuboid(1.0, 1.0, 1.0).check(&mut diagnostics);
+        assert!(diagnostics.is_empty());
     }
 }

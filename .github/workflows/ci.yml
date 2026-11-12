@@ -43,13 +43,18 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
-      - name: Slice reference model
-        run: cargo run --release --locked -p slicer-cli -- slice examples/cube_20mm.stl -o cube_20mm.gcode
+      - name: Slice reference models
+        shell: bash
+        run: |
+          mkdir -p gcode
+          for model in examples/*.stl; do
+            cargo run --release --locked -p slicer-cli -- slice "$model" -o "gcode/$(basename "${model%.stl}").gcode"
+          done
 
       - uses: actions/upload-artifact@v7
         with:
           name: gcode-${{ matrix.os }}
-          path: cube_20mm.gcode
+          path: gcode/
           if-no-files-found: error
           retention-days: 7
 
@@ -64,11 +69,11 @@ jobs:
 
       - name: Compare
         run: |
-          sha256sum gcode/*/cube_20mm.gcode
+          sha256sum gcode/*/*.gcode
           for other in windows-latest macos-latest; do
-            if ! cmp gcode/gcode-ubuntu-latest/cube_20mm.gcode "gcode/gcode-$other/cube_20mm.gcode"; then
+            if ! diff -rq gcode/gcode-ubuntu-latest "gcode/gcode-$other"; then
               echo "::error::G-code from $other differs from ubuntu-latest"
-              diff gcode/gcode-ubuntu-latest/cube_20mm.gcode "gcode/gcode-$other/cube_20mm.gcode" | head -n 40
+              diff -r gcode/gcode-ubuntu-latest "gcode/gcode-$other" | head -n 40
               exit 1
             fi
           done

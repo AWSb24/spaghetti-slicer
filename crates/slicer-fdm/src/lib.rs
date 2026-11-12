@@ -7,8 +7,8 @@ pub mod preview;
 use std::fmt;
 
 use slicer_core::polygon::{self, HatchDirection, distance};
-use slicer_core::slice::slice_mesh;
-use slicer_core::{Contour, Mesh, Point, Shapes};
+use slicer_core::slice::slice_mesh_reporting;
+use slicer_core::{Contour, Diagnostic, Diagnostics, Mesh, Point, Shapes};
 use slicer_profiles::{InfillPattern, Settings};
 
 /// What a path is for. Determines speed and the label in the G-code.
@@ -104,9 +104,40 @@ impl fmt::Display for FdmError {
 
 impl std::error::Error for FdmError {}
 
+impl slicer_core::Diagnose for FdmError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::EmptyModel => "slicing.empty_model",
+            Self::TooLarge { .. } => "slicing.too_large",
+            Self::NothingToPrint => "slicing.nothing_to_print",
+        }
+    }
+
+    fn context(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::TooLarge { model, volume } => {
+                let text = |v: &[f64; 3]| format!("{:.3} x {:.3} x {:.3}", v[0], v[1], v[2]);
+                vec![("model_size", text(model)), ("build_volume", text(volume))]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
 /// Slices `mesh` and generates toolpaths. The model is centred on the bed
 /// and placed on it.
 pub fn generate(mesh: &Mesh, settings: &Settings) -> Result<Toolpaths, FdmError> {
+    generate_reporting(mesh, settings, &mut Diagnostics::new())
+}
+
+/// Like [`generate`], and collects warnings about the mesh and about
+/// geometry that could not be printed faithfully.
+pub fn generate_reporting(
+    mesh: &Mesh,
+    settings: &Settings,
+    diagnostics: &mut Diagnostics,
+) -> Result<Toolpaths, FdmError> {
+    mesh.check(diagnostics);
     let (min, max) = mesh.bounds().ok_or(FdmError::EmptyModel)?;
     let size = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
     let volume = [
@@ -151,28 +182,53 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Result<Toolpaths, FdmError>
         .zip(&heights)
         .map(|(top, h)| top - h / 2.0)
         .collect();
-    let slices = slice_mesh(&mesh, &cut_heights);
+    let slices = slice_mesh_reporting(&mesh, &cut_heights, diagnostics);
     if slices.iter().all(Vec::is_empty) {
         return Err(FdmError::NothingToPrint);
     }
 
     let mut position: Point = [0.0, 0.0];
+    let mut thin_layers = Vec::new();
     let layers = (0..slices.len())
-        .map(|index| Layer {
-            z: tops[index],
-            height: heights[index],
-            paths: layer_paths(&slices, index, settings, &mut position),
+        .map(|index| {
+            let (paths, thin) = layer_paths(&slices, index, settings, &mut position);
+            if thin {
+                thin_layers.push(index);
+            }
+            Layer {
+                z: tops[index],
+                height: heights[index],
+                paths,
+            }
         })
         .collect();
+    if let Some(first) = thin_layers.first() {
+        diagnostics.push(
+            Diagnostic::warning(
+                "slicing.thin_regions",
+                format!(
+                    "{} of {} layers contain regions narrower than the line width ({} mm) that are not printed (first: layer {})",
+                    thin_layers.len(),
+                    slices.len(),
+                    settings.line_width,
+                    first + 1
+                ),
+            )
+            .with("layers", thin_layers.len())
+            .with("first_layer", first + 1),
+        );
+    }
     Ok(Toolpaths { layers })
 }
 
+/// Generates the paths of one layer. The flag tells whether a noticeable
+/// part of the layer is too narrow to be covered by a wall.
 fn layer_paths(
     slices: &[Shapes],
     index: usize,
     settings: &Settings,
     position: &mut Point,
-) -> Vec<Path> {
+) -> (Vec<Path>, bool) {
     let slice = &slices[index];
     let width = settings.line_width;
     let walls = settings.wall_loops as usize;
@@ -184,9 +240,18 @@ fn layer_paths(
 
     // Walls: centre lines half a width inside the contour, then one width
     // further in for every additional loop. Printed from the inside out.
-    let mut wall_loops: Vec<Vec<Contour>> = (0..walls)
-        .map(|k| contours(&polygon::offset(slice, -(0.5 + k as f64) * width)))
+    let wall_shapes: Vec<Shapes> = (0..walls)
+        .map(|k| polygon::offset(slice, -(0.5 + k as f64) * width))
         .collect();
+
+    // What the outer wall covers is its centre line grown back by half a
+    // width. Anything of the slice beyond that is lost. Rounded corners
+    // always lose a little, so only report a noticeable share.
+    let total = polygon::area(slice);
+    let covered = polygon::area(&polygon::offset(&wall_shapes[0], 0.5 * width));
+    let mut thin = total - covered > (0.02 * total).max(width * width);
+
+    let mut wall_loops: Vec<Vec<Contour>> = wall_shapes.iter().map(contours).collect();
     while let Some(loops) = wall_loops.pop() {
         let kind = if wall_loops.is_empty() {
             PathKind::OuterWall
@@ -195,6 +260,10 @@ fn layer_paths(
         };
         push_loops(loops, kind, width, position, &mut paths);
     }
+    // A layer with material but without any outer wall prints nothing.
+    if !slice.is_empty() && paths.iter().all(|p| p.kind != PathKind::OuterWall) {
+        thin = true;
+    }
 
     // Infill centre lines stay half a width away from the inner edge of the
     // innermost wall, so line ends and the links between lines do not
@@ -202,7 +271,7 @@ fn layer_paths(
     let inset = (walls as f64 + 0.5 - settings.infill_overlap / 100.0) * width;
     let fill_area = polygon::offset(slice, -inset);
     if fill_area.is_empty() {
-        return paths;
+        return (paths, thin);
     }
     let (solid, sparse) = split_solid_sparse(slices, index, &fill_area, settings);
 
@@ -254,7 +323,7 @@ fn layer_paths(
             }
         }
     }
-    paths
+    (paths, thin)
 }
 
 /// Splits the fill area of a layer into the part that needs solid infill

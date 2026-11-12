@@ -16,8 +16,11 @@ Summe: 40 Tickets (7 × S, 25 × M, 8 × L), also rechnerisch etwa 5–8 Monate 
 | T-003 | Erledigt: `i_overlay` bestätigt, festes 10-nm-Raster eingeführt, siehe `docs/decisions/0001-polygon-library.md` |
 | T-004 | Offen, nur am Gerät möglich |
 | T-005 | Erledigt: CI auf Linux, Windows, macOS; erster Lauf grün |
-| T-046 | Teilweise: CI vergleicht den G-Code des Würfels zwischen den drei Plattformen (bitgleich); Sollausgaben im Repo fehlen noch |
+| T-006 | Erledigt: einheitliche Diagnosen mit stabilem Code, Meldung und Kontext; Warnungen werden gesammelt und als JSON ausgegeben |
+| T-007 | Teilweise: 37 erzeugte Modelle als Korpus-Test, sechs Referenzmodelle in `examples/`, defekte Dateien als Test. Offen: Benchy und reale, frei lizenzierte Modelle (Download nötig) |
+| T-046 | Teilweise: CI vergleicht den G-Code aller sechs Referenzmodelle zwischen den drei Plattformen; Sollausgaben im Repo fehlen noch |
 | T-010, T-011 | Erledigt |
+| T-013 | Teilweise: offene Kanten und nicht schließende Konturen werden erkannt und gemeldet; keine Reparatur |
 | T-020 bis T-023, T-030 bis T-036 | Als Prototyp umgesetzt (Schichtung nicht parallel, Naht und Leerwege einfach) |
 | T-041, T-043, T-050 | Als Prototyp umgesetzt (Marlin und Klipper noch identisch) |
 | T-040, T-044 | Teilweise: flache Einstellungen ohne Profilebenen; Zeitschätzung ohne Beschleunigung |

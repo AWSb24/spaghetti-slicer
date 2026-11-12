@@ -28,7 +28,28 @@ Use a config file and override single settings:
 cargo run --release -p slicer-cli -- slice model.stl -c settings.toml -s layer_height=0.1 -s infill_density=30 --json
 ```
 
-Errors go to stderr with exit code 1; with `--json` they are machine-readable.
+Errors go to stderr with exit code 1. With `--json`, errors and warnings are objects with a stable `code`, a `message` and a `context`:
+
+| Code | Meaning |
+|---|---|
+| `model.unrecognized`, `model.truncated`, `model.invalid_vertex`, `model.incomplete_triangle`, `model.non_finite`, `model.no_triangles` | The STL file cannot be read |
+| `settings.parse`, `settings.unknown_key`, `settings.out_of_range` | A settings file or `--set` value is invalid |
+| `slicing.empty_model`, `slicing.too_large`, `slicing.nothing_to_print` | The model cannot be sliced |
+| `gcode.unknown_placeholder`, `gcode.unclosed_placeholder` | Custom start or end G-code is invalid |
+| `io.read`, `io.write`, `cli.invalid_override` | A file cannot be accessed or an argument is malformed |
+| `mesh.not_watertight` (warning) | The mesh has open or inconsistently oriented edges |
+| `slicing.open_contours` (warning) | Some layers have contours that do not close and were dropped |
+| `slicing.thin_regions` (warning) | Some layers have parts narrower than the line width that are not printed |
+
+## Reference models
+
+`examples/` holds six generated models that print without supports: a cube, a cylinder, a dome, a tube, a stepped block and a gear with a hub. CI slices all of them on Linux, Windows and macOS and fails if the G-code differs between platforms. Regenerate them with:
+
+```bash
+cargo run -p slicer-formats --example reference_models -- examples
+```
+
+## Project documents
 
 - Product requirements: [PRD.md](PRD.md) (German)
 - Ticket breakdown for phase 0–1: [TICKETS.md](TICKETS.md) (German)

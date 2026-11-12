@@ -114,7 +114,14 @@ fn errors_use_exit_code_and_json() {
     let out = run(&["slice", broken.to_str().unwrap(), "--json"]);
     assert_eq!(out.status.code(), Some(1));
     let error: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
-    assert_eq!(error["error"]["code"], "model_invalid");
+    assert_eq!(error["error"]["code"], "model.unrecognized");
+    assert_eq!(error["error"]["severity"], "error");
+    assert!(
+        error["error"]["context"]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("broken.stl")
+    );
     assert!(!dir.join("broken.gcode").exists());
 
     let out = run(&["slice", dir.join("missing.stl").to_str().unwrap()]);
@@ -129,7 +136,9 @@ fn errors_use_exit_code_and_json() {
         "layer_height=5",
     ]);
     let error: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
-    assert_eq!(error["error"]["code"], "setting_invalid");
+    assert_eq!(error["error"]["code"], "settings.out_of_range");
+    assert_eq!(error["error"]["context"]["key"], "layer_height");
+    assert_eq!(error["error"]["context"]["value"], "5");
     assert!(
         error["error"]["message"]
             .as_str()
@@ -148,7 +157,7 @@ fn errors_use_exit_code_and_json() {
     ]);
     assert_eq!(out.status.code(), Some(1));
     let error: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
-    assert_eq!(error["error"]["code"], "slicing_failed");
+    assert_eq!(error["error"]["code"], "slicing.too_large");
 }
 
 #[test]
@@ -162,12 +171,10 @@ fn open_mesh_produces_a_warning() {
     let out = run(&["slice", stl.to_str().unwrap(), "--json"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert!(
-        report["warnings"][0]
-            .as_str()
-            .unwrap()
-            .contains("not watertight")
-    );
+    assert_eq!(report["warnings"].as_array().unwrap().len(), 1);
+    assert_eq!(report["warnings"][0]["code"], "mesh.not_watertight");
+    assert_eq!(report["warnings"][0]["severity"], "warning");
+    assert_eq!(report["warnings"][0]["context"]["open_edges"], "3");
 }
 
 #[test]

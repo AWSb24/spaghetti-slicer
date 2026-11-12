@@ -2,9 +2,12 @@
 //!
 //! All lengths are millimetres.
 
+pub mod diagnostics;
 pub mod mesh;
 pub mod polygon;
+pub mod primitives;
 pub mod slice;
 
+pub use diagnostics::{Diagnose, Diagnostic, Diagnostics, Severity};
 pub use mesh::Mesh;
 pub use polygon::{Contour, Point, Shape, Shapes};

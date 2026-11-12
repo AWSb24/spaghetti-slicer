@@ -286,6 +286,7 @@ name = "slicer-core"
 version = "0.1.0"
 dependencies = [
  "i_overlay",
+ "serde",
 ]
 
 [[package]]
@@ -318,6 +319,7 @@ name = "slicer-profiles"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "slicer-core",
  "toml",
 ]
 

@@ -50,6 +50,30 @@ impl fmt::Display for StlError {
 
 impl std::error::Error for StlError {}
 
+impl slicer_core::Diagnose for StlError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Unrecognized => "model.unrecognized",
+            Self::Truncated { .. } => "model.truncated",
+            Self::InvalidVertex { .. } => "model.invalid_vertex",
+            Self::IncompleteTriangle => "model.incomplete_triangle",
+            Self::NonFiniteCoordinate => "model.non_finite",
+            Self::NoTriangles => "model.no_triangles",
+        }
+    }
+
+    fn context(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::Truncated { expected, actual } => vec![
+                ("expected_bytes", expected.to_string()),
+                ("actual_bytes", actual.to_string()),
+            ],
+            Self::InvalidVertex { line } => vec![("line", line.to_string())],
+            _ => Vec::new(),
+        }
+    }
+}
+
 /// Parses a binary or ASCII STL file.
 pub fn parse_stl(bytes: &[u8]) -> Result<Mesh, StlError> {
     let triangles = match binary_triangle_count(bytes) {
