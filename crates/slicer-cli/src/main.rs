@@ -46,10 +46,10 @@ enum Command {
     DefaultConfig,
 }
 
-/// Turns a library error into a diagnostic that names the file it concerns.
-fn in_file(path: &Path) -> impl Fn(&dyn Diagnose) -> Diagnostic + '_ {
-    move |error| {
-        let mut diagnostic = error.diagnostic().with("path", path.display());
+/// Names the file a diagnostic concerns.
+fn in_file(path: &Path) -> impl Fn(Diagnostic) -> Diagnostic + '_ {
+    move |diagnostic| {
+        let mut diagnostic = diagnostic.with("path", path.display());
         diagnostic.message = format!("{}: {}", path.display(), diagnostic.message);
         diagnostic
     }
@@ -104,7 +104,7 @@ fn slice(
     let mut settings = match &config {
         Some(path) => {
             let text = fs::read_to_string(path).map_err(|e| io_error("io.read", path, &e))?;
-            Settings::from_toml(&text).map_err(|e| in_file(path)(&e))?
+            Settings::from_toml(&text).map_err(|e| in_file(path)(e.diagnostic()))?
         }
         None => Settings::default(),
     };
@@ -123,11 +123,7 @@ fn slice(
 
     let bytes = fs::read(&input).map_err(|e| io_error("io.read", &input, &e))?;
     let mut warnings = Diagnostics::new();
-    let mesh = if slicer_formats::looks_like_3mf(&bytes) {
-        slicer_formats::parse_3mf(&bytes, &mut warnings).map_err(|e| in_file(&input)(&e))?
-    } else {
-        slicer_formats::parse_stl(&bytes).map_err(|e| in_file(&input)(&e))?
-    };
+    let mesh = slicer_formats::parse_model(&bytes, &mut warnings).map_err(in_file(&input))?;
 
     let toolpaths = slicer_fdm::generate_reporting(&mesh, &settings, &mut warnings)
         .map_err(|e| e.diagnostic())?;

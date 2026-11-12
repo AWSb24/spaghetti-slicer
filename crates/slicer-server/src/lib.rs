@@ -287,11 +287,7 @@ fn slice(
     settings: &Settings,
 ) -> Result<(slicer_gcode::Output, Diagnostics), Diagnostic> {
     let mut warnings = Diagnostics::new();
-    let mesh = if slicer_formats::looks_like_3mf(model) {
-        slicer_formats::parse_3mf(model, &mut warnings).map_err(|e| e.diagnostic())?
-    } else {
-        slicer_formats::parse_stl(model).map_err(|e| e.diagnostic())?
-    };
+    let mesh = slicer_formats::parse_model(model, &mut warnings)?;
     let toolpaths = slicer_fdm::generate_reporting(&mesh, settings, &mut warnings)
         .map_err(|e| e.diagnostic())?;
     let output = slicer_gcode::write_gcode(&toolpaths, settings).map_err(|e| e.diagnostic())?;
