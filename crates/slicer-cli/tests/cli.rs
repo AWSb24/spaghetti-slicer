@@ -198,3 +198,30 @@ fn default_config_is_valid_toml_accepted_by_slice() {
     ]);
     assert!(out.status.success(), "{}", text(&out.stderr));
 }
+
+#[test]
+fn a_3mf_file_gives_the_same_gcode_as_the_stl() {
+    let dir = workdir("threemf");
+    let mesh = Mesh::cuboid(20.0, 20.0, 20.0);
+    let stl = dir.join("stl.stl");
+    fs::write(&stl, slicer_formats::write_stl_binary(&mesh)).unwrap();
+    let threemf = dir.join("threemf.3mf");
+    fs::write(&threemf, slicer_formats::write_3mf(&mesh).unwrap()).unwrap();
+
+    for file in [&stl, &threemf] {
+        let out = run(&["slice", file.to_str().unwrap(), "--json"]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+    }
+    assert_eq!(
+        fs::read(dir.join("stl.gcode")).unwrap(),
+        fs::read(dir.join("threemf.gcode")).unwrap()
+    );
+
+    // A ZIP archive that is not a 3MF package is rejected with a code.
+    let broken = dir.join("broken.3mf");
+    fs::write(&broken, b"PK\x03\x04garbage").unwrap();
+    let out = run(&["slice", broken.to_str().unwrap(), "--json"]);
+    assert!(!out.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(report["error"]["code"], "model.archive");
+}

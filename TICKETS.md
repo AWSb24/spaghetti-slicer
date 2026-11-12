@@ -7,7 +7,7 @@ Grundlage: [PRD.md](PRD.md), Requirements R1–R13. Referenzdrucker: Bambu Lab X
 
 Summe: 40 Tickets (7 × S, 25 × M, 8 × L), also rechnerisch etwa 5–8 Monate Vollzeit-Äquivalent, ohne Puffer für Nacharbeit. Das ist eine Größenordnung, keine Zusage.
 
-## Stand (2026-11-11)
+## Stand (2026-11-12)
 
 | Ticket | Stand |
 |---|---|
@@ -20,6 +20,7 @@ Summe: 40 Tickets (7 × S, 25 × M, 8 × L), also rechnerisch etwa 5–8 Monate 
 | T-007 | Weitgehend erledigt: 37 erzeugte Modelle als Korpus-Test, sechs Referenzmodelle in `examples/`, defekte Dateien als Test, dazu 21 reale Dateien (3DBenchy, CC0) per Abrufskript. Offen: weitere reale Modelle aus anderen Quellen; Ziel 200 ist nicht erreicht |
 | T-046 | Teilweise: CI vergleicht den G-Code aller sechs Referenzmodelle zwischen den drei Plattformen; Sollausgaben im Repo fehlen noch |
 | T-010, T-011 | Erledigt |
+| T-012 | Erledigt: Geometrie, Einheiten, Komponenten, Build-Items und Transformationen; Verweise auf andere Modellteile im Paket (Production-Erweiterung); �brige Erweiterungen als Warnung. Noch nicht mit Dateien aus fremden Programmen gepr�ft |
 | T-013 | Teilweise: offene Kanten und nicht schließende Konturen werden erkannt und gemeldet; keine Reparatur |
 | T-020 bis T-023, T-030 bis T-036 | Als Prototyp umgesetzt (Schichtung nicht parallel, Naht und Leerwege einfach) |
 | T-041, T-043, T-050 | Als Prototyp umgesetzt (Marlin und Klipper noch identisch) |

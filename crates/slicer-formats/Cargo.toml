@@ -10,4 +10,6 @@ repository.workspace = true
 [lints]
 workspace = true
 [dependencies]
+quick-xml = "0.42.0"
 slicer-core.workspace = true
+zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }

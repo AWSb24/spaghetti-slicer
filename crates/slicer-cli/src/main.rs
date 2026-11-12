@@ -22,9 +22,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Slice an STL model into G-code
+    /// Slice an STL or 3MF model into G-code
     Slice {
-        /// Model file (binary or ASCII STL)
+        /// Model file (STL or 3MF)
         input: PathBuf,
         /// G-code file to write [default: input with .gcode extension]
         #[arg(short, long)]
@@ -122,9 +122,13 @@ fn slice(
     }
 
     let bytes = fs::read(&input).map_err(|e| io_error("io.read", &input, &e))?;
-    let mesh = slicer_formats::parse_stl(&bytes).map_err(|e| in_file(&input)(&e))?;
-
     let mut warnings = Diagnostics::new();
+    let mesh = if slicer_formats::looks_like_3mf(&bytes) {
+        slicer_formats::parse_3mf(&bytes, &mut warnings).map_err(|e| in_file(&input)(&e))?
+    } else {
+        slicer_formats::parse_stl(&bytes).map_err(|e| in_file(&input)(&e))?
+    };
+
     let toolpaths = slicer_fdm::generate_reporting(&mesh, &settings, &mut warnings)
         .map_err(|e| e.diagnostic())?;
     let result = slicer_gcode::write_gcode(&toolpaths, &settings).map_err(|e| e.diagnostic())?;

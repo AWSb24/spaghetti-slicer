@@ -4,9 +4,9 @@ A 3D printing slicer written entirely in Rust, for desktop and server use.
 
 **Status: early prototype. The G-code has never been run on a printer. Do not print it unattended.**
 
-What works: STL import, slicing, walls, solid top/bottom layers, sparse infill (rectilinear, grid), skirt, brim, retraction, G-code for Marlin and Klipper, per-layer SVG preview.
+What works: STL and 3MF import (geometry only), slicing, walls, solid top/bottom layers, sparse infill (rectilinear, grid), skirt, brim, retraction, G-code for Marlin and Klipper, per-layer SVG preview.
 
-What does not exist yet: supports, 3MF, Bambu Lab output, seam control, bridges, the HTTP server, the UI.
+What does not exist yet: supports, 3MF projects with settings or colours, Bambu Lab output, seam control, bridges, the HTTP server, the UI.
 
 ## Usage
 
@@ -33,10 +33,13 @@ Errors go to stderr with exit code 1. With `--json`, errors and warnings are obj
 | Code | Meaning |
 |---|---|
 | `model.unrecognized`, `model.truncated`, `model.invalid_vertex`, `model.incomplete_triangle`, `model.non_finite`, `model.no_triangles` | The STL file cannot be read |
+| `model.archive`, `model.missing_part`, `model.xml`, `model.invalid_attribute`, `model.unsupported_unit`, `model.invalid_index`, `model.unknown_object`, `model.component_cycle`, `model.too_large` | The 3MF file cannot be read |
 | `settings.parse`, `settings.unknown_key`, `settings.out_of_range` | A settings file or `--set` value is invalid |
 | `slicing.empty_model`, `slicing.too_large`, `slicing.nothing_to_print` | The model cannot be sliced |
 | `gcode.unknown_placeholder`, `gcode.unclosed_placeholder` | Custom start or end G-code is invalid |
 | `io.read`, `io.write`, `cli.invalid_override` | A file cannot be accessed or an argument is malformed |
+| `model.unsupported_extension` (warning) | The 3MF file uses extensions that are ignored |
+| `model.skipped_objects` (warning) | The 3MF file has objects that are not of type `model`; they are not printed |
 | `mesh.not_watertight` (warning) | The mesh has open or inconsistently oriented edges |
 | `slicing.open_contours` (warning) | Some layers have contours that do not close and were dropped |
 | `slicing.thin_regions` (warning) | Some layers have parts narrower than the line width that are not printed |
