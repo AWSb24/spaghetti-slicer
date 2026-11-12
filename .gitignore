@@ -9,3 +9,4 @@ Thumbs.db
 /tools/*/target
 /tools/*/Cargo.lock
 /corpus/*/
+/graphify-out/
