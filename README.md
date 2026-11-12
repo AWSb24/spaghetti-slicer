@@ -4,9 +4,9 @@ A 3D printing slicer written entirely in Rust, for desktop and server use.
 
 **Status: early prototype. The G-code has never been run on a printer. Do not print it unattended.**
 
-What works: STL and 3MF import (geometry only), slicing, walls, solid top/bottom layers, sparse infill (rectilinear, grid), skirt, brim, retraction, G-code for Marlin and Klipper, per-layer SVG preview.
+What works: STL and 3MF import (geometry only), slicing, walls, solid top/bottom layers, sparse infill (rectilinear, grid), skirt, brim, retraction, G-code for Marlin and Klipper, per-layer SVG preview, an HTTP server with a job API.
 
-What does not exist yet: supports, 3MF projects with settings or colours, Bambu Lab output, seam control, bridges, the HTTP server, the UI.
+What does not exist yet: supports, 3MF projects with settings or colours, Bambu Lab output, seam control, bridges, a Docker image, the UI.
 
 ## Usage
 
@@ -43,6 +43,43 @@ Errors go to stderr with exit code 1. With `--json`, errors and warnings are obj
 | `mesh.not_watertight` (warning) | The mesh has open or inconsistently oriented edges |
 | `slicing.open_contours` (warning) | Some layers have contours that do not close and were dropped |
 | `slicing.thin_regions` (warning) | Some layers have parts narrower than the line width that are not printed |
+
+## Server
+
+Start the server; it listens on port 8080:
+
+```bash
+cargo run --release -p slicer-server
+```
+
+Create a job from a model, optionally with a settings file and single overrides. The answer contains the job id:
+
+```bash
+curl -F model=@examples/cube_20mm.stl -F settings=@settings.toml -F set=infill_density=30 localhost:8080/v1/jobs
+```
+
+| Request | Purpose |
+|---|---|
+| `GET /health` | Liveness check, never needs a token |
+| `POST /v1/jobs` | Create a job (multipart fields `model`, `settings`, `set`); answers `202` at once |
+| `GET /v1/jobs/{id}` | Status (`queued`, `running`, `done`, `failed`, `cancelled`), statistics, warnings or the error |
+| `GET /v1/jobs/{id}/gcode` | The G-code of a finished job |
+| `DELETE /v1/jobs/{id}` | Cancel an unfinished job or delete a finished one |
+
+Errors have the same shape and codes as the command line tool, plus `request.invalid`, `request.too_large`, `request.unauthorized`, `request.not_found`, `job.not_found`, `job.no_result` and `server.busy`. Jobs live in memory and are lost on restart. Cancelling a job that is already being sliced discards its result but does not stop the computation.
+
+The server is configured through environment variables only:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SPAGHETTI_LISTEN` | `0.0.0.0:8080` | Address and port |
+| `SPAGHETTI_WORKERS` | number of CPU cores | Jobs sliced at the same time |
+| `SPAGHETTI_MAX_PENDING` | `100` | Unfinished jobs accepted before new ones get `503` |
+| `SPAGHETTI_MAX_UPLOAD_BYTES` | `268435456` | Largest request body |
+| `SPAGHETTI_RESULT_TTL_SECONDS` | `3600` | How long finished jobs are kept |
+| `SPAGHETTI_TOKEN` | unset | If set, `/v1/` requires `Authorization: Bearer <token>` |
+
+Without a token anyone who can reach the port can submit jobs. Logs are JSON lines on standard output.
 
 ## Reference models
 

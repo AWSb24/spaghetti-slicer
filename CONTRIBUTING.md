@@ -63,6 +63,7 @@ All three must pass. New behaviour needs a test.
 | Extrusion amount (line width × layer height per millimetre) | Volume conservation, own design |
 | STL parsing | Public STL format description |
 | 3MF parsing | 3MF Core Specification and Production Extension (3MF Consortium, public); `zip` (MIT) and `quick-xml` (MIT) crates |
+| HTTP server | `axum` and `tokio` (MIT), `uuid` (MIT OR Apache-2.0); API is an own design |
 | G-code commands | Marlin and RepRap G-code documentation |
 | `;TYPE:` and `;LAYER_CHANGE` comments | Naming convention read by common G-code viewers, used for interoperability |
 | Default start and end G-code | Generic Marlin commands, not taken from any profile |
