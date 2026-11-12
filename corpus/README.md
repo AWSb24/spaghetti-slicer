@@ -47,6 +47,14 @@ The repository itself carries no license file; the license statement comes from 
 | `multi_part_single_wheel.stl` | 73 | `d229ff677f3e5ac8…` |
 | `multi_part_single_window.stl` | 22 | `60adae0cd5bc4645…` |
 
+## Private models
+
+STL and 3MF files placed directly in this folder are ignored by git. They are sliced by a separate test, on a 256 x 256 mm bed; models that do not fit are skipped:
+
+```bash
+cargo test --release -p slicer-cli --test corpus local_models -- --ignored --nocapture
+```
+
 ## Adding models
 
 Only add models whose license is stated by the author and allows redistribution and use for testing (CC0, CC BY, MIT or similar). Record author, license, where the license is stated, the source at a fixed revision and checksums. See [CONTRIBUTING.md](../CONTRIBUTING.md).

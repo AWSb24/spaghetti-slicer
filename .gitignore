@@ -10,3 +10,6 @@ Thumbs.db
 /tools/*/Cargo.lock
 /corpus/*/
 /graphify-out/
+# Private test models, see corpus/README.md
+/corpus/*.stl
+/corpus/*.3mf

@@ -292,14 +292,17 @@ fn parse_part(name: &str, text: &str) -> Result<Part, ThreeMfError> {
             Event::Start(element) | Event::Empty(element) if core => {
                 match element.local_name().into_inner() {
                     "model" => {
-                        let [unit] = attributes(&element, ["unit"]);
+                        let [unit, required] = attributes(&element, ["unit", "requiredextensions"]);
+                        let required = required.unwrap_or_default();
                         if let Some(unit) = unit {
                             scale =
                                 unit_scale(&unit).ok_or(ThreeMfError::UnsupportedUnit { unit })?;
                         }
                         for attribute in element.attributes().flatten() {
-                            let key = attribute.key.into_inner();
-                            if key.starts_with("xmlns:")
+                            // Most writers declare every extension they know;
+                            // only the ones marked as required matter.
+                            let prefix = attribute.key.into_inner().strip_prefix("xmlns:");
+                            if prefix.is_some_and(|p| required.split_whitespace().any(|r| r == p))
                                 && attribute.value != CORE_NS
                                 && attribute.value != PRODUCTION_NS
                             {
@@ -564,7 +567,7 @@ pub fn parse_3mf(bytes: &[u8], diagnostics: &mut Diagnostics) -> Result<Mesh, Th
             Diagnostic::warning(
                 "model.unsupported_extension",
                 format!(
-                    "the file uses {} 3MF extension(s) that are ignored: {}",
+                    "the file requires {} 3MF extension(s) that are not supported and ignored: {}",
                     extensions.len(),
                     extensions.join(", ")
                 ),
@@ -747,7 +750,7 @@ mod tests {
     #[test]
     fn extensions_and_other_object_types_are_reported() {
         let text = model(
-            "xmlns:v=\"http://example.com/vendor\" xmlns:m=\"http://example.com/materials\"",
+            "xmlns:v=\"http://example.com/vendor\" xmlns:m=\"http://example.com/materials\" xmlns:x=\"http://example.com/declared-only\" requiredextensions=\"m v\"",
             &format!(
                 "<metadata name=\"Title\">x</metadata><resources><v:thing v:x=\"1\"><v:vertex x=\"9\"/></v:thing><object id=\"1\" v:colour=\"red\">{TETRAHEDRON}</object><object id=\"2\" type=\"support\">{TETRAHEDRON}</object></resources><build><item objectid=\"1\"/><item objectid=\"2\"/></build>"
             ),

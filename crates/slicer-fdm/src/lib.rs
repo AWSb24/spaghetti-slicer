@@ -373,9 +373,14 @@ fn adhesion_paths(
     let brim_loops = (settings.brim_width / width).round() as usize;
 
     let skirt_start = brim_loops as f64 * width + settings.skirt_distance;
+    // The skirt goes around the convex hull of everything on the first
+    // layer. Following a detailed outline at a distance of millimetres is
+    // very slow to compute (14 s for an outline of 5000 points).
+    let points: Vec<Point> = outlines.iter().flatten().flatten().copied().collect();
+    let hull: Shapes = vec![vec![polygon::convex_hull(&points)]];
     for k in (0..settings.skirt_loops as usize).rev() {
         let loops = outer_contours(&polygon::offset(
-            &outlines,
+            &hull,
             skirt_start + (0.5 + k as f64) * width,
         ));
         push_loops(loops, PathKind::Skirt, width, position, paths);

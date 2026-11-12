@@ -166,6 +166,40 @@ pub fn clean(shapes: Shapes, min_area: f64, min_segment: f64) -> Shapes {
         .collect()
 }
 
+/// Convex hull of a set of points as a counter-clockwise contour (Andrew's
+/// monotone chain). Fewer than three distinct points give them back as is.
+pub fn convex_hull(points: &[Point]) -> Contour {
+    let mut sorted = points.to_vec();
+    sorted.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+    sorted.dedup();
+    if sorted.len() < 3 {
+        return sorted;
+    }
+    let cross = |o: Point, a: Point, b: Point| {
+        (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    };
+    let mut hull: Contour = Vec::new();
+    // Lower chain left to right, then upper chain back.
+    for pass in 0..2 {
+        let start = hull.len();
+        let chain: Box<dyn Iterator<Item = &Point>> = if pass == 0 {
+            Box::new(sorted.iter())
+        } else {
+            Box::new(sorted.iter().rev())
+        };
+        for &point in chain {
+            while hull.len() >= start + 2
+                && cross(hull[hull.len() - 2], hull[hull.len() - 1], point) <= 0.0
+            {
+                hull.pop();
+            }
+            hull.push(point);
+        }
+        hull.pop();
+    }
+    hull
+}
+
 /// Signed area of a contour: positive when counter-clockwise.
 pub fn signed_area(contour: &[Point]) -> f64 {
     let n = contour.len();
@@ -290,6 +324,25 @@ pub fn hatch(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn convex_hull_drops_inner_and_collinear_points() {
+        let points = [
+            [4.0, 4.0],
+            [0.0, 0.0],
+            [2.0, 0.0],
+            [1.0, 1.0],
+            [4.0, 0.0],
+            [0.0, 4.0],
+            [0.0, 0.0],
+            [3.0, 2.0],
+        ];
+        assert_eq!(
+            super::convex_hull(&points),
+            [[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]]
+        );
+        assert_eq!(super::convex_hull(&points[..1]), [[4.0, 4.0]]);
+    }
+
     use super::*;
 
     fn square(x: f64, y: f64, size: f64) -> Contour {

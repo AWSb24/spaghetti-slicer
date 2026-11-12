@@ -38,7 +38,7 @@ Errors go to stderr with exit code 1. With `--json`, errors and warnings are obj
 | `slicing.empty_model`, `slicing.too_large`, `slicing.nothing_to_print` | The model cannot be sliced |
 | `gcode.unknown_placeholder`, `gcode.unclosed_placeholder` | Custom start or end G-code is invalid |
 | `io.read`, `io.write`, `cli.invalid_override` | A file cannot be accessed or an argument is malformed |
-| `model.unsupported_extension` (warning) | The 3MF file uses extensions that are ignored |
+| `model.unsupported_extension` (warning) | The 3MF file requires extensions that are not supported; they are ignored |
 | `model.skipped_objects` (warning) | The 3MF file has objects that are not of type `model`; they are not printed |
 | `mesh.not_watertight` (warning) | The mesh has open or inconsistently oriented edges |
 | `slicing.open_contours` (warning) | Some layers have contours that do not close and were dropped |

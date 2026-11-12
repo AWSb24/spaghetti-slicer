@@ -247,6 +247,19 @@ fn word(line: &str, letter: char) -> Option<f64> {
         .find_map(|w| w.strip_prefix(letter).and_then(|v| v.parse().ok()))
 }
 
+/// The first move that leaves the bed or has a broken coordinate.
+fn bad_move<'a>(gcode: &'a str, settings: &Settings) -> Option<&'a str> {
+    gcode
+        .lines()
+        .filter(|l| l.starts_with("G0 ") || l.starts_with("G1 "))
+        .find(|line| {
+            let on_bed = [('X', settings.bed_size_x), ('Y', settings.bed_size_y)]
+                .iter()
+                .all(|&(axis, size)| word(line, axis).is_none_or(|v| (0.0..=size).contains(&v)));
+            !on_bed || line.contains("NaN") || line.contains("inf")
+        })
+}
+
 #[test]
 fn corpus_invariants() {
     let defaults = Settings::default();
@@ -304,18 +317,8 @@ fn corpus_invariants() {
         }
 
         let output = slicer_gcode::write_gcode(&toolpaths, &defaults).unwrap();
-        for line in output
-            .gcode
-            .lines()
-            .filter(|l| l.starts_with("G0 ") || l.starts_with("G1 "))
-        {
-            let on_bed = [('X', defaults.bed_size_x), ('Y', defaults.bed_size_y)]
-                .iter()
-                .all(|&(axis, size)| word(line, axis).is_none_or(|v| (0.0..=size).contains(&v)));
-            if !on_bed || line.contains("NaN") || line.contains("inf") {
-                failures.push(format!("{}: bad move '{line}'", model.name));
-                break;
-            }
+        if let Some(line) = bad_move(&output.gcode, &defaults) {
+            failures.push(format!("{}: bad move '{line}'", model.name));
         }
         if !output.stats.filament_length_mm.is_finite() || output.stats.filament_length_mm < 0.0 {
             failures.push(format!(
@@ -507,16 +510,7 @@ fn real_world_models() {
             .floor() as usize
             + 1;
         assert_eq!(toolpaths.layers.len(), expected_layers, "{name}");
-        for line in output
-            .gcode
-            .lines()
-            .filter(|l| l.starts_with("G0 ") || l.starts_with("G1 "))
-        {
-            let on_bed = [('X', settings.bed_size_x), ('Y', settings.bed_size_y)]
-                .iter()
-                .all(|&(axis, size)| word(line, axis).is_none_or(|v| (0.0..=size).contains(&v)));
-            assert!(on_bed && !line.contains("NaN"), "{name}: bad move '{line}'");
-        }
+        assert_eq!(bad_move(&output.gcode, &settings), None, "{name}");
         println!(
             "{name:64} {:>7} tris {:>4} layers {:>6.1} g {:>6} ms  {:?}",
             mesh.triangles.len(),
@@ -534,4 +528,64 @@ fn real_world_models() {
             assert!((9.0..14.0).contains(&grams), "{grams} g");
         }
     }
+}
+
+/// Slices whatever STL and 3MF files lie directly in `corpus/`. Those are
+/// private models that are not part of the repository, so the test passes
+/// without any. The bed is that of the Bambu Lab X1C.
+#[test]
+#[ignore = "slices the private models in corpus/, which takes a while"]
+fn local_models() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
+    let mut settings = Settings::default();
+    settings.bed_size_x = 256.0;
+    settings.bed_size_y = 256.0;
+    let mut paths: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|e| e == "stl" || e == "3mf"))
+        .collect();
+    paths.sort();
+
+    let mut failures = Vec::new();
+    for path in &paths {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let started = std::time::Instant::now();
+        let mut warnings = Diagnostics::new();
+        let result = slicer_formats::parse_model(&std::fs::read(path).unwrap(), &mut warnings)
+            .and_then(|mesh| {
+                slicer_fdm::generate_reporting(&mesh, &settings, &mut warnings)
+                    .map_err(|e| slicer_core::Diagnose::diagnostic(&e))
+            });
+        match result {
+            Ok(toolpaths) => {
+                let output = slicer_gcode::write_gcode(&toolpaths, &settings).unwrap();
+                if let Some(line) = bad_move(&output.gcode, &settings) {
+                    failures.push(format!("{name}: bad move '{line}'"));
+                }
+                println!(
+                    "{name:40} {:>4} layers {:>6.1} g {:>6} ms  {:?}",
+                    toolpaths.layers.len(),
+                    output.stats.filament_weight_g,
+                    started.elapsed().as_millis(),
+                    warnings.codes()
+                );
+            }
+            // A model larger than the bed is not the slicer's fault.
+            Err(error) if error.code == "slicing.too_large" => {
+                println!("{name:40} skipped: {}", error.message);
+            }
+            Err(error) => failures.push(format!("{name}: {}", error.message)),
+        }
+    }
+    println!("{} models", paths.len());
+    assert!(
+        failures.is_empty(),
+        "
+{}",
+        failures.join(
+            "
+"
+        )
+    );
 }
