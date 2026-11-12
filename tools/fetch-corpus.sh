@@ -28,7 +28,7 @@ git -C "$work/src" checkout -q FETCH_HEAD
 mkdir -p "$target"
 count=0
 while IFS=$'\t' read -r expected name source; do
-  source="${source%$''}"
+  source="${source%$'\r'}"
   [ -n "$expected" ] || continue
   cp "$work/src/$source" "$target/$name"
   actual="$(sha256 "$target/$name")"
