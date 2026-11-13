@@ -3,3 +3,4 @@
 *.tsv text eol=lf
 Dockerfile text eol=lf
 fuzz/** text eol=lf
+*.py text eol=lf

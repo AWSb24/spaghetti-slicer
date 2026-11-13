@@ -136,7 +136,7 @@ UPDATE_GOLDEN=1 cargo test -p slicer-cli --test corpus golden
 
 ## Real-world models
 
-3DBenchy (CC0) and its parts are used as real-world test models. They are not stored in the repository; see [corpus/README.md](corpus/README.md) for sources, license and how to fetch them.
+3DBenchy (CC0) with its parts and 200 models from the Thingi10K dataset (CC BY, CC BY-SA or public domain) are used as real-world test models. They are not stored in the repository; see [corpus/README.md](corpus/README.md) for sources, license and how to fetch them.
 
 ## Fuzzing
 

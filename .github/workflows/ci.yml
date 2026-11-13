@@ -47,6 +47,10 @@ jobs:
         shell: bash
         run: bash tools/fetch-corpus.sh
 
+      - name: Fetch Thingi10K models
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 tools/fetch-thingi10k.py
+
       - name: Test real-world models
         if: matrix.os == 'ubuntu-latest'
         run: cargo test --locked -p slicer-cli --test corpus -- --ignored

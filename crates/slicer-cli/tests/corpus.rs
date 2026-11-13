@@ -538,13 +538,10 @@ fn real_world_models() {
     }
 }
 
-/// Slices whatever STL and 3MF files lie directly in `corpus/`. Those are
-/// private models that are not part of the repository, so the test passes
-/// without any. The bed is that of the Bambu Lab X1C.
-#[test]
-#[ignore = "slices the private models in corpus/, which takes a while"]
-fn local_models() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
+/// Slices every STL and 3MF file in a folder on the bed of the Bambu Lab
+/// X1C and checks the G-code. Returns how many files were sliced, how many
+/// were skipped because the slicer rightly refused them, and what went wrong.
+fn slice_folder(dir: &std::path::Path) -> (usize, usize, Vec<String>) {
     let mut settings = Settings::default();
     settings.bed_size_x = 256.0;
     settings.bed_size_y = 256.0;
@@ -555,7 +552,7 @@ fn local_models() {
         .collect();
     paths.sort();
 
-    let mut failures = Vec::new();
+    let (mut sliced, mut skipped, mut failures) = (0, 0, Vec::new());
     for path in &paths {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let started = std::time::Instant::now();
@@ -572,31 +569,61 @@ fn local_models() {
                 if let Some(line) = bad_move(&output.gcode, &settings) {
                     failures.push(format!("{name}: bad move '{line}'"));
                 }
+                let stats = &output.stats;
+                if !(stats.filament_length_mm > 0.0 && stats.print_time_s.is_finite()) {
+                    failures.push(format!("{name}: implausible statistics"));
+                }
+                sliced += 1;
                 println!(
                     "{name:40} {:>4} layers {:>6.1} g {:>6} ms  {:?}",
                     toolpaths.layers.len(),
-                    output.stats.filament_weight_g,
+                    stats.filament_weight_g,
                     started.elapsed().as_millis(),
                     warnings.codes()
                 );
             }
-            // A model larger than the bed is not the slicer's fault.
-            Err(error) if error.code == "slicing.too_large" => {
+            // Larger than the bed, or thinner than one layer or one line:
+            // not the slicer's fault.
+            Err(error)
+                if error.code == "slicing.too_large"
+                    || error.code == "slicing.nothing_to_print" =>
+            {
+                skipped += 1;
                 println!("{name:40} skipped: {}", error.message);
             }
             Err(error) => failures.push(format!("{name}: {}", error.message)),
         }
     }
-    println!("{} models", paths.len());
-    assert!(
-        failures.is_empty(),
-        "
-{}",
-        failures.join(
-            "
-"
-        )
+    println!(
+        "{sliced} sliced, {skipped} skipped, {} failed",
+        failures.len()
     );
+    (sliced, skipped, failures)
+}
+
+/// Slices whatever STL and 3MF files lie directly in `corpus/`. Those are
+/// private models that are not part of the repository, so the test passes
+/// without any.
+#[test]
+#[ignore = "slices the private models in corpus/, which takes a while"]
+fn local_models() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
+    let (_, _, failures) = slice_folder(&dir);
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// Slices the 200 models from the Thingi10K dataset listed in
+/// `corpus/thingi10k.tsv`. Fetch them with `python tools/fetch-thingi10k.py`.
+#[test]
+#[ignore = "needs the models fetched by tools/fetch-thingi10k.py"]
+fn thingi10k_models() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/thingi10k");
+    assert!(dir.is_dir(), "run `python tools/fetch-thingi10k.py` first");
+    let (sliced, skipped, failures) = slice_folder(&dir);
+    assert_eq!(sliced + skipped + failures.len(), 200);
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    // Most of them must actually be sliced, or the test proves little.
+    assert!(sliced >= 150, "only {sliced} models were sliced");
 }
 
 /// Fingerprints of the G-code of the reference models, compared with

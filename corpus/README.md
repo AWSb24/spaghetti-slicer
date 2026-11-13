@@ -1,9 +1,13 @@
 # Real-world test models
 
-The models themselves are not stored in this repository (about 55 MB). Fetch them with:
+The models themselves are not stored in this repository (about 115 MB). Fetch them with:
 
 ```bash
 bash tools/fetch-corpus.sh
+```
+
+```bash
+python tools/fetch-thingi10k.py
 ```
 
 Then run the tests that use them:
@@ -46,6 +50,19 @@ The repository itself carries no license file; the license statement comes from 
 | `multi_part_single_stern_window.stl` | 68 | `edb429f92294de24…` |
 | `multi_part_single_wheel.stl` | 73 | `d229ff677f3e5ac8…` |
 | `multi_part_single_window.stl` | 22 | `60adae0cd5bc4645…` |
+
+## Thingi10K
+
+| | |
+|---|---|
+| Dataset | Thingi10K by Qingnan Zhou and Alec Jacobson, a collection of models published on Thingiverse |
+| Source | https://huggingface.co/datasets/Thingi10K/Thingi10K at revision `2d5d3b2f3cd3711028ad75b12788c13b25559ec6` |
+| Files | 200 models, listed with author, name, Thingiverse id, license and SHA-256 in [thingi10k.tsv](thingi10k.tsv) |
+| Licenses | Each model has its own. Only models under CC BY (32), CC BY-SA (149), CC0 (1) or marked public domain (18) were taken; the license is the one recorded in the dataset's metadata (checked 2026-11-13), not checked again on Thingiverse |
+
+The selection is mechanical: ordered by file id, at most two files per Thingiverse entry, 20 to 50000 triangles, the first 160 that the dataset marks as clean (closed, manifold, one component) and the first 40 that are open or not manifold. The models are downloaded as arrays and written as binary STL by the fetch script; the checksum in the manifest is that of the downloaded file.
+
+The models under CC BY and CC BY-SA require attribution: author and name of each are in the manifest. They are used unchanged, for testing only, and are not redistributed by this repository.
 
 ## Private models
 

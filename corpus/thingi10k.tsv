@@ -1,0 +1,201 @@
+file_id	thing_id	license	author	name	state	faces	sha256
+32770	10367	CC BY-SA	BrianEnigma	Octocat	clean	37884	8c06992e21029728d12f566b0922b729ca9f9ece616bd9349ba8c7a3703d2d12
+34783	10955	CC BY-SA	GeneralRulofDumb	Spiral bevel gear	clean	29132	3f0644d9743fa5f9c36ae26009ec3329495e6f24866f3ab1130bc24ad375ed35
+34784	10955	CC BY-SA	GeneralRulofDumb	Spiral bevel gear	clean	29164	03abd24b99aa11dd077ae224295f00a4db458e14e43567d46b76b899f403ce18
+35269	10367	CC BY-SA	BrianEnigma	Octocat	clean	40246	df71296afc5030cfbe56d823182465c57b1065339085693d5df8e6a4503ce6e4
+36069	11322	CC BY-SA	HPaul	Coin Sorter and Counting/Wrapping Tubes	clean	160	f5d56f8e525b63b408a9b908e9baade26996727117bd18a61cfaa4b46542a242
+36075	11322	CC BY-SA	HPaul	Coin Sorter and Counting/Wrapping Tubes	defective	165	8f02393d9db83c65cbd0bd9c77aca7da3b6a921328d682f004bd7223e25322b2
+37011	11600	CC BY-SA	bohnded	Another MakerBot Mascot Contest Entry	defective	17288	5d5b20e6d2c1bada1ab8bc4c6057a5a4e8ed8b8f4bce231cfe2eeca30d07dabd
+37065	11614	CC BY-SA	litwan	bench vise jaw plates	defective	1508	a8bbb5fb925e170bf273dd6d894ff530dc2db010aff44c86ce028ece345b2777
+37211	11653	CC BY-SA	peter_	3D-Printable Laser Cutter	defective	2226	032668b0b62ed9c1d673ce95c6be57a0fd4e7f0e598423f285931269e81a22c6
+37213	11653	CC BY-SA	peter_	3D-Printable Laser Cutter	defective	3816	8021db177e582213d5312d2c314ec0d1eaac59cd6a12e41cb2e22677dadd1842
+37272	11663	CC BY-SA	Tinkerer	Shower Handle Holder	clean	4450	82b3d10288739010ac784e904d0c332a4714b6ef1ba50f1ee2d10e509b257596
+37274	11654	CC BY-SA	Mr_MegaTronic	R. Maker - Mark I	clean	944	837912ecc06d4118bb255d8b4e1789beb49de4c8b3fdec6af9cf24420fa1318c
+37275	11654	CC BY-SA	Mr_MegaTronic	R. Maker - Mark I	clean	18594	8f0f88310979914cb1c20120565f782eea44417cf43c96cdc6fc032211972fc4
+37366	11691	Public Domain	cymon	Tiny Toy Dump Truck for dual extruder	defective	1232	219b990ebcd095193ff50409ea2492b8e18eed1f82b6ff9d0a98811f5db84025
+37384	11705	CC BY-SA	MBCook	Squirrel	clean	17596	9091bbd93b602e6a65077c3c95c9aaa5b326a43d1d2fdce593d3e5f607dae4ab
+37385	11705	CC BY-SA	MBCook	Squirrel	defective	20000	00d0e10240bb2154f88e0dc53aea8c9633dc428ec0fcd80ca4ec366521452950
+37402	11710	CC BY-SA	Lenbok	SOTC Model Cleanup Test	defective	8322	2679ec4f2d1ece1b88dde7aa5400560aca594394e7c7dff4c44a176908b7639c
+37415	11710	CC BY-SA	Lenbok	SOTC Model Cleanup Test	defective	13340	830167bb6bd177db76d5dfa0290f009c4a1b90b9d16ae51a78c562100a78dbba
+37506	11742	CC BY-SA	cyclone	Filament Colorizer - Marker Holder For 3mm filament	clean	714	ea1a445969239cb864b3eb658ad08e58207d943f2dc8989a604e14d02881f31f
+37568	11761	CC BY-SA	quadrivia	iSight Clamp for ToM	clean	280	9837780b9e642e7fe5a0bab5fe9368c63efc072b4dcd974cbcc49114005c0379
+37622	11782	CC BY-SA	colah	Laser Chess	clean	28	5caed9cc1c51ea63120e8f54f6a958bfca8c2fd3b693ae5ae5576f80ed73db55
+37627	11782	CC BY-SA	colah	Laser Chess	clean	80	90e82d6e2c1b98b407f420b14e53f78a580b7575f8838193ae637a75a74576e0
+37743	11814	Public Domain	jag	Robot Head TP Holder	clean	1292	dbbb5e23274127c59d59e87469d5be31aa27bc66f4573bc82bbfbc3ae451dd74
+37744	11814	Public Domain	jag	Robot Head TP Holder	clean	712	41450d37ca578a6b795e10411257dd48919435a946c9992e1fac15012bcba4f1
+37765	11796	CC BY-SA	cymon	Recorder (instrument)	clean	2610	ce47e26082a1b05a89ff27c51a8b04f49d365c5f8bec19fdc419c17c1a08b0c4
+37766	11796	CC BY-SA	cymon	Recorder (instrument)	defective	4102	c4cf8dfe3d6d9ca4cf635c6f19624d759e45beed3a6008dd54fcbaf65f321be2
+37786	11791	CC BY-SA	LorenIPSVM	REPLICANT - g	clean	31252	be3ff92c50ede15c421e7198d2eb5671ce22c1bb3abfc185a9b606d8e337af26
+37825	11825	CC BY-SA	kyle170	Minecraft Creeper	defective	162	fc8473171ab1433b2aa4aa154198fa619df1c44ab44043881ec2290acc5ea93b
+37841	11776	CC BY-SA	JimmyDean	Dirt Tire and Rim	clean	2656	4edb09d4218b4bba0b53f3e88e92733008f64fbecf6af68b70b4981fde902ecc
+37865	11835	CC BY-SA	sconine	Stacking Logs for a Log Cabin	clean	60	cab1c02c98cc7c1b0c8e440b649364384738517619b0acd1bd1e20271b3234a0
+37866	11835	CC BY-SA	sconine	Stacking Logs for a Log Cabin	clean	72	72fb4cb2c6aec96d1c01fe37ae8271f5efb7a825080bf40cb801c5081bf67546
+37879	11836	CC BY-SA	Thing-O-Fun	Functional Differential Gear System	defective	8806	06ab15e2626ccc01ff6937759d109cff0fb6fb30b27386b4ec1c143fbf7f3242
+37880	11836	CC BY-SA	Thing-O-Fun	Functional Differential Gear System	clean	6184	ee09f93f426ee7c6a583f435af72cea5468974d39cb5d99666a35fc87f22a64a
+37964	11855	CC BY-SA	Plasticguy	Mbot Logo Transformer	clean	3960	28dd60fbb02175880893da8fcbce46c8caafbec89e80a6100b9d54523af79bfd
+37965	11855	CC BY-SA	Plasticguy	Mbot Logo Transformer	clean	8654	26fffcaf2fa83bd20d40b06358b91bb7abd002bbefdae783ae6a7b7f60410b36
+37989	11860	CC BY-SA	MrJohn	Geordi La Forge&#039;s Visor (Star Trek)	defective	4364	6bdf1aa652073065b05d4ec524362fc3815ad94a87b67401202c68474b658ea5
+38035	11869	CC BY-SA	GeekyDad	Demon tail for Halloween costume.	defective	3812	15933d558d263ba8662726a61c7dbc8e4216c5f274f87f59ad7e7eaa8b8dd576
+38066	11882	CC BY-SA	PolygonPusher	Hook for hanging pots and pans	defective	1332	3a7d65c0e07b1fd33b641156f920ca05fbe40c131b3727626c7bfd1104da2daa
+38087	11860	CC BY-SA	MrJohn	Geordi La Forge&#039;s Visor (Star Trek)	defective	3104	d200c963ae263e14d8624706c2895935da88193e031556cfdd81d37f930c845c
+38261	11934	CC BY-SA	Stephenwinter	Umbrella stay tip	clean	13670	56d0ab66e26e2f964e29f755446fe151385f94c7757be5023c3da74203e9fc5a
+38318	11953	CC BY-SA	HPaul	Elvis; the Printable(?) Skull	defective	13150	5db9facc27222bc87a92ac36e18a75a27b36254c50222addf9d087ebf1dafebe
+38464	11978	CC BY-SA	RotoScan	Cable Chain	clean	1308	95b028cfbd5e1d557afeab7042a93ee55c4d27e5d02c48b0cacffb8455b5c909
+38465	11978	CC BY-SA	RotoScan	Cable Chain	defective	2682	f99a24523fff9d6f1337294549502fe778ab53d5144a0b0d404fdd95d9755199
+38557	11995	CC BY-SA	vVdesign	Make-a-bot	defective	34802	c56215f4666b0772339c7c7734a5d85a0200d93a3a5fbc0480dcdefef617b0a8
+38741	12034	CC BY	JonMonaghan	Snowflake	clean	2208	6bf559f6b581d22fdb4f418b625886680fbb87658a78b075e8154c61422378a2
+39050	12034	CC BY	JonMonaghan	Snowflake	clean	2184	1f426b19b41e918042bcbbe65a7f38db88bb98ee316eb686c30c6da62ce57856
+39084	12108	CC BY-SA	benglish	Spiral Lightbulb Sculpture	defective	14924	2d5b6ea42363b67161a1c1a98ed52d9c0e6be25157823c8fddc95c0d219c3846
+39085	12108	CC BY-SA	benglish	Spiral Lightbulb Sculpture	defective	14924	b33995bb731680b21609bee5a5d96a7895af8f510740b9292899aeab75ab25fb
+39107	12120	CC BY	MakeALot	basic receptacles	defective	45228	c780425de9b00cbb7ecf51289a40d99900195b368139f3cd7e25915d006ac4bf
+39108	12120	CC BY	MakeALot	basic receptacles	clean	14980	340790a5e73ca4445f3f54dc879db3d51f1989d9b5fc8221842cb7c90c9768bd
+39150	12134	CC BY	camperking	Parametric Round Box	defective	818	465b861e265aea57ffe98d02c12c288c192fd5c4cc4c3fba0549efcde9b2c855
+39152	12134	CC BY	camperking	Parametric Round Box	defective	742	83379ae87127fe8f74bc9a8cc7b3751ca4138a16c4eb0a6be068a7ee4a7a8272
+39344	12180	CC BY-SA	tekeian	Robot Toy #A	clean	4156	c41aa4f5caaf1945f300e5f796af0312fb16f4c4be3d6402e032e534ffba7e1e
+39345	12180	CC BY-SA	tekeian	Robot Toy #A	clean	1334	7e7ab11c09ab53916945a94fde679328e897a45b9deaf32cf68b53893c234fbb
+39358	12182	CC BY-SA	br3ttb	4-Color Self-Portrait	clean	1068	db6ee636bb559e103d231173e3e4de76fbffd6528a9e726b6f14ca0cd3460625
+39381	12146	CC BY-SA	joo	Totoro	defective	48284	a7a6088c2a0384a73f270498d74d365e131626eec3c29e70fb3aed81e05a7d28
+39442	12208	CC BY-SA	emmett	Screwless Heart Gears	clean	4550	8c774ea6590c16f11a08757c869bf5efb2ceeb74548088946bf26784377d2fb5
+39443	12208	CC BY-SA	emmett	Screwless Heart Gears	clean	4562	cca937a9919c6e6f7bd11278df4231fea408c72d2d5c6015116e247a60e54220
+39572	12256	CC BY	sliptonic	Servo controlled Silly-String Trigger	clean	1202	d0beebf63a67ae6ddae236daedc1c49fbe18f46df167f7336a7390acfa3d8df8
+39573	12256	CC BY	sliptonic	Servo controlled Silly-String Trigger	clean	448	8fece0d15e50cfd4491d79d179d25e0fd98b3e8e423e5f43f7a3c6df8142c182
+39585	12261	CC BY-SA	patchorang	Button Top	defective	432	95116fc6743b865359c7cd6de885812be25e80263232366a5cbcbaa3518654bf
+39635	12274	CC BY-SA	mread	Bearing	defective	4670	15eeeecdfbcf0cc585b93020e37e1d218875fc37891db60cfa5006369733690a
+39636	11980	CC BY-SA	sconine	Mechanical Animals	clean	580	c6d427e4ddefdca9edcb1651cbcddf1b9589e05faf7121a14244a9dc4c86c645
+39637	11980	CC BY-SA	sconine	Mechanical Animals	clean	212	373bfd09165e12b26c558eab9ec5edb3fa9a641bd8d951f37974e28ef3a35add
+39678	12285	CC BY-SA	tbuser	Dualstrusion Business Card	clean	4596	9c5dee182f441a79ced0e1757f80d82cecddb6133193aa7beb6047273790ebfa
+39749	12301	CC BY-SA	cymon	Recorder V2.2 (instrument)	defective	1554	9f92c4df5a0b601425dbda0640f858a460f9e0d82a39f43c9e39fd57deb18923
+39751	12301	CC BY-SA	cymon	Recorder V2.2 (instrument)	defective	2292	8e70cff331d74b988fc633b1e82cf747eb3f3551bd3487ac3d4d45e76a186e04
+39806	12319	CC BY	2ROBOTGUY	Twisted Bottle Whistle	defective	33230	4eeca77aea6b6b724d65a07b0f6291e25146776625d0f6dc841e2c7bf3675fb6
+39878	12283	CC BY	pmoews	Protein Models	clean	20180	547aa93643e6004e124d3f7dc224879df8fe48656d9fb6b2468eddb5528134c0
+39879	12283	CC BY	pmoews	Protein Models	clean	11136	8f862a8961e7d462fe98c4586ae9d50bd00c0d0cd7f22befc7cccc455e04fc1d
+39890	12348	CC BY-SA	br3ttb	Tapered Pocket Coin-Op	defective	596	fe8709372867a4b534d0916b0279d2460a3e49f6c2c4b9f2971cca39f31153c3
+39891	12348	CC BY-SA	br3ttb	Tapered Pocket Coin-Op	defective	994	c5783b3abedb278fda3ab4d07147a20c4809d0d06d11a18866c3a6bf444a8c16
+39922	12354	CC BY-SA	tarturo	3D Initials Logo - Make your own	clean	538	1ab3683e42b7ddcef3a5f8d86f393c772a6b837ce2da30bc0bf30265c844920c
+39923	12354	CC BY-SA	tarturo	3D Initials Logo - Make your own	clean	618	07feeff9e1d65fe58f98fbc81881d5b860fa16b711e6bc283b51360085eca9b9
+39946	12359	Public Domain	Nbickford	Bachmann Klein Bottle	clean	8378	64d78ad3648b1e34c79afbbd737322da4ea6c3c1a9c85fc49c292b25d5704842
+39950	12362	CC BY-SA	gaarden	Tire Lever	clean	4120	69721a6983108f6b953e6b6f94f71f9d9404bbf97b39e4dd45d84f3a22d2abad
+39967	12367	CC BY-SA	Landru	Clarinet Mouthpiece 1.0	defective	1958	2bae7289019d0816f4ee9a0716811c685590c6503f8da79af5b9e032e6147cb0
+40017	12391	CC BY-SA	Rupert	Embossing Stamp for Paper	defective	3530	7a64d60bedf212fc0120c3dd2e229406b7562d9f50cab97e57a0d2605d18217c
+40067	12405	CC BY-SA	tbuser	Grayscale Dualstrusion Poster	clean	2284	bd00a1c3dba3f7aa4032c5b00aaf94343c0346ad389ced025fcee937a99506a1
+40171	12419	CC BY	WilliamAAdams	SuperEllipse in OpenScad	clean	1224	821471c8e058dd4ba1022fc93c8d562f1ba9c55f59cffa5d0f5a5a7edb69329f
+40172	12419	CC BY	WilliamAAdams	SuperEllipse in OpenScad	clean	576	e047a3f4ceabdcfc6a9569047057266a95e9859bf0c52dcbcf9f834438534b0d
+40176	12432	CC BY	MakeALot	Klein Bottle from simple primitives	defective	17256	d43feba83c1113c623698cf46dcd8646343f3000c2506553e76f16fade49152d
+40184	12432	CC BY	MakeALot	Klein Bottle from simple primitives	defective	8740	8fa09bdfe1757ecea4433f72a18ff52ae3962c7ca9ac3a47d2d964a7dd073882
+40261	12460	Public Domain	Zydac	Economic Spiral	defective	25518	19d26d8439cc830bfb47de807dded318baf35d8d091a1a1bf4268c53397a18f5
+40311	12476	CC BY-SA	SuperAmi	Parametric Pirate Hook	clean	376	d91e6a71a84cd4b5b88a2dcd5f4925971f1bfbec9e94451f0cd26182b404ed8d
+40312	12476	CC BY-SA	SuperAmi	Parametric Pirate Hook	clean	316	35bb2f6ffcfab85436dadd6c5a7ea841e5d3041d0189502c7de837074372fe2f
+40447	12520	CC BY-SA	bengarvey	Toy Robot	clean	212	eeed1a4f7815bdc40235bdbd505ae9c95336fd6dc727d61325e9f16cd9af9508
+40448	12520	CC BY-SA	bengarvey	Toy Robot	clean	1220	be3d2f2a5451c1f53dfb66f575ecd9b1933b9b73ef23dd1c5015823813263b1f
+40509	12537	CC BY	CarryTheWhat	Brain Slug Hair Clip	defective	14370	27d09951b27e324809894c0a7aa903d0d35390df9341a67daa1699b99d5b4ad9
+40583	12556	CC BY	scorch	Thumb Roller Hook for Dial Caliper	clean	8216	29b2386651f320d763a6f28be4b62f84c57173f8630dc980b0575067d34c7483
+40584	12556	CC BY	scorch	Thumb Roller Hook for Dial Caliper	clean	7208	7e4f5e00d86c0a01e49e71dfa5e86c2e1b3b7567146d50abc700015fd6d75512
+40601	12560	CC BY-SA	irts	Cupcake case maker	clean	1436	7888143195ab92507f1544513bc2fa216014ad4c18279c9ece00ce9f0f46153f
+40602	12560	CC BY-SA	irts	Cupcake case maker	clean	52	518327bf2ee7f72befb2ba68508101108e49840b3909998e3d7280721ba1699b
+40614	12564	Public Domain	TeamTeamUSA	MIC CHK	clean	1544	142ca3edaf27b6befa45582bfc5113448fb33d65ca6b514ff95e00f50b514bd5
+40659	12572	Public Domain	Pointedstick	Imperial Star Destroyer	defective	5426	54170ac3399dbbb1e3d38106bf20f79b80efaff339a5d9dce6e05eb696925c27
+40662	12572	Public Domain	Pointedstick	Imperial Star Destroyer	clean	946	861c4060b639c7069ab065d30169d918202f4bcca98275e96b82999ff6e4055f
+40741	12580	CC BY-SA	peetwolmarans	Nest iPhone Cover	defective	33658	1012a92c1f2a686e73457c00086cf1a623881a242fd8861da17cab5d2691872e
+40746	12585	CC BY-SA	navalguijo	Little Green Ghost	clean	3392	b0ed694a4d94a601cfd4a757cdd457458e80864613315ffdff6272cfe65d540c
+40842	12616	CC BY-SA	RotoScan	Hobby Clamps	clean	180	a8f81fdc3876a0fded3928026aa26fffd907401435436fe94148889d78657f6b
+40843	12616	CC BY-SA	RotoScan	Hobby Clamps	clean	140	40861642d156552d0dc96bc01bd8a8f98794f8e6f3b3680d71214767b0dd7095
+40900	12319	CC BY	2ROBOTGUY	Twisted Bottle Whistle	clean	27708	3de045ec3bfe69253998de720691f91124ddc3a906590798f549070ce243c382
+40982	12652	CC BY-SA	hlbrosnihan	Creatures of Thingiverse	clean	43542	2e4c7c67fad9abb685b25d90055b3d35732e165ca806a2712bbc993dfeda548e
+40984	12652	CC BY-SA	hlbrosnihan	Creatures of Thingiverse	clean	18110	5b75ab0b14b2d41f66c346f9fd7391d22b56e6b13c44a5d5a0b5f050f61941be
+41141	12675	CC BY	pmoews	Buckyballs - Molecular Models	clean	39240	432320a37538fbd9ee01cf0468665ad42e91e7b9805e733c3b037ff210afe1b9
+41178	12695	CC BY-SA	Tarjak	Handle Bar	clean	5386	05cf308fdb45b01a6406f34ef6754706d4fae2c6aa3cc2464a62a8dd8f2216c2
+41360	12746	CC BY	RichRap	NO SUPPORT needed - Roal The Bratty Dragon Prototype	clean	10058	b3964cce133038a9b851575093898c56a87dad9f2fa85d82693106ee867af6c9
+41458	12770	Public Domain	WilliamAAdams	SuperShapes in OpenScad	clean	480	323c832146131b28f01b566fed0e15068241caa7346b0d5c4f6b1dc0c68b69d2
+41466	12770	Public Domain	WilliamAAdams	SuperShapes in OpenScad	clean	896	cfe4d7783bca7e1027351f75227d1377ff7508cc2a8a181e478b27a512d3cebc
+41732	12858	CC BY-SA	bryanduxbury	Lightsaber for a 2-year-old	clean	15174	0a292a26e0b8033903d69a3077fd2f300d36e9051b515d5777711eb68ff2d417
+41970	12919	CC BY-SA	beauturner	Sailboat Curtain Slide for T-Track	clean	160	0473dbd85aeab692b6cad186d28ca581e98f729cb5c3d72153b63e27ff86e29f
+42025	12937	CC BY-SA	gicks	lens hood for canon 50mm 1.8	clean	19478	31e525ef28980e7ae58097cf599ce79e4089086862e50fcd12e56e7f0f607812
+42035	12943	CC BY-SA	jarvis	Cord Spool For MacBook Power Supply	clean	3890	f41c614d2e8fbb7eda463e503b928405a2290ac6e83d056aa48541d686661f02
+42036	12943	CC BY-SA	jarvis	Cord Spool For MacBook Power Supply	clean	792	73137a61ebdd8ddd047b54788efdec1ad419513e180af0680ce2fefa2e748234
+42040	12858	CC BY-SA	bryanduxbury	Lightsaber for a 2-year-old	clean	7532	ad4be26c9abc3b4c34f1e74e5c042113430dd1f28598599c7606a8979adcef96
+42192	12969	CC BY-SA	scooter46290	Trap Inc Tattoos 3D printed tattoos	clean	13508	6392972a6d60e65671e817a1b06fccb7622683d21d3720b0313cbe66ad483471
+42194	12969	CC BY-SA	scooter46290	Trap Inc Tattoos 3D printed tattoos	clean	27866	3647586e5a883c85b60469cc83cdc5707d89e8f5257c25ccc9eee9fb3dfc0906
+42250	12920	CC BY-SA	cymon	Snake/Chain Desk Toy	clean	1144	ff15da48d9a1150deed28e0b4a2b91654181686b15ae8aa3f7af3ebc10248104
+42268	12989	CC BY-SA	johnbiehler	Page Keeper	clean	268	e76634e4c0147100507ba849afaa698cf45d433088e60f46f2f864ada23caba8
+42370	13009	CC BY-SA	emmett	Ouroboros Bracelet	clean	5738	68dca07286634db69d11a6f319273312c3d7e0319d1cb0e34c189541912d866f
+42432	13032	CC BY-SA	TrevorLaw	Air-tight Single Piece Pump - Shkolnikov Pump	clean	184	4c826070eda8e30974b6f91ee60662f8f2fa410512af2b0e35ecc1fede0dca05
+42435	13034	CC BY-SA	paenian	Bubble Hold for rock climbing	clean	3698	6359f19b0a0f891521876d55ce2ff63b60c7a8a746cf09591d50f7ce38289bee
+42500	13035	CC BY-SA	daviddotshaw	Elephant Mother and Child	clean	626	3d1e827764964916e081f5e3b061bdafbb938510082f0363c27096643898fca7
+42501	13035	CC BY-SA	daviddotshaw	Elephant Mother and Child	clean	1260	a5a14e6438b422816b90bd79cf325ccd3531a4e2962d043b9308713cc869e658
+42545	13052	Public Domain	scorch	Hockey Bic	clean	3450	cfc26da0b3da71a52f843e2daf15b17b03e4575617110409783c72ba24e66bc0
+42575	13052	Public Domain	scorch	Hockey Bic	clean	1764	5604e18198b3e0d8216d82a4dc82f9e63b1101857430092db3c31d1f3f728395
+42606	13067	CC BY-SA	ronthomp	Dishwasher silverware rack repair	clean	1276	6954fe7f44e343a72384b47df2750fadb7bb338aa547302f5714a006d8a72808
+42638	13072	CC BY-SA	1oldclown	LED mounts	clean	502	3b79ab5efc83f786902eb7479c8587f4dd95967b24fa4106638014956d27533d
+42652	13078	CC BY	2ROBOTGUY	King&#039;s Toilet Bowl Pedal	clean	596	3f2338feb8f24a9cc69b4fc743ffa978152a377e06e910ed4e5a8e4f6e145fd0
+42707	12978	CC BY-SA	NBitWonder	Iron Man Arc Reactor	clean	2108	3dc1b32fb5bb75daf316c40a4452e3efb19fcb60973e3af4e7e9bd7cc5a0d6ff
+42708	12978	CC BY-SA	NBitWonder	Iron Man Arc Reactor	clean	898	675d675eff51d29315a822afd44f3c9047bf574a3fb90bdc05d97f616d25f405
+42721	13099	CC BY-SA	bryanandaimee	Big 4 inch Seven Segment Display	clean	332	89962251050ead9d1070e432c970900d5bd73218376f746f281ca33c2332894a
+42727	13099	CC BY-SA	bryanandaimee	Big 4 inch Seven Segment Display	clean	188	415a497b1d5266eb2f921b1ddec3eb28097571b092a950dc9b86cacddd5968c5
+42823	13127	CC BY-SA	hspahr	Labyrinth Toy	clean	3398	887f426656ec9a75ea50aa5244a2b7900476bf87083e6dc110a7e01b3ea21e4e
+42839	13140	CC BY	tmartin	Car Audio 2DIN to 1DIN mounting kit	clean	428	d2667938e7fef7b5b24122b6b4c7b5273feb19b899f62a0fdb57d552f0cc76ec
+42840	13140	CC BY	tmartin	Car Audio 2DIN to 1DIN mounting kit	clean	428	f347497ce96e47b410ca1c188ff299cae1be9a92041cef1461821613701511e2
+42844	13143	CC BY	degroof	Ring Adapter For Lapel Button	clean	748	a3685f9f7817dd64aea3a7f5964742e640296726b566730a5ed9f46bddf312c4
+42936	13143	CC BY	degroof	Ring Adapter For Lapel Button	clean	704	3725045c12fe33a8b2877fd78fffcd8267d23afaeaaba39160824fa7ecbbdc86
+42974	13181	CC BY-SA	benglish	GoPro Hero Camera Mount	clean	1468	1607624b772cc0e9eb8c2493cec04cb598aaf3ac1bc0a074abe811f9fff4a5a3
+42986	13032	CC BY-SA	TrevorLaw	Air-tight Single Piece Pump - Shkolnikov Pump	clean	208	e07e2ecec88332e9fc9ca58344211c1975d0b3b11b55dcf58fd3d154d640dbe5
+42998	13188	CC BY	Landru	Dremel Turbine	clean	7950	778dfc7465f6536ce11bddf3af984e634585b97befd26bb0d926777379b17088
+43149	13188	CC BY	Landru	Dremel Turbine	clean	16930	941223e76c5c1b31e39f32362c4e798857b0ba4750730e49720f9e68ede226f7
+43208	13258	CC BY-SA	MichelleP	Mr Dinosaur	clean	5960	26a8ab434f87d01705690268d902bb42c8442e5a6b7a7f352d3ca07967cab25c
+43385	13298	CC BY-SA	Kepler	4Track	clean	812	7f406d1001c44c18cb54f40d03c8287288cb5f4fb0306de4875f61b3ead6c416
+43386	13298	CC BY-SA	Kepler	4Track	clean	308	50013a99b2dd8a4b8ebc6fd1cde73337efc76908ded594e86c2f3bdf804a0486
+43437	13324	CC BY-SA	CaptainKirk	Zipper	clean	972	ee01982149f09e72c6363b1ff967ee0c92165396fd56cb6413434b8f0f4a961c
+43439	13324	CC BY-SA	CaptainKirk	Zipper	clean	568	41d333a3810937a5c0676633a207adade598b6d1efaa1a3609b5648dfb84db52
+43584	13368	CC BY-SA	RonG	Motorized Functional Differential Gear System	clean	346	5b643daec4545bda08422da04b39d2a5343f30de80c1e5c72217d95d18121b6b
+43780	13423	CC BY-SA	bjepson	Simple desk case for WIMM One	clean	120	058d45ee473addc1a257991cefc561bbde40cd4013d7a536ba042626ecf8a75c
+43849	13406	Public Domain	jag	Wankel Rotary Engine Model	clean	376	938d7ad8c657ad47f3d8714e761bed0c7224fe4a0486805a91ddd9d5a14d3c38
+43850	13406	Public Domain	jag	Wankel Rotary Engine Model	clean	1596	60e962b4e49b5a6806a6522fb98e995e78c233b3ba8545e1d3b0754b0ecd3c71
+43988	13493	Public Domain	Brinny	Dolphin Automata	clean	900	8bd35816042911d05f39d91e946968f0af633c067a027a060a750344c0b8868e
+44000	13497	CC BY-SA	litwan	removable; levelable and ball bearing mounted ToM X axis	clean	548	86f3915cf0861a32d717dc7f8ca5438aba320989d7222e695d7f54ca3c256b24
+44025	13505	CC BY-SA	emmett	Stretchy Bracelet	clean	14192	2c62afd36fab0c1af72a6422c55b1b9d7f353de373b26548052715d8f4fdf12f
+44027	13505	CC BY-SA	emmett	Stretchy Bracelet	clean	6986	5f43dac6cd055f7d8adfee2a35bb47dedd0e64b5d498ce9ffd6a2944b5250663
+44100	13522	CC BY-SA	Pedrodeoro	Animatronic Tail.	clean	472	f0393a11bc63bb94775988b332be9582ebd03905a11b7e377bcc379af2721cc3
+44102	13522	CC BY-SA	Pedrodeoro	Animatronic Tail.	clean	60	db255aa36df2aca46ab4957c986e4c955c99c556ff93f1bb1dad8078741e3b83
+44397	13531	CC BY-SA	canadaduane	Trilego	clean	2708	ee631857d966026127627b19c692f1dafe8ef2e853cccd9f273e43e3805c90fe
+44398	13531	CC BY-SA	canadaduane	Trilego	clean	5012	6e5ea4222a2312cca30e35f71b3fb6244d292ba051b29dca5ea0aef634594432
+44498	13493	Public Domain	Brinny	Dolphin Automata	clean	2336	d1460a2044b4e958d2ad9f6c3126e0b2a1e09ed57c57c37e983bc04fa54fc21c
+44710	13678	CC BY-SA	HPaul	Apple Earbud Holder	clean	3172	2978f18e976ffb06b390241088abc86d5e724e7b9e5f56978c2eddb323e974e5
+44804	13718	CC BY-SA	HPaul	Apple USB Adapter Cable Spooler	clean	1262	489cd12b5dbe13cf2be4c353f8908be43811a9798bcc85c90757a6230415e718
+44899	13749	CC BY-SA	CarlosRZambrana	CarmaMovil	clean	1284	2729c78fecade688582a1395c98b0f0a29ec5ee09b62df0546beffaf1382c68b
+44900	13749	CC BY-SA	CarlosRZambrana	CarmaMovil	clean	1260	0ec3028265e9364dfedfe3048b0df6679b299f5937630b508fd5b87d8e986b4c
+44908	13750	CC BY-SA	Pedrodeoro	Mat&Atilde;&shy;as Wolf	clean	5904	dbe4bd55aa48f6b8c93ea284afa247f9982e1bb03a5cbc5d4192bbaa74e88ffa
+44910	13750	CC BY-SA	Pedrodeoro	Mat&Atilde;&shy;as Wolf	clean	1400	65b84c37b6ad619b825a6b50294b3de521c06421996d50404d07230c985345d3
+44950	13727	Public Domain	jag	mk7 ball bearing extruder drive	clean	5280	7b2906ce28908c8dad13dc710bf3e091756015fe39897bd39a13aae976cba961
+45009	13657	CC BY-SA	DEF	Lightsaber Chalk Holder	clean	2360	3f46211df7abfce77daf7a3ee038d5d4e6a8a98e49f22fcfe99ddb306f3bfa75
+45090	13810	CC BY-SA	pogden	Tentacle polyhedron vertex	clean	22162	638029284e10ea1128a7bbb502f8b3f7bf12f00c62eda6f712cdbb2442f4c66c
+45169	13753	CC0	chris	High-heel protector	clean	932	3ef1ae72443d7753762c97795b59b4905991447631a3bbf7fdc8aaacfc489607
+45333	13810	CC BY-SA	pogden	Tentacle polyhedron vertex	clean	22314	35e3decbdbaf2ac7983658d81e9dcc385685218c91879c98bd5998999eba7c34
+45370	13915	CC BY	MakerBot	Windup Walkers	clean	2370	013d19e2435a7f98a36dc3d6f34b336f0c714836f69c7c4f257f03939b1859aa
+45404	13927	CC BY-SA	Chu	CODE1 Bearing Rim Caps	clean	5016	c9f1159b04202f5c5d876b79805b3dcf2ae429b734fb2c94771d5bea725630b5
+45408	13928	CC BY-SA	Seynls	Formula 1 BatCar	clean	800	175f3bfebb8b0c96a4970065eb822b7277f7290eb6921f0ca8b833a247644e5e
+45409	13928	CC BY-SA	Seynls	Formula 1 BatCar	clean	128	edf11bf042ccab8c358a6cc266abf5930e4bc37531b84fbb03ee088eb9b00795
+45512	13816	CC BY	MatthewLaBerge	Printable Wool Winder	clean	3916	c429454aabc9c5e8385bc2aba8ee679f73b53f866fa1758105c1edccba60c861
+45513	13816	CC BY	MatthewLaBerge	Printable Wool Winder	clean	1124	095a2974648dc26437c25ad49e5a6645c192e86909b337bdeef23128eadf1655
+45550	13963	CC BY-SA	leemorton123	3D Perspective Illusion Generator(ish)	clean	3222	ee159d4c00d9c6cd39a9c3312deed71a214c27c1749d84ef59ccdb36287a6cd2
+45562	13968	CC BY-SA	dgwilson	Skeleton Gingerbread Man - Cookie Cutter - Version 2	clean	2048	b8f7d409e8bb50ae1c6d34cf28cfd6f50a2041e7d62695529602e06f1ce1cea9
+45617	13740	CC BY-SA	DEF	D&Acirc;&sup2; - Modular parametric car	clean	468	554fd7e9109a60efd2b282f4a8860451507938f278d054e5d33f3a2f12e8ceef
+45620	13740	CC BY-SA	DEF	D&Acirc;&sup2; - Modular parametric car	clean	12000	677ad501c6e41e2cb6fefb77b2b3c1153690a2f0b0947881460a39c26677f899
+45813	14012	CC BY-SA	dougc314	Helping Hands	clean	1848	07724fd7c41296abf79238218aee2865c8509729ce3130c399448935eaa7d27a
+45814	14012	CC BY-SA	dougc314	Helping Hands	clean	7216	42d0ac292351ffbe36ba9b00656dc30893b8d77c84090c170106a696c9cc11fc
+46260	14130	CC BY-SA	PacManFan	PrintrBot Clone	clean	1232	87b8e163833b924bdd15bd5660b3ea7a44111fc286dce0a74f3029b5824a0049
+46261	14130	CC BY-SA	PacManFan	PrintrBot Clone	clean	872	96c0a579bd1da619d1c286a6e2951b5e06e04a9559fdedeb55928b77e9e726ff
+46474	14176	CC BY-SA	Mr_MegaTronic	R. Maker Ornament V1	clean	3742	0361605b38389a164259e89b4fb77571588b1d52462716abef5673a2d40c5dce
+46527	14189	Public Domain	foxdewayne	Necklace Holder	clean	288	3c9e91afb528fe3c01eacc1e8b447e6b55dd06b0867d8b9fd207edf857ee329e
+46579	14197	CC BY-SA	obijuan	Skymega board	clean	636	67a5ddad7cb00fd6632a80ceb406be3355f204458c1f11dcadcb4f448d20d84e
+46665	14204	CC BY-SA	Mecano	Air 2	clean	764	02a3b21ab27a09480f30dc28138ae776b817c7be2a4e628f02bd39f4400743ed
+46780	14246	CC BY	WilliamAAdams	MetaBalls are Among Us!!	clean	16020	0009282bbc7598b2a3c443633a7d647e84713a5524b00d8028327013922781c0
+47076	14328	CC BY-SA	ramenspork	Matrix Buildings	clean	1532	647693820267a32945cd1e4e15985141ef5508d00c3cc3909810a9377c376780
+47096	14328	CC BY-SA	ramenspork	Matrix Buildings	clean	1528	cc903bb166e1c6572109f59503d844ff7324c7dedbcbaf0502f0c4ac454dd570
+47732	14493	CC BY-SA	Mr_MegaTronic	KaptonCaddy V1.1	clean	6102	6e8ad0f4cf8c587356a8f8bc52a2a3e127322c35e670a598e41f12c00230889c
+47733	14493	CC BY-SA	Mr_MegaTronic	KaptonCaddy V1.1	clean	252	682064005b10ccd5bd73b518aaf7455783deeed13175d401e96d0c9b60e25f35
+47845	14526	CC BY-SA	RonG	Pyramid shaped storage box	clean	44	7a8be62b24e6984622d6afe6d88f72ddc5f6a4c105a196a118d827d22d0604c3
+47851	14528	CC BY-SA	MBCook	Skull Bank	clean	4630	b0660a78142710a67a42f2a2fb3a0b5e08943e0662b1dc45ce5c86d39029e92b
+47852	14528	CC BY-SA	MBCook	Skull Bank	clean	2060	bcbb4f8b3559a7638f7ecc96be05ba38798cc1a3816a4515cb6d85dff6ffcb88
+48123	14599	CC BY-SA	Ktronics	Tri-Track dual servo robot tank chassis	clean	2098	435a0b652fb21efdc1e107e158607ca132f953d653fd2000abd237faf2653050
+48131	14607	CC BY-SA	Nudel_P	Arrow in the knee prosthesis	clean	520	02020e5e37c7229336280af5b4bb6c39222dd9b7f42475b5dbd75986c78f20e4
+48132	14607	CC BY-SA	Nudel_P	Arrow in the knee prosthesis	clean	572	f565430c885aad507ab6fcd6be0492eb87d6783d216d563a4aad341dae484a45
+48223	14599	CC BY-SA	Ktronics	Tri-Track dual servo robot tank chassis	clean	416	b4f4c13d442ce55221befc57fe80244c3895d70b57292c5ba71a22b29b9fcb73
