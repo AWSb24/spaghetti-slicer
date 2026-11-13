@@ -372,6 +372,10 @@ pub enum HatchDirection {
     Diagonal45,
     /// Lines running from lower right to upper left.
     Diagonal135,
+    /// Lines along X.
+    Horizontal,
+    /// Lines along Y.
+    Vertical,
 }
 
 /// Fills shapes with parallel line segments `spacing` millimetres apart.
@@ -395,12 +399,16 @@ pub fn hatch(
         match direction {
             HatchDirection::Diagonal45 => (u, v),
             HatchDirection::Diagonal135 => (v, u),
+            HatchDirection::Horizontal => (p[0], p[1]),
+            HatchDirection::Vertical => (p[1], p[0]),
         }
     };
     let backward = |a: f64, b: f64| -> Point {
         let (u, v) = match direction {
             HatchDirection::Diagonal45 => (a, b),
             HatchDirection::Diagonal135 => (b, a),
+            HatchDirection::Horizontal => return [a, b],
+            HatchDirection::Vertical => return [b, a],
         };
         [(u - v) * FRAC_1_SQRT_2, (u + v) * FRAC_1_SQRT_2]
     };
@@ -670,7 +678,12 @@ mod tests {
     #[test]
     fn hatch_covers_the_area() {
         let shapes = from_loops(&[square(0.0, 0.0, 20.0), square(5.0, 5.0, 10.0)]);
-        for direction in [HatchDirection::Diagonal45, HatchDirection::Diagonal135] {
+        for direction in [
+            HatchDirection::Diagonal45,
+            HatchDirection::Diagonal135,
+            HatchDirection::Horizontal,
+            HatchDirection::Vertical,
+        ] {
             let segments = hatch(&shapes, 0.5, direction, 0.0);
             let length: f64 = segments.iter().map(|s| distance(s[0], s[1])).sum();
             // Total length times spacing approximates the area.

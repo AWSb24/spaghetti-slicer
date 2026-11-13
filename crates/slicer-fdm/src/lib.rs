@@ -32,6 +32,10 @@ const SUPPORT_RESOLUTION: f64 = 0.05;
 /// Distance between the lines of the dense support layers, in line widths.
 const SUPPORT_INTERFACE_SPACING: f64 = 2.0;
 
+/// How far the lines of a bridge reach onto what carries them, in line
+/// widths.
+const BRIDGE_ANCHOR: f64 = 2.0;
+
 /// Longest rim of a hole in the mesh that is closed before slicing.
 const MAX_HOLE_EDGES: usize = 64;
 
@@ -529,6 +533,17 @@ fn layer_work(
     };
     let min_length = 0.5 * width;
 
+    let (solid, sparse) = if index > 0 {
+        let (bridges, solid, sparse) =
+            split_bridges(&slices[index - 1], &fill_area, solid, sparse, width);
+        for (bridge, across) in bridges {
+            let lines = polygon::hatch(&bridge, width, across, min_length);
+            work.push(Work::Lines(lines, PathKind::SolidInfill, 2.0 * width));
+        }
+        (solid, sparse)
+    } else {
+        (solid, sparse)
+    };
     let solid_lines = polygon::hatch(&solid, width, direction, min_length);
     work.push(Work::Lines(solid_lines, PathKind::SolidInfill, 2.0 * width));
 
@@ -596,6 +611,78 @@ fn split_solid_sparse(
     }
     let sparse = polygon::difference(fill_area, &solid);
     (solid, sparse)
+}
+
+/// Whether `point` lies inside the shapes (even-odd).
+fn point_inside(shapes: &Shapes, point: Point) -> bool {
+    let mut inside = false;
+    for contour in shapes.iter().flatten() {
+        for (i, &p) in contour.iter().enumerate() {
+            let q = contour[(i + 1) % contour.len()];
+            if (p[1] > point[1]) != (q[1] > point[1])
+                && point[0] < p[0] + (point[1] - p[1]) / (q[1] - p[1]) * (q[0] - p[0])
+            {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+/// Takes the bridges out of the solid and sparse areas of a layer: solid
+/// areas at least a line wide with nothing below, grown a little onto what
+/// carries them. Every bridge comes with the direction in which most of its
+/// lines rest on the layer below at both ends.
+// ponytail: four directions (along X, along Y, both diagonals), and bridges
+// print like other solid infill. A bridge at another angle gets the best of
+// the four; free angles, and their own speed, flow and cooling, come later.
+fn split_bridges(
+    below: &Shapes,
+    fill_area: &Shapes,
+    solid: Shapes,
+    sparse: Shapes,
+    width: f64,
+) -> (Vec<(Shapes, HatchDirection)>, Shapes, Shapes) {
+    if solid.is_empty() {
+        return (Vec::new(), solid, sparse);
+    }
+    // Shrinking and regrowing drops the strips a sloped surface leaves on
+    // every layer.
+    let air = polygon::difference(&solid, below);
+    let air = polygon::offset(&polygon::offset(&air, -0.5 * width), 0.5 * width);
+    if air.is_empty() {
+        return (Vec::new(), solid, sparse);
+    }
+    let area = polygon::intersection(&polygon::offset(&air, BRIDGE_ANCHOR * width), fill_area);
+    let bridges = area
+        .iter()
+        .map(|shape| {
+            let bridge = vec![shape.clone()];
+            let mut best = (f64::INFINITY, HatchDirection::Diagonal45);
+            for direction in [
+                HatchDirection::Horizontal,
+                HatchDirection::Vertical,
+                HatchDirection::Diagonal45,
+                HatchDirection::Diagonal135,
+            ] {
+                // Length of the lines with an end in the air.
+                let loose: f64 = polygon::hatch(&bridge, width, direction, 0.0)
+                    .iter()
+                    .filter(|line| !line.iter().all(|&end| point_inside(below, end)))
+                    .map(|line| distance(line[0], line[1]))
+                    .sum();
+                if loose < best.0 - 1e-6 {
+                    best = (loose, direction);
+                }
+            }
+            (bridge, best.1)
+        })
+        .collect();
+    (
+        bridges,
+        polygon::difference(&solid, &area),
+        polygon::difference(&sparse, &area),
+    )
 }
 
 /// Skirt and brim on the first layer.
@@ -856,6 +943,48 @@ mod tests {
             extruded_length(&toolpaths.layers[12], PathKind::SolidInfill),
             0.0
         );
+    }
+
+    #[test]
+    fn bridges_run_from_support_to_support() {
+        // Two pillars 20 mm apart carry a deck. Turned by a quarter, the
+        // lines of the bridge must turn with it.
+        for turned in [false, true] {
+            let mut mesh = Mesh::cuboid(5.0, 20.0, 5.0);
+            let mut pillar = Mesh::cuboid(5.0, 20.0, 5.0);
+            pillar.translate([25.0, 0.0, 0.0]);
+            mesh.merge(&pillar);
+            let mut deck = Mesh::cuboid(30.0, 20.0, 2.0);
+            deck.translate([0.0, 0.0, 5.0]);
+            mesh.merge(&deck);
+            if turned {
+                mesh.rotate_z(std::f64::consts::FRAC_PI_2);
+            }
+            let toolpaths = generate(&mesh, &Settings::default()).unwrap();
+            // Layer 25 is the lowest layer of the deck.
+            let mut along = 0.0;
+            let mut long = 0.0;
+            for path in &toolpaths.layers[25].paths {
+                if path.kind != PathKind::SolidInfill {
+                    continue;
+                }
+                for pair in path.points.windows(2) {
+                    let length = distance(pair[0], pair[1]);
+                    if length < 2.0 {
+                        continue;
+                    }
+                    long += length;
+                    let across = usize::from(!turned);
+                    if (pair[0][across] - pair[1][across]).abs() < 1e-6 {
+                        along += length;
+                        // From pillar to pillar, and a little onto both.
+                        assert!(length > 20.5, "{length}");
+                    }
+                }
+            }
+            assert!(long > 500.0, "{long}");
+            assert!(along > 0.95 * long, "{along} of {long}");
+        }
     }
 
     /// A square plate with a square through-hole. Winding is not
