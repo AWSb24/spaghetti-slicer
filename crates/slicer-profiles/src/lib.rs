@@ -1,8 +1,9 @@
 //! Printer, material and process profiles with inheritance and validation.
 //!
-//! For now this is a single flat [`Settings`] struct loaded from TOML. The
-//! split into printer, material and process profiles with inheritance comes
-//! later.
+//! Settings are one flat [`Settings`] struct. Profiles are TOML files that
+//! each set some of the keys and are applied one after the other, for
+//! example a printer, a material and a process file; a later file overrides
+//! an earlier one. The files themselves are not tied to one of these roles.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -255,10 +256,22 @@ impl Settings {
     /// Parses settings from TOML. Missing keys take their default value,
     /// unknown keys are rejected.
     pub fn from_toml(text: &str) -> Result<Self, SettingsError> {
-        let settings: Settings =
-            toml::from_str(text).map_err(|e| SettingsError::Parse(e.message().to_owned()))?;
-        settings.validate()?;
+        let mut settings = Settings::default();
+        settings.apply_toml(text)?;
         Ok(settings)
+    }
+
+    /// Overrides the settings named in a TOML text and keeps all others.
+    /// Applying several files in a row layers them: the last one wins.
+    /// Unknown keys are rejected; on any error nothing is changed.
+    pub fn apply_toml(&mut self, text: &str) -> Result<(), SettingsError> {
+        let parse = |e: toml::de::Error| SettingsError::Parse(e.message().to_owned());
+        let mut table = self.table();
+        table.extend(text.parse::<toml::Table>().map_err(parse)?);
+        let updated: Settings = table.try_into().map_err(parse)?;
+        updated.validate()?;
+        *self = updated;
+        Ok(())
     }
 
     /// Serializes all settings as TOML.
@@ -404,6 +417,34 @@ mod tests {
         assert_eq!(s.layer_height, 0.1);
         assert_eq!(s.flavor, Flavor::Klipper);
         assert_eq!(s.wall_loops, 2);
+    }
+
+    #[test]
+    fn files_are_layered_and_the_last_one_wins() {
+        let mut settings = Settings::default();
+        settings
+            .apply_toml("bed_size_x = 256.0\nnozzle_temp = 200.0")
+            .unwrap();
+        settings
+            .apply_toml("nozzle_temp = 240.0\nbed_temp = 80.0")
+            .unwrap();
+        settings.apply_toml("layer_height = 0.12").unwrap();
+        assert_eq!(settings.bed_size_x, 256.0);
+        assert_eq!(settings.nozzle_temp, 240.0);
+        assert_eq!(settings.bed_temp, 80.0);
+        assert_eq!(settings.layer_height, 0.12);
+        assert_eq!(settings.line_width, Settings::default().line_width);
+
+        // A broken layer changes nothing.
+        let before = settings.clone();
+        assert!(
+            settings
+                .apply_toml("layer_height = 0.12\nnope = 1")
+                .is_err()
+        );
+        assert!(settings.apply_toml("layer_height = 9.0").is_err());
+        assert!(settings.apply_toml("layer_height = \"thin\"").is_err());
+        assert_eq!(settings, before);
     }
 
     #[test]

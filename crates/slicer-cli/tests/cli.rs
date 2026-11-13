@@ -76,6 +76,9 @@ fn config_file_and_overrides_are_applied() {
         "layer_height = 0.1\nfirst_layer_height = 0.2\nflavor = \"klipper\"\n",
     )
     .unwrap();
+    // A second file overrides the first and keeps what it does not name.
+    let material = dir.join("material.toml");
+    fs::write(&material, "flavor = \"marlin\"\nbed_temp = 75.0\n").unwrap();
     let output = dir.join("out.gcode");
 
     let out = run(&[
@@ -83,6 +86,8 @@ fn config_file_and_overrides_are_applied() {
         stl.to_str().unwrap(),
         "-c",
         config.to_str().unwrap(),
+        "-c",
+        material.to_str().unwrap(),
         "-s",
         "nozzle_temp=230",
         "-o",
@@ -95,7 +100,8 @@ fn config_file_and_overrides_are_applied() {
         text(&out.stdout)
     );
     let gcode = fs::read_to_string(output).unwrap();
-    assert!(gcode.contains("; flavor: klipper"));
+    assert!(gcode.contains("; flavor: marlin"));
+    assert!(gcode.contains("; bed_temp = 75"));
     assert!(gcode.contains("M104 S230\n"));
 }
 

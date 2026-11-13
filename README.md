@@ -28,6 +28,12 @@ Use a config file and override single settings:
 cargo run --release -p slicer-cli -- slice model.stl -c settings.toml -s layer_height=0.1 -s infill_density=30 --json
 ```
 
+A settings file only needs the keys it changes. Several files are layered in the order given, so printer, material and process can live in separate files; a later file overrides an earlier one, and `--set` overrides them all:
+
+```bash
+cargo run --release -p slicer-cli -- slice model.stl -c printer.toml -c pla.toml -c draft.toml
+```
+
 Errors go to stderr with exit code 1. With `--json`, errors and warnings are objects with a stable `code`, a `message` and a `context`:
 
 | Code | Meaning |
@@ -75,7 +81,7 @@ curl -F model=@examples/cube_20mm.stl -F settings=@settings.toml -F set=infill_d
 | Request | Purpose |
 |---|---|
 | `GET /health` | Liveness check, never needs a token |
-| `POST /v1/jobs` | Create a job (multipart fields `model`, `settings`, `set`, `plate`); answers `202` at once |
+| `POST /v1/jobs` | Create a job (multipart fields `model`, `settings`, `set`, `plate`; several `settings` files are layered in order); answers `202` at once |
 | `GET /v1/jobs/{id}` | Status (`queued`, `running`, `done`, `failed`, `cancelled`), statistics, warnings or the error |
 | `GET /v1/jobs/{id}/gcode` | The G-code of a finished job |
 | `DELETE /v1/jobs/{id}` | Cancel an unfinished job or delete a finished one |

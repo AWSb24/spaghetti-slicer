@@ -324,10 +324,10 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
                     return invalid(format!("field '{name}' is not valid UTF-8"));
                 };
                 if name == "settings" {
-                    settings = match Settings::from_toml(text) {
-                        Ok(settings) => settings,
-                        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.diagnostic()),
-                    };
+                    // Several files are layered in the order they are sent.
+                    if let Err(e) = settings.apply_toml(text) {
+                        return error_response(StatusCode::BAD_REQUEST, &e.diagnostic());
+                    }
                 } else if name == "plate" {
                     let Ok(number) = text.trim().parse::<u32>() else {
                         return invalid(format!("field 'plate' expects a number, got '{text}'"));

@@ -97,6 +97,7 @@ async fn a_job_is_sliced_in_the_background() {
         &router,
         &[
             ("model", &stl),
+            ("settings", b"layer_height = 0.3\nwall_loops = 3\n"),
             ("settings", b"layer_height = 0.1\n"),
             ("set", b"infill_density=30"),
         ],

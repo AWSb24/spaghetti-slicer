@@ -29,9 +29,10 @@ enum Command {
         /// G-code file to write [default: input with .gcode extension]
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Settings file in TOML format; missing keys use defaults
+        /// Settings file in TOML format; may be given several times, later
+        /// files override earlier ones, missing keys use defaults
         #[arg(short, long)]
-        config: Option<PathBuf>,
+        config: Vec<PathBuf>,
         /// Override a single setting, e.g. --set layer_height=0.1
         #[arg(short, long = "set", value_name = "KEY=VALUE")]
         set: Vec<String>,
@@ -77,7 +78,7 @@ fn main() -> ExitCode {
             plate,
             svg,
             json,
-        } => match slice(input, output, config, &set, plate, svg) {
+        } => match slice(input, output, &config, &set, plate, svg) {
             Ok(result) => {
                 if json {
                     println!("{result:#}");
@@ -101,18 +102,18 @@ fn main() -> ExitCode {
 fn slice(
     input: PathBuf,
     output: Option<PathBuf>,
-    config: Option<PathBuf>,
+    config: &[PathBuf],
     overrides: &[String],
     plate: Option<u32>,
     svg: Option<PathBuf>,
 ) -> Result<serde_json::Value, Diagnostic> {
-    let mut settings = match &config {
-        Some(path) => {
-            let text = fs::read_to_string(path).map_err(|e| io_error("io.read", path, &e))?;
-            Settings::from_toml(&text).map_err(|e| in_file(path)(e.diagnostic()))?
-        }
-        None => Settings::default(),
-    };
+    let mut settings = Settings::default();
+    for path in config {
+        let text = fs::read_to_string(path).map_err(|e| io_error("io.read", path, &e))?;
+        settings
+            .apply_toml(&text)
+            .map_err(|e| in_file(path)(e.diagnostic()))?;
+    }
     for item in overrides {
         let (key, value) = item.split_once('=').ok_or_else(|| {
             Diagnostic::error(
