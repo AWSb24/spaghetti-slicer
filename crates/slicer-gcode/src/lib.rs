@@ -289,7 +289,9 @@ impl Writer<'_> {
         }
     }
 
-    fn travel(&mut self, to: Point) {
+    /// Moves without extruding. `inside` says that the way stays over the
+    /// part, where a little oozing does no harm and retraction is skipped.
+    fn travel(&mut self, to: Point, inside: bool) {
         let length = self
             .position
             .map_or(f64::INFINITY, |from| distance(from, to));
@@ -300,7 +302,8 @@ impl Writer<'_> {
         let direction = self
             .position
             .map(|from| [(to[0] - from[0]) / length, (to[1] - from[1]) / length]);
-        let long = self.position.is_some() && length >= self.settings.retraction_min_travel;
+        let long =
+            self.position.is_some() && !inside && length >= self.settings.retraction_min_travel;
         let hop = long && self.settings.z_hop > 0.0 && self.settings.retraction_length > 0.0;
         if long {
             self.retract();
@@ -400,7 +403,7 @@ pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output,
             let Some(&first) = path.points.first() else {
                 continue;
             };
-            w.travel(first);
+            w.travel(first, path.travel_inside);
             if current_kind != Some(path.kind) {
                 current_kind = Some(path.kind);
                 let _ = writeln!(w.out, ";TYPE:{}", label(path.kind));

@@ -30,7 +30,32 @@ Measured on 2026-11-13 on one Windows 11 machine (16 logical cores), with Orca S
 - **Filament:** Spaghetti Slicer reports 9 to 16 % less. For the cube the G-code of both was added up per feature: Orca's total contains 107 mm of filament for the purge line of its start sequence, which Spaghetti Slicer does not have. On the print moves alone the difference is 6 % (1115 mm against 1189 mm): Orca puts more into sparse infill (other pattern, wider first layer), Spaghetti Slicer slightly more into walls. No sign of a gross error in either.
 - **Print time:** not comparable. Both are estimates from different motion models, and Orca's includes more of what the printer does.
 
-## Problems this showed in Spaghetti Slicer
+## Problems this showed in Spaghetti Slicer, and their fix
 
-1. **Far too many retractions.** On the 20 mm cube Spaghetti Slicer retracts about 780 times in sparse infill alone, Orca about 90 times. Every move between two infill lines longer than 1.5 mm retracts, although it never leaves the inside of the part.
-2. **G-code is several times larger on curved models** (18.3 MB against 2.6 MB for the Benchy). Curves are written as very many short segments; Orca thins them out to a resolution of 0.012 mm and fits arcs. Files this dense can make a printer stutter.
+The table above is the state before the fix. Both problems were fixed in the commit after `d6d1191`:
+
+1. **Far too many retractions.** On the 20 mm cube Spaghetti Slicer retracted about 780 times in sparse infill alone, Orca about 90 times: every move between two infill lines longer than 1.5 mm retracted, although it never left the inside of the part. Now a move to infill or to an inner wall that stays inside the outline of the layer does not retract.
+2. **G-code several times larger on curved models.** Curves were written as very many short segments. Walls are now thinned out so that they move by at most 0.0125 mm, close to the 0.012 mm Orca uses.
+
+Measured again after the fix, same method:
+
+| Model | Slicer | Time [s] | Peak memory [MB] | G-code [MB] |
+|---|---|---|---|---|
+| cube_20mm.stl | Orca | 0.31 | 90 | 0.3 |
+| cube_20mm.stl | Spaghetti | 0.02 | 8 | 0.1 |
+| gear_with_hub.stl | Orca | 0.39 | 99 | 0.5 |
+| gear_with_hub.stl | Spaghetti | 0.05 | 17 | 0.4 |
+| tube_24mm.stl | Orca | 0.49 | 101 | 0.3 |
+| tube_24mm.stl | Spaghetti | 0.08 | 21 | 0.7 |
+| 3dbenchy.stl | Orca | 3.07 | 223 | 2.6 |
+| 3dbenchy.stl | Spaghetti | 1.38 | 83 | 2.6 |
+| 32770.stl (Octocat, Thingi10K) | Orca | 1.06 | 184 | 3.3 |
+| 32770.stl (Octocat, Thingi10K) | Spaghetti | 0.27 | 28 | 1.8 |
+
+| 3DBenchy | Orca | Spaghetti before | Spaghetti after |
+|---|---|---|---|
+| Retractions | 1481 | not counted | 1783 |
+| Moves with extrusion | 66697 | not counted | 82309 |
+| G-code size | 2.6 MB | 18.3 MB | 2.6 MB |
+
+On the 20 mm cube Spaghetti Slicer now retracts 100 times, once per layer. Layers and filament are unchanged by the fix. Orca still writes fewer moves because it fits arcs; Spaghetti Slicer writes straight segments only.

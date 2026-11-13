@@ -16,6 +16,11 @@ use slicer_profiles::{InfillPattern, SeamPosition, Settings, WallOrder};
 /// placing the seam, in millimetres.
 const SEAM_TOLERANCE: f64 = 0.001;
 
+/// Largest distance a wall may move when points are dropped from it, in
+/// millimetres. Far below what a printer can resolve, but it cuts the number
+/// of moves on curves several times.
+const PATH_RESOLUTION: f64 = 0.0125;
+
 /// Longest rim of a hole in the mesh that is closed before slicing.
 const MAX_HOLE_EDGES: usize = 64;
 
@@ -45,6 +50,9 @@ pub struct Path {
     pub points: Vec<Point>,
     /// Whether the path returns to its first point after the last one.
     pub closed: bool,
+    /// Whether the move from the end of the previous path to the start of
+    /// this one stays over the part, so that it needs no retraction.
+    pub travel_inside: bool,
 }
 
 impl Path {
@@ -211,7 +219,7 @@ pub fn generate_reporting(
     let geometry = parallel_map(slices.len(), |index| layer_work(&slices, index, settings));
     let mut position: Point = [0.0, 0.0];
     let mut thin_layers = Vec::new();
-    let layers = geometry
+    let mut layers: Vec<Layer> = geometry
         .into_iter()
         .enumerate()
         .map(|(index, (work, mut thin))| {
@@ -242,6 +250,16 @@ pub fn generate_reporting(
             }
         })
         .collect();
+    // Which travel moves stay over the part depends only on the finished
+    // order of a layer, so all cores can work on it again.
+    let inside = parallel_map(layers.len(), |index| {
+        travels_inside(&layers[index], &slices[index])
+    });
+    for (layer, flags) in layers.iter_mut().zip(inside) {
+        for (path, flag) in layer.paths.iter_mut().zip(flags) {
+            path.travel_inside = flag;
+        }
+    }
     if let Some(first) = thin_layers.first() {
         diagnostics.push(
             Diagnostic::warning(
@@ -259,6 +277,32 @@ pub fn generate_reporting(
         );
     }
     Ok(Toolpaths { layers })
+}
+
+/// For every path of a layer: whether the move to its start stays inside
+/// the outline of the layer. Only asked for infill and inner walls; before
+/// an outer wall the nozzle always retracts, to keep the visible surface
+/// clean.
+fn travels_inside(layer: &Layer, slice: &Shapes) -> Vec<bool> {
+    // The first path of a layer is reached from the layer below.
+    let mut flags = vec![false];
+    for pair in layer.paths.windows(2) {
+        let (previous, path) = (&pair[0], &pair[1]);
+        let hidden = matches!(
+            path.kind,
+            PathKind::InnerWall | PathKind::SolidInfill | PathKind::SparseInfill
+        );
+        let from = if previous.closed {
+            previous.points.first()
+        } else {
+            previous.points.last()
+        };
+        flags.push(match (hidden, from, path.points.first()) {
+            (true, Some(&from), Some(&to)) => polygon::segment_inside(slice, from, to),
+            _ => false,
+        });
+    }
+    flags
 }
 
 /// Geometry of one kind that still has to be put in printing order.
@@ -340,7 +384,11 @@ fn layer_work(slices: &[Shapes], index: usize, settings: &Settings) -> (Vec<Work
         } else {
             PathKind::InnerWall
         };
-        work.push(Work::Loops(contours(&wall_shapes[k]), kind, width));
+        let loops = contours(&wall_shapes[k])
+            .iter()
+            .map(|contour| polygon::simplify(contour, PATH_RESOLUTION))
+            .collect();
+        work.push(Work::Loops(loops, kind, width));
     }
 
     // Infill centre lines stay half a width away from the inner edge of the
@@ -506,6 +554,7 @@ fn push_loops(
             kind,
             points,
             closed: true,
+            travel_inside: false,
         };
         if path.length() >= min_length {
             *position = path.points[0];
@@ -549,6 +598,7 @@ fn push_lines(
                     kind,
                     points: line.to_vec(),
                     closed: false,
+                    travel_inside: false,
                 });
             }
         }
@@ -784,6 +834,49 @@ mod tests {
             starts[0][0] < 105.0 && starts[0][1] > 115.0,
             "{:?}",
             starts[0]
+        );
+    }
+
+    #[test]
+    fn travel_inside_the_part_is_marked() {
+        let mut settings = Settings::default();
+        settings.skirt_loops = 0;
+        let toolpaths = generate(&Mesh::cuboid(30.0, 30.0, 6.0), &settings).unwrap();
+        // A layer in the middle: sparse infill inside two walls.
+        let paths = &toolpaths.layers[15].paths;
+        let sparse: Vec<&Path> = paths
+            .iter()
+            .filter(|p| p.kind == PathKind::SparseInfill)
+            .collect();
+        assert!(sparse.len() > 10);
+        assert!(sparse.iter().all(|p| p.travel_inside));
+        // The first path of a layer and every outer wall are reached with a
+        // retraction.
+        assert!(!paths[0].travel_inside);
+        assert!(
+            paths
+                .iter()
+                .filter(|p| p.kind == PathKind::OuterWall)
+                .all(|p| !p.travel_inside)
+        );
+
+        // Between two separate parts the nozzle leaves the material.
+        let mut two = Mesh::cuboid(10.0, 10.0, 2.0);
+        let mut other = Mesh::cuboid(10.0, 10.0, 2.0);
+        other.translate([30.0, 0.0, 0.0]);
+        two.merge(&other);
+        let toolpaths = generate(&two, &settings).unwrap();
+        let paths = &toolpaths.layers[5].paths;
+        let leaving = paths
+            .windows(2)
+            .filter(|w| distance(w[0].points[0], w[1].points[0]) > 20.0)
+            .count();
+        assert!(leaving >= 1);
+        assert!(
+            paths
+                .windows(2)
+                .filter(|w| distance(w[0].points[0], w[1].points[0]) > 20.0)
+                .all(|w| !w[1].travel_inside)
         );
     }
 

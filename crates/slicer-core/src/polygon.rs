@@ -166,6 +166,96 @@ pub fn clean(shapes: Shapes, min_area: f64, min_segment: f64) -> Shapes {
         .collect()
 }
 
+/// Distance from `p` to the segment from `a` to `b`.
+fn segment_distance(p: Point, a: Point, b: Point) -> f64 {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let length2 = dx * dx + dy * dy;
+    if length2 == 0.0 {
+        return distance(p, a);
+    }
+    let t = (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / length2).clamp(0.0, 1.0);
+    distance(p, [a[0] + t * dx, a[1] + t * dy])
+}
+
+/// Thins out a closed loop: drops points as long as the loop moves by no
+/// more than `tolerance` (Ramer-Douglas-Peucker). Corners stay where they
+/// are; curves get fewer, longer segments.
+pub fn simplify(contour: &[Point], tolerance: f64) -> Contour {
+    let n = contour.len();
+    if n < 4 {
+        return contour.to_vec();
+    }
+    // Split the loop at point 0 and at the point farthest from it, then
+    // treat both halves as open lines. `ring` repeats point 0 at the end.
+    let far = (1..n)
+        .max_by(|&a, &b| {
+            distance(contour[0], contour[a]).total_cmp(&distance(contour[0], contour[b]))
+        })
+        .unwrap_or(1);
+    let mut ring = contour.to_vec();
+    ring.push(contour[0]);
+    let mut keep = vec![false; n + 1];
+    keep[0] = true;
+    keep[far] = true;
+    let mut pending = vec![(0, far), (far, n)];
+    while let Some((lo, hi)) = pending.pop() {
+        let mut worst = (lo, 0.0);
+        for i in lo + 1..hi {
+            let d = segment_distance(ring[i], ring[lo], ring[hi]);
+            if d > worst.1 {
+                worst = (i, d);
+            }
+        }
+        if worst.1 > tolerance {
+            keep[worst.0] = true;
+            pending.push((lo, worst.0));
+            pending.push((worst.0, hi));
+        }
+    }
+    (0..n).filter(|&i| keep[i]).map(|i| contour[i]).collect()
+}
+
+/// Whether the straight line from `a` to `b` stays inside the shapes: it
+/// starts inside and neither crosses nor touches any contour.
+pub fn segment_inside(shapes: &[Shape], a: Point, b: Point) -> bool {
+    let cross = |o: Point, p: Point, q: Point| {
+        (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0])
+    };
+    let (min_x, max_x) = (a[0].min(b[0]), a[0].max(b[0]));
+    let (min_y, max_y) = (a[1].min(b[1]), a[1].max(b[1]));
+    let mut inside = false;
+    for contour in shapes.iter().flatten() {
+        for (i, &p) in contour.iter().enumerate() {
+            let q = contour[(i + 1) % contour.len()];
+            // Even-odd count of the edges a ray from `a` to the right crosses.
+            if (p[1] > a[1]) != (q[1] > a[1])
+                && a[0] < p[0] + (a[1] - p[1]) / (q[1] - p[1]) * (q[0] - p[0])
+            {
+                inside = !inside;
+            }
+            if p[0].max(q[0]) < min_x
+                || p[0].min(q[0]) > max_x
+                || p[1].max(q[1]) < min_y
+                || p[1].min(q[1]) > max_y
+            {
+                continue;
+            }
+            // The edge and the line share a point unless one lies strictly
+            // on one side of the other.
+            let (d1, d2) = (cross(a, b, p), cross(a, b, q));
+            let (d3, d4) = (cross(p, q, a), cross(p, q, b));
+            let apart = (d1 > 0.0 && d2 > 0.0)
+                || (d1 < 0.0 && d2 < 0.0)
+                || (d3 > 0.0 && d4 > 0.0)
+                || (d3 < 0.0 && d4 < 0.0);
+            if !apart {
+                return false;
+            }
+        }
+    }
+    inside
+}
+
 /// Convex hull of a set of points as a counter-clockwise contour (Andrew's
 /// monotone chain). Fewer than three distinct points give them back as is.
 pub fn convex_hull(points: &[Point]) -> Contour {
@@ -324,6 +414,61 @@ pub fn hatch(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn simplify_keeps_corners_and_thins_curves() {
+        // A square with extra points on its edges, some slightly off.
+        let square = [
+            [0.0, 0.0],
+            [5.0, 0.001],
+            [10.0, 0.0],
+            [10.0, 4.0],
+            [10.0, 10.0],
+            [3.0, 10.0],
+            [0.0, 10.0],
+            [-0.002, 5.0],
+        ];
+        assert_eq!(
+            super::simplify(&square, 0.01),
+            [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]
+        );
+        // With a tighter tolerance the points that are off stay.
+        assert_eq!(super::simplify(&square, 0.0005).len(), 6);
+
+        // A circle of 720 points keeps its shape within the tolerance.
+        let circle: Vec<super::Point> = (0..720)
+            .map(|i| {
+                let angle = f64::from(i) * std::f64::consts::TAU / 720.0;
+                [10.0 * angle.cos(), 10.0 * angle.sin()]
+            })
+            .collect();
+        let thinned = super::simplify(&circle, 0.0125);
+        assert!(
+            thinned.len() < 120 && thinned.len() > 40,
+            "{}",
+            thinned.len()
+        );
+        let lost = super::signed_area(&circle) - super::signed_area(&thinned);
+        assert!((0.0..0.5).contains(&lost), "{lost}");
+        assert_eq!(super::simplify(&circle[..3], 1.0), circle[..3]);
+    }
+
+    #[test]
+    fn segment_inside_respects_outline_and_holes() {
+        let outer = vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+        let hole = vec![[4.0, 4.0], [4.0, 6.0], [6.0, 6.0], [6.0, 4.0]];
+        let shapes = vec![vec![outer, hole]];
+        let inside = |a, b| super::segment_inside(&shapes, a, b);
+        assert!(inside([1.0, 1.0], [9.0, 1.0]));
+        assert!(inside([1.0, 1.0], [1.0, 9.0]));
+        // Across the hole, out of the shape, starting in the hole or outside.
+        assert!(!inside([1.0, 5.0], [9.0, 5.0]));
+        assert!(!inside([1.0, 1.0], [12.0, 1.0]));
+        assert!(!inside([5.0, 5.0], [5.2, 5.2]));
+        assert!(!inside([-1.0, 1.0], [-2.0, 1.0]));
+        // Grazing a corner of the hole counts as leaving.
+        assert!(!inside([2.0, 4.0], [5.0, 4.0]));
+    }
+
     #[test]
     fn convex_hull_drops_inner_and_collinear_points() {
         let points = [
