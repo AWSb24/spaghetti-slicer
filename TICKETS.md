@@ -21,6 +21,7 @@ Summe: 40 Tickets (7 × S, 25 × M, 8 × L), also rechnerisch etwa 5–8 Monate 
 | T-046 | Weitgehend erledigt: CI vergleicht den G-Code der sechs Referenzmodelle und des Benchy zwischen den drei Plattformen; Sollwerte (Größe, Zeilenzahl, Prüfsumme) liegen in `examples/golden.tsv` und werden bei jedem Testlauf geprüft, Aktualisierung mit `UPDATE_GOLDEN=1`. Die Sollwerte zeigen nur, dass sich die Ausgabe geändert hat, nicht wo |
 | T-010, T-011 | Erledigt |
 | T-012 | Erledigt: Geometrie, Einheiten, Komponenten, Build-Items und Transformationen; Verweise auf andere Modellteile im Paket (Production-Erweiterung); übrige Erweiterungen als Warnung. Lokal mit 16 Dateien aus Fusion 360 und Bambu Studio geprüft (private Modelle, nicht im Repository). Bei Bambu-Projekten mit mehreren Druckplatten wird eine Platte gewählt (`--plate`, Server-Feld `plate`); Farben und Einstellungen aus der Datei werden ignoriert |
+| T-014 | Teilweise: Tests füttern STL- und 3MF-Leser mit 7000 zufällig, aber reproduzierbar beschädigten Dateien und prüfen, dass nichts abstürzt; bisher kein Absturz gefunden. Kein echtes Fuzzing mit Abdeckungsrückmeldung, kein eigener CI-Lauf |
 | T-013 | Teilweise: offene Kanten und nicht schließende Konturen werden erkannt und gemeldet; keine Reparatur |
 | T-020 bis T-023, T-030 bis T-036 | Als Prototyp umgesetzt (Bahngeometrie je Schicht parallel auf allen Kernen, der Mesh-Schnitt selbst nicht; Naht und Leerwege einfach) |
 | T-041, T-043, T-050 | Als Prototyp umgesetzt (Marlin und Klipper noch identisch) |

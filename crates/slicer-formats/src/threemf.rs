@@ -865,6 +865,56 @@ mod tests {
     }
 
     #[test]
+    fn damaged_files_never_panic() {
+        let root = model(
+            &format!("unit=\"inch\" xmlns:p=\"{PRODUCTION_NS}\" requiredextensions=\"p\""),
+            &format!(
+                "<resources><object id=\"1\">{TETRAHEDRON}</object><object id=\"2\"><components><component objectid=\"1\" transform=\"1 0 0 0 1 0 0 0 -1 5 0 0\"/><component p:path=\"/3D/other.model\" objectid=\"7\"/></components></object></resources><build><item objectid=\"1\"/><item objectid=\"2\" transform=\"0 1 0 -1 0 0 0 0 1 300 0 0\"/></build>"
+            ),
+        );
+        let other = model(
+            "",
+            &format!("<resources><object id=\"7\">{TETRAHEDRON}</object></resources>"),
+        );
+        let config = "<config><plate><metadata key=\"plater_id\" value=\"1\"/><model_instance><metadata key=\"object_id\" value=\"1\"/></model_instance></plate><plate><metadata key=\"plater_id\" value=\"2\"/><model_instance><metadata key=\"object_id\" value=\"2\"/></model_instance></plate></config>";
+        let parts = [root.as_str(), other.as_str(), config];
+        let names = ["3D/3dmodel.model", "3D/other.model", PLATE_PART];
+        let whole = package(&[
+            (names[0], parts[0]),
+            (names[1], parts[1]),
+            (names[2], parts[2]),
+        ]);
+
+        let mut state = 0x9e37_79b9_7f4a_7c15;
+        let mut accepted = 0;
+        for round in 0..3000 {
+            // Damage one part and pack it again, or damage the archive.
+            let bytes = if round % 4 == 3 {
+                crate::mutate(&whole, &mut state)
+            } else {
+                let target = round % 4;
+                let damaged = crate::mutate(parts[target].as_bytes(), &mut state);
+                let damaged = String::from_utf8_lossy(&damaged);
+                let mut all = [
+                    (names[0], parts[0]),
+                    (names[1], parts[1]),
+                    (names[2], parts[2]),
+                ];
+                all[target].1 = &damaged;
+                package(&all)
+            };
+            let plate = [None, Some(1), Some(2)][round % 3];
+            if let Ok(mesh) = parse_3mf_plate(&bytes, plate, &mut Diagnostics::new()) {
+                accepted += 1;
+                let count = mesh.vertices.len() as u32;
+                assert!(mesh.triangles.iter().flatten().all(|&v| v < count));
+                assert!(mesh.vertices.iter().flatten().all(|c| c.is_finite()));
+            }
+        }
+        assert!(accepted > 0);
+    }
+
+    #[test]
     fn one_plate_of_a_project_can_be_chosen() {
         let text = model(
             "",

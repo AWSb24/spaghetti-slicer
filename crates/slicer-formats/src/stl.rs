@@ -188,6 +188,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn damaged_files_never_panic() {
+        let mesh = Mesh::cuboid(20.0, 10.0, 5.0);
+        let binary = write_stl_binary(&mesh);
+        let ascii = b"solid a\n facet normal 0 0 1\n  outer loop\n   vertex 0 0 0\n   vertex 1 0 0\n   vertex 0 1 0\n  endloop\n endfacet\n facet normal 0 0 1\n  outer loop\n   vertex 1 0 0\n   vertex 1 1 0\n   vertex 0 1 0\n  endloop\n endfacet\nendsolid a\n";
+        let mut state = 0x9e37_79b9_7f4a_7c15;
+        let mut accepted = 0;
+        for round in 0..4000 {
+            let original: &[u8] = if round % 2 == 0 { &binary } else { ascii };
+            // Only the absence of a panic matters; a mesh that is returned
+            // must at least be consistent.
+            if let Ok(mesh) = parse_stl(&crate::mutate(original, &mut state)) {
+                accepted += 1;
+                let count = mesh.vertices.len() as u32;
+                assert!(mesh.triangles.iter().flatten().all(|&v| v < count));
+                assert!(mesh.vertices.iter().flatten().all(|c| c.is_finite()));
+            }
+        }
+        // Some damage must go unnoticed, or the test exercises nothing.
+        assert!(accepted > 0);
+    }
+
+    #[test]
     fn binary_roundtrip() {
         let mesh = Mesh::cuboid(20.0, 10.0, 5.0);
         let parsed = parse_stl(&write_stl_binary(&mesh)).unwrap();

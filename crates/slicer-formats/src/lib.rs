@@ -25,3 +25,52 @@ pub fn parse_model(
     }
     parse_stl(bytes).map_err(|e| e.diagnostic())
 }
+
+/// Damages a file in a random but reproducible way, for tests that feed
+/// broken input to the readers.
+// ponytail: blind mutation, no coverage feedback. It finds shallow crashes
+// only; a real fuzzer (cargo-fuzz) is the next step if those matter.
+#[cfg(test)]
+pub(crate) fn mutate(original: &[u8], state: &mut u64) -> Vec<u8> {
+    const TOKENS: [&[u8]; 10] = [
+        b"-1",
+        b"4294967295",
+        b"1e308",
+        b"nan",
+        b"inf",
+        b"\"",
+        b"<",
+        b"0",
+        b" ",
+        b"\xff\xff\xff\xff",
+    ];
+    let mut next = |below: usize| {
+        // xorshift64
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        (*state % below.max(1) as u64) as usize
+    };
+    let mut bytes = original.to_vec();
+    for _ in 0..=next(3) {
+        if bytes.is_empty() {
+            break;
+        }
+        let at = next(bytes.len());
+        let end = (at + 1 + next(40)).min(bytes.len());
+        match next(5) {
+            0 => bytes[at] = next(256) as u8,
+            1 => drop(bytes.drain(at..end)),
+            2 => {
+                let copy = bytes[at..end].to_vec();
+                bytes.splice(at..at, copy);
+            }
+            3 => bytes.truncate(at),
+            _ => {
+                let token = TOKENS[next(TOKENS.len())];
+                bytes.splice(at..end.min(at + token.len()), token.iter().copied());
+            }
+        }
+    }
+    bytes
+}
