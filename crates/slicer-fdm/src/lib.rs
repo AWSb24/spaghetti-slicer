@@ -1,6 +1,4 @@
 //! FDM toolpath generation: perimeters, infill, supports and path planning.
-//!
-//! Supports are not implemented yet.
 
 pub mod preview;
 
@@ -27,6 +25,13 @@ const MIN_OVERHANG_AREA: f64 = 1.0;
 
 /// Smallest area in mm² that gets a support.
 const MIN_SUPPORT_AREA: f64 = 0.25;
+
+/// Largest distance the outline of a support may move when points are
+/// dropped from it, in millimetres.
+const SUPPORT_RESOLUTION: f64 = 0.05;
+
+/// Distance between the lines of the dense support layers, in line widths.
+const SUPPORT_INTERFACE_SPACING: f64 = 2.0;
 
 /// Longest rim of a hole in the mesh that is closed before slicing.
 const MAX_HOLE_EDGES: usize = 64;
@@ -359,27 +364,63 @@ fn travels_inside(layer: &Layer, slice: &Shapes) -> Vec<bool> {
     flags
 }
 
-/// Where supports go on every layer: below everything that hangs free,
-/// down to the bed or to the model, with one empty layer under the surface
-/// they carry and one line width of distance to the sides of the model.
-// ponytail: plain columns of lines. No dense layer under the surface, no
-// supports that lean or branch, and where a support stands on the model it
-// touches it without a gap, so it is harder to remove there.
-fn support_areas(slices: &[Shapes], hanging: &[Shapes], settings: &Settings) -> Vec<Shapes> {
+/// Where supports go on every layer, and which part of that is filled
+/// densely: below everything that hangs free, down to the bed or to the
+/// model, with one empty layer under the surface they carry and above the
+/// model they stand on, and one line width of distance to its sides. The
+/// dense part is what lies right under a carried surface.
+// ponytail: straight columns. No supports that lean or branch, and bridges
+// a printer could span are supported like any other overhang.
+fn support_areas(
+    slices: &[Shapes],
+    hanging: &[Shapes],
+    settings: &Settings,
+) -> Vec<(Shapes, Shapes)> {
+    // Where no support may be depends only on the model, so all cores work
+    // on it; the supports themselves grow downwards layer by layer.
+    let keep_out = parallel_map(slices.len(), |index| {
+        let mut model = slices[index].clone();
+        if index > 0 {
+            model = polygon::union(&model, &slices[index - 1]);
+        }
+        polygon::offset(&model, settings.line_width)
+    });
     let mut areas: Vec<Shapes> = vec![Vec::new(); slices.len()];
     for index in (0..slices.len().saturating_sub(2)).rev() {
         let above = polygon::union(&hanging[index + 2], &areas[index + 1]);
         if above.is_empty() {
             continue;
         }
-        let keep_out = polygon::offset(&slices[index], settings.line_width);
+        // Every layer adds the points of its own outline. Without thinning
+        // them out a support under a round overhang ends up with tens of
+        // thousands of points and takes seconds per model.
         areas[index] = polygon::clean(
-            polygon::difference(&above, &keep_out),
+            polygon::difference(&above, &keep_out[index]),
             MIN_SUPPORT_AREA,
             0.0,
-        );
+        )
+        .iter()
+        .map(|shape| {
+            shape
+                .iter()
+                .map(|contour| polygon::simplify(contour, SUPPORT_RESOLUTION))
+                .filter(|contour| contour.len() > 2)
+                .collect()
+        })
+        .collect();
     }
-    areas
+    let dense_layers = settings.support_interface_layers as usize;
+    parallel_map(areas.len(), |index| {
+        let area = areas[index].clone();
+        let mut carried = Vec::new();
+        if !area.is_empty() {
+            for above in hanging.iter().skip(index + 2).take(dense_layers) {
+                carried = polygon::union(&carried, above);
+            }
+        }
+        let dense = polygon::intersection(&area, &carried);
+        (area, dense)
+    })
 }
 
 /// Geometry of one kind that still has to be put in printing order.
@@ -429,7 +470,7 @@ fn parallel_map<T: Send>(count: usize, job: impl Fn(usize) -> T + Sync) -> Vec<T
 /// by a wall.
 fn layer_work(
     slices: &[Shapes],
-    supports: &[Shapes],
+    supports: &[(Shapes, Shapes)],
     index: usize,
     settings: &Settings,
 ) -> (Vec<Work>, bool) {
@@ -438,15 +479,32 @@ fn layer_work(
     let walls = settings.wall_loops as usize;
     let mut work = Vec::new();
 
+    let support = supports.get(index).filter(|(area, _)| !area.is_empty());
     if index == 0 {
-        adhesion_work(slice, settings, &mut work);
+        adhesion_work(slice, support.map(|(area, _)| area), settings, &mut work);
     }
-    if let Some(area) = supports.get(index).filter(|area| !area.is_empty()) {
+    if let Some((area, dense)) = support {
+        // A loop around every support holds its lines together and makes
+        // sure that a support too narrow for a line is printed at all.
+        let inner = polygon::offset(area, -0.5 * width);
+        let loops = contours(&inner)
+            .iter()
+            .map(|contour| polygon::simplify(contour, PATH_RESOLUTION))
+            .collect();
+        work.push(Work::Loops(loops, PathKind::Support, width));
         // The same direction on every layer, so the lines stack up to walls.
         let lines = polygon::hatch(
-            area,
+            &polygon::difference(&inner, dense),
             settings.support_spacing,
             HatchDirection::Diagonal45,
+            0.5 * width,
+        );
+        work.push(Work::Lines(lines, PathKind::Support, 0.0));
+        // Close lines across the walls below carry the surface.
+        let lines = polygon::hatch(
+            &polygon::intersection(&inner, dense),
+            SUPPORT_INTERFACE_SPACING * width,
+            HatchDirection::Diagonal135,
             0.5 * width,
         );
         work.push(Work::Lines(lines, PathKind::Support, 0.0));
@@ -564,7 +622,12 @@ fn split_solid_sparse(
 }
 
 /// Skirt and brim on the first layer.
-fn adhesion_work(slice: &Shapes, settings: &Settings, work: &mut Vec<Work>) {
+fn adhesion_work(
+    slice: &Shapes,
+    support: Option<&Shapes>,
+    settings: &Settings,
+    work: &mut Vec<Work>,
+) {
     let width = settings.line_width;
     // Ignore holes: adhesion aids go around the outside only.
     let outlines: Shapes = slice
@@ -575,9 +638,16 @@ fn adhesion_work(slice: &Shapes, settings: &Settings, work: &mut Vec<Work>) {
 
     let skirt_start = brim_loops as f64 * width + settings.skirt_distance;
     // The skirt goes around the convex hull of everything on the first
-    // layer. Following a detailed outline at a distance of millimetres is
-    // very slow to compute (14 s for an outline of 5000 points).
-    let points: Vec<Point> = outlines.iter().flatten().flatten().copied().collect();
+    // layer, supports included. Following a detailed outline at a distance
+    // of millimetres is very slow to compute (14 s for an outline of 5000
+    // points).
+    let points: Vec<Point> = outlines
+        .iter()
+        .chain(support.into_iter().flatten())
+        .flatten()
+        .flatten()
+        .copied()
+        .collect();
     let hull: Shapes = vec![vec![polygon::convex_hull(&points)]];
     for k in (0..settings.skirt_loops as usize).rev() {
         let loops = outer_contours(&polygon::offset(
@@ -1026,6 +1096,50 @@ mod tests {
             xs.iter().any(|&x| x < 105.0) && xs.iter().any(|&x| x > 115.0)
         };
         assert!(toolpaths.layers[..49].iter().all(both_sides));
+
+        // The two layers right under the plate are filled densely.
+        let length = |layer: &Layer| -> f64 {
+            layer
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::Support)
+                .flat_map(|p| p.points.windows(2))
+                .map(|w| distance(w[0], w[1]))
+                .sum()
+        };
+        let sparse = length(&toolpaths.layers[40]);
+        assert!((length(&toolpaths.layers[46]) - sparse).abs() < 1.0);
+        assert!(length(&toolpaths.layers[47]) > 2.0 * sparse);
+        assert!(length(&toolpaths.layers[48]) > 2.0 * sparse);
+
+        // The skirt goes around the supports, not only around the column.
+        let skirt_left = toolpaths.layers[0]
+            .paths
+            .iter()
+            .filter(|p| p.kind == PathKind::Skirt)
+            .flat_map(|p| p.points.iter().map(|q| q[0]))
+            .fold(f64::MAX, f64::min);
+        assert!(skirt_left < 95.0, "{skirt_left}");
+
+        // With a base under the column the supports stand on the model and
+        // leave one layer empty above it too: the base ends at 2 mm (layers
+        // 0 to 9), the plate starts at 12 mm (layer 60).
+        let mut h = Mesh::cuboid(30.0, 10.0, 2.0);
+        let mut column = Mesh::cuboid(10.0, 10.0, 10.0);
+        column.translate([10.0, 0.0, 2.0]);
+        h.merge(&column);
+        plate.translate([0.0, 0.0, 2.0]);
+        h.merge(&plate);
+        let toolpaths = generate(&h, &settings).unwrap();
+        let layers: Vec<usize> = (0..toolpaths.layers.len())
+            .filter(|&i| {
+                toolpaths.layers[i]
+                    .paths
+                    .iter()
+                    .any(|p| p.kind == PathKind::Support)
+            })
+            .collect();
+        assert_eq!(layers, (11..59).collect::<Vec<usize>>());
     }
 
     #[test]

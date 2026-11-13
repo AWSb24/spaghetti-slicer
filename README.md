@@ -8,7 +8,7 @@ What works: STL and 3MF import (geometry only, one plate of a Bambu Studio proje
 
 ## Known limitations
 
-- Supports are simple: straight columns of lines under everything that overhangs by more than half a line width per layer (`supports = true`, off by default). No dense layer under the supported surface, no tree supports, no special handling of bridges. The seam is either lined up at the back of the model or left where the nozzle happens to be; it cannot be hidden in corners or placed by hand.
+- Supports are simple: straight columns of lines with a loop around them under everything that overhangs by more than half a line width per layer (`supports = true`, off by default), filled densely in the layers right under the surface they carry, with one empty layer between support and model above and below. No tree supports, no special handling of bridges, and the gaps cannot be set. The seam is either lined up at the back of the model or left where the nozzle happens to be; it cannot be hidden in corners or placed by hand.
 - The G-code for Marlin and Klipper is the same. For Bambu Lab printers there is a project file (`-o name.gcode.3mf`) and an X1C profile, but neither has ever been tried on a printer: the start sequence uses common commands only, and it is not known whether the printer accepts the file.
 - Colours, materials and settings stored in a 3MF file are ignored.
 - The time estimate has not been compared with a real print and ignores heating.

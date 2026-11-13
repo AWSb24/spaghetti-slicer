@@ -135,6 +135,8 @@ pub struct Settings {
     pub supports: bool,
     /// Distance between the lines of a support.
     pub support_spacing: f64,
+    /// Number of densely filled support layers right under the surface they carry.
+    pub support_interface_layers: u32,
 
     // Speeds
     /// Speed of the outermost wall.
@@ -205,6 +207,7 @@ impl Default for Settings {
             brim_width: 0.0,
             supports: false,
             support_spacing: 2.5,
+            support_interface_layers: 2,
             outer_wall_speed: 40.0,
             inner_wall_speed: 60.0,
             infill_speed: 80.0,
@@ -438,6 +441,12 @@ impl Settings {
             ("skirt_distance", self.skirt_distance, 0.0, 50.0),
             ("brim_width", self.brim_width, 0.0, 50.0),
             ("support_spacing", self.support_spacing, 0.5, 20.0),
+            (
+                "support_interface_layers",
+                f64::from(self.support_interface_layers),
+                0.0,
+                10.0,
+            ),
             ("outer_wall_speed", self.outer_wall_speed, 1.0, 1000.0),
             ("inner_wall_speed", self.inner_wall_speed, 1.0, 1000.0),
             ("infill_speed", self.infill_speed, 1.0, 1000.0),
