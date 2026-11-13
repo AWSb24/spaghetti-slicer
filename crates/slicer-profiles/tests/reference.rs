@@ -70,6 +70,7 @@ fn settings_reference_is_current() {
                 "flavor" => "`marlin`, `klipper`".to_string(),
                 "infill_pattern" => "`rectilinear`, `grid`".to_string(),
                 "wall_order" => "`inner_outer`, `outer_inner`".to_string(),
+                "seam_position" => "`rear`, `nearest`".to_string(),
                 "extrusion_mode" => "`relative`, `absolute`".to_string(),
                 "fan_off_layers" => "0 or more".to_string(),
                 "start_gcode" | "end_gcode" => "text with `{key}` placeholders".to_string(),

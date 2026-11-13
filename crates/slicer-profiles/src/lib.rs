@@ -40,6 +40,19 @@ pub enum WallOrder {
     OuterInner,
 }
 
+/// Where the walls of a layer start and end. The seam is visible on the
+/// print as a small mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SeamPosition {
+    /// At the rearmost point of every loop, so the seams of all layers line
+    /// up at the back of the model.
+    Rear,
+    /// Wherever the nozzle happens to be closest; shortest travel, but the
+    /// seams are scattered.
+    Nearest,
+}
+
 /// How the amount of filament is written to the G-code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -100,6 +113,8 @@ pub struct Settings {
     pub wall_loops: u32,
     /// Order in which the walls of a layer are printed.
     pub wall_order: WallOrder,
+    /// Where the walls of a layer start and end.
+    pub seam_position: SeamPosition,
     /// Number of solid layers at the top.
     pub top_layers: u32,
     /// Number of solid layers at the bottom.
@@ -175,6 +190,7 @@ impl Default for Settings {
             line_width: 0.45,
             wall_loops: 2,
             wall_order: WallOrder::InnerOuter,
+            seam_position: SeamPosition::Rear,
             top_layers: 5,
             bottom_layers: 4,
             infill_density: 15.0,

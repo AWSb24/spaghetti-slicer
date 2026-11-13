@@ -26,6 +26,7 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `line_width` | 0.45 | 0.24 to 1 * | Width of one extruded line. |
 | `wall_loops` | 2 | 1 to 50 | Number of wall loops. |
 | `wall_order` | inner_outer | `inner_outer`, `outer_inner` | Order in which the walls of a layer are printed. |
+| `seam_position` | rear | `rear`, `nearest` | Where the walls of a layer start and end. |
 | `top_layers` | 5 | 0 to 1000 | Number of solid layers at the top. |
 | `bottom_layers` | 4 | 0 to 1000 | Number of solid layers at the bottom. |
 | `infill_density` | 15 | 0 to 100 | Sparse infill density in percent. |

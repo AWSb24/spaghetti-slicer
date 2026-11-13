@@ -10,7 +10,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use slicer_core::polygon::{self, HatchDirection, distance};
 use slicer_core::slice::slice_mesh_reporting;
 use slicer_core::{Contour, Diagnostic, Diagnostics, Mesh, Point, Shapes};
-use slicer_profiles::{InfillPattern, Settings, WallOrder};
+use slicer_profiles::{InfillPattern, SeamPosition, Settings, WallOrder};
+
+/// Difference in Y below which two points count as equally far back when
+/// placing the seam, in millimetres.
+const SEAM_TOLERANCE: f64 = 0.001;
 
 /// Longest rim of a hole in the mesh that is closed before slicing.
 const MAX_HOLE_EDGES: usize = 64;
@@ -215,7 +219,9 @@ pub fn generate_reporting(
             for piece in work {
                 match piece {
                     Work::Loops(loops, kind, min_length) => {
-                        push_loops(loops, kind, min_length, &mut position, &mut paths);
+                        let wall = matches!(kind, PathKind::OuterWall | PathKind::InnerWall);
+                        let rear = wall && settings.seam_position == SeamPosition::Rear;
+                        push_loops(loops, kind, min_length, rear, &mut position, &mut paths);
                     }
                     Work::Lines(lines, kind, join_distance) => {
                         push_lines(lines, kind, join_distance, &mut position, &mut paths);
@@ -455,11 +461,14 @@ fn outer_contours(shapes: &Shapes) -> Vec<Contour> {
 }
 
 /// Appends closed loops, always continuing with the loop whose nearest
-/// vertex is closest to the current position and starting it there.
+/// vertex is closest to the current position. A loop starts at that vertex
+/// or, with `rear_start`, at its rearmost vertex (largest Y, then smallest
+/// X), so the starts of all layers line up.
 fn push_loops(
     mut loops: Vec<Contour>,
     kind: PathKind,
     min_length: f64,
+    rear_start: bool,
     position: &mut Point,
     paths: &mut Vec<Path>,
 ) {
@@ -475,7 +484,24 @@ fn push_loops(
             }
         }
         let mut points = loops.swap_remove(best.0);
-        points.rotate_left(best.1);
+        let start = if rear_start {
+            // Points almost as far back as the rearmost one count as equally
+            // far back; the leftmost of them is taken. Otherwise rounding
+            // would move the seam along a straight rear edge from layer to
+            // layer.
+            let back = points.iter().map(|p| p[1]).fold(f64::MIN, f64::max);
+            let mut rear = None;
+            for (j, p) in points.iter().enumerate() {
+                let better = rear.is_none_or(|r: usize| p[0] < points[r][0]);
+                if p[1] >= back - SEAM_TOLERANCE && better {
+                    rear = Some(j);
+                }
+            }
+            rear.unwrap_or(0)
+        } else {
+            best.1
+        };
+        points.rotate_left(start);
         let path = Path {
             kind,
             points,
@@ -703,6 +729,62 @@ mod tests {
                 assert!(!in_hole, "infill crosses the hole at {mid:?}");
             }
         }
+    }
+
+    #[test]
+    fn seams_line_up_at_the_rear() {
+        // A cylinder off the bed centre, so "nearest" would wander.
+        let mesh = slicer_core::primitives::cylinder(10.0, 4.0, 64);
+        let starts = |seam| {
+            let mut settings = Settings::default();
+            settings.seam_position = seam;
+            let toolpaths = generate(&mesh, &settings).unwrap();
+            toolpaths
+                .layers
+                .iter()
+                .flat_map(|layer| &layer.paths)
+                .filter(|path| path.kind == PathKind::OuterWall)
+                .map(|path| path.points[0])
+                .collect::<Vec<Point>>()
+        };
+        let rear = starts(SeamPosition::Rear);
+        assert_eq!(rear.len(), 20);
+        // Every outer wall starts at the same point, the rearmost one.
+        assert!(
+            rear.iter().all(|p| distance(*p, rear[1]) < 0.05),
+            "{rear:?}"
+        );
+        assert!(
+            (rear[0][1] - (110.0 + 10.0 - 0.225)).abs() < 0.01,
+            "{:?}",
+            rear[0]
+        );
+        let nearest = starts(SeamPosition::Nearest);
+        assert!(nearest.iter().any(|p| distance(*p, nearest[0]) > 1.0));
+
+        // On a straight rear edge the seam is at its left end on every layer.
+        let mut settings = Settings::default();
+        settings.skirt_loops = 0;
+        let mut cube = Mesh::cuboid(20.0, 20.0, 4.0);
+        cube.rotate_z(0.3);
+        cube.rotate_z(-0.3);
+        let toolpaths = generate(&cube, &settings).unwrap();
+        let starts: Vec<Point> = toolpaths
+            .layers
+            .iter()
+            .flat_map(|layer| &layer.paths)
+            .filter(|path| path.kind == PathKind::OuterWall)
+            .map(|path| path.points[0])
+            .collect();
+        assert!(
+            starts.iter().all(|p| distance(*p, starts[0]) < 0.01),
+            "{starts:?}"
+        );
+        assert!(
+            starts[0][0] < 105.0 && starts[0][1] > 115.0,
+            "{:?}",
+            starts[0]
+        );
     }
 
     #[test]

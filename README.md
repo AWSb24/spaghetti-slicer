@@ -8,7 +8,7 @@ What works: STL and 3MF import (geometry only, one plate of a Bambu Studio proje
 
 ## Known limitations
 
-- No supports, no bridges, no seam control: models must print without them, and the start of each loop is wherever the previous move ended.
+- No supports and no bridges: models must print without them. The seam is either lined up at the back of the model or left where the nozzle happens to be; it cannot be hidden in corners or placed by hand.
 - The G-code for Marlin and Klipper is the same. There is no output specific to Bambu Lab printers; the X1C profile uses common commands only and has never been run.
 - Colours, materials and settings stored in a 3MF file are ignored.
 - The time estimate has not been compared with a real print and ignores heating.
