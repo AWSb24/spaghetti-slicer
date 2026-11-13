@@ -142,11 +142,7 @@ fn corpus() -> Vec<Model> {
         model("sphere", sphere(10.0, 64), HANGING, Some(0.04)),
         model("sphere_low_poly", sphere(8.0, 8), THIN, Some(0.05)),
         model("dome", dome(12.0, 64), NONE, Some(0.04)),
-        // Rings come out 3 to 5 percent short of their volume: the gaps
-        // between round walls and straight infill lines count for more the
-        // thinner the ring is. Until walls were cleaned of spikes, the
-        // material wasted on those hid a part of this.
-        model("tube", tube(12.0, 7.0, 10.0, 64), NONE, Some(0.035)),
+        model("tube", tube(12.0, 7.0, 10.0, 64), NONE, Some(0.03)),
         model("thin_tube_1mm_wall", tube(12.0, 11.0, 6.0, 96), NONE, None),
         model("torus", torus(15.0, 4.0, 64, 32), HANGING, Some(0.05)),
         model(
@@ -214,7 +210,7 @@ fn corpus() -> Vec<Model> {
                 cylinder(3.0, 10.0, 32),
             ]),
             NONE,
-            Some(0.05),
+            Some(0.04),
         ),
         model(
             "fin_on_base",
@@ -272,7 +268,9 @@ fn corpus_invariants() {
     let mut solid = Settings::default();
     solid.infill_density = 100.0;
     solid.skirt_loops = 0;
-    solid.infill_overlap = 0.0;
+    // The overlap of infill and walls stays at its default: it decides how
+    // much material a solid layer gets. Without any overlap rings come out
+    // 3 to 5 percent short, with 25 percent most models 1 to 3 percent over.
 
     let models = corpus();
     assert!(

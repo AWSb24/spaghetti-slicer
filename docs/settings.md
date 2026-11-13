@@ -31,7 +31,7 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `bottom_layers` | 4 | 0 to 1000 | Number of solid layers at the bottom. |
 | `infill_density` | 15 | 0 to 100 | Sparse infill density in percent. |
 | `infill_pattern` | grid | `rectilinear`, `grid` | Sparse infill pattern. |
-| `infill_overlap` | 25 | 0 to 50 | How far infill reaches into the innermost wall, in percent of the line width. |
+| `infill_overlap` | 15 | 0 to 50 | How far infill reaches into the innermost wall, in percent of the line width. |
 | `skirt_loops` | 2 | 0 to 20 | Number of skirt loops around the first layer. |
 | `skirt_distance` | 4 | 0 to 50 | Distance between skirt and model. |
 | `brim_width` | 0 | 0 to 50 | Width of the brim attached to the first layer; 0 disables it. |

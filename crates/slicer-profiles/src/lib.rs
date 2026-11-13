@@ -201,7 +201,7 @@ impl Default for Settings {
             bottom_layers: 4,
             infill_density: 15.0,
             infill_pattern: InfillPattern::Grid,
-            infill_overlap: 25.0,
+            infill_overlap: 15.0,
             skirt_loops: 2,
             skirt_distance: 4.0,
             brim_width: 0.0,

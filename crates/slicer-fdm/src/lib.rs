@@ -584,7 +584,18 @@ fn split_solid_sparse(
         &polygon::offset(&polygon::offset(&interior, -width), width),
         fill_area,
     );
-    (polygon::difference(fill_area, &interior), interior)
+    // Regrowing rounds the corners of the interior. The bits it leaves in
+    // the corners of the fill area are no surface; they stay sparse.
+    let solid = polygon::clean(
+        polygon::difference(fill_area, &interior),
+        width * width,
+        0.0,
+    );
+    if solid.is_empty() {
+        return (solid, fill_area.clone());
+    }
+    let sparse = polygon::difference(fill_area, &solid);
+    (solid, sparse)
 }
 
 /// Skirt and brim on the first layer.
