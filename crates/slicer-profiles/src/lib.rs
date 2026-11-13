@@ -330,72 +330,82 @@ impl Settings {
     /// Checks every value against its allowed range and the settings against
     /// each other.
     pub fn validate(&self) -> Result<(), SettingsError> {
-        range("bed_size_x", self.bed_size_x, 10.0, 2000.0)?;
-        range("bed_size_y", self.bed_size_y, 10.0, 2000.0)?;
-        range("max_print_height", self.max_print_height, 1.0, 2000.0)?;
-        range("nozzle_diameter", self.nozzle_diameter, 0.1, 2.0)?;
-        range("filament_diameter", self.filament_diameter, 1.0, 3.5)?;
-        range("filament_density", self.filament_density, 0.1, 20.0)?;
-        range("flow_ratio", self.flow_ratio, 0.5, 2.0)?;
-        range("nozzle_temp", self.nozzle_temp, 0.0, 500.0)?;
-        range(
-            "nozzle_temp_first_layer",
-            self.nozzle_temp_first_layer,
-            0.0,
-            500.0,
-        )?;
-        range("bed_temp", self.bed_temp, 0.0, 200.0)?;
-        range(
-            "bed_temp_first_layer",
-            self.bed_temp_first_layer,
-            0.0,
-            200.0,
-        )?;
-        range("fan_speed", self.fan_speed, 0.0, 100.0)?;
-        range(
-            "layer_height",
-            self.layer_height,
-            0.02,
-            self.nozzle_diameter,
-        )?;
-        range(
-            "first_layer_height",
-            self.first_layer_height,
-            0.02,
-            self.nozzle_diameter,
-        )?;
-        let thickest = self.layer_height.max(self.first_layer_height);
-        range(
-            "line_width",
-            self.line_width,
-            (0.6 * self.nozzle_diameter).max(1.05 * thickest),
-            2.5 * self.nozzle_diameter,
-        )?;
-        range("wall_loops", f64::from(self.wall_loops), 1.0, 50.0)?;
-        range("top_layers", f64::from(self.top_layers), 0.0, 1000.0)?;
-        range("bottom_layers", f64::from(self.bottom_layers), 0.0, 1000.0)?;
-        range("infill_density", self.infill_density, 0.0, 100.0)?;
-        range("infill_overlap", self.infill_overlap, 0.0, 50.0)?;
-        range("skirt_loops", f64::from(self.skirt_loops), 0.0, 20.0)?;
-        range("skirt_distance", self.skirt_distance, 0.0, 50.0)?;
-        range("brim_width", self.brim_width, 0.0, 50.0)?;
-        range("outer_wall_speed", self.outer_wall_speed, 1.0, 1000.0)?;
-        range("inner_wall_speed", self.inner_wall_speed, 1.0, 1000.0)?;
-        range("infill_speed", self.infill_speed, 1.0, 1000.0)?;
-        range("first_layer_speed", self.first_layer_speed, 1.0, 1000.0)?;
-        range("travel_speed", self.travel_speed, 1.0, 2000.0)?;
-        range("acceleration", self.acceleration, 10.0, 100_000.0)?;
-        range("jerk", self.jerk, 0.0, 1000.0)?;
-        range("retraction_length", self.retraction_length, 0.0, 20.0)?;
-        range("retraction_speed", self.retraction_speed, 1.0, 200.0)?;
-        range(
-            "retraction_min_travel",
-            self.retraction_min_travel,
-            0.0,
-            100.0,
-        )?;
-        range("z_hop", self.z_hop, 0.0, 10.0)?;
+        for (key, value, min, max) in self.limits() {
+            range(key, value, min, max)?;
+        }
         Ok(())
+    }
+
+    /// Every numeric setting with its value and the smallest and largest
+    /// value allowed. Some limits depend on other settings.
+    pub fn limits(&self) -> Vec<(&'static str, f64, f64, f64)> {
+        let thickest = self.layer_height.max(self.first_layer_height);
+        vec![
+            ("bed_size_x", self.bed_size_x, 10.0, 2000.0),
+            ("bed_size_y", self.bed_size_y, 10.0, 2000.0),
+            ("max_print_height", self.max_print_height, 1.0, 2000.0),
+            ("nozzle_diameter", self.nozzle_diameter, 0.1, 2.0),
+            ("filament_diameter", self.filament_diameter, 1.0, 3.5),
+            ("filament_density", self.filament_density, 0.1, 20.0),
+            ("flow_ratio", self.flow_ratio, 0.5, 2.0),
+            ("nozzle_temp", self.nozzle_temp, 0.0, 500.0),
+            (
+                "nozzle_temp_first_layer",
+                self.nozzle_temp_first_layer,
+                0.0,
+                500.0,
+            ),
+            ("bed_temp", self.bed_temp, 0.0, 200.0),
+            (
+                "bed_temp_first_layer",
+                self.bed_temp_first_layer,
+                0.0,
+                200.0,
+            ),
+            ("fan_speed", self.fan_speed, 0.0, 100.0),
+            (
+                "layer_height",
+                self.layer_height,
+                0.02,
+                self.nozzle_diameter,
+            ),
+            (
+                "first_layer_height",
+                self.first_layer_height,
+                0.02,
+                self.nozzle_diameter,
+            ),
+            (
+                "line_width",
+                self.line_width,
+                (0.6 * self.nozzle_diameter).max(1.05 * thickest),
+                2.5 * self.nozzle_diameter,
+            ),
+            ("wall_loops", f64::from(self.wall_loops), 1.0, 50.0),
+            ("top_layers", f64::from(self.top_layers), 0.0, 1000.0),
+            ("bottom_layers", f64::from(self.bottom_layers), 0.0, 1000.0),
+            ("infill_density", self.infill_density, 0.0, 100.0),
+            ("infill_overlap", self.infill_overlap, 0.0, 50.0),
+            ("skirt_loops", f64::from(self.skirt_loops), 0.0, 20.0),
+            ("skirt_distance", self.skirt_distance, 0.0, 50.0),
+            ("brim_width", self.brim_width, 0.0, 50.0),
+            ("outer_wall_speed", self.outer_wall_speed, 1.0, 1000.0),
+            ("inner_wall_speed", self.inner_wall_speed, 1.0, 1000.0),
+            ("infill_speed", self.infill_speed, 1.0, 1000.0),
+            ("first_layer_speed", self.first_layer_speed, 1.0, 1000.0),
+            ("travel_speed", self.travel_speed, 1.0, 2000.0),
+            ("acceleration", self.acceleration, 10.0, 100_000.0),
+            ("jerk", self.jerk, 0.0, 1000.0),
+            ("retraction_length", self.retraction_length, 0.0, 20.0),
+            ("retraction_speed", self.retraction_speed, 1.0, 200.0),
+            (
+                "retraction_min_travel",
+                self.retraction_min_travel,
+                0.0,
+                100.0,
+            ),
+            ("z_hop", self.z_hop, 0.0, 10.0),
+        ]
     }
 }
 

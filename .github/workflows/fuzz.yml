@@ -1,0 +1,41 @@
+name: Fuzz
+
+# Runs the importers against generated input for a few minutes, once a
+# week and on demand. A crash fails the run and is kept as an artifact.
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [stl, threemf]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install nightly toolchain and cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --locked
+
+      - name: Seed
+        run: |
+          mkdir -p fuzz/corpus/stl
+          cp examples/cube_20mm.stl examples/steps.stl fuzz/corpus/stl/
+
+      - name: Fuzz for three minutes
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=180 -max_len=65536
+
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts/

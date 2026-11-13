@@ -13,3 +13,7 @@ Thumbs.db
 # Private test models, see corpus/README.md
 /corpus/*.stl
 /corpus/*.3mf
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/Cargo.lock

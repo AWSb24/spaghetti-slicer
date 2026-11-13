@@ -45,7 +45,7 @@ Use a config file and override single settings:
 cargo run --release -p slicer-cli -- slice model.stl -c settings.toml -s layer_height=0.1 -s infill_density=30 --json
 ```
 
-A settings file only needs the keys it changes. Several files are layered in the order given, so printer, material and process can live in separate files; a later file overrides an earlier one, and `--set` overrides them all:
+All settings with defaults, limits and meaning are listed in [docs/settings.md](docs/settings.md). A settings file only needs the keys it changes. Several files are layered in the order given, so printer, material and process can live in separate files; a later file overrides an earlier one, and `--set` overrides them all:
 
 ```bash
 cargo run --release -p slicer-cli -- slice model.stl -c printer.toml -c pla.toml -c draft.toml
@@ -137,6 +137,14 @@ UPDATE_GOLDEN=1 cargo test -p slicer-cli --test corpus golden
 ## Real-world models
 
 3DBenchy (CC0) and its parts are used as real-world test models. They are not stored in the repository; see [corpus/README.md](corpus/README.md) for sources, license and how to fetch them.
+
+## Fuzzing
+
+`fuzz/` holds fuzz targets for the STL and 3MF readers. `.github/workflows/fuzz.yml` runs them for a few minutes every week. Locally, with a nightly toolchain and `cargo install cargo-fuzz`:
+
+```bash
+cargo +nightly fuzz run stl
+```
 
 ## Releases
 
