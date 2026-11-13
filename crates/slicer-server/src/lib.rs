@@ -199,6 +199,7 @@ impl App {
             .layer(middleware::from_fn_with_state(self.clone(), authorize));
         Router::new()
             .route("/health", get(health))
+            .route("/openapi.json", get(|| async { Json(openapi()) }))
             .nest("/v1", api)
             .fallback(|| async {
                 failure(
@@ -210,6 +211,126 @@ impl App {
             .layer(middleware::from_fn(log_request))
             .with_state(self.clone())
     }
+}
+
+/// Description of the API in OpenAPI 3.1 form, served at `/openapi.json`.
+///
+/// It is written by hand next to the router. A test calls every operation
+/// listed here, so a path that is renamed or removed in one place but not
+/// the other is noticed.
+pub fn openapi() -> Value {
+    let error = json!({
+        "description": "Error",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+    });
+    let job = json!({
+        "description": "State of the job",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Job" } } }
+    });
+    let id = json!([{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }]);
+    json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "Spaghetti Slicer",
+            "version": env!("CARGO_PKG_VERSION"),
+            "description": "Slices 3D models into G-code. Jobs are kept in memory and expire."
+        },
+        "security": [{ "token": [] }],
+        "paths": {
+            "/health": { "get": {
+                "summary": "Liveness check",
+                "security": [],
+                "responses": { "200": { "description": "The server is running" } }
+            } },
+            "/openapi.json": { "get": {
+                "summary": "This description",
+                "security": [],
+                "responses": { "200": { "description": "OpenAPI document" } }
+            } },
+            "/v1/jobs": { "post": {
+                "summary": "Create a slicing job",
+                "requestBody": { "required": true, "content": { "multipart/form-data": { "schema": {
+                    "type": "object",
+                    "required": ["model"],
+                    "properties": {
+                        "model": { "type": "string", "format": "binary", "description": "STL or 3MF file" },
+                        "settings": { "type": "string", "description": "Settings in TOML form; may be repeated, later ones override earlier ones" },
+                        "set": { "type": "string", "description": "One override KEY=VALUE; may be repeated" },
+                        "plate": { "type": "integer", "description": "Build plate of a project file with several plates" }
+                    }
+                } } } },
+                "responses": {
+                    "202": job,
+                    "400": error, "401": error, "413": error, "503": error
+                }
+            } },
+            "/v1/jobs/{id}": {
+                "get": {
+                    "summary": "State, statistics and warnings of a job",
+                    "parameters": id,
+                    "responses": { "200": job, "401": error, "404": error }
+                },
+                "delete": {
+                    "summary": "Cancel an unfinished job or delete a finished one",
+                    "parameters": id,
+                    "responses": {
+                        "200": job,
+                        "204": { "description": "The finished job was deleted" },
+                        "401": error, "404": error
+                    }
+                }
+            },
+            "/v1/jobs/{id}/gcode": { "get": {
+                "summary": "G-code of a finished job",
+                "parameters": id,
+                "responses": {
+                    "200": { "description": "G-code", "content": { "text/plain": { "schema": { "type": "string" } } } },
+                    "401": error, "404": error, "409": error
+                }
+            } }
+        },
+        "components": {
+            "securitySchemes": { "token": {
+                "type": "http", "scheme": "bearer",
+                "description": "Only required if the server was started with SPAGHETTI_TOKEN"
+            } },
+            "schemas": {
+                "Diagnostic": {
+                    "type": "object",
+                    "required": ["severity", "code", "message"],
+                    "properties": {
+                        "severity": { "type": "string", "enum": ["warning", "error"] },
+                        "code": { "type": "string", "description": "Stable identifier, e.g. model.truncated" },
+                        "message": { "type": "string" },
+                        "context": { "type": "object", "additionalProperties": { "type": "string" } }
+                    }
+                },
+                "Error": {
+                    "type": "object",
+                    "required": ["error"],
+                    "properties": { "error": { "$ref": "#/components/schemas/Diagnostic" } }
+                },
+                "Job": {
+                    "type": "object",
+                    "required": ["id", "status"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "status": { "type": "string", "enum": ["queued", "running", "done", "failed", "cancelled"] },
+                        "stats": { "type": "object", "properties": {
+                            "layers": { "type": "integer" },
+                            "filament_length_mm": { "type": "number" },
+                            "filament_volume_cm3": { "type": "number" },
+                            "filament_weight_g": { "type": "number" },
+                            "print_time_s": { "type": "number" }
+                        } },
+                        "warnings": { "type": "array", "items": { "$ref": "#/components/schemas/Diagnostic" } },
+                        "error": { "$ref": "#/components/schemas/Diagnostic" },
+                        "gcode_url": { "type": "string" }
+                    }
+                }
+            }
+        }
+    })
 }
 
 /// An error response in the same shape as the command line tool's errors.

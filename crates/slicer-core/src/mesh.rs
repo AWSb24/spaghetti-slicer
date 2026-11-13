@@ -193,6 +193,63 @@ impl Mesh {
         six_v / 6.0
     }
 
+    /// Closes holes in the surface whose rim has at most `max_edges` edges
+    /// and returns how many were closed. A hole is a closed chain of edges
+    /// that belong to one triangle only.
+    // ponytail: each hole is filled with a fan of triangles from one rim
+    // vertex. That is exact for flat convex holes (a missing facet) and only
+    // roughly right for bent or concave ones; a proper triangulation of the
+    // rim would be the upgrade.
+    pub fn close_holes(&mut self, max_edges: usize) -> usize {
+        let mut uses: HashMap<(u32, u32), usize> = HashMap::new();
+        for t in &self.triangles {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                *uses.entry((a.min(b), a.max(b))).or_default() += 1;
+            }
+        }
+        // The rim of a hole runs against the direction of the triangles
+        // next to it. Vertices where two rims meet are left alone.
+        let mut next: HashMap<u32, Option<u32>> = HashMap::new();
+        for t in &self.triangles {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                if uses[&(a.min(b), a.max(b))] == 1 {
+                    next.entry(b).and_modify(|n| *n = None).or_insert(Some(a));
+                }
+            }
+        }
+        let mut starts: Vec<u32> = next.keys().copied().collect();
+        starts.sort_unstable();
+        let mut closed = 0;
+        for start in starts {
+            let mut rim = vec![start];
+            let complete = loop {
+                let Some(Some(to)) = next.get(&rim[rim.len() - 1]).copied() else {
+                    break false;
+                };
+                if to == start {
+                    break true;
+                }
+                if rim.len() >= max_edges || rim.contains(&to) {
+                    break false;
+                }
+                rim.push(to);
+            };
+            if !complete || rim.len() < 3 {
+                continue;
+            }
+            for vertex in &rim {
+                next.remove(vertex);
+            }
+            for pair in rim[1..].windows(2) {
+                self.triangles.push([rim[0], pair[0], pair[1]]);
+            }
+            closed += 1;
+        }
+        closed
+    }
+
     /// Number of triangle edges without a matching neighbour. Zero for a
     /// closed, consistently oriented mesh.
     pub fn open_edge_count(&self) -> usize {
@@ -230,6 +287,36 @@ mod tests {
         assert_eq!(m.open_edge_count(), 0);
         assert!((m.volume() - 1000.0).abs() < 1e-9);
         assert_eq!(m.bounds(), Some(([0.0; 3], [20.0, 10.0, 5.0])));
+    }
+
+    #[test]
+    fn holes_are_closed() {
+        let cube = Mesh::cuboid(2.0, 3.0, 4.0);
+
+        // One missing triangle and a whole missing face.
+        for missing in [1, 2] {
+            let mut open = cube.clone();
+            open.triangles.truncate(12 - missing);
+            assert!(open.open_edge_count() > 0);
+            assert_eq!(open.close_holes(64), 1);
+            assert_eq!(open.edge_defects(), (0, 0));
+            assert!((open.signed_volume() - 24.0).abs() < 1e-9);
+            assert_eq!(open.close_holes(64), 0);
+        }
+
+        // Two holes far apart are both closed; a closed mesh is untouched.
+        let mut two = cube.clone();
+        two.triangles.remove(11);
+        two.triangles.remove(0);
+        assert_eq!(two.close_holes(64), 2);
+        assert_eq!(two.edge_defects(), (0, 0));
+        assert_eq!(cube.clone().close_holes(64), 0);
+
+        // A hole with a longer rim than allowed stays open.
+        let mut wide = cube.clone();
+        wide.triangles.truncate(10);
+        assert_eq!(wide.close_holes(3), 0);
+        assert_eq!(wide.triangles.len(), 10);
     }
 
     #[test]

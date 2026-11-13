@@ -1,0 +1,108 @@
+name: Release
+
+# A tag like v0.1.0 builds everything and publishes a release and the
+# container image. Started by hand it only builds, as a rehearsal.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  binaries:
+    name: Binaries (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, name: linux-x86_64 }
+          - { os: windows-latest, name: windows-x86_64 }
+          - { os: macos-latest, name: macos-arm64 }
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Build
+        run: cargo build --release --locked -p slicer-cli -p slicer-server
+
+      - name: Package
+        shell: bash
+        run: |
+          dir="spaghetti-slicer-${{ matrix.name }}"
+          mkdir "$dir"
+          cp target/release/spaghetti-slicer{,-server}${{ runner.os == 'Windows' && '.exe' || '' }} "$dir/"
+          cp -r README.md LICENSE-MIT LICENSE-APACHE profiles "$dir/"
+          "$dir/spaghetti-slicer${{ runner.os == 'Windows' && '.exe' || '' }}" --version
+          if [ "${{ runner.os }}" = Windows ]; then
+            7z a "$dir.zip" "$dir"
+          else
+            tar czf "$dir.tar.gz" "$dir"
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binaries-${{ matrix.name }}
+          path: |
+            spaghetti-slicer-*.zip
+            spaghetti-slicer-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  image:
+    name: Container image (amd64, arm64)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up emulation and builder
+        run: |
+          docker run --privileged --rm tonistiigi/binfmt --install arm64
+          docker buildx create --use
+
+      - name: Build${{ github.ref_type == 'tag' && ' and push' || '' }}
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          image="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+            docker buildx build --platform linux/amd64,linux/arm64 \
+              -t "$image:${GITHUB_REF_NAME#v}" -t "$image:latest" --push .
+          else
+            docker buildx build --platform linux/amd64,linux/arm64 .
+          fi
+
+  release:
+    name: Publish release
+    if: github.ref_type == 'tag'
+    needs: [binaries, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums and release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd dist
+          sha256sum spaghetti-slicer-* > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --generate-notes spaghetti-slicer-* SHA256SUMS

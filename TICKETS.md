@@ -7,7 +7,7 @@ Grundlage: [PRD.md](PRD.md), Requirements R1–R13. Referenzdrucker: Bambu Lab X
 
 Summe: 40 Tickets (7 × S, 25 × M, 8 × L), also rechnerisch etwa 5–8 Monate Vollzeit-Äquivalent, ohne Puffer für Nacharbeit. Das ist eine Größenordnung, keine Zusage.
 
-## Stand (2026-11-12)
+## Stand (2026-11-13)
 
 | Ticket | Stand |
 |---|---|
@@ -22,13 +22,19 @@ Summe: 40 Tickets (7 × S, 25 × M, 8 × L), also rechnerisch etwa 5–8 Monate 
 | T-010, T-011 | Erledigt |
 | T-012 | Erledigt: Geometrie, Einheiten, Komponenten, Build-Items und Transformationen; Verweise auf andere Modellteile im Paket (Production-Erweiterung); übrige Erweiterungen als Warnung. Lokal mit 16 Dateien aus Fusion 360 und Bambu Studio geprüft (private Modelle, nicht im Repository). Bei Bambu-Projekten mit mehreren Druckplatten wird eine Platte gewählt (`--plate`, Server-Feld `plate`); Farben und Einstellungen aus der Datei werden ignoriert |
 | T-014 | Teilweise: Tests füttern STL- und 3MF-Leser mit 7000 zufällig, aber reproduzierbar beschädigten Dateien und prüfen, dass nichts abstürzt; bisher kein Absturz gefunden. Kein echtes Fuzzing mit Abdeckungsrückmeldung, kein eigener CI-Lauf |
-| T-013 | Teilweise: erkannt und mit Art und Anzahl gemeldet werden offene Kanten, Kanten mit mehr als zwei Dreiecken, nach innen gedrehte Modelle und nicht schließende Konturen; entartete Dreiecke entfernen die Importer. Keine Reparatur (Löcher schließen, einzelne umgedrehte Flächen ausrichten) |
+| T-013 | Weitgehend erledigt: erkannt und mit Art und Anzahl gemeldet werden offene Kanten, Kanten mit mehr als zwei Dreiecken, nach innen gedrehte Modelle und nicht schließende Konturen; Löcher mit bis zu 64 Randkanten werden vor dem Schneiden geschlossen (Fächer aus Dreiecken, bei gebogenen oder einspringenden Löchern nur grob richtig). Offen: einzelne umgedrehte Flächen ausrichten |
 | T-020 bis T-023, T-030 bis T-036 | Als Prototyp umgesetzt (Bahngeometrie je Schicht parallel auf allen Kernen, der Mesh-Schnitt selbst nicht; Naht und Leerwege einfach) |
 | T-041, T-043, T-050 | Als Prototyp umgesetzt (Marlin und Klipper noch identisch) |
 | T-051, T-052, T-053 | Erledigt: Server mit Health, Konfiguration über Umgebungsvariablen, JSON-Logs, Auftrags-API unter `/v1/`, begrenzte Parallelität, Verfall, Token und Upload-Limit. Aufträge liegen nur im Speicher; ein laufender Slice lässt sich nicht unterbrechen; sauberes Herunterfahren ist nicht getestet |
-| T-055 | Teilweise: mehrstufiges `Dockerfile`, statische Binaries in einem leeren Image, Nicht-Root; CI baut das Image für amd64, prüft Größe (≤ 50 MB) und slict ein Modell über die API. arm64 ist nicht gebaut und nicht getestet |
-| T-040 | Teilweise: Einstellungsdateien lassen sich schichten (`-c` mehrfach, im Server mehrere `settings`-Felder), spätere überschreiben frühere, also z. B. Drucker, Material, Prozess in getrennten Dateien. Fehler nennen Schlüssel, Wert und Bereich; unbekannte Schlüssel werden abgelehnt. Offen: feste Ebenen mit Technologie-Kennung, Schema mit Einheiten und daraus erzeugte Referenzdokumentation, mitgelieferte Profile |
+| T-055 | Erledigt bis auf einen Test auf arm64: mehrstufiges `Dockerfile`, statische Binaries in einem leeren Image (2,5 MB), Nicht-Root; CI baut das Image für amd64 und slict ein Modell über die API; die Release-Pipeline baut amd64 und arm64. Das arm64-Image ist nie gelaufen |
+| T-040 | Weitgehend erledigt: Einstellungsdateien lassen sich schichten (`-c` mehrfach, im Server mehrere `settings`-Felder); mitgelieferte Profile für Drucker, Material und Prozess in `profiles/`, ein Test lädt alle Kombinationen und prüft, dass sich die Rollen nicht überschneiden. Fehler nennen Schlüssel, Wert und Bereich; unbekannte Schlüssel werden abgelehnt. Offen: Technologie-Kennung, Schema mit Einheiten und daraus erzeugte Referenzdokumentation |
 | T-044 | Teilweise: Zeitschätzung mit Beschleunigung und Abbremsen an Ecken (Einstellungen `acceleration`, `jerk`), Material in Länge, Volumen, Gewicht. Offen: Vergleich mit einem echten Druck; Aufheizen und Start-/End-G-Code zählen nicht mit |
+| T-045 | Teilweise: `profiles/printers/bambu-x1c.toml` mit selbst gewählten Werten und einer Start-/Endsequenz aus allgemein üblichen Befehlen; nie am Gerät gelaufen, hängt an T-004 |
+| T-054 | Weitgehend erledigt: OpenAPI-3.1-Beschreibung unter `/openapi.json`; von Hand neben dem Router geschrieben, nicht aus dem Code erzeugt. Ein Test ruft jede beschriebene Operation auf und prüft, dass die Antwort angekündigt ist |
+| T-056 | Umgesetzt, Veröffentlichung ungetestet: `release.yml` baut bei einem Tag `v*` Archive für drei Betriebssysteme und das Image für amd64/arm64, legt Prüfsummen an und veröffentlicht ein Release mit erzeugten Notizen. Geprobt ist nur der Bau ohne Veröffentlichung |
+| T-061 | Teilweise: die CI misst Zeit und Spitzenspeicher der Referenzmodelle und des Benchy und zeigt sie in der Zusammenfassung des Laufs; kein Verlauf über mehrere Läufe, kein Vergleich mit Orca |
+| T-062 | Weitgehend erledigt: README mit Schnellstart für CLI, Server und Docker, bekannten Einschränkungen, Hinweisen zum ersten Druck, Profilen und Release-Ablauf; API-Beschreibung unter `/openapi.json`. Offen: Referenz aller Einstellungen (bisher nur `default-config`) |
+| T-042, T-060 | Offen, nur am Gerät möglich (hängen an T-004) |
 | Alle übrigen | Offen |
 
 ---

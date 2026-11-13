@@ -178,9 +178,9 @@ fn open_mesh_produces_a_warning() {
     assert!(out.status.success(), "{}", text(&out.stderr));
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["warnings"].as_array().unwrap().len(), 1);
-    assert_eq!(report["warnings"][0]["code"], "mesh.not_watertight");
+    assert_eq!(report["warnings"][0]["code"], "mesh.repaired");
     assert_eq!(report["warnings"][0]["severity"], "warning");
-    assert_eq!(report["warnings"][0]["context"]["open_edges"], "3");
+    assert_eq!(report["warnings"][0]["context"]["holes"], "1");
 }
 
 #[test]

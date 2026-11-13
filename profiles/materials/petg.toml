@@ -1,0 +1,9 @@
+# PETG, 1.75 mm.
+filament_diameter = 1.75
+filament_density = 1.27
+nozzle_temp = 240.0
+nozzle_temp_first_layer = 245.0
+bed_temp = 80.0
+bed_temp_first_layer = 80.0
+fan_speed = 50.0
+fan_off_layers = 3

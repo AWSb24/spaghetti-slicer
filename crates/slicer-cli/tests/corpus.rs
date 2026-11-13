@@ -48,7 +48,7 @@ fn corpus() -> Vec<Model> {
     };
     const NONE: &[&str] = &[];
     const THIN: &[&str] = &["slicing.thin_regions"];
-    const LEAKY: &[&str] = &["mesh.not_watertight"];
+    const REPAIRED: &[&str] = &["mesh.repaired"];
 
     let rotated_z = {
         let mut m = Mesh::cuboid(20.0, 20.0, 10.0);
@@ -233,13 +233,9 @@ fn corpus() -> Vec<Model> {
             &["mesh.non_manifold", "mesh.not_watertight"],
             Some(0.03),
         ),
-        model("open_top", open_top, LEAKY, None),
-        model(
-            "hole_in_side",
-            hole_in_side,
-            &["mesh.not_watertight", "slicing.open_contours"],
-            None,
-        ),
+        // The volume of the open mesh is not that of the box it encloses.
+        model("open_top", open_top, REPAIRED, None),
+        model("hole_in_side", hole_in_side, REPAIRED, Some(0.03)),
     ]
 }
 
@@ -372,10 +368,17 @@ fn corpus_invariants() {
 #[test]
 fn model_open_on_every_layer_is_an_error() {
     use slicer_core::Diagnose;
-    // Half of one side face is missing over the full height, so no layer
+    // A cylinder without its caps and with a strip of its side missing
+    // over the full height: the rim is too long to be closed, and no layer
     // has a closed contour.
-    let mut mesh = Mesh::cuboid(15.0, 15.0, 5.0);
-    mesh.triangles.retain(|t| *t != [0, 1, 5]);
+    let mut mesh = cylinder(10.0, 5.0, 100);
+    let vertices = mesh.vertices.clone();
+    mesh.triangles.retain(|t| {
+        let corners = t.map(|i| vertices[i as usize]);
+        let flat = corners.iter().all(|c| c[2] == corners[0][2]);
+        let strip = corners.iter().all(|c| c[0] > 9.97);
+        !flat && !strip
+    });
     let mut warnings = Diagnostics::new();
     let error =
         slicer_fdm::generate_reporting(&mesh, &Settings::default(), &mut warnings).unwrap_err();

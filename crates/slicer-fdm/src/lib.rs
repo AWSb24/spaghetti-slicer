@@ -12,6 +12,9 @@ use slicer_core::slice::slice_mesh_reporting;
 use slicer_core::{Contour, Diagnostic, Diagnostics, Mesh, Point, Shapes};
 use slicer_profiles::{InfillPattern, Settings};
 
+/// Longest rim of a hole in the mesh that is closed before slicing.
+const MAX_HOLE_EDGES: usize = 64;
+
 /// What a path is for. Determines speed and the label in the G-code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathKind {
@@ -138,6 +141,17 @@ pub fn generate_reporting(
     settings: &Settings,
     diagnostics: &mut Diagnostics,
 ) -> Result<Toolpaths, FdmError> {
+    let mut mesh = mesh.clone();
+    let closed = mesh.close_holes(MAX_HOLE_EDGES);
+    if closed > 0 {
+        diagnostics.push(
+            Diagnostic::warning(
+                "mesh.repaired",
+                format!("{closed} hole(s) in the surface of the mesh were closed"),
+            )
+            .with("holes", closed),
+        );
+    }
     mesh.check(diagnostics);
     let (min, max) = mesh.bounds().ok_or(FdmError::EmptyModel)?;
     let size = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
@@ -152,7 +166,6 @@ pub fn generate_reporting(
             volume,
         });
     }
-    let mut mesh = mesh.clone();
     mesh.translate([
         volume[0] / 2.0 - (min[0] + max[0]) / 2.0,
         volume[1] / 2.0 - (min[1] + max[1]) / 2.0,

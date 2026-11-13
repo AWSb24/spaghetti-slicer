@@ -59,6 +59,20 @@ jobs:
             cargo run --release --locked -p slicer-cli -- slice "$model" -o "gcode/$(basename "${model%.stl}").gcode"
           done
 
+      # Time and peak memory per model, shown on the summary page of the run.
+      - name: Benchmark
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          {
+            echo "| Model | Time [s] | Peak memory [MB] |"
+            echo "|---|---|---|"
+            for model in examples/*.stl corpus/3dbenchy/3dbenchy.stl; do
+              /usr/bin/time -f "%e %M" -o time.txt target/release/spaghetti-slicer slice "$model" -o /tmp/bench.gcode > /dev/null
+              read -r seconds kilobytes < time.txt
+              echo "| $(basename "$model") | $seconds | $((kilobytes / 1024)) |"
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/upload-artifact@v7
         with:
           name: gcode-${{ matrix.os }}

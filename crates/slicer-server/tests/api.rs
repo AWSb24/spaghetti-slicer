@@ -90,6 +90,50 @@ async fn health_and_unknown_paths() {
 }
 
 #[tokio::test]
+async fn the_api_description_matches_the_router() {
+    let router = App::new(Config {
+        token: Some("secret".to_string()),
+        ..Config::default()
+    })
+    .router();
+    // Served without a token, like the health check.
+    let (status, served) = call(&router, "GET", "/openapi.json").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(served, slicer_server::openapi());
+    assert_eq!(served["openapi"], "3.1.0");
+
+    // Every operation exists: with a token it is answered by its handler,
+    // not by the fallback, and never with "method not allowed".
+    let id = "00000000-0000-4000-8000-000000000000";
+    let mut operations = 0;
+    for (path, methods) in served["paths"].as_object().unwrap() {
+        for (method, operation) in methods.as_object().unwrap() {
+            let request = Request::builder()
+                .method(method.to_uppercase().as_str())
+                .uri(path.replace("{id}", id))
+                .header(header::AUTHORIZATION, "Bearer secret")
+                .body(Body::empty())
+                .unwrap();
+            let (status, body) = send(&router, request).await;
+            let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            assert_ne!(status, StatusCode::METHOD_NOT_ALLOWED, "{method} {path}");
+            assert_ne!(
+                body["error"]["code"], "request.not_found",
+                "{method} {path}"
+            );
+            // The answer is one the description announces.
+            let announced = operation["responses"].as_object().unwrap();
+            assert!(
+                announced.contains_key(status.as_str()),
+                "{method} {path} answered {status}"
+            );
+            operations += 1;
+        }
+    }
+    assert_eq!(operations, 6);
+}
+
+#[tokio::test]
 async fn a_job_is_sliced_in_the_background() {
     let router = App::new(Config::default()).router();
     let stl = cube();

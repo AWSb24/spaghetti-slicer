@@ -4,9 +4,26 @@ A 3D printing slicer written entirely in Rust, for desktop and server use.
 
 **Status: early prototype. The G-code has never been run on a printer. Do not print it unattended.**
 
-What works: STL and 3MF import (geometry only), slicing, walls, solid top/bottom layers, sparse infill (rectilinear, grid), skirt, brim, retraction, G-code for Marlin and Klipper, per-layer SVG preview, an HTTP server with a job API.
+What works: STL and 3MF import (geometry only, one plate of a Bambu Studio project), closing small holes in a mesh, slicing, walls, solid top/bottom layers, sparse infill (rectilinear, grid), skirt, brim, retraction, G-code for Marlin and Klipper, layered settings files with a set of [profiles](profiles/README.md), time and material estimates, per-layer SVG preview, an HTTP server with a job API, a container image.
 
-What does not exist yet: supports, 3MF projects with settings or colours, Bambu Lab output, seam control, bridges, a Docker image, the UI.
+## Known limitations
+
+- No supports, no bridges, no seam control: models must print without them, and the start of each loop is wherever the previous move ended.
+- The G-code for Marlin and Klipper is the same. There is no output specific to Bambu Lab printers; the X1C profile uses common commands only and has never been run.
+- Colours, materials and settings stored in a 3MF file are ignored.
+- The time estimate has not been compared with a real print and ignores heating.
+- No user interface, no resin printing.
+- Server jobs live in memory; a slice that is running cannot be interrupted.
+
+## Trying it on a printer
+
+Pick the files for your printer, material and layer height from [profiles/](profiles/README.md), slice a small model first, and look at the result before printing, for example with the SVG preview (`--svg`) or a G-code viewer:
+
+```bash
+cargo run --release -p slicer-cli -- slice examples/cube_20mm.stl -c profiles/printers/generic-220.toml -c profiles/materials/pla.toml -c profiles/processes/standard-0.20.toml -o cube.gcode
+```
+
+Check the start and end G-code of the printer file against what your machine needs. Stay next to the printer for the first layers.
 
 ## Usage
 
@@ -48,6 +65,7 @@ Errors go to stderr with exit code 1. With `--json`, errors and warnings are obj
 | `model.multiple_plates` (warning) | The project file has several build plates; only the first is sliced unless one is chosen |
 | `model.unsupported_extension` (warning) | The 3MF file requires extensions that are not supported; they are ignored |
 | `model.skipped_objects` (warning) | The 3MF file has objects that are not of type `model`; they are not printed |
+| `mesh.repaired` (warning) | Small holes in the surface of the mesh were closed before slicing |
 | `mesh.non_manifold` (warning) | Edges of the mesh belong to more than two triangles |
 | `mesh.inside_out` (warning) | All triangles face inward; the model is sliced as if they faced outward |
 | `mesh.not_watertight` (warning) | The mesh has open or inconsistently oriented edges |
@@ -81,6 +99,7 @@ curl -F model=@examples/cube_20mm.stl -F settings=@settings.toml -F set=infill_d
 | Request | Purpose |
 |---|---|
 | `GET /health` | Liveness check, never needs a token |
+| `GET /openapi.json` | Description of this API (OpenAPI 3.1), never needs a token |
 | `POST /v1/jobs` | Create a job (multipart fields `model`, `settings`, `set`, `plate`; several `settings` files are layered in order); answers `202` at once |
 | `GET /v1/jobs/{id}` | Status (`queued`, `running`, `done`, `failed`, `cancelled`), statistics, warnings or the error |
 | `GET /v1/jobs/{id}/gcode` | The G-code of a finished job |
@@ -118,6 +137,10 @@ UPDATE_GOLDEN=1 cargo test -p slicer-cli --test corpus golden
 ## Real-world models
 
 3DBenchy (CC0) and its parts are used as real-world test models. They are not stored in the repository; see [corpus/README.md](corpus/README.md) for sources, license and how to fetch them.
+
+## Releases
+
+A tag `v*` runs `.github/workflows/release.yml`: it builds archives with both programs and the profiles for Linux, Windows and macOS, a container image for amd64 and arm64 (pushed to `ghcr.io`), and publishes a GitHub release with checksums and generated notes. Started by hand, the workflow only builds, as a rehearsal.
 
 ## Project documents
 

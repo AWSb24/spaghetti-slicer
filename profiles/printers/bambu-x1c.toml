@@ -1,0 +1,39 @@
+# Bambu Lab X1C, 256 x 256 x 250 mm, 0.4 mm nozzle, one material, no AMS.
+#
+# NEVER RUN ON THE PRINTER. The start and end sequence below uses only common
+# commands (heat, home, level, heat) and was written without knowing what the
+# firmware expects. It does not clean the nozzle and draws no purge line.
+# Watch the first print.
+bed_size_x = 256.0
+bed_size_y = 256.0
+max_print_height = 250.0
+nozzle_diameter = 0.4
+flavor = "marlin"
+outer_wall_speed = 60.0
+inner_wall_speed = 100.0
+infill_speed = 120.0
+first_layer_speed = 30.0
+travel_speed = 250.0
+# Only used for the time estimate.
+acceleration = 5000.0
+jerk = 9.0
+# Direct drive extruder.
+retraction_length = 0.8
+retraction_speed = 30.0
+z_hop = 0.4
+skirt_loops = 2
+start_gcode = """
+M140 S{bed_temp_first_layer}
+M104 S150
+G28
+M190 S{bed_temp_first_layer}
+G29
+M109 S{nozzle_temp_first_layer}"""
+end_gcode = """
+M104 S0
+M140 S0
+M107
+G91
+G1 Z10 F600
+G90
+M84"""

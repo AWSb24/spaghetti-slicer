@@ -1,0 +1,11 @@
+# Generic Marlin printer, 220 x 220 x 250 mm, 0.4 mm nozzle.
+bed_size_x = 220.0
+bed_size_y = 220.0
+max_print_height = 250.0
+nozzle_diameter = 0.4
+flavor = "marlin"
+travel_speed = 150.0
+acceleration = 1000.0
+jerk = 8.0
+retraction_length = 0.8
+retraction_speed = 35.0
