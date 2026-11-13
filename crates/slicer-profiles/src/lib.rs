@@ -103,6 +103,12 @@ pub struct Settings {
     pub first_layer_speed: f64,
     /// Speed of moves without extrusion.
     pub travel_speed: f64,
+    /// Acceleration of the printer in mm/s². Only used to estimate the
+    /// print time; it is not written to the G-code.
+    pub acceleration: f64,
+    /// Largest speed change in mm/s the printer makes at once, for example
+    /// at a corner. Only used to estimate the print time.
+    pub jerk: f64,
 
     // Retraction
     /// Filament length pulled back before a travel move; 0 disables retraction.
@@ -155,6 +161,8 @@ impl Default for Settings {
             infill_speed: 80.0,
             first_layer_speed: 25.0,
             travel_speed: 150.0,
+            acceleration: 1000.0,
+            jerk: 8.0,
             retraction_length: 0.8,
             retraction_speed: 35.0,
             retraction_min_travel: 1.5,
@@ -363,6 +371,8 @@ impl Settings {
         range("infill_speed", self.infill_speed, 1.0, 1000.0)?;
         range("first_layer_speed", self.first_layer_speed, 1.0, 1000.0)?;
         range("travel_speed", self.travel_speed, 1.0, 2000.0)?;
+        range("acceleration", self.acceleration, 10.0, 100_000.0)?;
+        range("jerk", self.jerk, 0.0, 1000.0)?;
         range("retraction_length", self.retraction_length, 0.0, 20.0)?;
         range("retraction_speed", self.retraction_speed, 1.0, 200.0)?;
         range(

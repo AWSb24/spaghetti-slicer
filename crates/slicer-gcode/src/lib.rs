@@ -23,8 +23,9 @@ pub struct Stats {
     pub filament_volume_cm3: f64,
     /// Filament consumed, in grams.
     pub filament_weight_g: f64,
-    /// Estimated print time in seconds. Ignores acceleration and heating,
-    /// so real prints take longer.
+    /// Estimated print time in seconds, with acceleration and slowing down
+    /// at corners. Ignores heating and everything the start and end G-code
+    /// do. Not yet compared with a real print.
     pub print_time_s: f64,
 }
 
@@ -151,6 +152,61 @@ fn expand(
     Ok(out)
 }
 
+/// One movement of the printer, as far as its duration is concerned.
+struct Move {
+    /// Unit vector in the XY plane; zero for moves along Z or of the
+    /// filament only.
+    direction: Point,
+    /// Distance in millimetres.
+    length: f64,
+    /// Requested speed in mm/s.
+    speed: f64,
+}
+
+/// Time in seconds the moves take when the printer starts and ends at rest,
+/// changes its speed by at most `acceleration` (mm/s²) and may change its
+/// velocity at once by at most `jerk` (mm/s) where two moves meet.
+///
+/// The speeds where moves meet are limited three ways: by the requested
+/// speeds, by the change of direction, and by what the neighbouring moves can
+/// reach or shed over their length. Each move then accelerates, cruises and
+/// brakes.
+fn planned_time(moves: &[Move], acceleration: f64, jerk: f64) -> f64 {
+    let reachable = |from: f64, m: &Move| (from * from + 2.0 * acceleration * m.length).sqrt();
+    // junction[i] is the speed at the start of move i; both ends are at rest.
+    let mut junction = vec![0.0; moves.len() + 1];
+    for i in 1..moves.len() {
+        let (a, b) = (&moves[i - 1], &moves[i]);
+        let change = distance(a.direction, b.direction);
+        let corner = if change > 1e-9 {
+            jerk / change
+        } else {
+            f64::INFINITY
+        };
+        junction[i] = a.speed.min(b.speed).min(corner);
+    }
+    for (i, m) in moves.iter().enumerate() {
+        junction[i + 1] = junction[i + 1].min(reachable(junction[i], m));
+    }
+    for (i, m) in moves.iter().enumerate().rev() {
+        junction[i] = junction[i].min(reachable(junction[i + 1], m));
+    }
+    moves
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let (start, end) = (junction[i], junction[i + 1]);
+            // Highest speed when accelerating from `start` and braking to
+            // `end` without cruising.
+            let peak = ((2.0 * acceleration * m.length + start * start + end * end) / 2.0)
+                .sqrt()
+                .min(m.speed);
+            let ramps = (2.0 * peak * peak - start * start - end * end) / (2.0 * acceleration);
+            (2.0 * peak - start - end) / acceleration + (m.length - ramps).max(0.0) / peak
+        })
+        .sum()
+}
+
 struct Writer<'a> {
     settings: &'a Settings,
     out: String,
@@ -159,7 +215,10 @@ struct Writer<'a> {
     feed: f64,
     retracted: bool,
     filament: f64,
-    time: f64,
+    /// Every movement so far, for the time estimate.
+    moves: Vec<Move>,
+    /// Height of the nozzle; unknown before the first Z move.
+    nozzle_z: Option<f64>,
 }
 
 impl Writer<'_> {
@@ -182,7 +241,7 @@ impl Writer<'_> {
             let _ = writeln!(self.out, "G1 E-{length:.5}{f}");
             self.retracted = true;
             self.filament -= length;
-            self.time += length / self.settings.retraction_speed;
+            self.record([0.0, 0.0], length, self.settings.retraction_speed);
         }
     }
 
@@ -193,13 +252,26 @@ impl Writer<'_> {
             let _ = writeln!(self.out, "G1 E{length:.5}{f}");
             self.retracted = false;
             self.filament += length;
-            self.time += length / self.settings.retraction_speed;
+            self.record([0.0, 0.0], length, self.settings.retraction_speed);
+        }
+    }
+
+    fn record(&mut self, direction: Point, length: f64, speed: f64) {
+        if length > 0.0 {
+            self.moves.push(Move {
+                direction,
+                length,
+                speed,
+            });
         }
     }
 
     fn move_z(&mut self, z: f64) {
         let f = self.feed_word(self.settings.travel_speed);
         let _ = writeln!(self.out, "G1 Z{z:.3}{f}");
+        if let Some(from) = self.nozzle_z.replace(z) {
+            self.record([0.0, 0.0], (z - from).abs(), self.settings.travel_speed);
+        }
     }
 
     fn travel(&mut self, to: Point) {
@@ -209,6 +281,10 @@ impl Writer<'_> {
         if length < 1e-4 {
             return;
         }
+        // The travel is recorded between the hop moves, where it happens.
+        let direction = self
+            .position
+            .map(|from| [(to[0] - from[0]) / length, (to[1] - from[1]) / length]);
         let long = self.position.is_some() && length >= self.settings.retraction_min_travel;
         let hop = long && self.settings.z_hop > 0.0 && self.settings.retraction_length > 0.0;
         if long {
@@ -219,11 +295,11 @@ impl Writer<'_> {
         }
         let f = self.feed_word(self.settings.travel_speed);
         let _ = writeln!(self.out, "G0 X{:.3} Y{:.3}{f}", to[0], to[1]);
+        if let Some(direction) = direction {
+            self.record(direction, length, self.settings.travel_speed);
+        }
         if hop {
             self.move_z(self.z);
-        }
-        if length.is_finite() {
-            self.time += length / self.settings.travel_speed;
         }
         self.position = Some(to);
     }
@@ -239,7 +315,8 @@ impl Writer<'_> {
         let f = self.feed_word(speed);
         let _ = writeln!(self.out, "G1 X{:.3} Y{:.3} E{e:.5}{f}", to[0], to[1]);
         self.filament += e;
-        self.time += length / speed;
+        let direction = [(to[0] - from[0]) / length, (to[1] - from[1]) / length];
+        self.record(direction, length, speed);
         self.position = Some(to);
     }
 }
@@ -262,7 +339,8 @@ pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output,
         feed: 0.0,
         retracted: false,
         filament: 0.0,
-        time: 0.0,
+        moves: Vec::new(),
+        nozzle_z: None,
     };
     w.out.push_str(&start);
     w.out.push_str("G21\nG90\nM83\n");
@@ -333,7 +411,7 @@ pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output,
         filament_length_mm: used,
         filament_volume_cm3: volume_cm3,
         filament_weight_g: volume_cm3 * settings.filament_density,
-        print_time_s: w.time,
+        print_time_s: planned_time(&w.moves, settings.acceleration, settings.jerk),
     };
 
     let flavor = match settings.flavor {
@@ -361,7 +439,7 @@ pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output,
     let _ = writeln!(gcode, "; filament used [g]: {:.2}", stats.filament_weight_g);
     let _ = writeln!(
         gcode,
-        "; estimated printing time [s]: {:.0} (ignores acceleration and heating)",
+        "; estimated printing time [s]: {:.0} (with acceleration, without heating)",
         stats.print_time_s
     );
     gcode.push_str(&w.out);
@@ -435,6 +513,51 @@ mod tests {
         let ratio = output.stats.filament_volume_cm3 / 4.0;
         assert!((ratio - 1.0).abs() < 0.03, "{ratio}");
         assert!((output.stats.filament_weight_g - 4.0 * 1.24 * ratio).abs() < 1e-9);
+    }
+
+    #[test]
+    fn time_estimate_follows_acceleration_and_corners() {
+        let go = |direction, length, speed| Move {
+            direction,
+            length,
+            speed,
+        };
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // 100 mm at 50 mm/s with 1000 mm/s²: 0.05 s and 1.25 mm for each
+        // ramp, 97.5 mm of cruising.
+        let straight = planned_time(&[go([1.0, 0.0], 100.0, 50.0)], 1000.0, 8.0);
+        assert!(close(straight, 0.05 + 0.05 + 97.5 / 50.0), "{straight}");
+        // Too short to reach the speed: accelerate half way, then brake.
+        let short = planned_time(&[go([1.0, 0.0], 1.0, 50.0)], 1000.0, 8.0);
+        assert!(close(short, 2.0 * (0.5_f64 / 500.0).sqrt()), "{short}");
+        // Cutting a straight line in two changes nothing.
+        let halves = [go([1.0, 0.0], 50.0, 50.0), go([1.0, 0.0], 50.0, 50.0)];
+        assert!(close(planned_time(&halves, 1000.0, 8.0), straight));
+        // A right angle is taken at jerk / sqrt(2), which costs time; a
+        // full stop costs more.
+        let corner = [go([1.0, 0.0], 50.0, 50.0), go([0.0, 1.0], 50.0, 50.0)];
+        let stop = [go([1.0, 0.0], 50.0, 50.0), go([-1.0, 0.0], 50.0, 50.0)];
+        let (corner, stop) = (
+            planned_time(&corner, 1000.0, 8.0),
+            planned_time(&stop, 1000.0, 8.0),
+        );
+        let slow = 8.0 / 2.0_f64.sqrt();
+        let expected = straight + 2.0 * (50.0 - slow) / 1000.0
+            - 2.0 * (50.0 * 50.0 - slow * slow) / 2000.0 / 50.0;
+        assert!(close(corner, expected), "{corner} {expected}");
+        assert!(straight < corner && corner < stop);
+        assert!(close(planned_time(&[], 1000.0, 8.0), 0.0));
+
+        // The estimate of a real slice is longer than distance over speed.
+        let mut settings = Settings::default();
+        let fast = slice(&Mesh::cuboid(20.0, 20.0, 2.0), &settings)
+            .stats
+            .print_time_s;
+        settings.acceleration = 100.0;
+        let slow = slice(&Mesh::cuboid(20.0, 20.0, 2.0), &settings)
+            .stats
+            .print_time_s;
+        assert!(fast.is_finite() && slow > fast, "{fast} {slow}");
     }
 
     #[test]

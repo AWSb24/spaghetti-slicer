@@ -166,7 +166,7 @@ fn print_summary(result: &serde_json::Value) {
         number("filament_weight_g")
     );
     println!(
-        "  time:      {}h {:02}m {:02}s (estimate without acceleration, real prints take longer)",
+        "  time:      {}h {:02}m {:02}s (estimate with acceleration, without heating)",
         seconds / 3600,
         seconds / 60 % 60,
         seconds % 60

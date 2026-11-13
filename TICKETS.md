@@ -26,7 +26,8 @@ Summe: 40 Tickets (7 × S, 25 × M, 8 × L), also rechnerisch etwa 5–8 Monate 
 | T-041, T-043, T-050 | Als Prototyp umgesetzt (Marlin und Klipper noch identisch) |
 | T-051, T-052, T-053 | Erledigt: Server mit Health, Konfiguration über Umgebungsvariablen, JSON-Logs, Auftrags-API unter `/v1/`, begrenzte Parallelität, Verfall, Token und Upload-Limit. Aufträge liegen nur im Speicher; ein laufender Slice lässt sich nicht unterbrechen; sauberes Herunterfahren ist nicht getestet |
 | T-055 | Teilweise: mehrstufiges `Dockerfile`, statische Binaries in einem leeren Image, Nicht-Root; CI baut das Image für amd64, prüft Größe (≤ 50 MB) und slict ein Modell über die API. arm64 ist nicht gebaut und nicht getestet |
-| T-040, T-044 | Teilweise: flache Einstellungen ohne Profilebenen; Zeitschätzung ohne Beschleunigung |
+| T-040 | Teilweise: flache Einstellungen ohne Profilebenen |
+| T-044 | Teilweise: Zeitschätzung mit Beschleunigung und Abbremsen an Ecken (Einstellungen `acceleration`, `jerk`), Material in Länge, Volumen, Gewicht. Offen: Vergleich mit einem echten Druck; Aufheizen und Start-/End-G-Code zählen nicht mit |
 | Alle übrigen | Offen |
 
 ---
