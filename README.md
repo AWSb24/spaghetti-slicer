@@ -38,6 +38,8 @@ Errors go to stderr with exit code 1. With `--json`, errors and warnings are obj
 | `slicing.empty_model`, `slicing.too_large`, `slicing.nothing_to_print` | The model cannot be sliced |
 | `gcode.unknown_placeholder`, `gcode.unclosed_placeholder` | Custom start or end G-code is invalid |
 | `io.read`, `io.write`, `cli.invalid_override` | A file cannot be accessed or an argument is malformed |
+| `model.unknown_plate` | The build plate chosen with `--plate` does not exist in the file |
+| `model.multiple_plates` (warning) | The project file has several build plates; only the first is sliced unless one is chosen |
 | `model.unsupported_extension` (warning) | The 3MF file requires extensions that are not supported; they are ignored |
 | `model.skipped_objects` (warning) | The 3MF file has objects that are not of type `model`; they are not printed |
 | `mesh.not_watertight` (warning) | The mesh has open or inconsistently oriented edges |
@@ -71,7 +73,7 @@ curl -F model=@examples/cube_20mm.stl -F settings=@settings.toml -F set=infill_d
 | Request | Purpose |
 |---|---|
 | `GET /health` | Liveness check, never needs a token |
-| `POST /v1/jobs` | Create a job (multipart fields `model`, `settings`, `set`); answers `202` at once |
+| `POST /v1/jobs` | Create a job (multipart fields `model`, `settings`, `set`, `plate`); answers `202` at once |
 | `GET /v1/jobs/{id}` | Status (`queued`, `running`, `done`, `failed`, `cancelled`), statistics, warnings or the error |
 | `GET /v1/jobs/{id}/gcode` | The G-code of a finished job |
 | `DELETE /v1/jobs/{id}` | Cancel an unfinished job or delete a finished one |

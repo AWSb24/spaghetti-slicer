@@ -3,7 +3,9 @@
 //! Reads meshes, components, build items and their transforms. Of the
 //! production extension it follows component references into other model
 //! parts of the same package. Everything else (materials, colours, slices,
-//! vendor data) is ignored.
+//! vendor data) is ignored, with one exception: project files of Bambu
+//! Studio list which objects lie on which build plate, and the reader can
+//! pick one plate.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -75,6 +77,13 @@ pub enum ThreeMfError {
     NoTriangles,
     /// A model part or the expanded model exceeds the size limits.
     TooLarge,
+    /// The requested build plate does not exist in the file.
+    UnknownPlate {
+        /// The plate that was asked for.
+        plate: u32,
+        /// The plates the file has; empty if it has no plate information.
+        available: Vec<u32>,
+    },
 }
 
 impl fmt::Display for ThreeMfError {
@@ -103,6 +112,18 @@ impl fmt::Display for ThreeMfError {
             Self::NonFiniteCoordinate => write!(f, "file contains NaN or infinite coordinates"),
             Self::NoTriangles => write!(f, "file contains no printable triangles"),
             Self::TooLarge => write!(f, "model exceeds the size limits of the 3MF reader"),
+            Self::UnknownPlate { plate, available } if available.is_empty() => write!(
+                f,
+                "plate {plate} was requested, but the file has no build plates to choose from"
+            ),
+            Self::UnknownPlate { plate, available } => {
+                let list: Vec<String> = available.iter().map(u32::to_string).collect();
+                write!(
+                    f,
+                    "the file has no plate {plate}; it has {}",
+                    list.join(", ")
+                )
+            }
         }
     }
 }
@@ -123,6 +144,7 @@ impl slicer_core::Diagnose for ThreeMfError {
             Self::NonFiniteCoordinate => "model.non_finite",
             Self::NoTriangles => "model.no_triangles",
             Self::TooLarge => "model.too_large",
+            Self::UnknownPlate { .. } => "model.unknown_plate",
         }
     }
 
@@ -139,6 +161,7 @@ impl slicer_core::Diagnose for ThreeMfError {
                 ("attribute", (*attribute).to_string()),
             ],
             Self::UnsupportedUnit { unit } => vec![("unit", unit.clone())],
+            Self::UnknownPlate { plate, .. } => vec![("plate", plate.to_string())],
             Self::InvalidIndex { object } | Self::UnknownObject { object } => {
                 vec![("object", object.to_string())]
             }
@@ -517,11 +540,67 @@ impl Package<'_> {
     }
 }
 
+/// Name of the part in which Bambu Studio lists the objects of each plate.
+const PLATE_PART: &str = "Metadata/model_settings.config";
+
+/// Reads the build plates of a Bambu Studio project: the number of each
+/// plate and the identifiers of the objects on it. The layout was worked out
+/// from project files; text that does not fit it yields no plates.
+fn plates(text: &str) -> Vec<(u32, Vec<u32>)> {
+    let mut plates: Vec<(u32, Vec<u32>)> = Vec::new();
+    let (mut in_plate, mut in_instance) = (false, false);
+    let mut reader = quick_xml::Reader::from_str(text);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element) | Event::Empty(element)) => {
+                match element.local_name().into_inner() {
+                    "plate" => {
+                        in_plate = true;
+                        plates.push((0, Vec::new()));
+                    }
+                    "model_instance" => in_instance = true,
+                    "metadata" if in_plate => {
+                        let [key, value] = attributes(&element, ["key", "value"]);
+                        let value = value.and_then(|v| v.trim().parse::<u32>().ok());
+                        if let (Some(plate), Some(value)) = (plates.last_mut(), value) {
+                            match key.as_deref() {
+                                Some("plater_id") if !in_instance => plate.0 = value,
+                                Some("object_id") if in_instance => plate.1.push(value),
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(element)) => match element.local_name().into_inner() {
+                "plate" => in_plate = false,
+                "model_instance" => in_instance = false,
+                _ => {}
+            },
+            Ok(Event::Eof) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    plates
+}
+
 /// Parses a 3MF package into a single mesh in millimetres.
 ///
 /// All build items are placed as the file positions them and returned as one
 /// mesh. Extensions the reader does not understand are reported as warnings.
 pub fn parse_3mf(bytes: &[u8], diagnostics: &mut Diagnostics) -> Result<Mesh, ThreeMfError> {
+    parse_3mf_plate(bytes, None, diagnostics)
+}
+
+/// Like [`parse_3mf`], but keeps only the objects on one build plate of a
+/// project with several plates. Without a choice the first plate is used
+/// and a warning says so.
+pub fn parse_3mf_plate(
+    bytes: &[u8],
+    plate: Option<u32>,
+    diagnostics: &mut Diagnostics,
+) -> Result<Mesh, ThreeMfError> {
     let archive = zip::ZipArchive::new(Cursor::new(bytes))
         .map_err(|e| ThreeMfError::Archive(e.to_string()))?;
     let mut package = Package {
@@ -537,6 +616,41 @@ pub fn parse_3mf(bytes: &[u8], diagnostics: &mut Diagnostics) -> Result<Mesh, Th
     let root = root.trim_start_matches('/').to_string();
     package.load(&root)?;
 
+    let plates = package
+        .read(PLATE_PART)?
+        .map(|text| plates(&text))
+        .unwrap_or_default();
+    // A file with a single plate is read as a whole, so nothing is lost if
+    // its plate list is incomplete.
+    let chosen = match plate {
+        Some(number) => match plates.iter().find(|(id, _)| *id == number) {
+            Some(found) => Some(found),
+            None if number == 1 && plates.is_empty() => None,
+            None => {
+                return Err(ThreeMfError::UnknownPlate {
+                    plate: number,
+                    available: plates.iter().map(|(id, _)| *id).collect(),
+                });
+            }
+        },
+        None if plates.len() > 1 => {
+            diagnostics.push(
+                Diagnostic::warning(
+                    "model.multiple_plates",
+                    format!(
+                        "the file has {} build plates; only plate {} is sliced, choose another with the plate option",
+                        plates.len(),
+                        plates[0].0
+                    ),
+                )
+                .with("plates", plates.len())
+                .with("plate", plates[0].0),
+            );
+            plates.first()
+        }
+        None => None,
+    };
+
     let mut mesh = Mesh::default();
     let mut skipped = 0;
     let items = package.parts.get(&root).map_or(0, |part| part.build.len());
@@ -544,6 +658,9 @@ pub fn parse_3mf(bytes: &[u8], diagnostics: &mut Diagnostics) -> Result<Mesh, Th
         let Some(item) = package.parts.get(&root).map(|part| &part.build[index]) else {
             break;
         };
+        if chosen.is_some_and(|(_, objects)| !objects.contains(&item.object)) {
+            continue;
+        }
         let item = Reference {
             path: item.path.clone(),
             object: item.object,
@@ -745,6 +862,52 @@ mod tests {
         .unwrap();
         assert!(diagnostics.is_empty());
         assert_eq!(mesh.bounds().unwrap().1, [25.4, 25.4, 25.4]);
+    }
+
+    #[test]
+    fn one_plate_of_a_project_can_be_chosen() {
+        let text = model(
+            "",
+            &format!(
+                "<resources><object id=\"1\">{TETRAHEDRON}</object><object id=\"2\">{TETRAHEDRON}</object></resources><build><item objectid=\"1\"/><item objectid=\"2\" transform=\"1 0 0 0 1 0 0 0 1 300 0 0\"/></build>"
+            ),
+        );
+        let plate = |id: u32, object: u32| {
+            format!(
+                "<plate><metadata key=\"plater_id\" value=\"{id}\"/><metadata key=\"locked\" value=\"false\"/><model_instance><metadata key=\"object_id\" value=\"{object}\"/><metadata key=\"instance_id\" value=\"0\"/></model_instance></plate>"
+            )
+        };
+        let config = format!(
+            "<config><object id=\"1\"/>{}{}</config>",
+            plate(1, 1),
+            plate(2, 2)
+        );
+        let bytes = package(&[("3D/3dmodel.model", &text), (PLATE_PART, &config)]);
+        let read = |plate| {
+            let mut diagnostics = Diagnostics::new();
+            parse_3mf_plate(&bytes, plate, &mut diagnostics).map(|mesh| {
+                let (min, max) = mesh.bounds().unwrap();
+                (mesh.triangles.len(), min[0], max[0], diagnostics.codes())
+            })
+        };
+        assert_eq!(read(None), Ok((4, 0.0, 1.0, vec!["model.multiple_plates"])));
+        assert_eq!(read(Some(1)), Ok((4, 0.0, 1.0, vec![])));
+        assert_eq!(read(Some(2)), Ok((4, 300.0, 301.0, vec![])));
+        assert_eq!(
+            read(Some(3)),
+            Err(ThreeMfError::UnknownPlate {
+                plate: 3,
+                available: vec![1, 2]
+            })
+        );
+
+        // Without plate information everything is one plate.
+        let plain = package(&[("3D/3dmodel.model", &text)]);
+        let mut diagnostics = Diagnostics::new();
+        let whole = parse_3mf_plate(&plain, Some(1), &mut diagnostics).unwrap();
+        assert_eq!(whole.triangles.len(), 8);
+        assert!(parse_3mf_plate(&plain, Some(2), &mut diagnostics).is_err());
+        assert!(diagnostics.is_empty());
     }
 
     #[test]

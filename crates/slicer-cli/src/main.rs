@@ -35,6 +35,9 @@ enum Command {
         /// Override a single setting, e.g. --set layer_height=0.1
         #[arg(short, long = "set", value_name = "KEY=VALUE")]
         set: Vec<String>,
+        /// Build plate to slice from a project file with several plates
+        #[arg(long, value_name = "NUMBER")]
+        plate: Option<u32>,
         /// Write one SVG preview per layer into this directory
         #[arg(long, value_name = "DIR")]
         svg: Option<PathBuf>,
@@ -71,9 +74,10 @@ fn main() -> ExitCode {
             output,
             config,
             set,
+            plate,
             svg,
             json,
-        } => match slice(input, output, config, &set, svg) {
+        } => match slice(input, output, config, &set, plate, svg) {
             Ok(result) => {
                 if json {
                     println!("{result:#}");
@@ -99,6 +103,7 @@ fn slice(
     output: Option<PathBuf>,
     config: Option<PathBuf>,
     overrides: &[String],
+    plate: Option<u32>,
     svg: Option<PathBuf>,
 ) -> Result<serde_json::Value, Diagnostic> {
     let mut settings = match &config {
@@ -123,7 +128,8 @@ fn slice(
 
     let bytes = fs::read(&input).map_err(|e| io_error("io.read", &input, &e))?;
     let mut warnings = Diagnostics::new();
-    let mesh = slicer_formats::parse_model(&bytes, &mut warnings).map_err(in_file(&input))?;
+    let mesh =
+        slicer_formats::parse_model(&bytes, plate, &mut warnings).map_err(in_file(&input))?;
 
     let toolpaths = slicer_fdm::generate_reporting(&mesh, &settings, &mut warnings)
         .map_err(|e| e.diagnostic())?;

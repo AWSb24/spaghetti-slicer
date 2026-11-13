@@ -284,10 +284,11 @@ async fn health() -> Json<Value> {
 /// Slices a model; the body of every background job.
 fn slice(
     model: &[u8],
+    plate: Option<u32>,
     settings: &Settings,
 ) -> Result<(slicer_gcode::Output, Diagnostics), Diagnostic> {
     let mut warnings = Diagnostics::new();
-    let mesh = slicer_formats::parse_model(model, &mut warnings)?;
+    let mesh = slicer_formats::parse_model(model, plate, &mut warnings)?;
     let toolpaths = slicer_fdm::generate_reporting(&mesh, settings, &mut warnings)
         .map_err(|e| e.diagnostic())?;
     let output = slicer_gcode::write_gcode(&toolpaths, settings).map_err(|e| e.diagnostic())?;
@@ -304,6 +305,7 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
     let mut model = None;
     let mut settings = Settings::default();
     let mut overrides = Vec::new();
+    let mut plate = None;
     loop {
         let field = match multipart.next_field().await {
             Ok(Some(field)) => field,
@@ -317,7 +319,7 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
         };
         match name.as_str() {
             "model" => model = Some(bytes),
-            "settings" | "set" => {
+            "settings" | "set" | "plate" => {
                 let Ok(text) = std::str::from_utf8(&bytes) else {
                     return invalid(format!("field '{name}' is not valid UTF-8"));
                 };
@@ -326,6 +328,11 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
                         Ok(settings) => settings,
                         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.diagnostic()),
                     };
+                } else if name == "plate" {
+                    let Ok(number) = text.trim().parse::<u32>() else {
+                        return invalid(format!("field 'plate' expects a number, got '{text}'"));
+                    };
+                    plate = Some(number);
                 } else {
                     overrides.push(text.to_string());
                 }
@@ -373,7 +380,7 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
         "job.created",
         json!({ "job": id.to_string(), "bytes": model.len() }),
     );
-    tokio::spawn(run_job(app.clone(), id, model, settings));
+    tokio::spawn(run_job(app.clone(), id, model, plate, settings));
 
     let mut response = (
         StatusCode::ACCEPTED,
@@ -401,7 +408,13 @@ fn multipart_error(error: &axum::extract::multipart::MultipartError) -> Response
     }
 }
 
-async fn run_job(app: App, id: Uuid, model: axum::body::Bytes, settings: Settings) {
+async fn run_job(
+    app: App,
+    id: Uuid,
+    model: axum::body::Bytes,
+    plate: Option<u32>,
+    settings: Settings,
+) {
     let Ok(_slot) = app.slots.clone().acquire_owned().await else {
         return;
     };
@@ -414,7 +427,7 @@ async fn run_job(app: App, id: Uuid, model: axum::body::Bytes, settings: Setting
         }
     }
     let started = Instant::now();
-    let outcome = tokio::task::spawn_blocking(move || slice(&model, &settings))
+    let outcome = tokio::task::spawn_blocking(move || slice(&model, plate, &settings))
         .await
         .unwrap_or_else(|_| {
             Err(Diagnostic::error(

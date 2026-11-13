@@ -170,6 +170,17 @@ async fn errors_have_the_same_shape_as_the_command_line() {
 
     let (status, _) = call(&router, "GET", "/v1/jobs/not-an-id").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A plate must be a number, and a plain model has only plate 1.
+    let (status, body) = create(&router, &[("model", &stl), ("plate", b"two")]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "request.invalid");
+    let (_, created) = create(&router, &[("model", &stl), ("plate", b"2")]).await;
+    let job = finished(&router, created["id"].as_str().unwrap()).await;
+    assert_eq!(job["error"]["code"], "model.unknown_plate");
+    let (_, created) = create(&router, &[("model", &stl), ("plate", b"1")]).await;
+    let job = finished(&router, created["id"].as_str().unwrap()).await;
+    assert_eq!(job["status"], "done");
 }
 
 #[tokio::test]

@@ -552,11 +552,12 @@ fn local_models() {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let started = std::time::Instant::now();
         let mut warnings = Diagnostics::new();
-        let result = slicer_formats::parse_model(&std::fs::read(path).unwrap(), &mut warnings)
-            .and_then(|mesh| {
-                slicer_fdm::generate_reporting(&mesh, &settings, &mut warnings)
-                    .map_err(|e| slicer_core::Diagnose::diagnostic(&e))
-            });
+        let result =
+            slicer_formats::parse_model(&std::fs::read(path).unwrap(), None, &mut warnings)
+                .and_then(|mesh| {
+                    slicer_fdm::generate_reporting(&mesh, &settings, &mut warnings)
+                        .map_err(|e| slicer_core::Diagnose::diagnostic(&e))
+                });
         match result {
             Ok(toolpaths) => {
                 let output = slicer_gcode::write_gcode(&toolpaths, &settings).unwrap();
