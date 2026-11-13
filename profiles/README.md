@@ -11,7 +11,7 @@ Each file only sets the keys that belong to its role; everything else keeps its 
 | File | Status |
 |---|---|
 | `printers/generic-220.toml` | Generic Marlin printer with a 220 x 220 mm bed. Not run on a printer. |
-| `printers/bambu-x1c.toml` | Bambu Lab X1C. **Never run on the printer.** The start and end sequence uses only common commands and was written without knowing what the firmware needs; watch the first print and keep a hand on the power switch. |
+| `printers/bambu-x1c.toml` | Bambu Lab X1C. **Never run on the printer.** The start and end sequence uses only common commands and was written without knowing what the firmware needs; watch the first print and keep a hand on the power switch. Use `-o name.gcode.3mf` to get a project file; whether the printer accepts it is not known either. |
 | `materials/pla.toml`, `materials/petg.toml` | Typical temperatures from filament makers' data sheets; adjust to your filament. |
 | `processes/*.toml` | Layer heights 0.12, 0.20 and 0.28 mm for a 0.4 mm nozzle. |
 

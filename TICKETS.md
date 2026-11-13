@@ -34,7 +34,8 @@ Summe: 40 Tickets (7 × S, 25 × M, 8 × L), also rechnerisch etwa 5–8 Monate 
 | T-056 | Umgesetzt, Veröffentlichung ungetestet: `release.yml` baut bei einem Tag `v*` Archive für drei Betriebssysteme und das Image für amd64/arm64, legt Prüfsummen an und veröffentlicht ein Release mit erzeugten Notizen. Geprobt ist nur der Bau ohne Veröffentlichung |
 | T-061 | Erledigt: die CI misst Zeit und Spitzenspeicher der Referenzmodelle und des Benchy und zeigt sie in der Zusammenfassung des Laufs (kein Verlauf über mehrere Läufe); Vergleich mit Orca Slicer 2.3.1 auf demselben Rechner mit dokumentierten Einstellungen in `docs/benchmarks.md`, Skripte in `tools/orca-compare/`. Die beiden dabei gefundenen Mängel (zu viele Retractions im Infill, sehr großer G-Code bei runden Modellen) sind behoben und nachgemessen |
 | T-062 | Erledigt: README mit Schnellstart für CLI, Server und Docker, bekannten Einschränkungen, Hinweisen zum ersten Druck, Profilen und Release-Ablauf; Referenz aller Einstellungen in `docs/settings.md`; API-Beschreibung unter `/openapi.json` |
-| T-042, T-060 | Offen, nur am Gerät möglich (hängen an T-004) |
+| T-042 | Vorbereitet, ungeprüft: die CLI schreibt bei einem Ausgabenamen auf `.gcode.3mf` eine Projektdatei mit G-Code, MD5-Prüfsumme und Beschreibungsdateien, Aufbau an einem Export aus Bambu Studio abgelesen. Ohne Vorschaubilder und ohne vollständige Einstellungsdatei. Ob der X1C die Datei annimmt und welche Startsequenz er braucht, klärt erst T-004 am Gerät |
+| T-060 | Offen, nur am Gerät möglich |
 | Alle übrigen | Offen |
 
 ---

@@ -739,7 +739,7 @@ pub fn write_3mf(mesh: &Mesh) -> Result<Vec<u8>, ThreeMfError> {
 }
 
 /// Packs named parts into a ZIP archive.
-fn write_package(parts: &[(&str, &str)]) -> Result<Vec<u8>, ThreeMfError> {
+pub(crate) fn write_package(parts: &[(&str, &str)]) -> Result<Vec<u8>, ThreeMfError> {
     let archive = |e: zip::result::ZipError| ThreeMfError::Archive(e.to_string());
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);

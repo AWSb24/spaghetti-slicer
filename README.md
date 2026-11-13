@@ -9,7 +9,7 @@ What works: STL and 3MF import (geometry only, one plate of a Bambu Studio proje
 ## Known limitations
 
 - No supports and no bridges: models must print without them. The seam is either lined up at the back of the model or left where the nozzle happens to be; it cannot be hidden in corners or placed by hand.
-- The G-code for Marlin and Klipper is the same. There is no output specific to Bambu Lab printers; the X1C profile uses common commands only and has never been run.
+- The G-code for Marlin and Klipper is the same. For Bambu Lab printers there is a project file (`-o name.gcode.3mf`) and an X1C profile, but neither has ever been tried on a printer: the start sequence uses common commands only, and it is not known whether the printer accepts the file.
 - Colours, materials and settings stored in a 3MF file are ignored.
 - The time estimate has not been compared with a real print and ignores heating.
 - No user interface, no resin printing.
@@ -23,7 +23,7 @@ Pick the files for your printer, material and layer height from [profiles/](prof
 cargo run --release -p slicer-cli -- slice examples/cube_20mm.stl -c profiles/printers/generic-220.toml -c profiles/materials/pla.toml -c profiles/processes/standard-0.20.toml -o cube.gcode
 ```
 
-Check the start and end G-code of the printer file against what your machine needs. Stay next to the printer for the first layers.
+For a Bambu Lab printer, name the output `cube.gcode.3mf` to get a project file instead of plain G-code. Check the start and end G-code of the printer file against what your machine needs. Stay next to the printer for the first layers.
 
 ## Usage
 

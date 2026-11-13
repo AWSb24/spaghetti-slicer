@@ -63,6 +63,7 @@ All three must pass. New behaviour needs a test.
 | Extrusion amount (line width × layer height per millimetre) | Volume conservation, own design |
 | STL parsing | Public STL format description |
 | 3MF parsing | 3MF Core Specification and Production Extension (3MF Consortium, public); `zip` (MIT) and `quick-xml` (MIT) crates |
+| Sliced project file for Bambu Lab printers (`.gcode.3mf`) | Worked out from a file exported by Bambu Studio (names of the parts, checksum file, description files); no source code read. MD5 from RFC 1321 |
 | Build plates of Bambu Studio projects | Worked out from the `Metadata/model_settings.config` part of project files written by the program; no source code read |
 | HTTP server | `axum` and `tokio` (MIT), `uuid` (MIT OR Apache-2.0); API is an own design |
 | G-code commands | Marlin and RepRap G-code documentation |

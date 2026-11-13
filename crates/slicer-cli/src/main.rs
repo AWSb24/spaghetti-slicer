@@ -26,7 +26,8 @@ enum Command {
     Slice {
         /// Model file (STL or 3MF)
         input: PathBuf,
-        /// G-code file to write [default: input with .gcode extension]
+        /// G-code file to write [default: input with .gcode extension]; a name
+        /// ending in .gcode.3mf writes a project file for Bambu Lab printers
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Settings file in TOML format; may be given several times, later
@@ -137,7 +138,25 @@ fn slice(
     let result = slicer_gcode::write_gcode(&toolpaths, &settings).map_err(|e| e.diagnostic())?;
 
     let output = output.unwrap_or_else(|| input.with_extension("gcode"));
-    fs::write(&output, &result.gcode).map_err(|e| io_error("io.write", &output, &e))?;
+    // A name ending in .gcode.3mf asks for the container of Bambu Lab
+    // printers around the same G-code.
+    let container = output
+        .to_string_lossy()
+        .to_lowercase()
+        .ends_with(".gcode.3mf");
+    let content = if container {
+        let info = slicer_formats::PrintInfo {
+            seconds: result.stats.print_time_s,
+            weight_g: result.stats.filament_weight_g,
+            filament_m: result.stats.filament_length_mm / 1000.0,
+            layers: result.stats.layers,
+            nozzle_diameter: settings.nozzle_diameter,
+        };
+        slicer_formats::write_gcode_3mf(&result.gcode, &info).map_err(|e| e.diagnostic())?
+    } else {
+        result.gcode.clone().into_bytes()
+    };
+    fs::write(&output, content).map_err(|e| io_error("io.write", &output, &e))?;
 
     if let Some(dir) = &svg {
         fs::create_dir_all(dir).map_err(|e| io_error("io.write", dir, &e))?;
