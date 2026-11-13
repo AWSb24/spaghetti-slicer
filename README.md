@@ -104,6 +104,7 @@ curl -F model=@examples/cube_20mm.stl -F settings=@settings.toml -F set=infill_d
 | `POST /v1/jobs` | Create a job (multipart fields `model`, `settings`, `set`, `plate`; several `settings` files are layered in order); answers `202` at once |
 | `GET /v1/jobs/{id}` | Status (`queued`, `running`, `done`, `failed`, `cancelled`), statistics, warnings or the error |
 | `GET /v1/jobs/{id}/gcode` | The G-code of a finished job |
+| `GET /v1/jobs/{id}/gcode.3mf` | The same G-code as a project file for Bambu Lab printers (untested on a printer, like the file the command line tool writes) |
 | `DELETE /v1/jobs/{id}` | Cancel an unfinished job or delete a finished one |
 
 Errors have the same shape and codes as the command line tool, plus `request.invalid`, `request.too_large`, `request.unauthorized`, `request.not_found`, `job.not_found`, `job.no_result` and `server.busy`. Jobs live in memory and are lost on restart. Cancelling a job that is already being sliced discards its result but does not stop the computation.

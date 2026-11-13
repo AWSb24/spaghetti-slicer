@@ -143,6 +143,8 @@ struct Job {
     warnings: Vec<Diagnostic>,
     error: Option<Diagnostic>,
     gcode: Option<Arc<String>>,
+    /// What the project file for Bambu Lab printers says about the print.
+    info: Option<slicer_formats::PrintInfo>,
 }
 
 impl Job {
@@ -152,6 +154,7 @@ impl Job {
             out["stats"] = self.stats.clone().unwrap_or(Value::Null);
             out["warnings"] = json!(self.warnings);
             out["gcode_url"] = json!(format!("/v1/jobs/{id}/gcode"));
+            out["gcode_3mf_url"] = json!(format!("/v1/jobs/{id}/gcode.3mf"));
         }
         if let Some(error) = &self.error {
             out["error"] = json!(error);
@@ -195,6 +198,7 @@ impl App {
             .route("/jobs", post(create_job))
             .route("/jobs/{id}", get(job_status).delete(cancel_job))
             .route("/jobs/{id}/gcode", get(job_gcode))
+            .route("/jobs/{id}/gcode.3mf", get(job_gcode_3mf))
             .layer(DefaultBodyLimit::max(self.config.max_upload_bytes))
             .layer(middleware::from_fn_with_state(self.clone(), authorize));
         Router::new()
@@ -287,6 +291,14 @@ pub fn openapi() -> Value {
                     "200": { "description": "G-code", "content": { "text/plain": { "schema": { "type": "string" } } } },
                     "401": error, "404": error, "409": error
                 }
+            } },
+            "/v1/jobs/{id}/gcode.3mf": { "get": {
+                "summary": "G-code of a finished job as a project file for Bambu Lab printers",
+                "parameters": id,
+                "responses": {
+                    "200": { "description": "Project file (.gcode.3mf)", "content": { "model/3mf": { "schema": { "type": "string", "format": "binary" } } } },
+                    "401": error, "404": error, "409": error
+                }
             } }
         },
         "components": {
@@ -325,7 +337,8 @@ pub fn openapi() -> Value {
                         } },
                         "warnings": { "type": "array", "items": { "$ref": "#/components/schemas/Diagnostic" } },
                         "error": { "$ref": "#/components/schemas/Diagnostic" },
-                        "gcode_url": { "type": "string" }
+                        "gcode_url": { "type": "string" },
+                        "gcode_3mf_url": { "type": "string" }
                     }
                 }
             }
@@ -493,6 +506,7 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
                 warnings: Vec::new(),
                 error: None,
                 gcode: None,
+                info: None,
             },
         );
     }
@@ -548,6 +562,7 @@ async fn run_job(
         }
     }
     let started = Instant::now();
+    let nozzle_diameter = settings.nozzle_diameter;
     let outcome = tokio::task::spawn_blocking(move || slice(&model, plate, &settings))
         .await
         .unwrap_or_else(|_| {
@@ -568,6 +583,13 @@ async fn run_job(
         Ok((output, warnings)) => {
             job.status = Status::Done;
             job.stats = Some(json!(output.stats));
+            job.info = Some(slicer_formats::PrintInfo {
+                seconds: output.stats.print_time_s,
+                weight_g: output.stats.filament_weight_g,
+                filament_m: output.stats.filament_length_mm / 1000.0,
+                layers: output.stats.layers,
+                nozzle_diameter,
+            });
             job.warnings = warnings.as_slice().to_vec();
             job.gcode = Some(Arc::new(output.gcode));
         }
@@ -604,31 +626,60 @@ async fn job_status(State(app): State<App>, Path(id): Path<String>) -> Response 
     }
 }
 
-async fn job_gcode(State(app): State<App>, Path(id): Path<String>) -> Response {
-    let gcode = {
-        let jobs = app.jobs();
-        let Some(job) = id.parse().ok().and_then(|id: Uuid| jobs.get(&id)) else {
-            return not_found(&id);
-        };
-        match &job.gcode {
-            Some(gcode) => gcode.clone(),
-            None => {
-                return error_response(
-                    StatusCode::CONFLICT,
-                    &Diagnostic::error(
-                        "job.no_result",
-                        format!("job is {} and has no G-code", job.status.name()),
-                    )
-                    .with("status", job.status.name()),
-                );
-            }
-        }
+/// The G-code of a finished job and what is known about the print, or the
+/// answer for a job that is unknown or has no result.
+fn result_of(
+    app: &App,
+    id: &str,
+) -> Result<(Arc<String>, slicer_formats::PrintInfo), Box<Response>> {
+    let jobs = app.jobs();
+    let Some(job) = id.parse().ok().and_then(|id: Uuid| jobs.get(&id)) else {
+        return Err(Box::new(not_found(id)));
     };
-    (
-        [(header::CONTENT_TYPE, "text/x.gcode; charset=utf-8")],
-        Body::from(gcode.as_ref().clone()),
-    )
-        .into_response()
+    match (&job.gcode, &job.info) {
+        (Some(gcode), Some(info)) => Ok((gcode.clone(), info.clone())),
+        _ => Err(Box::new(error_response(
+            StatusCode::CONFLICT,
+            &Diagnostic::error(
+                "job.no_result",
+                format!("job is {} and has no G-code", job.status.name()),
+            )
+            .with("status", job.status.name()),
+        ))),
+    }
+}
+
+async fn job_gcode(State(app): State<App>, Path(id): Path<String>) -> Response {
+    match result_of(&app, &id) {
+        Ok((gcode, _)) => (
+            [(header::CONTENT_TYPE, "text/x.gcode; charset=utf-8")],
+            Body::from(gcode.as_ref().clone()),
+        )
+            .into_response(),
+        Err(response) => *response,
+    }
+}
+
+/// The same G-code packed into the project file of Bambu Lab printers.
+async fn job_gcode_3mf(State(app): State<App>, Path(id): Path<String>) -> Response {
+    let (gcode, info) = match result_of(&app, &id) {
+        Ok(result) => result,
+        Err(response) => return *response,
+    };
+    match slicer_formats::write_gcode_3mf(&gcode, &info) {
+        Ok(package) => (
+            [
+                (header::CONTENT_TYPE, "model/3mf"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"plate.gcode.3mf\"",
+                ),
+            ],
+            Body::from(package),
+        )
+            .into_response(),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.diagnostic()),
+    }
 }
 
 /// Cancels an unfinished job, or deletes the result of a finished one.

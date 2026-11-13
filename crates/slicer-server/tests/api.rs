@@ -130,7 +130,7 @@ async fn the_api_description_matches_the_router() {
             operations += 1;
         }
     }
-    assert_eq!(operations, 6);
+    assert_eq!(operations, 7);
 }
 
 #[tokio::test]
@@ -164,6 +164,15 @@ async fn a_job_is_sliced_in_the_background() {
     let (status, gcode) = send(&router, request).await;
     assert_eq!(status, StatusCode::OK);
     assert!(String::from_utf8(gcode).unwrap().contains(";LAYER_CHANGE"));
+
+    // The same result as a project file for Bambu Lab printers.
+    let request = Request::builder()
+        .uri(job["gcode_3mf_url"].as_str().unwrap())
+        .body(Body::empty())
+        .unwrap();
+    let (status, package) = send(&router, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(slicer_formats::looks_like_3mf(&package));
 
     // Deleting a finished job removes it.
     let (status, _) = call(&router, "DELETE", &format!("/v1/jobs/{id}")).await;
