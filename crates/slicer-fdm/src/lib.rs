@@ -21,6 +21,10 @@ const SEAM_TOLERANCE: f64 = 0.001;
 /// of moves on curves several times.
 const PATH_RESOLUTION: f64 = 0.0125;
 
+/// Smallest area in mm² hanging free over the layer below that is reported
+/// as an overhang.
+const MIN_OVERHANG_AREA: f64 = 1.0;
+
 /// Longest rim of a hole in the mesh that is closed before slicing.
 const MAX_HOLE_EDGES: usize = 64;
 
@@ -259,6 +263,35 @@ pub fn generate_reporting(
         for (path, flag) in layer.paths.iter_mut().zip(flags) {
             path.travel_inside = flag;
         }
+    }
+    // There are no supports yet, so say where they would be needed: what
+    // a layer has beyond the layer below, grown by one line width.
+    let hanging = parallel_map(slices.len(), |index| {
+        if index == 0 {
+            return 0.0;
+        }
+        let below = polygon::offset(&slices[index - 1], settings.line_width);
+        let free = polygon::difference(&slices[index], &below);
+        polygon::area(&polygon::clean(free, MIN_OVERHANG_AREA, 0.0))
+    });
+    let hanging_layers: Vec<usize> = (0..hanging.len())
+        .filter(|&index| hanging[index] > 0.0)
+        .collect();
+    if let Some(first) = hanging_layers.first() {
+        let largest = hanging.iter().copied().fold(0.0, f64::max);
+        diagnostics.push(
+            Diagnostic::warning(
+                "slicing.unsupported_overhangs",
+                format!(
+                    "{} of {} layers have areas with nothing below them (overhangs or bridges, up to {largest:.1} mm² in one layer); supports are not generated, these areas may sag (first: layer {})",
+                    hanging_layers.len(),
+                    slices.len(),
+                    first + 1
+                ),
+            )
+            .with("layers", hanging_layers.len())
+            .with("first_layer", first + 1),
+        );
     }
     if let Some(first) = thin_layers.first() {
         diagnostics.push(

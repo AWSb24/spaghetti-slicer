@@ -70,6 +70,7 @@ Errors go to stderr with exit code 1. With `--json`, errors and warnings are obj
 | `mesh.inside_out` (warning) | All triangles face inward; the model is sliced as if they faced outward |
 | `mesh.not_watertight` (warning) | The mesh has open or inconsistently oriented edges |
 | `slicing.open_contours` (warning) | Some layers have contours that do not close and were dropped |
+| `slicing.unsupported_overhangs` (warning) | Some layers reach more than one line width beyond the layer below (overhangs or bridges); there are no supports |
 | `slicing.thin_regions` (warning) | Some layers have parts narrower than the line width that are not printed |
 
 ## Server
@@ -174,6 +175,8 @@ A tag `v*` runs `.github/workflows/release.yml`: it builds archives with both pr
 ## Building
 
 Requires a stable Rust toolchain (installed automatically by `rustup` from `rust-toolchain.toml`).
+
+If the project lies on a network drive, the build fails with "access denied" when it tries to run its build scripts. Point cargo to a local folder first, for example in PowerShell with `$env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\cargo-target"`.
 
 ```bash
 cargo build

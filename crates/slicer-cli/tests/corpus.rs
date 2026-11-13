@@ -48,6 +48,7 @@ fn corpus() -> Vec<Model> {
     };
     const NONE: &[&str] = &[];
     const THIN: &[&str] = &["slicing.thin_regions"];
+    const HANGING: &[&str] = &["slicing.unsupported_overhangs"];
     const REPAIRED: &[&str] = &["mesh.repaired"];
 
     let rotated_z = {
@@ -138,12 +139,12 @@ fn corpus() -> Vec<Model> {
         model("triangle_prism", cylinder(10.0, 10.0, 3), NONE, Some(0.04)),
         model("cone", cone(10.0, 20.0, 64), THIN, Some(0.04)),
         model("pyramid", cone(12.0, 15.0, 4), THIN, Some(0.05)),
-        model("sphere", sphere(10.0, 64), NONE, Some(0.04)),
+        model("sphere", sphere(10.0, 64), HANGING, Some(0.04)),
         model("sphere_low_poly", sphere(8.0, 8), THIN, Some(0.05)),
         model("dome", dome(12.0, 64), NONE, Some(0.04)),
         model("tube", tube(12.0, 7.0, 10.0, 64), NONE, Some(0.03)),
         model("thin_tube_1mm_wall", tube(12.0, 11.0, 6.0, 96), NONE, None),
-        model("torus", torus(15.0, 4.0, 64, 32), NONE, Some(0.05)),
+        model("torus", torus(15.0, 4.0, 64, 32), HANGING, Some(0.05)),
         model(
             "star_5",
             prism(&star_contour(5, 15.0, 6.0), 5.0),
@@ -530,8 +531,9 @@ fn real_world_models() {
 
         if name == "3dbenchy.stl" {
             // 48 mm tall, closed, and nothing in it is thinner than a line.
+            // Its roof, windows and bow hang free; there are no supports.
             assert_eq!(toolpaths.layers.len(), 240);
-            assert!(warnings.is_empty(), "{:?}", warnings.codes());
+            assert_eq!(warnings.codes(), ["slicing.unsupported_overhangs"]);
             let grams = output.stats.filament_weight_g;
             assert!((9.0..14.0).contains(&grams), "{grams} g");
         }
