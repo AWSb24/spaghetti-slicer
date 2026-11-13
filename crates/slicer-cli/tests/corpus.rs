@@ -589,3 +589,53 @@ fn local_models() {
         )
     );
 }
+
+/// Fingerprints of the G-code of the reference models, compared with
+/// `examples/golden.tsv`. Any change to the output shows up here. If the
+/// change is intended, rewrite the file with
+/// `UPDATE_GOLDEN=1 cargo test -p slicer-cli --test corpus golden` and
+/// commit it together with the change.
+// ponytail: a fingerprint says that the output changed, not where. Storing
+// the G-code itself (5 MB) would give a diff; do that if this is not enough.
+#[test]
+fn reference_models_match_golden() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let mut paths: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|e| e == "stl"))
+        .collect();
+    paths.sort();
+
+    let settings = Settings::default();
+    let mut actual = String::from("model\tbytes\tlines\tfnv1a64\n");
+    for path in &paths {
+        let mesh = slicer_formats::parse_stl(&std::fs::read(path).unwrap()).unwrap();
+        let toolpaths = slicer_fdm::generate(&mesh, &settings).unwrap();
+        let gcode = slicer_gcode::write_gcode(&toolpaths, &settings)
+            .unwrap()
+            .gcode;
+        // FNV-1a, 64 bit.
+        let hash = gcode.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+        actual.push_str(&format!(
+            "{}\t{}\t{}\t{hash:016x}\n",
+            path.file_stem().unwrap().to_string_lossy(),
+            gcode.len(),
+            gcode.lines().count()
+        ));
+    }
+
+    let golden = dir.join("golden.tsv");
+    if std::env::var_os("UPDATE_GOLDEN").is_some() {
+        std::fs::write(&golden, &actual).unwrap();
+    }
+    let expected = std::fs::read_to_string(&golden)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
+    assert_eq!(
+        actual, expected,
+        "the G-code of the reference models changed; see the comment on this test"
+    );
+}

@@ -99,6 +99,12 @@ Without a token anyone who can reach the port can submit jobs. Logs are JSON lin
 cargo run -p slicer-formats --example reference_models -- examples
 ```
 
+`examples/golden.tsv` holds size, line count and a checksum of the G-code of each reference model, and the tests fail if the output changes. After an intended change, rewrite the file and commit it with the change:
+
+```bash
+UPDATE_GOLDEN=1 cargo test -p slicer-cli --test corpus golden
+```
+
 ## Real-world models
 
 3DBenchy (CC0) and its parts are used as real-world test models. They are not stored in the repository; see [corpus/README.md](corpus/README.md) for sources, license and how to fetch them.
