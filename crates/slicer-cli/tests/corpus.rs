@@ -226,8 +226,13 @@ fn corpus() -> Vec<Model> {
             NONE,
             None,
         ),
-        model("inside_out", inverted, NONE, Some(0.03)),
-        model("duplicate_triangle", with_junk, LEAKY, Some(0.03)),
+        model("inside_out", inverted, &["mesh.inside_out"], Some(0.03)),
+        model(
+            "duplicate_triangle",
+            with_junk,
+            &["mesh.non_manifold", "mesh.not_watertight"],
+            Some(0.03),
+        ),
         model("open_top", open_top, LEAKY, None),
         model(
             "hole_in_side",

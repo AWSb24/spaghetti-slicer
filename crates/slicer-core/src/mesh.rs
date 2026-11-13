@@ -141,7 +141,24 @@ impl Mesh {
 
     /// Reports problems that make slicing results unreliable.
     pub fn check(&self, diagnostics: &mut Diagnostics) {
-        let open_edges = self.open_edge_count();
+        let (open_edges, shared_edges) = self.edge_defects();
+        if shared_edges > 0 {
+            diagnostics.push(
+                Diagnostic::warning(
+                    "mesh.non_manifold",
+                    format!(
+                        "{shared_edges} edges of the mesh belong to more than two triangles (duplicate or touching surfaces); affected layers may be wrong"
+                    ),
+                )
+                .with("edges", shared_edges),
+            );
+        }
+        if open_edges == 0 && self.signed_volume() < 0.0 {
+            diagnostics.push(Diagnostic::warning(
+                "mesh.inside_out",
+                "all triangles of the mesh face inward; it is sliced as if they faced outward",
+            ));
+        }
         if open_edges > 0 {
             diagnostics.push(
                 Diagnostic::warning(
@@ -179,18 +196,27 @@ impl Mesh {
     /// Number of triangle edges without a matching neighbour. Zero for a
     /// closed, consistently oriented mesh.
     pub fn open_edge_count(&self) -> usize {
-        let mut balance: HashMap<(u32, u32), i32> = HashMap::new();
+        self.edge_defects().0
+    }
+
+    /// Counts triangle edges without a matching neighbour, and edges that
+    /// more than two triangles share.
+    fn edge_defects(&self) -> (usize, usize) {
+        // How often each edge is used in either direction.
+        let mut uses: HashMap<(u32, u32), [usize; 2]> = HashMap::new();
         for t in &self.triangles {
             for k in 0..3 {
                 let (a, b) = (t[k], t[(k + 1) % 3]);
                 if a < b {
-                    *balance.entry((a, b)).or_insert(0) += 1;
+                    uses.entry((a, b)).or_default()[0] += 1;
                 } else {
-                    *balance.entry((b, a)).or_insert(0) -= 1;
+                    uses.entry((b, a)).or_default()[1] += 1;
                 }
             }
         }
-        balance.values().map(|v| v.unsigned_abs() as usize).sum()
+        let open = uses.values().map(|[f, b]| f.abs_diff(*b)).sum();
+        let shared = uses.values().filter(|[f, b]| f + b > 2).count();
+        (open, shared)
     }
 }
 
@@ -204,6 +230,44 @@ mod tests {
         assert_eq!(m.open_edge_count(), 0);
         assert!((m.volume() - 1000.0).abs() < 1e-9);
         assert_eq!(m.bounds(), Some(([0.0; 3], [20.0, 10.0, 5.0])));
+    }
+
+    #[test]
+    fn check_names_the_kind_of_defect() {
+        let codes = |mesh: &Mesh| {
+            let mut diagnostics = Diagnostics::new();
+            mesh.check(&mut diagnostics);
+            diagnostics.codes()
+        };
+        let cube = Mesh::cuboid(1.0, 2.0, 3.0);
+        assert!(codes(&cube).is_empty());
+
+        let mut inside_out = cube.clone();
+        inside_out.flip();
+        assert_eq!(codes(&inside_out), ["mesh.inside_out"]);
+
+        let mut open = cube.clone();
+        open.triangles.pop();
+        assert_eq!(codes(&open), ["mesh.not_watertight"]);
+
+        // A second copy of one triangle: its edges have three users, and
+        // the surplus direction has no partner.
+        let mut doubled = cube.clone();
+        doubled.triangles.push(cube.triangles[0]);
+        assert_eq!(doubled.edge_defects(), (3, 3));
+        assert_eq!(
+            codes(&doubled),
+            ["mesh.non_manifold", "mesh.not_watertight"]
+        );
+
+        // Two cubes sharing an edge: closed, but four triangles meet there.
+        let mut touching = cube.clone();
+        let mut second = cube.clone();
+        second.translate([1.0, 2.0, 0.0]);
+        touching.merge(&second);
+        let touching = Mesh::from_triangle_soup(&touching.to_triangle_soup());
+        assert_eq!(touching.edge_defects(), (0, 1));
+        assert_eq!(codes(&touching), ["mesh.non_manifold"]);
     }
 
     #[test]

@@ -42,6 +42,8 @@ Errors go to stderr with exit code 1. With `--json`, errors and warnings are obj
 | `model.multiple_plates` (warning) | The project file has several build plates; only the first is sliced unless one is chosen |
 | `model.unsupported_extension` (warning) | The 3MF file requires extensions that are not supported; they are ignored |
 | `model.skipped_objects` (warning) | The 3MF file has objects that are not of type `model`; they are not printed |
+| `mesh.non_manifold` (warning) | Edges of the mesh belong to more than two triangles |
+| `mesh.inside_out` (warning) | All triangles face inward; the model is sliced as if they faced outward |
 | `mesh.not_watertight` (warning) | The mesh has open or inconsistently oriented edges |
 | `slicing.open_contours` (warning) | Some layers have contours that do not close and were dropped |
 | `slicing.thin_regions` (warning) | Some layers have parts narrower than the line width that are not printed |
