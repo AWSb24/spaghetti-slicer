@@ -138,6 +138,10 @@ UPDATE_GOLDEN=1 cargo test -p slicer-cli --test corpus golden
 
 3DBenchy (CC0) with its parts and 200 models from the Thingi10K dataset (CC BY, CC BY-SA or public domain) are used as real-world test models. They are not stored in the repository; see [corpus/README.md](corpus/README.md) for sources, license and how to fetch them.
 
+## Comparison with Orca Slicer
+
+Slicing time, memory and results for five models next to Orca Slicer, with method and findings, are in [docs/benchmarks.md](docs/benchmarks.md).
+
 ## Fuzzing
 
 `fuzz/` holds fuzz targets for the STL and 3MF readers. `.github/workflows/fuzz.yml` runs them for a few minutes every week. Locally, with a nightly toolchain and `cargo install cargo-fuzz`:
