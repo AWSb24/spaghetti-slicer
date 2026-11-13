@@ -30,6 +30,26 @@ pub enum InfillPattern {
     Grid,
 }
 
+/// Order in which the walls of a layer are printed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WallOrder {
+    /// From the innermost wall outward; the outer wall leans on the others.
+    InnerOuter,
+    /// The outer wall first, for the most accurate outside dimensions.
+    OuterInner,
+}
+
+/// How the amount of filament is written to the G-code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExtrusionMode {
+    /// Every move states how much filament it adds (`M83`).
+    Relative,
+    /// Every move states the total since the start of the layer (`M82`).
+    Absolute,
+}
+
 /// All settings that influence slicing. Lengths in mm, speeds in mm/s,
 /// temperatures in °C.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -46,6 +66,8 @@ pub struct Settings {
     pub nozzle_diameter: f64,
     /// G-code dialect.
     pub flavor: Flavor,
+    /// Whether extrusion amounts in the G-code are relative or absolute.
+    pub extrusion_mode: ExtrusionMode,
 
     // Material
     /// Filament diameter.
@@ -76,6 +98,8 @@ pub struct Settings {
     pub line_width: f64,
     /// Number of wall loops.
     pub wall_loops: u32,
+    /// Order in which the walls of a layer are printed.
+    pub wall_order: WallOrder,
     /// Number of solid layers at the top.
     pub top_layers: u32,
     /// Number of solid layers at the bottom.
@@ -136,6 +160,7 @@ impl Default for Settings {
             max_print_height: 250.0,
             nozzle_diameter: 0.4,
             flavor: Flavor::Marlin,
+            extrusion_mode: ExtrusionMode::Relative,
             filament_diameter: 1.75,
             filament_density: 1.24,
             flow_ratio: 1.0,
@@ -149,6 +174,7 @@ impl Default for Settings {
             first_layer_height: 0.2,
             line_width: 0.45,
             wall_loops: 2,
+            wall_order: WallOrder::InnerOuter,
             top_layers: 5,
             bottom_layers: 4,
             infill_density: 15.0,

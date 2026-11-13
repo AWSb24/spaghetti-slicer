@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use slicer_core::polygon::{self, HatchDirection, distance};
 use slicer_core::slice::slice_mesh_reporting;
 use slicer_core::{Contour, Diagnostic, Diagnostics, Mesh, Point, Shapes};
-use slicer_profiles::{InfillPattern, Settings};
+use slicer_profiles::{InfillPattern, Settings, WallOrder};
 
 /// Longest rim of a hole in the mesh that is closed before slicing.
 const MAX_HOLE_EDGES: usize = 64;
@@ -323,14 +323,18 @@ fn layer_work(slices: &[Shapes], index: usize, settings: &Settings) -> (Vec<Work
     let covered = polygon::area(&polygon::offset(&wall_shapes[0], 0.5 * width));
     let thin = total - covered > (0.02 * total).max(width * width);
 
-    let mut wall_loops: Vec<Vec<Contour>> = wall_shapes.iter().map(contours).collect();
-    while let Some(loops) = wall_loops.pop() {
-        let kind = if wall_loops.is_empty() {
+    // Wall 0 is the outer one.
+    let mut order: Vec<usize> = (0..walls).collect();
+    if settings.wall_order == WallOrder::InnerOuter {
+        order.reverse();
+    }
+    for k in order {
+        let kind = if k == 0 {
             PathKind::OuterWall
         } else {
             PathKind::InnerWall
         };
-        work.push(Work::Loops(loops, kind, width));
+        work.push(Work::Loops(contours(&wall_shapes[k]), kind, width));
     }
 
     // Infill centre lines stay half a width away from the inner edge of the
@@ -699,6 +703,21 @@ mod tests {
                 assert!(!in_hole, "infill crosses the hole at {mid:?}");
             }
         }
+    }
+
+    #[test]
+    fn wall_order_can_be_chosen() {
+        let first_wall = |order| {
+            let mut settings = Settings::default();
+            settings.wall_order = order;
+            settings.skirt_loops = 0;
+            let toolpaths = generate(&Mesh::cuboid(20.0, 20.0, 1.0), &settings).unwrap();
+            let kinds: Vec<PathKind> = toolpaths.layers[0].paths.iter().map(|p| p.kind).collect();
+            assert!(kinds.contains(&PathKind::OuterWall) && kinds.contains(&PathKind::InnerWall));
+            kinds[0]
+        };
+        assert_eq!(first_wall(WallOrder::InnerOuter), PathKind::InnerWall);
+        assert_eq!(first_wall(WallOrder::OuterInner), PathKind::OuterWall);
     }
 
     #[test]

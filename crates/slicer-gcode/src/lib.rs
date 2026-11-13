@@ -10,7 +10,7 @@ use serde::Serialize;
 use slicer_core::Point;
 use slicer_core::polygon::distance;
 use slicer_fdm::{PathKind, Toolpaths};
-use slicer_profiles::{Flavor, Settings};
+use slicer_profiles::{ExtrusionMode, Flavor, Settings};
 
 /// Summary of a generated print.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -215,6 +215,9 @@ struct Writer<'a> {
     feed: f64,
     retracted: bool,
     filament: f64,
+    /// Filament extruded since the last `G92 E0`; only used for absolute
+    /// extrusion.
+    e: f64,
     /// Every movement so far, for the time estimate.
     moves: Vec<Move>,
     /// Height of the nozzle; unknown before the first Z move.
@@ -234,11 +237,22 @@ impl Writer<'_> {
         }
     }
 
+    /// The ` E...` word for adding `amount` millimetres of filament.
+    fn e_word(&mut self, amount: f64) -> String {
+        if self.settings.extrusion_mode == ExtrusionMode::Absolute {
+            self.e += amount;
+            format!(" E{:.5}", self.e)
+        } else {
+            format!(" E{amount:.5}")
+        }
+    }
+
     fn retract(&mut self) {
         let length = self.settings.retraction_length;
         if length > 0.0 && !self.retracted {
             let f = self.feed_word(self.settings.retraction_speed);
-            let _ = writeln!(self.out, "G1 E-{length:.5}{f}");
+            let e = self.e_word(-length);
+            let _ = writeln!(self.out, "G1{e}{f}");
             self.retracted = true;
             self.filament -= length;
             self.record([0.0, 0.0], length, self.settings.retraction_speed);
@@ -249,7 +263,8 @@ impl Writer<'_> {
         if self.retracted {
             let length = self.settings.retraction_length;
             let f = self.feed_word(self.settings.retraction_speed);
-            let _ = writeln!(self.out, "G1 E{length:.5}{f}");
+            let e = self.e_word(length);
+            let _ = writeln!(self.out, "G1{e}{f}");
             self.retracted = false;
             self.filament += length;
             self.record([0.0, 0.0], length, self.settings.retraction_speed);
@@ -313,7 +328,8 @@ impl Writer<'_> {
         self.unretract();
         let e = length * filament_per_mm;
         let f = self.feed_word(speed);
-        let _ = writeln!(self.out, "G1 X{:.3} Y{:.3} E{e:.5}{f}", to[0], to[1]);
+        let word = self.e_word(e);
+        let _ = writeln!(self.out, "G1 X{:.3} Y{:.3}{word}{f}", to[0], to[1]);
         self.filament += e;
         let direction = [(to[0] - from[0]) / length, (to[1] - from[1]) / length];
         self.record(direction, length, speed);
@@ -323,7 +339,8 @@ impl Writer<'_> {
 
 /// Converts toolpaths into a G-code file.
 ///
-/// Extrusion is relative (`M83`). Every millimetre of path deposits a volume
+/// Extrusion is relative (`M83`) unless the settings ask for absolute
+/// values (`M82`, reset with `G92 E0` on every layer). Every millimetre of path deposits a volume
 /// of line width times layer height, so parallel lines one line width apart
 /// fill a layer completely.
 pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output, GcodeError> {
@@ -339,11 +356,17 @@ pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output,
         feed: 0.0,
         retracted: false,
         filament: 0.0,
+        e: 0.0,
         moves: Vec::new(),
         nozzle_z: None,
     };
     w.out.push_str(&start);
-    w.out.push_str("G21\nG90\nM83\n");
+    let absolute = settings.extrusion_mode == ExtrusionMode::Absolute;
+    w.out.push_str(if absolute {
+        "G21\nG90\nM82\n"
+    } else {
+        "G21\nG90\nM83\n"
+    });
 
     for (index, layer) in toolpaths.layers.iter().enumerate() {
         let _ = writeln!(
@@ -361,6 +384,11 @@ pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output,
         }
         if index == settings.fan_off_layers as usize && settings.fan_speed > 0.0 {
             let _ = writeln!(w.out, "M106 S{:.0}", settings.fan_speed * 2.55);
+        }
+        if absolute {
+            // Start every layer at zero so the numbers stay short and exact.
+            w.out.push_str("G92 E0\n");
+            w.e = 0.0;
         }
         w.z = layer.z;
         w.move_z(layer.z);
@@ -565,6 +593,54 @@ mod tests {
         let settings = Settings::default();
         let mesh = Mesh::cuboid(12.0, 17.0, 3.0);
         assert_eq!(slice(&mesh, &settings).gcode, slice(&mesh, &settings).gcode);
+    }
+
+    #[test]
+    fn absolute_extrusion_adds_up_to_the_same_filament() {
+        let mesh = Mesh::cuboid(10.0, 10.0, 1.0);
+        let relative = slice(&mesh, &Settings::default());
+        let mut settings = Settings::default();
+        settings.extrusion_mode = ExtrusionMode::Absolute;
+        let absolute = slice(&mesh, &settings);
+        assert!(relative.gcode.contains("\nM83\n") && !relative.gcode.contains("G92 E0"));
+        assert!(absolute.gcode.contains("\nM82\n"));
+        assert_eq!(
+            absolute.gcode.matches("G92 E0").count(),
+            absolute.stats.layers
+        );
+        assert_eq!(
+            absolute.stats.filament_length_mm,
+            relative.stats.filament_length_mm
+        );
+
+        // Replay both files: the filament pushed through must be the same.
+        let pushed = |gcode: &str, absolute: bool| {
+            let (mut total, mut last) = (0.0, 0.0);
+            for line in gcode.lines() {
+                if line == "G92 E0" {
+                    last = 0.0;
+                } else if let Some(e) = word(line, 'E').filter(|_| line.starts_with("G1")) {
+                    total += if absolute { e - last } else { e };
+                    last = e;
+                }
+            }
+            total
+        };
+        let (a, r) = (
+            pushed(&absolute.gcode, true),
+            pushed(&relative.gcode, false),
+        );
+        assert!((a - r).abs() < 1e-3, "{a} {r}");
+        // Within a layer the value never jumps back by more than a retraction.
+        let mut last = 0.0;
+        for line in absolute.gcode.lines() {
+            if line == "G92 E0" {
+                last = 0.0;
+            } else if let Some(e) = word(line, 'E').filter(|_| line.starts_with("G1")) {
+                assert!(e >= last - settings.retraction_length - 1e-9, "{line}");
+                last = e;
+            }
+        }
     }
 
     #[test]

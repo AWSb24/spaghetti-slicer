@@ -11,6 +11,7 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `max_print_height` | 250 | 1 to 2000 | Maximum print height (Z). |
 | `nozzle_diameter` | 0.4 | 0.1 to 2 | Nozzle diameter. |
 | `flavor` | marlin | `marlin`, `klipper` | G-code dialect. |
+| `extrusion_mode` | relative | `relative`, `absolute` | Whether extrusion amounts in the G-code are relative or absolute. |
 | `filament_diameter` | 1.75 | 1 to 3.5 | Filament diameter. |
 | `filament_density` | 1.24 | 0.1 to 20 | Filament density in g/cm³, used for the weight estimate. |
 | `flow_ratio` | 1 | 0.5 to 2 | Multiplier on the extruded amount. |
@@ -24,6 +25,7 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `first_layer_height` | 0.2 | 0.02 to 0.4 * | Height of the first layer. |
 | `line_width` | 0.45 | 0.24 to 1 * | Width of one extruded line. |
 | `wall_loops` | 2 | 1 to 50 | Number of wall loops. |
+| `wall_order` | inner_outer | `inner_outer`, `outer_inner` | Order in which the walls of a layer are printed. |
 | `top_layers` | 5 | 0 to 1000 | Number of solid layers at the top. |
 | `bottom_layers` | 4 | 0 to 1000 | Number of solid layers at the bottom. |
 | `infill_density` | 15 | 0 to 100 | Sparse infill density in percent. |
