@@ -8,7 +8,7 @@ What works: STL and 3MF import (geometry only, one plate of a Bambu Studio proje
 
 ## Known limitations
 
-- No supports and no bridges: models must print without them. The seam is either lined up at the back of the model or left where the nozzle happens to be; it cannot be hidden in corners or placed by hand.
+- Supports are simple: straight columns of lines under everything that overhangs by more than half a line width per layer (`supports = true`, off by default). No dense layer under the supported surface, no tree supports, no special handling of bridges. The seam is either lined up at the back of the model or left where the nozzle happens to be; it cannot be hidden in corners or placed by hand.
 - The G-code for Marlin and Klipper is the same. For Bambu Lab printers there is a project file (`-o name.gcode.3mf`) and an X1C profile, but neither has ever been tried on a printer: the start sequence uses common commands only, and it is not known whether the printer accepts the file.
 - Colours, materials and settings stored in a 3MF file are ignored.
 - The time estimate has not been compared with a real print and ignores heating.
@@ -70,7 +70,7 @@ Errors go to stderr with exit code 1. With `--json`, errors and warnings are obj
 | `mesh.inside_out` (warning) | All triangles face inward; the model is sliced as if they faced outward |
 | `mesh.not_watertight` (warning) | The mesh has open or inconsistently oriented edges |
 | `slicing.open_contours` (warning) | Some layers have contours that do not close and were dropped |
-| `slicing.unsupported_overhangs` (warning) | Some layers reach more than one line width beyond the layer below (overhangs or bridges); there are no supports |
+| `slicing.unsupported_overhangs` (warning) | Some layers reach more than one line width beyond the layer below (overhangs or bridges) and supports are switched off |
 | `slicing.thin_regions` (warning) | Some layers have parts narrower than the line width that are not printed |
 
 ## Server

@@ -112,6 +112,7 @@ fn label(kind: PathKind) -> &'static str {
     match kind {
         PathKind::Skirt => "Skirt",
         PathKind::Brim => "Brim",
+        PathKind::Support => "Support",
         PathKind::OuterWall => "Outer wall",
         PathKind::InnerWall => "Inner wall",
         PathKind::SolidInfill => "Solid infill",
@@ -414,7 +415,9 @@ pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output,
                 match path.kind {
                     PathKind::OuterWall => settings.outer_wall_speed,
                     PathKind::InnerWall => settings.inner_wall_speed,
-                    PathKind::SolidInfill | PathKind::SparseInfill => settings.infill_speed,
+                    PathKind::SolidInfill | PathKind::SparseInfill | PathKind::Support => {
+                        settings.infill_speed
+                    }
                     PathKind::Skirt | PathKind::Brim => settings.first_layer_speed,
                 }
             };

@@ -7,6 +7,7 @@ use crate::{Layer, PathKind};
 fn color(kind: PathKind) -> &'static str {
     match kind {
         PathKind::Skirt | PathKind::Brim => "#8a8a8a",
+        PathKind::Support => "#c9a227",
         PathKind::OuterWall => "#e8590c",
         PathKind::InnerWall => "#f2b01e",
         PathKind::SolidInfill => "#7b2cbf",

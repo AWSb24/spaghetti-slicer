@@ -131,6 +131,10 @@ pub struct Settings {
     pub skirt_distance: f64,
     /// Width of the brim attached to the first layer; 0 disables it.
     pub brim_width: f64,
+    /// Whether to print supports under overhangs and bridges.
+    pub supports: bool,
+    /// Distance between the lines of a support.
+    pub support_spacing: f64,
 
     // Speeds
     /// Speed of the outermost wall.
@@ -199,6 +203,8 @@ impl Default for Settings {
             skirt_loops: 2,
             skirt_distance: 4.0,
             brim_width: 0.0,
+            supports: false,
+            support_spacing: 2.5,
             outer_wall_speed: 40.0,
             inner_wall_speed: 60.0,
             infill_speed: 80.0,
@@ -431,6 +437,7 @@ impl Settings {
             ("skirt_loops", f64::from(self.skirt_loops), 0.0, 20.0),
             ("skirt_distance", self.skirt_distance, 0.0, 50.0),
             ("brim_width", self.brim_width, 0.0, 50.0),
+            ("support_spacing", self.support_spacing, 0.5, 20.0),
             ("outer_wall_speed", self.outer_wall_speed, 1.0, 1000.0),
             ("inner_wall_speed", self.inner_wall_speed, 1.0, 1000.0),
             ("infill_speed", self.infill_speed, 1.0, 1000.0),

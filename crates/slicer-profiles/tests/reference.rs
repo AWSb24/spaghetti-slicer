@@ -73,6 +73,7 @@ fn settings_reference_is_current() {
                 "seam_position" => "`rear`, `nearest`".to_string(),
                 "extrusion_mode" => "`relative`, `absolute`".to_string(),
                 "fan_off_layers" => "0 or more".to_string(),
+                "supports" => "`true`, `false`".to_string(),
                 "start_gcode" | "end_gcode" => "text with `{key}` placeholders".to_string(),
                 other => panic!("'{other}' has neither limits nor a description of its values"),
             },

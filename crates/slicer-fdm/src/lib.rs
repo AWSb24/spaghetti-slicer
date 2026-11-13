@@ -25,6 +25,9 @@ const PATH_RESOLUTION: f64 = 0.0125;
 /// as an overhang.
 const MIN_OVERHANG_AREA: f64 = 1.0;
 
+/// Smallest area in mm² that gets a support.
+const MIN_SUPPORT_AREA: f64 = 0.25;
+
 /// Longest rim of a hole in the mesh that is closed before slicing.
 const MAX_HOLE_EDGES: usize = 64;
 
@@ -35,6 +38,8 @@ pub enum PathKind {
     Skirt,
     /// Loops attached to the first layer to improve adhesion.
     Brim,
+    /// Lines that carry overhangs and are removed after printing.
+    Support,
     /// The visible outermost wall.
     OuterWall,
     /// Walls behind the outer wall.
@@ -220,7 +225,29 @@ pub fn generate_reporting(
     // The geometry of a layer depends only on the slices, so all cores work
     // on it. Putting the pieces in printing order depends on where the
     // previous layer ended and happens one layer after the other.
-    let geometry = parallel_map(slices.len(), |index| layer_work(&slices, index, settings));
+    // What every layer has beyond the layer below. With supports the limit
+    // is half a line width (about 50 degrees from vertical at the default
+    // layer height); without, only a full line width is worth a warning.
+    let (reach, least) = if settings.supports {
+        (0.5 * settings.line_width, 0.01)
+    } else {
+        (settings.line_width, MIN_OVERHANG_AREA)
+    };
+    let hanging: Vec<Shapes> = parallel_map(slices.len(), |index| {
+        if index == 0 {
+            return Vec::new();
+        }
+        let below = polygon::offset(&slices[index - 1], reach);
+        polygon::clean(polygon::difference(&slices[index], &below), least, 0.0)
+    });
+    let supports = if settings.supports {
+        support_areas(&slices, &hanging, settings)
+    } else {
+        Vec::new()
+    };
+    let geometry = parallel_map(slices.len(), |index| {
+        layer_work(&slices, &supports, index, settings)
+    });
     let mut position: Point = [0.0, 0.0];
     let mut thin_layers = Vec::new();
     let mut layers: Vec<Layer> = geometry
@@ -264,21 +291,15 @@ pub fn generate_reporting(
             path.travel_inside = flag;
         }
     }
-    // There are no supports yet, so say where they would be needed: what
-    // a layer has beyond the layer below, grown by one line width.
-    let hanging = parallel_map(slices.len(), |index| {
-        if index == 0 {
-            return 0.0;
-        }
-        let below = polygon::offset(&slices[index - 1], settings.line_width);
-        let free = polygon::difference(&slices[index], &below);
-        polygon::area(&polygon::clean(free, MIN_OVERHANG_AREA, 0.0))
-    });
+    // Without supports, say where they would be needed.
     let hanging_layers: Vec<usize> = (0..hanging.len())
-        .filter(|&index| hanging[index] > 0.0)
+        .filter(|&index| !settings.supports && !hanging[index].is_empty())
         .collect();
     if let Some(first) = hanging_layers.first() {
-        let largest = hanging.iter().copied().fold(0.0, f64::max);
+        let largest = hanging
+            .iter()
+            .map(|shapes| polygon::area(shapes))
+            .fold(0.0, f64::max);
         diagnostics.push(
             Diagnostic::warning(
                 "slicing.unsupported_overhangs",
@@ -338,6 +359,29 @@ fn travels_inside(layer: &Layer, slice: &Shapes) -> Vec<bool> {
     flags
 }
 
+/// Where supports go on every layer: below everything that hangs free,
+/// down to the bed or to the model, with one empty layer under the surface
+/// they carry and one line width of distance to the sides of the model.
+// ponytail: plain columns of lines. No dense layer under the surface, no
+// supports that lean or branch, and where a support stands on the model it
+// touches it without a gap, so it is harder to remove there.
+fn support_areas(slices: &[Shapes], hanging: &[Shapes], settings: &Settings) -> Vec<Shapes> {
+    let mut areas: Vec<Shapes> = vec![Vec::new(); slices.len()];
+    for index in (0..slices.len().saturating_sub(2)).rev() {
+        let above = polygon::union(&hanging[index + 2], &areas[index + 1]);
+        if above.is_empty() {
+            continue;
+        }
+        let keep_out = polygon::offset(&slices[index], settings.line_width);
+        areas[index] = polygon::clean(
+            polygon::difference(&above, &keep_out),
+            MIN_SUPPORT_AREA,
+            0.0,
+        );
+    }
+    areas
+}
+
 /// Geometry of one kind that still has to be put in printing order.
 enum Work {
     /// Closed loops, their kind and the shortest loop worth printing.
@@ -383,7 +427,12 @@ fn parallel_map<T: Send>(count: usize, job: impl Fn(usize) -> T + Sync) -> Vec<T
 /// Generates the geometry of one layer in the order it is printed. The flag
 /// tells whether a noticeable part of the layer is too narrow to be covered
 /// by a wall.
-fn layer_work(slices: &[Shapes], index: usize, settings: &Settings) -> (Vec<Work>, bool) {
+fn layer_work(
+    slices: &[Shapes],
+    supports: &[Shapes],
+    index: usize,
+    settings: &Settings,
+) -> (Vec<Work>, bool) {
     let slice = &slices[index];
     let width = settings.line_width;
     let walls = settings.wall_loops as usize;
@@ -391,6 +440,16 @@ fn layer_work(slices: &[Shapes], index: usize, settings: &Settings) -> (Vec<Work
 
     if index == 0 {
         adhesion_work(slice, settings, &mut work);
+    }
+    if let Some(area) = supports.get(index).filter(|area| !area.is_empty()) {
+        // The same direction on every layer, so the lines stack up to walls.
+        let lines = polygon::hatch(
+            area,
+            settings.support_spacing,
+            HatchDirection::Diagonal45,
+            0.5 * width,
+        );
+        work.push(Work::Lines(lines, PathKind::Support, 0.0));
     }
 
     // Walls: centre lines half a width inside the contour, then one width
@@ -911,6 +970,62 @@ mod tests {
                 .filter(|w| distance(w[0].points[0], w[1].points[0]) > 20.0)
                 .all(|w| !w[1].travel_inside)
         );
+    }
+
+    #[test]
+    fn supports_stand_under_overhangs() {
+        // A column with a wide plate on top, like the letter T.
+        let mut t = Mesh::cuboid(10.0, 10.0, 10.0);
+        t.translate([10.0, 0.0, 0.0]);
+        let mut plate = Mesh::cuboid(30.0, 10.0, 2.0);
+        plate.translate([0.0, 0.0, 10.0]);
+        t.merge(&plate);
+
+        let support_layers = |settings: &Settings| -> (Vec<usize>, Diagnostics, Toolpaths) {
+            let mut warnings = Diagnostics::new();
+            let toolpaths = generate_reporting(&t, settings, &mut warnings).unwrap();
+            let layers = (0..toolpaths.layers.len())
+                .filter(|&i| {
+                    toolpaths.layers[i]
+                        .paths
+                        .iter()
+                        .any(|p| p.kind == PathKind::Support)
+                })
+                .collect();
+            (layers, warnings, toolpaths)
+        };
+        let mut settings = Settings::default();
+        let (none, warnings, _) = support_layers(&settings);
+        assert!(none.is_empty());
+        assert_eq!(warnings.codes(), ["slicing.unsupported_overhangs"]);
+
+        settings.supports = true;
+        let (layers, warnings, toolpaths) = support_layers(&settings);
+        assert!(warnings.is_empty(), "{:?}", warnings.codes());
+        // The plate starts at 10 mm, layer 50. Supports fill layers 0 to 48
+        // and leave layer 49 empty.
+        assert_eq!(layers, (0..49).collect::<Vec<usize>>());
+        // They stand left and right of the column (which is centred on the
+        // bed at x 105 to 115), a line width away from it, under the plate.
+        for layer in &toolpaths.layers[..49] {
+            for path in layer.paths.iter().filter(|p| p.kind == PathKind::Support) {
+                for p in &path.points {
+                    assert!((94.99..=125.01).contains(&p[0]), "{p:?}");
+                    assert!(p[0] <= 105.0 - 0.4 || p[0] >= 115.0 + 0.4, "{p:?}");
+                    assert!((104.99..=115.01).contains(&p[1]), "{p:?}");
+                }
+            }
+        }
+        let both_sides = |layer: &Layer| {
+            let xs: Vec<f64> = layer
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::Support)
+                .flat_map(|p| p.points.iter().map(|q| q[0]))
+                .collect();
+            xs.iter().any(|&x| x < 105.0) && xs.iter().any(|&x| x > 115.0)
+        };
+        assert!(toolpaths.layers[..49].iter().all(both_sides));
     }
 
     #[test]

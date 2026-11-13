@@ -35,6 +35,8 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `skirt_loops` | 2 | 0 to 20 | Number of skirt loops around the first layer. |
 | `skirt_distance` | 4 | 0 to 50 | Distance between skirt and model. |
 | `brim_width` | 0 | 0 to 50 | Width of the brim attached to the first layer; 0 disables it. |
+| `supports` | false | `true`, `false` | Whether to print supports under overhangs and bridges. |
+| `support_spacing` | 2.5 | 0.5 to 20 | Distance between the lines of a support. |
 | `outer_wall_speed` | 40 | 1 to 1000 | Speed of the outermost wall. |
 | `inner_wall_speed` | 60 | 1 to 1000 | Speed of inner walls. |
 | `infill_speed` | 80 | 1 to 1000 | Speed of solid and sparse infill. |
