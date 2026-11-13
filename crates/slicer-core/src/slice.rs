@@ -19,6 +19,10 @@ struct End {
     point: Point,
 }
 
+/// Largest distance an outline may move when points are dropped from it,
+/// in millimetres.
+const OUTLINE_RESOLUTION: f64 = 0.005;
+
 fn edge_key(a: u32, b: u32) -> u64 {
     (u64::from(a.min(b)) << 32) | u64::from(a.max(b))
 }
@@ -84,23 +88,33 @@ pub fn slice_mesh_reporting(
     // shells can be united. Otherwise fall back to counting crossings, which
     // tolerates flipped triangles but turns overlaps into holes.
     let oriented = mesh.open_edge_count() == 0;
-    let mut open_layers = Vec::new();
-    let slices = segments
-        .iter()
-        .enumerate()
-        .map(|(index, layer)| {
-            let (loops, open) = chain_segments(layer);
-            if open > 0 {
-                open_layers.push(index);
-            }
-            let shapes = if oriented {
-                polygon::from_oriented_loops(&loops)
-            } else {
-                polygon::from_loops(&loops)
-            };
-            polygon::clean(shapes, MIN_CONTOUR_AREA, MIN_SEGMENT_LENGTH)
-        })
-        .collect();
+    // Joining the segments of a layer to outlines is most of the work and
+    // independent of the other layers, so all cores share it.
+    let (slices, open): (Vec<Shapes>, Vec<bool>) = crate::parallel_map(segments.len(), |index| {
+        let (loops, open) = chain_segments(&segments[index]);
+        let shapes = if oriented {
+            polygon::from_oriented_loops(&loops)
+        } else {
+            polygon::from_loops(&loops)
+        };
+        // A fine mesh gives outlines with thousands of points a few
+        // micrometres apart. Every later step pays for each of them, so
+        // they are thinned out here, far below what a printer resolves.
+        let shapes = polygon::clean(shapes, MIN_CONTOUR_AREA, MIN_SEGMENT_LENGTH)
+            .iter()
+            .map(|shape| {
+                shape
+                    .iter()
+                    .map(|contour| polygon::simplify(contour, OUTLINE_RESOLUTION))
+                    .filter(|contour| contour.len() > 2)
+                    .collect()
+            })
+            .collect();
+        (shapes, open > 0)
+    })
+    .into_iter()
+    .unzip();
+    let open_layers: Vec<usize> = (0..open.len()).filter(|&index| open[index]).collect();
     if let Some(first) = open_layers.first() {
         diagnostics.push(
             Diagnostic::warning(

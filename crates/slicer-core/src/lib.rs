@@ -4,10 +4,12 @@
 
 pub mod diagnostics;
 pub mod mesh;
+pub mod parallel;
 pub mod polygon;
 pub mod primitives;
 pub mod slice;
 
 pub use diagnostics::{Diagnose, Diagnostic, Diagnostics, Severity};
 pub use mesh::Mesh;
+pub use parallel::parallel_map;
 pub use polygon::{Contour, Point, Shape, Shapes};

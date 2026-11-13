@@ -59,3 +59,14 @@ Measured again after the fix, same method:
 | G-code size | 2.6 MB | 18.3 MB | 2.6 MB |
 
 On the 20 mm cube Spaghetti Slicer now retracts 100 times, once per layer. Layers and filament are unchanged by the fix. Orca still writes fewer moves because it fits arcs; Spaghetti Slicer writes straight segments only.
+
+## Later: outlines thinned out after cutting
+
+Measured on the same machine (16 threads), wall time of the command line tool, not compared with Orca again:
+
+| Model | Before [s] | After [s] |
+|---|---|---|
+| 3dbenchy.stl | 1.6 | 0.45 |
+| 32770.stl (Octocat, Thingi10K) | 0.36 | 0.22 |
+
+The outline of every layer is now thinned out by at most 0.005 mm right after the mesh is cut, and joining the cut segments runs on all cores. Almost all of the time went into polygon operations on outlines with thousands of points; on one core the Benchy took 11 s before. Filament and print time of the Benchy are unchanged (11.0 g, 55 min 48 s instead of 55 min 51 s).

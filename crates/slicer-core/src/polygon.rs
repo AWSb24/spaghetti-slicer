@@ -35,6 +35,9 @@ const SCALE: f64 = 1e5;
 const ARC_TOLERANCE: f64 = 0.0025;
 
 /// Removes floating-point noise by moving every point onto the grid.
+/// Width in millimetres below which a detour of a contour counts as a spike.
+const SPIKE_WIDTH: f64 = 1e-4;
+
 fn snap(mut shapes: Shapes) -> Shapes {
     for point in shapes.iter_mut().flatten().flatten() {
         point[0] = (point[0] * SCALE).round() / SCALE;
@@ -122,11 +125,51 @@ pub fn offset(shapes: &Shapes, delta: f64) -> Shapes {
     let t = (ARC_TOLERANCE / delta.abs()).min(1.0);
     let step = 2.0 * (2.0 * t).sqrt();
     let style = OutlineStyle::new(delta).line_join(LineJoin::Round(step.min(FRAC_PI_4)));
-    snap(
+    let grown = snap(
         shapes
             .outline_fixed_scale(&style, SCALE)
             .unwrap_or_else(|_| shapes.outline(&style)),
-    )
+    );
+    grown
+        .into_iter()
+        .filter_map(|shape| {
+            let mut contours = shape.into_iter().map(without_spikes);
+            let outer = contours.next().filter(|c| c.len() > 2)?;
+            Some(
+                std::iter::once(outer)
+                    .chain(contours.filter(|c| c.len() > 2))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// Drops points where a contour runs out and straight back on itself. At a
+/// point where the input barely bends, the offset now and then leaves such a
+/// spike of no width reaching back to the input; printed as a wall it would
+/// be a line across the other walls.
+fn without_spikes(mut contour: Contour) -> Contour {
+    let mut i = 0;
+    let mut unchanged = 0;
+    while contour.len() > 2 && unchanged < contour.len() {
+        let n = contour.len();
+        let (a, b, c) = (
+            contour[(i + n - 1) % n],
+            contour[i % n],
+            contour[(i + 1) % n],
+        );
+        let back = (b[0] - a[0]) * (c[0] - b[0]) + (b[1] - a[1]) * (c[1] - b[1]) < 0.0;
+        let on_line = segment_distance(c, a, b).min(segment_distance(a, b, c)) < SPIKE_WIDTH;
+        if (back && on_line) || distance(a, b) < SPIKE_WIDTH {
+            contour.remove(i % n);
+            i = (i % n + n - 1) % n;
+            unchanged = 0;
+        } else {
+            i = (i + 1) % n;
+            unchanged += 1;
+        }
+    }
+    contour
 }
 
 /// Removes debris from shapes: points closer than `min_segment` to their
@@ -467,6 +510,40 @@ mod tests {
         assert!(!inside([-1.0, 1.0], [-2.0, 1.0]));
         // Grazing a corner of the hole counts as leaving.
         assert!(!inside([2.0, 4.0], [5.0, 4.0]));
+    }
+
+    #[test]
+    fn offset_leaves_no_spikes() {
+        // The outlines of a cylinder keep a point in the middle of one
+        // side. Without the clean-up, 5 of these 200 offsets have a spike
+        // from the offset circle out to the cylinder.
+        let mesh = crate::primitives::cylinder(10.0, 20.0, 64);
+        let heights: Vec<f64> = (0..100).map(|i| 0.1 + 0.2 * f64::from(i)).collect();
+        for slice in crate::slice::slice_mesh(&mesh, &heights) {
+            for delta in [-0.225, -0.675] {
+                let grown = offset(&slice, delta);
+                assert_eq!(grown.len(), 1);
+                let radii: Vec<f64> = grown[0][0]
+                    .iter()
+                    .map(|&point| distance(point, [0.0, 0.0]))
+                    .collect();
+                let least = radii.iter().copied().fold(f64::MAX, f64::min);
+                let most = radii.iter().copied().fold(0.0, f64::max);
+                assert!(most - least < 0.02, "{delta}: {least} to {most}");
+            }
+        }
+        // A spike on its own is removed, a sharp corner is not.
+        let spiked = vec![
+            [0.0, 0.0],
+            [4.0, 0.0],
+            [4.0, 3.0],
+            [4.0, 0.0],
+            [4.0, -4.0],
+            [0.0, -4.0],
+        ];
+        assert_eq!(super::without_spikes(spiked).len(), 4);
+        let sharp = vec![[0.0, 0.0], [4.0, 0.0], [0.0, 0.1]];
+        assert_eq!(super::without_spikes(sharp).len(), 3);
     }
 
     #[test]
