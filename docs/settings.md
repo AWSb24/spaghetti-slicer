@@ -38,6 +38,7 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `supports` | false | `true`, `false` | Whether to print supports under overhangs and bridges. |
 | `support_spacing` | 2.5 | 0.5 to 20 | Distance between the lines of a support. |
 | `support_interface_layers` | 2 | 0 to 10 | Number of densely filled support layers right under the surface they carry. |
+| `support_bridge_length` | 10 | 0 to 1000 | Bridges up to this length in millimetres get no supports; 0 supports every bridge. |
 | `outer_wall_speed` | 40 | 1 to 1000 | Speed of the outermost wall. |
 | `inner_wall_speed` | 60 | 1 to 1000 | Speed of inner walls. |
 | `infill_speed` | 80 | 1 to 1000 | Speed of solid and sparse infill. |

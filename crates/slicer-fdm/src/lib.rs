@@ -251,7 +251,15 @@ pub fn generate_reporting(
         polygon::clean(polygon::difference(&slices[index], &below), least, 0.0)
     });
     let supports = if settings.supports {
-        support_areas(&slices, &hanging, settings)
+        // Short bridges carry themselves.
+        let carried: Vec<Shapes> = parallel_map(slices.len(), |index| {
+            hanging[index]
+                .iter()
+                .filter(|shape| !spans_freely(shape, &slices[index - 1], settings))
+                .cloned()
+                .collect()
+        });
+        support_areas(&slices, &carried, settings)
     } else {
         Vec::new()
     };
@@ -374,8 +382,7 @@ fn travels_inside(layer: &Layer, slice: &Shapes) -> Vec<bool> {
 /// model, with one empty layer under the surface they carry and above the
 /// model they stand on, and one line width of distance to its sides. The
 /// dense part is what lies right under a carried surface.
-// ponytail: straight columns. No supports that lean or branch, and bridges
-// a printer could span are supported like any other overhang.
+// ponytail: straight columns. No supports that lean or branch.
 fn support_areas(
     slices: &[Shapes],
     hanging: &[Shapes],
@@ -631,6 +638,45 @@ fn point_inside(shapes: &Shapes, point: Point) -> bool {
     inside
 }
 
+/// The directions lines can run in.
+const DIRECTIONS: [HatchDirection; 4] = [
+    HatchDirection::Horizontal,
+    HatchDirection::Vertical,
+    HatchDirection::Diagonal45,
+    HatchDirection::Diagonal135,
+];
+
+/// Whether an area that hangs free is a bridge short enough to print
+/// without supports: in one direction nearly all lines across it go on over
+/// the layer below at both ends, and none is longer than the setting allows.
+fn spans_freely(shape: &[Contour], below: &Shapes, settings: &Settings) -> bool {
+    let width = settings.line_width;
+    let area = vec![shape.to_vec()];
+    DIRECTIONS.iter().any(|&direction| {
+        let (mut total, mut loose, mut longest) = (0.0, 0.0, 0.0_f64);
+        for [a, b] in polygon::hatch(&area, width, direction, 0.0) {
+            let length = distance(a, b);
+            if length == 0.0 {
+                continue;
+            }
+            // The area ends half a line before the layer below begins.
+            let step = 2.0 * width / length;
+            let beyond = |from: Point, to: Point| {
+                [
+                    to[0] + (to[0] - from[0]) * step,
+                    to[1] + (to[1] - from[1]) * step,
+                ]
+            };
+            total += length;
+            longest = longest.max(length);
+            if !(point_inside(below, beyond(a, b)) && point_inside(below, beyond(b, a))) {
+                loose += length;
+            }
+        }
+        total > 0.0 && loose <= 0.1 * total && longest <= settings.support_bridge_length
+    })
+}
+
 /// Takes the bridges out of the solid and sparse areas of a layer: solid
 /// areas at least a line wide with nothing below, grown a little onto what
 /// carries them. Every bridge comes with the direction in which most of its
@@ -661,12 +707,7 @@ fn split_bridges(
         .map(|shape| {
             let bridge = vec![shape.clone()];
             let mut best = (f64::INFINITY, HatchDirection::Diagonal45);
-            for direction in [
-                HatchDirection::Horizontal,
-                HatchDirection::Vertical,
-                HatchDirection::Diagonal45,
-                HatchDirection::Diagonal135,
-            ] {
+            for direction in DIRECTIONS {
                 // Length of the lines with an end in the air.
                 let loose: f64 = polygon::hatch(&bridge, width, direction, 0.0)
                     .iter()
@@ -963,6 +1004,19 @@ mod tests {
                 mesh.rotate_z(std::f64::consts::FRAC_PI_2);
             }
             let toolpaths = generate(&mesh, &Settings::default()).unwrap();
+            // Supports go under a bridge only if it is longer than allowed.
+            for (limit, expected) in [(10.0, true), (25.0, false)] {
+                let mut settings = Settings::default();
+                settings.supports = true;
+                settings.support_bridge_length = limit;
+                let supported = generate(&mesh, &settings)
+                    .unwrap()
+                    .layers
+                    .iter()
+                    .flat_map(|layer| &layer.paths)
+                    .any(|path| path.kind == PathKind::Support);
+                assert_eq!(supported, expected, "limit {limit}");
+            }
             // Layer 25 is the lowest layer of the deck.
             let mut along = 0.0;
             let mut long = 0.0;
