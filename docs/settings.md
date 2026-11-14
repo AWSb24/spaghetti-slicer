@@ -41,6 +41,7 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `outer_wall_speed` | 40 | 1 to 1000 | Speed of the outermost wall. |
 | `inner_wall_speed` | 60 | 1 to 1000 | Speed of inner walls. |
 | `infill_speed` | 80 | 1 to 1000 | Speed of solid and sparse infill. |
+| `bridge_speed` | 30 | 1 to 1000 | Speed of bridges: solid infill with nothing below it. |
 | `first_layer_speed` | 25 | 1 to 1000 | Speed of all extrusion on the first layer. |
 | `travel_speed` | 150 | 1 to 2000 | Speed of moves without extrusion. |
 | `acceleration` | 1000 | 10 to 100000 | Acceleration of the printer in mm/s². Only used to estimate the print time; it is not written to the G-code. |

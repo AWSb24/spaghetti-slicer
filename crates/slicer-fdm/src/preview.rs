@@ -11,6 +11,7 @@ fn color(kind: PathKind) -> &'static str {
         PathKind::OuterWall => "#e8590c",
         PathKind::InnerWall => "#f2b01e",
         PathKind::SolidInfill => "#7b2cbf",
+        PathKind::Bridge => "#4c8dff",
         PathKind::SparseInfill => "#2a9d8f",
     }
 }

@@ -54,6 +54,8 @@ pub enum PathKind {
     InnerWall,
     /// Dense fill of top and bottom surfaces.
     SolidInfill,
+    /// Solid infill with nothing below it, spanning from side to side.
+    Bridge,
     /// Low-density fill of the interior.
     SparseInfill,
 }
@@ -352,7 +354,7 @@ fn travels_inside(layer: &Layer, slice: &Shapes) -> Vec<bool> {
         let (previous, path) = (&pair[0], &pair[1]);
         let hidden = matches!(
             path.kind,
-            PathKind::InnerWall | PathKind::SolidInfill | PathKind::SparseInfill
+            PathKind::InnerWall | PathKind::SolidInfill | PathKind::Bridge | PathKind::SparseInfill
         );
         let from = if previous.closed {
             previous.points.first()
@@ -538,7 +540,7 @@ fn layer_work(
             split_bridges(&slices[index - 1], &fill_area, solid, sparse, width);
         for (bridge, across) in bridges {
             let lines = polygon::hatch(&bridge, width, across, min_length);
-            work.push(Work::Lines(lines, PathKind::SolidInfill, 2.0 * width));
+            work.push(Work::Lines(lines, PathKind::Bridge, 2.0 * width));
         }
         (solid, sparse)
     } else {
@@ -633,9 +635,9 @@ fn point_inside(shapes: &Shapes, point: Point) -> bool {
 /// areas at least a line wide with nothing below, grown a little onto what
 /// carries them. Every bridge comes with the direction in which most of its
 /// lines rest on the layer below at both ends.
-// ponytail: four directions (along X, along Y, both diagonals), and bridges
-// print like other solid infill. A bridge at another angle gets the best of
-// the four; free angles, and their own speed, flow and cooling, come later.
+// ponytail: four directions (along X, along Y, both diagonals). A bridge at
+// another angle gets the best of the four. Bridges have their own speed but
+// the flow and cooling of everything else; free angles and those come later.
 fn split_bridges(
     below: &Shapes,
     fill_area: &Shapes,
@@ -965,7 +967,7 @@ mod tests {
             let mut along = 0.0;
             let mut long = 0.0;
             for path in &toolpaths.layers[25].paths {
-                if path.kind != PathKind::SolidInfill {
+                if path.kind != PathKind::Bridge {
                     continue;
                 }
                 for pair in path.points.windows(2) {

@@ -145,6 +145,8 @@ pub struct Settings {
     pub inner_wall_speed: f64,
     /// Speed of solid and sparse infill.
     pub infill_speed: f64,
+    /// Speed of bridges: solid infill with nothing below it.
+    pub bridge_speed: f64,
     /// Speed of all extrusion on the first layer.
     pub first_layer_speed: f64,
     /// Speed of moves without extrusion.
@@ -211,6 +213,7 @@ impl Default for Settings {
             outer_wall_speed: 40.0,
             inner_wall_speed: 60.0,
             infill_speed: 80.0,
+            bridge_speed: 30.0,
             first_layer_speed: 25.0,
             travel_speed: 150.0,
             acceleration: 1000.0,
@@ -450,6 +453,7 @@ impl Settings {
             ("outer_wall_speed", self.outer_wall_speed, 1.0, 1000.0),
             ("inner_wall_speed", self.inner_wall_speed, 1.0, 1000.0),
             ("infill_speed", self.infill_speed, 1.0, 1000.0),
+            ("bridge_speed", self.bridge_speed, 1.0, 1000.0),
             ("first_layer_speed", self.first_layer_speed, 1.0, 1000.0),
             ("travel_speed", self.travel_speed, 1.0, 2000.0),
             ("acceleration", self.acceleration, 10.0, 100_000.0),
