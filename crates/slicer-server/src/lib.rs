@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -145,6 +146,8 @@ struct Job {
     gcode: Option<Arc<String>>,
     /// What the project file for Bambu Lab printers says about the print.
     info: Option<slicer_formats::PrintInfo>,
+    /// Set when the job is cancelled, so slicing gives up early.
+    stop: Arc<AtomicBool>,
 }
 
 impl Job {
@@ -420,10 +423,11 @@ fn slice(
     model: &[u8],
     plate: Option<u32>,
     settings: &Settings,
+    stop: &AtomicBool,
 ) -> Result<(slicer_gcode::Output, Diagnostics), Diagnostic> {
     let mut warnings = Diagnostics::new();
     let mesh = slicer_formats::parse_model(model, plate, &mut warnings)?;
-    let toolpaths = slicer_fdm::generate_reporting(&mesh, settings, &mut warnings)
+    let toolpaths = slicer_fdm::generate_cancellable(&mesh, settings, &mut warnings, stop)
         .map_err(|e| e.diagnostic())?;
     let output = slicer_gcode::write_gcode(&toolpaths, settings).map_err(|e| e.diagnostic())?;
     Ok((output, warnings))
@@ -507,6 +511,7 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
                 error: None,
                 gcode: None,
                 info: None,
+                stop: Arc::new(AtomicBool::new(false)),
             },
         );
     }
@@ -553,17 +558,20 @@ async fn run_job(
     let Ok(_slot) = app.slots.clone().acquire_owned().await else {
         return;
     };
-    {
+    let stop = {
         let mut jobs = app.jobs();
         match jobs.get_mut(&id) {
-            Some(job) if job.status == Status::Queued => job.status = Status::Running,
+            Some(job) if job.status == Status::Queued => {
+                job.status = Status::Running;
+                job.stop.clone()
+            }
             // Cancelled or expired while waiting.
             _ => return,
         }
-    }
+    };
     let started = Instant::now();
     let nozzle_diameter = settings.nozzle_diameter;
-    let outcome = tokio::task::spawn_blocking(move || slice(&model, plate, &settings))
+    let outcome = tokio::task::spawn_blocking(move || slice(&model, plate, &settings, &stop))
         .await
         .unwrap_or_else(|_| {
             Err(Diagnostic::error(
@@ -697,6 +705,7 @@ async fn cancel_job(State(app): State<App>, Path(id): Path<String>) -> Response 
         return StatusCode::NO_CONTENT.into_response();
     }
     job.status = Status::Cancelled;
+    job.stop.store(true, Ordering::Relaxed);
     job.finished_at = Some(Instant::now());
     log("info", "job.cancelled", json!({ "job": id.to_string() }));
     Json(job.describe(id)).into_response()

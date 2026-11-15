@@ -3,6 +3,7 @@
 pub mod preview;
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use slicer_core::polygon::{self, HatchDirection, distance};
 use slicer_core::slice::slice_mesh_reporting;
@@ -126,6 +127,8 @@ pub enum FdmError {
     /// The model is lower than the first layer, or slicing produced no
     /// printable area.
     NothingToPrint,
+    /// The caller asked to stop.
+    Cancelled,
 }
 
 impl fmt::Display for FdmError {
@@ -141,6 +144,7 @@ impl fmt::Display for FdmError {
                 f,
                 "nothing to print: the model is lower than the first layer or has no printable area"
             ),
+            Self::Cancelled => write!(f, "slicing was cancelled"),
         }
     }
 }
@@ -153,6 +157,7 @@ impl slicer_core::Diagnose for FdmError {
             Self::EmptyModel => "slicing.empty_model",
             Self::TooLarge { .. } => "slicing.too_large",
             Self::NothingToPrint => "slicing.nothing_to_print",
+            Self::Cancelled => "slicing.cancelled",
         }
     }
 
@@ -180,6 +185,21 @@ pub fn generate_reporting(
     settings: &Settings,
     diagnostics: &mut Diagnostics,
 ) -> Result<Toolpaths, FdmError> {
+    generate_cancellable(mesh, settings, diagnostics, &AtomicBool::new(false))
+}
+
+/// Like [`generate_reporting`], and gives up with [`FdmError::Cancelled`]
+/// soon after `stop` is set.
+// ponytail: looked at between the steps and before every layer of the
+// longest one. Cutting the mesh and putting the paths in order run to their
+// end; on a large model that can be a second or two.
+pub fn generate_cancellable(
+    mesh: &Mesh,
+    settings: &Settings,
+    diagnostics: &mut Diagnostics,
+    stop: &AtomicBool,
+) -> Result<Toolpaths, FdmError> {
+    let stopped = || stop.load(Ordering::Relaxed);
     let mut mesh = mesh.clone();
     let turned = mesh.orient();
     if turned > 0 {
@@ -248,6 +268,9 @@ pub fn generate_reporting(
         .map(|(top, h)| top - h / 2.0)
         .collect();
     let slices = slice_mesh_reporting(&mesh, &cut_heights, diagnostics);
+    if stopped() {
+        return Err(FdmError::Cancelled);
+    }
     if slices.iter().all(Vec::is_empty) {
         return Err(FdmError::NothingToPrint);
     }
@@ -284,8 +307,14 @@ pub fn generate_reporting(
         Vec::new()
     };
     let geometry = parallel_map(slices.len(), |index| {
+        if stopped() {
+            return (Vec::new(), false);
+        }
         layer_work(&slices, &supports, index, settings)
     });
+    if stopped() {
+        return Err(FdmError::Cancelled);
+    }
     let mut position: Point = [0.0, 0.0];
     let mut thin_layers = Vec::new();
     let mut layers: Vec<Layer> = geometry
@@ -1235,6 +1264,15 @@ mod tests {
             }
             assert!(long > 3, "{long}");
         }
+    }
+
+    #[test]
+    fn slicing_can_be_cancelled() {
+        let mesh = Mesh::cuboid(20.0, 20.0, 20.0);
+        let stop = AtomicBool::new(true);
+        let result =
+            generate_cancellable(&mesh, &Settings::default(), &mut Diagnostics::new(), &stop);
+        assert_eq!(result, Err(FdmError::Cancelled));
     }
 
     #[test]

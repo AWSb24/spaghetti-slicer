@@ -116,6 +116,8 @@ pub struct Settings {
     pub fan_speed: f64,
     /// Number of initial layers printed with the fan off.
     pub fan_off_layers: u32,
+    /// Part cooling fan speed in percent while printing bridges.
+    pub bridge_fan_speed: f64,
 
     // Process
     /// Layer height.
@@ -168,6 +170,8 @@ pub struct Settings {
     pub infill_speed: f64,
     /// Speed of bridges: solid infill with nothing below it.
     pub bridge_speed: f64,
+    /// Multiplier on the extruded amount of bridges, on top of `flow_ratio`.
+    pub bridge_flow: f64,
     /// Speed of all extrusion on the first layer.
     pub first_layer_speed: f64,
     /// Speed of moves without extrusion.
@@ -215,6 +219,7 @@ impl Default for Settings {
             bed_temp_first_layer: 60.0,
             fan_speed: 100.0,
             fan_off_layers: 1,
+            bridge_fan_speed: 100.0,
             layer_height: 0.2,
             first_layer_height: 0.2,
             line_width: 0.45,
@@ -238,6 +243,7 @@ impl Default for Settings {
             inner_wall_speed: 60.0,
             infill_speed: 80.0,
             bridge_speed: 30.0,
+            bridge_flow: 1.0,
             first_layer_speed: 25.0,
             travel_speed: 150.0,
             acceleration: 1000.0,
@@ -485,6 +491,8 @@ impl Settings {
             ("inner_wall_speed", self.inner_wall_speed, 1.0, 1000.0),
             ("infill_speed", self.infill_speed, 1.0, 1000.0),
             ("bridge_speed", self.bridge_speed, 1.0, 1000.0),
+            ("bridge_flow", self.bridge_flow, 0.5, 2.0),
+            ("bridge_fan_speed", self.bridge_fan_speed, 0.0, 100.0),
             ("first_layer_speed", self.first_layer_speed, 1.0, 1000.0),
             ("travel_speed", self.travel_speed, 1.0, 2000.0),
             ("acceleration", self.acceleration, 10.0, 100_000.0),

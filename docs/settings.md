@@ -22,6 +22,7 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `bed_temp_first_layer` | 60 | 0 to 200 | Bed temperature on the first layer. |
 | `fan_speed` | 100 | 0 to 100 | Part cooling fan speed in percent. |
 | `fan_off_layers` | 1 | 0 or more | Number of initial layers printed with the fan off. |
+| `bridge_fan_speed` | 100 | 0 to 100 | Part cooling fan speed in percent while printing bridges. |
 | `layer_height` | 0.2 | 0.02 to 0.4 * | Layer height. |
 | `first_layer_height` | 0.2 | 0.02 to 0.4 * | Height of the first layer. |
 | `line_width` | 0.45 | 0.24 to 1 * | Width of one extruded line. |
@@ -45,6 +46,7 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `inner_wall_speed` | 60 | 1 to 1000 | Speed of inner walls. |
 | `infill_speed` | 80 | 1 to 1000 | Speed of solid and sparse infill. |
 | `bridge_speed` | 30 | 1 to 1000 | Speed of bridges: solid infill with nothing below it. |
+| `bridge_flow` | 1 | 0.5 to 2 | Multiplier on the extruded amount of bridges, on top of `flow_ratio`. |
 | `first_layer_speed` | 25 | 1 to 1000 | Speed of all extrusion on the first layer. |
 | `travel_speed` | 150 | 1 to 2000 | Speed of moves without extrusion. |
 | `acceleration` | 1000 | 10 to 100000 | Acceleration of the printer in mm/s². Only used to estimate the print time; it is not written to the G-code. |
