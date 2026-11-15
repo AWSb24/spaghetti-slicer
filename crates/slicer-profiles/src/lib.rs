@@ -10,6 +10,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+pub mod orca;
+pub use orca::{OrcaImport, import_orca};
+
 /// G-code dialect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -361,6 +364,16 @@ impl Settings {
     /// Serializes all settings as TOML.
     pub fn to_toml(&self) -> String {
         toml::to_string(self).unwrap_or_default()
+    }
+
+    /// Serializes only the named settings as TOML.
+    pub fn to_toml_keys(&self, keys: &[&str]) -> String {
+        let mut table = self.table();
+        table.retain(|key, _| {
+            let key: &str = key;
+            keys.contains(&key)
+        });
+        toml::to_string(&table).unwrap_or_default()
     }
 
     /// Overrides a single setting from its textual value, as given on the

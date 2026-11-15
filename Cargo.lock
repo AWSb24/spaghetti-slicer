@@ -725,6 +725,7 @@ name = "slicer-profiles"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "slicer-core",
  "toml",
 ]

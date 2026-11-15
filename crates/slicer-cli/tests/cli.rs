@@ -259,3 +259,65 @@ fn a_3mf_file_gives_the_same_gcode_as_the_stl() {
     let report: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
     assert_eq!(report["error"]["code"], "model.archive");
 }
+
+#[test]
+fn orca_profiles_become_a_settings_file() {
+    let dir = workdir("orca");
+    let printer = dir.join("printer.json");
+    let process = dir.join("process.json");
+    fs::write(
+        &printer,
+        r#"{"name": "Printer", "inherits": "Base printer", "printable_area": ["0x0", "180x0", "180x180", "0x180"], "nozzle_diameter": ["0.4"]}"#,
+    )
+    .unwrap();
+    fs::write(
+        &process,
+        r#"{"name": "Process", "layer_height": "0.12", "sparse_infill_density": "20%", "ironing_type": "top"}"#,
+    )
+    .unwrap();
+    let settings = dir.join("imported.toml");
+    let out = run(&[
+        "import-orca",
+        printer.to_str().unwrap(),
+        process.to_str().unwrap(),
+        "-o",
+        settings.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let report = text(&out.stderr);
+    assert!(
+        report.contains("ironing_type: no matching setting"),
+        "{report}"
+    );
+    assert!(
+        report.contains("'Base printer' are not included"),
+        "{report}"
+    );
+
+    // The file works as a settings file.
+    let stl = dir.join("cube.stl");
+    fs::write(
+        &stl,
+        slicer_formats::write_stl_binary(&Mesh::cuboid(10.0, 10.0, 1.2)),
+    )
+    .unwrap();
+    let out = run(&[
+        "slice",
+        stl.to_str().unwrap(),
+        "-c",
+        settings.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["stats"]["layers"], 9);
+    let gcode = fs::read_to_string(dir.join("cube.gcode")).unwrap();
+    assert!(
+        gcode.contains("bed_size_x = 180"),
+        "settings are listed in the header"
+    );
+
+    // A file that is no profile is an error.
+    let out = run(&["import-orca", stl.to_str().unwrap()]);
+    assert!(!out.status.success());
+}

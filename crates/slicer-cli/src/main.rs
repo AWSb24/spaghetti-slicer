@@ -49,6 +49,18 @@ enum Command {
     },
     /// Print all settings with their default values as TOML
     DefaultConfig,
+    /// Turn profiles saved by Orca Slicer (JSON) into a settings file
+    ///
+    /// Give printer, material and process profile in this order; later files
+    /// override earlier ones. Settings without a counterpart are listed.
+    ImportOrca {
+        /// Orca Slicer profiles (JSON)
+        #[arg(required = true)]
+        profiles: Vec<PathBuf>,
+        /// Settings file to write [default: print to standard output]
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 /// Names the file a diagnostic concerns.
@@ -71,6 +83,13 @@ fn main() -> ExitCode {
             print!("{}", Settings::default().to_toml());
             ExitCode::SUCCESS
         }
+        Command::ImportOrca { profiles, output } => match import_orca(&profiles, output) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::FAILURE
+            }
+        },
         Command::Slice {
             input,
             output,
@@ -172,6 +191,48 @@ fn slice(
         "stats": result.stats,
         "warnings": warnings.as_slice(),
     }))
+}
+
+fn import_orca(profiles: &[PathBuf], output: Option<PathBuf>) -> Result<(), Diagnostic> {
+    let mut settings = Settings::default();
+    let mut keys: Vec<String> = Vec::new();
+    let mut header = String::from("# Imported from Orca Slicer profiles by spaghetti-slicer.\n");
+    for path in profiles {
+        let text = fs::read_to_string(path).map_err(|e| io_error("io.read", path, &e))?;
+        let import = slicer_profiles::import_orca(&text, &mut settings)
+            .map_err(|e| in_file(path)(e.diagnostic()))?;
+        let name = import.name.unwrap_or_else(|| path.display().to_string());
+        header.push_str(&format!(
+            "# {name}: {} setting(s) taken",
+            import.taken.len()
+        ));
+        if let Some(parent) = &import.inherits {
+            // The parent is one of Orca's own presets, which are not read.
+            header.push_str(&format!(
+                "; values inherited from '{parent}' are not included"
+            ));
+            eprintln!("note: {name}: values inherited from '{parent}' are not included");
+        }
+        header.push('\n');
+        for (key, reason) in &import.skipped {
+            eprintln!("skipped: {name}: {key}: {reason}");
+        }
+        for (ours, _, _) in import.taken {
+            if !keys.contains(&ours) {
+                keys.push(ours);
+            }
+        }
+    }
+    let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let text = format!("{header}\n{}", settings.to_toml_keys(&keys));
+    match output {
+        Some(path) => {
+            fs::write(&path, text).map_err(|e| io_error("io.write", &path, &e))?;
+            eprintln!("Wrote {} with {} setting(s)", path.display(), keys.len());
+        }
+        None => print!("{text}"),
+    }
+    Ok(())
 }
 
 fn print_summary(result: &serde_json::Value) {

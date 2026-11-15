@@ -69,6 +69,7 @@ All three must pass. New behaviour needs a test.
 | G-code commands | Marlin and RepRap G-code documentation |
 | `;TYPE:` and `;LAYER_CHANGE` comments | Naming convention read by common G-code viewers, used for interoperability |
 | Default start and end G-code | Generic Marlin commands, not taken from any profile |
+| Import of Orca Slicer profiles | Key names and value formats read from profiles a user saved in Orca Slicer, as data files; no source code or shipped profile read |
 
 The initial implementation was written with an AI coding assistant, without consulting the source code of other slicers.
 

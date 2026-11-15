@@ -51,13 +51,21 @@ All settings with defaults, limits and meaning are listed in [docs/settings.md](
 cargo run --release -p slicer-cli -- slice model.stl -c printer.toml -c pla.toml -c draft.toml
 ```
 
+Profiles you saved in Orca Slicer (the JSON files in its `user` folder, or exported ones) can be turned into a settings file. Give printer, material and process in this order:
+
+```bash
+cargo run --release -p slicer-cli -- import-orca printer.json material.json process.json -o from-orca.toml
+```
+
+Only settings with a clear counterpart are taken; every other one is listed on stderr with the reason. A saved Orca profile usually holds only what differs from the Orca preset it builds on (`inherits`). Those inherited values are not in the file and are not imported, so combine the result with a printer profile from `profiles/`, for example `-c profiles/printers/bambu-x1c.toml -c from-orca.toml`. The bed temperature is taken from the setting for the high-temperature plate (`hot_plate_temp`); start and end G-code are not taken, since Orca's placeholders differ.
+
 Errors go to stderr with exit code 1. With `--json`, errors and warnings are objects with a stable `code`, a `message` and a `context`:
 
 | Code | Meaning |
 |---|---|
 | `model.unrecognized`, `model.truncated`, `model.invalid_vertex`, `model.incomplete_triangle`, `model.non_finite`, `model.no_triangles` | The STL file cannot be read |
 | `model.archive`, `model.missing_part`, `model.xml`, `model.invalid_attribute`, `model.unsupported_unit`, `model.invalid_index`, `model.unknown_object`, `model.component_cycle`, `model.too_large` | The 3MF file cannot be read |
-| `settings.parse`, `settings.unknown_key`, `settings.out_of_range` | A settings file or `--set` value is invalid |
+| `settings.parse`, `settings.unknown_key`, `settings.out_of_range` | A settings file, `--set` value or Orca profile is invalid |
 | `slicing.empty_model`, `slicing.too_large`, `slicing.nothing_to_print` | The model cannot be sliced |
 | `gcode.unknown_placeholder`, `gcode.unclosed_placeholder` | Custom start or end G-code is invalid |
 | `io.read`, `io.write`, `cli.invalid_override` | A file cannot be accessed or an argument is malformed |
