@@ -48,6 +48,10 @@ pub enum SeamPosition {
     /// At the rearmost point of every loop, so the seams of all layers line
     /// up at the back of the model.
     Rear,
+    /// At the sharpest corner of every loop, where the mark shows least;
+    /// among equally sharp corners and on loops without corners at the
+    /// rearmost point.
+    Corner,
     /// Wherever the nozzle happens to be closest; shortest travel, but the
     /// seams are scattered.
     Nearest,

@@ -13,6 +13,14 @@ use slicer_profiles::{InfillPattern, SeamPosition, Settings, WallOrder};
 /// placing the seam, in millimetres.
 const SEAM_TOLERANCE: f64 = 0.001;
 
+/// How sharp a corner must be to take the seam: one minus the cosine of the
+/// angle by which the wall turns there (0.1 is about 26 degrees).
+const MIN_SEAM_CORNER: f64 = 0.1;
+
+/// Corners this close in sharpness to the sharpest one count as equally
+/// sharp.
+const SEAM_CORNER_TOLERANCE: f64 = 0.05;
+
 /// Largest distance a wall may move when points are dropped from it, in
 /// millimetres. Far below what a printer can resolve, but it cuts the number
 /// of moves on curves several times.
@@ -277,8 +285,12 @@ pub fn generate_reporting(
                 match piece {
                     Work::Loops(loops, kind, min_length) => {
                         let wall = matches!(kind, PathKind::OuterWall | PathKind::InnerWall);
-                        let rear = wall && settings.seam_position == SeamPosition::Rear;
-                        push_loops(loops, kind, min_length, rear, &mut position, &mut paths);
+                        let seam = if wall {
+                            settings.seam_position
+                        } else {
+                            SeamPosition::Nearest
+                        };
+                        push_loops(loops, kind, min_length, seam, &mut position, &mut paths);
                     }
                     Work::Lines(lines, kind, join_distance) => {
                         push_lines(lines, kind, join_distance, &mut position, &mut paths);
@@ -777,15 +789,53 @@ fn outer_contours(shapes: &Shapes) -> Vec<Contour> {
     shapes.iter().filter_map(|s| s.first().cloned()).collect()
 }
 
+/// The rearmost of the points that `allowed` lets through (largest Y, then
+/// smallest X). Points almost as far back as the rearmost one count as
+/// equally far back; otherwise rounding would move the seam along a straight
+/// rear edge from layer to layer.
+fn rearmost(points: &[Point], allowed: impl Fn(usize) -> bool) -> usize {
+    let back = (0..points.len())
+        .filter(|&j| allowed(j))
+        .map(|j| points[j][1])
+        .fold(f64::MIN, f64::max);
+    let mut rear = None;
+    for (j, p) in points.iter().enumerate() {
+        let better = rear.is_none_or(|r: usize| p[0] < points[r][0]);
+        if allowed(j) && p[1] >= back - SEAM_TOLERANCE && better {
+            rear = Some(j);
+        }
+    }
+    rear.unwrap_or(0)
+}
+
+/// How sharply a closed loop turns at each of its points: one minus the
+/// cosine of the angle between the edges that meet there.
+// ponytail: looks only at the two edges that meet in a point. A corner
+// rounded off by many short edges is not seen, which includes every
+// inward corner of a wall, since walls are rounded there.
+fn sharpness(points: &[Point]) -> Vec<f64> {
+    let n = points.len();
+    (0..n)
+        .map(|j| {
+            let (p, q, r) = (points[(j + n - 1) % n], points[j], points[(j + 1) % n]);
+            let (a, b) = ([q[0] - p[0], q[1] - p[1]], [r[0] - q[0], r[1] - q[1]]);
+            let lengths = distance(p, q) * distance(q, r);
+            if lengths == 0.0 {
+                return 0.0;
+            }
+            1.0 - (a[0] * b[0] + a[1] * b[1]) / lengths
+        })
+        .collect()
+}
+
 /// Appends closed loops, always continuing with the loop whose nearest
-/// vertex is closest to the current position. A loop starts at that vertex
-/// or, with `rear_start`, at its rearmost vertex (largest Y, then smallest
-/// X), so the starts of all layers line up.
+/// vertex is closest to the current position. Where a loop starts is up to
+/// `seam`.
 fn push_loops(
     mut loops: Vec<Contour>,
     kind: PathKind,
     min_length: f64,
-    rear_start: bool,
+    seam: SeamPosition,
     position: &mut Point,
     paths: &mut Vec<Path>,
 ) {
@@ -801,22 +851,18 @@ fn push_loops(
             }
         }
         let mut points = loops.swap_remove(best.0);
-        let start = if rear_start {
-            // Points almost as far back as the rearmost one count as equally
-            // far back; the leftmost of them is taken. Otherwise rounding
-            // would move the seam along a straight rear edge from layer to
-            // layer.
-            let back = points.iter().map(|p| p[1]).fold(f64::MIN, f64::max);
-            let mut rear = None;
-            for (j, p) in points.iter().enumerate() {
-                let better = rear.is_none_or(|r: usize| p[0] < points[r][0]);
-                if p[1] >= back - SEAM_TOLERANCE && better {
-                    rear = Some(j);
+        let start = match seam {
+            SeamPosition::Rear => rearmost(&points, |_| true),
+            SeamPosition::Corner => {
+                let sharp = sharpness(&points);
+                let sharpest = sharp.iter().copied().fold(0.0, f64::max);
+                if sharpest < MIN_SEAM_CORNER {
+                    rearmost(&points, |_| true)
+                } else {
+                    rearmost(&points, |j| sharp[j] >= sharpest - SEAM_CORNER_TOLERANCE)
                 }
             }
-            rear.unwrap_or(0)
-        } else {
-            best.1
+            SeamPosition::Nearest => best.1,
         };
         points.rotate_left(start);
         let path = Path {
@@ -1158,6 +1204,47 @@ mod tests {
             starts[0][0] < 105.0 && starts[0][1] > 115.0,
             "{:?}",
             starts[0]
+        );
+    }
+
+    #[test]
+    fn seams_hide_in_corners() {
+        // A house lying on its side: the rearmost point is the blunt ridge,
+        // the sharpest corners are the two at the front.
+        let house = [
+            [0.0, 0.0],
+            [20.0, 0.0],
+            [20.0, 10.0],
+            [10.0, 14.0],
+            [0.0, 10.0],
+        ];
+        let mesh = slicer_core::primitives::extrude(&house, [10.0, 5.0], 4.0, 1, 0.0);
+        let starts = |mesh: &Mesh, seam| {
+            let mut settings = Settings::default();
+            settings.seam_position = seam;
+            generate(mesh, &settings)
+                .unwrap()
+                .layers
+                .iter()
+                .flat_map(|layer| layer.paths.clone())
+                .filter(|path| path.kind == PathKind::OuterWall)
+                .map(|path| path.points[0])
+                .collect::<Vec<Point>>()
+        };
+        let rear = starts(&mesh, SeamPosition::Rear);
+        let corner = starts(&mesh, SeamPosition::Corner);
+        assert_eq!(corner.len(), 20);
+        // The model is 20 x 14 mm, centred on the bed at (110, 110).
+        assert!(rear.iter().all(|p| distance(*p, [110.0, 117.0]) < 0.5));
+        assert!(
+            corner.iter().all(|p| distance(*p, [100.0, 103.0]) < 0.5),
+            "{corner:?}"
+        );
+        // Without corners the seam is at the rear.
+        let round = slicer_core::primitives::cylinder(10.0, 4.0, 64);
+        assert_eq!(
+            starts(&round, SeamPosition::Corner),
+            starts(&round, SeamPosition::Rear)
         );
     }
 
