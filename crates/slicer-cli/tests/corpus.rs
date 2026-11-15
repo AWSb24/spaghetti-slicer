@@ -631,11 +631,13 @@ fn thingi10k_models() {
 }
 
 /// Fingerprints of the G-code of the reference models, compared with
-/// `examples/golden.tsv`. Any change to the output shows up here. If the
-/// change is intended, rewrite the file with
-/// `UPDATE_GOLDEN=1 cargo test -p slicer-cli --test corpus golden` and
-/// commit it together with the change.
-// ponytail: a fingerprint says that the output changed, not where. Storing
+/// `examples/golden.tsv` (whole file) and `examples/golden-layers.tsv` (one
+/// row per layer; layer 0 is the start G-code, the last layer includes the
+/// end G-code). Any change to the output shows up here, and the message names
+/// the first layer that differs. If the change is intended, rewrite both files
+/// with `UPDATE_GOLDEN=1 cargo test -p slicer-cli --test corpus golden` and
+/// commit them together with the change.
+// ponytail: a fingerprint says which layer changed, not which line. Storing
 // the G-code itself (5 MB) would give a diff; do that if this is not enough.
 #[test]
 fn reference_models_match_golden() {
@@ -647,35 +649,61 @@ fn reference_models_match_golden() {
         .collect();
     paths.sort();
 
+    // FNV-1a, 64 bit.
+    let fnv = |text: &str| {
+        text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    };
     let settings = Settings::default();
     let mut actual = String::from("model\tbytes\tlines\tfnv1a64\n");
+    let mut actual_layers = String::from("model\tlayer\tz\tfnv1a64\n");
     for path in &paths {
+        let model = path.file_stem().unwrap().to_string_lossy();
         let mesh = slicer_formats::parse_stl(&std::fs::read(path).unwrap()).unwrap();
         let toolpaths = slicer_fdm::generate(&mesh, &settings).unwrap();
         let gcode = slicer_gcode::write_gcode(&toolpaths, &settings)
             .unwrap()
             .gcode;
-        // FNV-1a, 64 bit.
-        let hash = gcode.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
-        });
         actual.push_str(&format!(
-            "{}\t{}\t{}\t{hash:016x}\n",
-            path.file_stem().unwrap().to_string_lossy(),
+            "{model}\t{}\t{}\t{:016x}\n",
             gcode.len(),
-            gcode.lines().count()
+            gcode.lines().count(),
+            fnv(&gcode)
         ));
+        for (layer, part) in gcode.split(";LAYER_CHANGE").enumerate() {
+            let z = part
+                .lines()
+                .find_map(|line| line.strip_prefix(";Z:"))
+                .unwrap_or("-");
+            actual_layers.push_str(&format!("{model}\t{layer}\t{z}\t{:016x}\n", fnv(part)));
+        }
     }
 
     let golden = dir.join("golden.tsv");
+    let golden_layers = dir.join("golden-layers.tsv");
     if std::env::var_os("UPDATE_GOLDEN").is_some() {
         std::fs::write(&golden, &actual).unwrap();
+        std::fs::write(&golden_layers, &actual_layers).unwrap();
     }
-    let expected = std::fs::read_to_string(&golden)
-        .unwrap_or_default()
-        .replace("\r\n", "\n");
-    assert_eq!(
-        actual, expected,
-        "the G-code of the reference models changed; see the comment on this test"
+    let read = |path: &std::path::Path| {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .replace("\r\n", "\n")
+    };
+    let expected = read(&golden);
+    let expected_layers = read(&golden_layers);
+    let (a, e): (Vec<_>, Vec<_>) = (
+        actual_layers.lines().collect(),
+        expected_layers.lines().collect(),
+    );
+    let first = (0..a.len().max(e.len())).find(|&i| a.get(i) != e.get(i));
+    assert!(
+        actual == expected && first.is_none(),
+        "the G-code of the reference models changed; see the comment on this test.\n\
+         First difference in golden-layers.tsv (model, layer, z, fnv1a64): \
+         expected {:?}, got {:?}",
+        first.and_then(|i| e.get(i)),
+        first.and_then(|i| a.get(i)),
     );
 }

@@ -15,7 +15,7 @@ use axum::extract::{DefaultBodyLimit, Multipart, Path, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{MethodRouter, delete, get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 use slicer_core::{Diagnose, Diagnostic, Diagnostics};
@@ -349,18 +349,20 @@ impl App {
         }
     }
 
-    /// Builds the HTTP routes.
+    /// Builds the HTTP routes from [`operations`].
     pub fn router(&self) -> Router {
-        let api = Router::new()
-            .route("/jobs", post(create_job))
-            .route("/jobs/{id}", get(job_status).delete(cancel_job))
-            .route("/jobs/{id}/gcode", get(job_gcode))
-            .route("/jobs/{id}/gcode.3mf", get(job_gcode_3mf))
+        let mut public = Router::new();
+        let mut api = Router::new();
+        for (_, path, handler) in OPERATIONS {
+            match path.strip_prefix("/v1") {
+                Some(path) => api = api.route(path, handler()),
+                None => public = public.route(path, handler()),
+            }
+        }
+        let api = api
             .layer(DefaultBodyLimit::max(self.config.max_upload_bytes))
             .layer(middleware::from_fn_with_state(self.clone(), authorize));
-        Router::new()
-            .route("/health", get(health))
-            .route("/openapi.json", get(|| async { Json(openapi()) }))
+        public
             .nest("/v1", api)
             .fallback(|| async {
                 failure(
@@ -374,11 +376,38 @@ impl App {
     }
 }
 
+/// Builds the handler of one operation.
+type Handler = fn() -> MethodRouter<App>;
+
+/// Every operation the server answers, as (method, path, handler). The
+/// router is built from this list alone; paths under `/v1` need the token.
+// ponytail: the method is not checked against the handler here; the API test
+// calls each operation with its method and fails on "method not allowed". A
+// route added in `App::router` outside this list is not noticed by any test.
+const OPERATIONS: [(&str, &str, Handler); 7] = [
+    ("get", "/health", || get(health)),
+    ("get", "/openapi.json", || get(|| async { Json(openapi()) })),
+    ("post", "/v1/jobs", || post(create_job)),
+    ("get", "/v1/jobs/{id}", || get(job_status)),
+    ("delete", "/v1/jobs/{id}", || delete(cancel_job)),
+    ("get", "/v1/jobs/{id}/gcode", || get(job_gcode)),
+    ("get", "/v1/jobs/{id}/gcode.3mf", || get(job_gcode_3mf)),
+];
+
+/// Method (lower case, as in OpenAPI) and path of every operation the router
+/// answers. A test checks that [`openapi`] describes exactly these.
+pub fn operations() -> Vec<(&'static str, &'static str)> {
+    OPERATIONS
+        .iter()
+        .map(|(method, path, _)| (*method, *path))
+        .collect()
+}
+
 /// Description of the API in OpenAPI 3.1 form, served at `/openapi.json`.
 ///
-/// It is written by hand next to the router. A test calls every operation
-/// listed here, so a path that is renamed or removed in one place but not
-/// the other is noticed.
+/// It is written by hand next to the router. A test checks that it names
+/// exactly the [`operations`] and calls each of them, so a path that is
+/// added, renamed or removed in one place but not the other is noticed.
 pub fn openapi() -> Value {
     let error = json!({
         "description": "Error",
