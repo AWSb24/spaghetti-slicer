@@ -12,9 +12,44 @@ pub struct Mesh {
     pub vertices: Vec<[f64; 3]>,
     /// Triangles as indices into `vertices`.
     pub triangles: Vec<[u32; 3]>,
+    /// Extruder that prints each triangle, counted from 0. Empty while every
+    /// triangle belongs to extruder 0, otherwise one entry per triangle.
+    /// Read it through [`Mesh::extruder`], which tolerates both.
+    pub extruders: Vec<u32>,
 }
 
 impl Mesh {
+    /// Extruder that prints triangle `index`.
+    pub fn extruder(&self, index: usize) -> u32 {
+        self.extruders.get(index).copied().unwrap_or(0)
+    }
+
+    /// Gives the triangles from `first` to the last one to `extruder`.
+    pub fn set_extruder(&mut self, first: usize, extruder: u32) {
+        if extruder == 0 && self.extruders.is_empty() {
+            return;
+        }
+        self.extruders.resize(self.triangles.len(), 0);
+        if let Some(tail) = self.extruders.get_mut(first..) {
+            tail.fill(extruder);
+        }
+    }
+
+    /// The extruders the triangles ask for, ascending and without repeats.
+    /// Empty for a mesh without triangles.
+    pub fn used_extruders(&self) -> Vec<u32> {
+        // Triangles beyond the end of `extruders` belong to extruder 0.
+        let tail = (self.extruders.len() < self.triangles.len()).then_some(0);
+        let used: std::collections::BTreeSet<u32> = self
+            .extruders
+            .iter()
+            .take(self.triangles.len())
+            .copied()
+            .chain(tail)
+            .collect();
+        used.into_iter().collect()
+    }
+
     /// Builds a mesh from unconnected triangles, merging vertices with
     /// identical coordinates and dropping degenerate triangles.
     pub fn from_triangle_soup(triangles: &[[[f32; 3]; 3]]) -> Self {
@@ -77,6 +112,7 @@ impl Mesh {
                 [3, 0, 4],
                 [3, 4, 7],
             ],
+            extruders: Vec::new(),
         }
     }
 
@@ -123,13 +159,20 @@ impl Mesh {
         }
     }
 
-    /// Appends all triangles of `other`. Vertices are not merged, so the
-    /// result consists of separate shells even where they touch.
+    /// Appends all triangles of `other` with their extruders. Vertices are not
+    /// merged, so the result consists of separate shells even where they
+    /// touch.
     pub fn merge(&mut self, other: &Mesh) {
         let offset = self.vertices.len() as u32;
+        let first = self.triangles.len();
         self.vertices.extend(&other.vertices);
         self.triangles
             .extend(other.triangles.iter().map(|t| t.map(|i| i + offset)));
+        if !self.extruders.is_empty() || !other.extruders.is_empty() {
+            self.extruders.resize(first, 0);
+            self.extruders
+                .extend((0..other.triangles.len()).map(|i| other.extruder(i)));
+        }
     }
 
     /// Reverses the winding of every triangle, turning the mesh inside out.
@@ -265,13 +308,16 @@ impl Mesh {
             }
         }
         // The rim of a hole runs against the direction of the triangles
-        // next to it. Vertices where two rims meet are left alone.
-        let mut next: HashMap<u32, Option<u32>> = HashMap::new();
-        for t in &self.triangles {
+        // next to it. Vertices where two rims meet are left alone. Each rim
+        // edge also remembers its triangle, whose extruder the patch takes.
+        let mut next: HashMap<u32, Option<(u32, usize)>> = HashMap::new();
+        for (index, t) in self.triangles.iter().enumerate() {
             for k in 0..3 {
                 let (a, b) = (t[k], t[(k + 1) % 3]);
                 if uses[&(a.min(b), a.max(b))] == 1 {
-                    next.entry(b).and_modify(|n| *n = None).or_insert(Some(a));
+                    next.entry(b)
+                        .and_modify(|n| *n = None)
+                        .or_insert(Some((a, index)));
                 }
             }
         }
@@ -280,8 +326,9 @@ impl Mesh {
         let mut closed = 0;
         for start in starts {
             let mut rim = vec![start];
+            let neighbour = next.get(&start).copied().flatten().map_or(0, |(_, t)| t);
             let complete = loop {
-                let Some(Some(to)) = next.get(&rim[rim.len() - 1]).copied() else {
+                let Some(Some((to, _))) = next.get(&rim[rim.len() - 1]).copied() else {
                     break false;
                 };
                 if to == start {
@@ -298,9 +345,12 @@ impl Mesh {
             for vertex in &rim {
                 next.remove(vertex);
             }
+            let first = self.triangles.len();
             for pair in rim[1..].windows(2) {
                 self.triangles.push([rim[0], pair[0], pair[1]]);
             }
+            let extruder = self.extruder(neighbour);
+            self.set_extruder(first, extruder);
             closed += 1;
         }
         closed
@@ -427,6 +477,32 @@ mod tests {
         let touching = Mesh::from_triangle_soup(&touching.to_triangle_soup());
         assert_eq!(touching.edge_defects(), (0, 1));
         assert_eq!(codes(&touching), ["mesh.non_manifold"]);
+    }
+
+    #[test]
+    fn extruders_follow_their_triangles() {
+        let cube = Mesh::cuboid(1.0, 1.0, 1.0);
+        assert_eq!(cube.used_extruders(), [0]);
+        assert_eq!(Mesh::default().used_extruders(), Vec::<u32>::new());
+
+        // A second object on extruder 2, with a hole that gets closed.
+        let mut other = cube.clone();
+        other.translate([5.0, 0.0, 0.0]);
+        other.triangles.truncate(10);
+        other.set_extruder(0, 2);
+        let mut mesh = cube.clone();
+        mesh.merge(&other);
+        assert_eq!(mesh.used_extruders(), [0, 2]);
+        assert_eq!(mesh.close_holes(64), 1);
+        assert_eq!(mesh.extruders.len(), mesh.triangles.len());
+        let counts = |e: u32| mesh.extruders.iter().filter(|&&x| x == e).count();
+        assert_eq!((counts(0), counts(2)), (12, 12));
+
+        // Extruder 0 alone allocates nothing.
+        let mut plain = cube.clone();
+        plain.set_extruder(0, 0);
+        plain.merge(&cube);
+        assert!(plain.extruders.is_empty());
     }
 
     #[test]
