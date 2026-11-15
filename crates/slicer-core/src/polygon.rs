@@ -365,8 +365,43 @@ pub fn distance(a: Point, b: Point) -> f64 {
     (dx * dx + dy * dy).sqrt()
 }
 
+/// Sine and cosine of an angle in degrees, computed with additions and
+/// multiplications only, so every platform gets the same bits. The
+/// functions of the platform's maths library may differ in the last one.
+pub fn sin_cos_degrees(degrees: f64) -> (f64, f64) {
+    // Series around zero, used up to 45 degrees where they are exact to
+    // the last bit or two.
+    let series = |degrees: f64| -> (f64, f64) {
+        let x = degrees * (std::f64::consts::PI / 180.0);
+        let x2 = x * x;
+        let mut sin = 1.0;
+        let mut cos = 1.0;
+        for k in (1..=8).rev() {
+            let k = f64::from(k);
+            sin = 1.0 - x2 / ((2.0 * k) * (2.0 * k + 1.0)) * sin;
+            cos = 1.0 - x2 / ((2.0 * k - 1.0) * (2.0 * k)) * cos;
+        }
+        (x * sin, cos)
+    };
+    let turned = degrees.rem_euclid(360.0);
+    let quarter = (turned / 90.0).floor();
+    let rest = turned - quarter * 90.0;
+    let (sin, cos) = if rest <= 45.0 {
+        series(rest)
+    } else {
+        let (sin, cos) = series(90.0 - rest);
+        (cos, sin)
+    };
+    match quarter as u8 % 4 {
+        0 => (sin, cos),
+        1 => (cos, -sin),
+        2 => (-sin, -cos),
+        _ => (-cos, sin),
+    }
+}
+
 /// Direction of hatch lines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum HatchDirection {
     /// Lines running from lower left to upper right.
     Diagonal45,
@@ -376,6 +411,28 @@ pub enum HatchDirection {
     Horizontal,
     /// Lines along Y.
     Vertical,
+    /// Lines along the direction with this cosine and sine.
+    Angle(f64, f64),
+}
+
+impl HatchDirection {
+    /// Lines at an angle in degrees, counted from the X axis towards Y.
+    pub fn degrees(angle: f64) -> Self {
+        let angle = angle.rem_euclid(180.0);
+        // The four directions with their own, exact arithmetic.
+        if angle == 0.0 {
+            Self::Horizontal
+        } else if angle == 45.0 {
+            Self::Diagonal45
+        } else if angle == 90.0 {
+            Self::Vertical
+        } else if angle == 135.0 {
+            Self::Diagonal135
+        } else {
+            let (sin, cos) = sin_cos_degrees(angle);
+            Self::Angle(cos, sin)
+        }
+    }
 }
 
 /// Fills shapes with parallel line segments `spacing` millimetres apart.
@@ -401,6 +458,7 @@ pub fn hatch(
             HatchDirection::Diagonal135 => (v, u),
             HatchDirection::Horizontal => (p[0], p[1]),
             HatchDirection::Vertical => (p[1], p[0]),
+            HatchDirection::Angle(cos, sin) => (p[0] * cos + p[1] * sin, p[1] * cos - p[0] * sin),
         }
     };
     let backward = |a: f64, b: f64| -> Point {
@@ -409,6 +467,7 @@ pub fn hatch(
             HatchDirection::Diagonal135 => (b, a),
             HatchDirection::Horizontal => return [a, b],
             HatchDirection::Vertical => return [b, a],
+            HatchDirection::Angle(cos, sin) => return [a * cos - b * sin, a * sin + b * cos],
         };
         [(u - v) * FRAC_1_SQRT_2, (u + v) * FRAC_1_SQRT_2]
     };
@@ -465,6 +524,25 @@ pub fn hatch(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn own_sine_and_cosine_are_right() {
+        for step in -800..800 {
+            let degrees = f64::from(step) * 0.7;
+            let (sin, cos) = super::sin_cos_degrees(degrees);
+            let (s, c) = degrees.to_radians().sin_cos();
+            assert!(
+                (sin - s).abs() < 1e-14 && (cos - c).abs() < 1e-14,
+                "{degrees}"
+            );
+        }
+        assert_eq!(super::sin_cos_degrees(90.0), (1.0, 0.0));
+        assert_eq!(super::sin_cos_degrees(180.0), (0.0, -1.0));
+        assert_eq!(
+            super::HatchDirection::degrees(225.0),
+            super::HatchDirection::Diagonal45
+        );
+    }
+
     #[test]
     fn simplify_keeps_corners_and_thins_curves() {
         // A square with extra points on its edges, some slightly off.
@@ -683,6 +761,8 @@ mod tests {
             HatchDirection::Diagonal135,
             HatchDirection::Horizontal,
             HatchDirection::Vertical,
+            HatchDirection::degrees(30.0),
+            HatchDirection::degrees(-100.0),
         ] {
             let segments = hatch(&shapes, 0.5, direction, 0.0);
             let length: f64 = segments.iter().map(|s| distance(s[0], s[1])).sum();

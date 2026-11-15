@@ -66,6 +66,7 @@ Errors go to stderr with exit code 1. With `--json`, errors and warnings are obj
 | `model.unsupported_extension` (warning) | The 3MF file requires extensions that are not supported; they are ignored |
 | `model.skipped_objects` (warning) | The 3MF file has objects that are not of type `model`; they are not printed |
 | `mesh.repaired` (warning) | Small holes in the surface of the mesh were closed before slicing |
+| `mesh.reoriented` (warning) | Triangles that faced the other way than their neighbours were turned around before slicing |
 | `mesh.non_manifold` (warning) | Edges of the mesh belong to more than two triangles |
 | `mesh.inside_out` (warning) | All triangles face inward; the model is sliced as if they faced outward |
 | `mesh.not_watertight` (warning) | The mesh has open or inconsistently oriented edges |

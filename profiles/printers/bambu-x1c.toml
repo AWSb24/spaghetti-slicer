@@ -4,6 +4,7 @@
 # commands (heat, home, level, heat) and was written without knowing what the
 # firmware expects. It does not clean the nozzle and draws no purge line.
 # Watch the first print.
+technology = "fdm"
 bed_size_x = 256.0
 bed_size_y = 256.0
 max_print_height = 250.0

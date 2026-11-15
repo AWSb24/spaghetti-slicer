@@ -139,6 +139,62 @@ impl Mesh {
         }
     }
 
+    /// Turns triangles around until neighbours agree on which side is
+    /// outside, and returns how many were turned. In every connected piece
+    /// of the surface the smaller part gives way to the larger one. Edges
+    /// with more or fewer than two triangles do not connect.
+    pub fn orient(&mut self) -> usize {
+        let mut at: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+        for (i, t) in self.triangles.iter().enumerate() {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                at.entry((a.min(b), a.max(b))).or_default().push(i);
+            }
+        }
+        // 0: not seen, 1: as the first triangle of its piece, 2: the other way.
+        let mut side = vec![0u8; self.triangles.len()];
+        let mut turned = 0;
+        for start in 0..self.triangles.len() {
+            if side[start] != 0 {
+                continue;
+            }
+            side[start] = 1;
+            let mut piece = vec![start];
+            let mut next = 0;
+            while next < piece.len() {
+                let i = piece[next];
+                next += 1;
+                let t = self.triangles[i];
+                for k in 0..3 {
+                    let (a, b) = (t[k], t[(k + 1) % 3]);
+                    let pair = &at[&(a.min(b), a.max(b))];
+                    if pair.len() != 2 {
+                        continue;
+                    }
+                    let j = if pair[0] == i { pair[1] } else { pair[0] };
+                    if side[j] != 0 {
+                        continue;
+                    }
+                    // Neighbours that agree run along their shared edge in
+                    // opposite directions.
+                    let u = self.triangles[j];
+                    let same = (0..3).any(|m| u[m] == a && u[(m + 1) % 3] == b);
+                    side[j] = if same { 3 - side[i] } else { side[i] };
+                    piece.push(j);
+                }
+            }
+            let others = piece.iter().filter(|&&i| side[i] == 2).count();
+            let wrong = if 2 * others > piece.len() { 1 } else { 2 };
+            for &i in &piece {
+                if side[i] == wrong {
+                    self.triangles[i].swap(1, 2);
+                    turned += 1;
+                }
+            }
+        }
+        turned
+    }
+
     /// Reports problems that make slicing results unreliable.
     pub fn check(&self, diagnostics: &mut Diagnostics) {
         let (open_edges, shared_edges) = self.edge_defects();
@@ -287,6 +343,22 @@ mod tests {
         assert_eq!(m.open_edge_count(), 0);
         assert!((m.volume() - 1000.0).abs() < 1e-9);
         assert_eq!(m.bounds(), Some(([0.0; 3], [20.0, 10.0, 5.0])));
+    }
+
+    #[test]
+    fn turned_triangles_are_turned_back() {
+        let cube = Mesh::cuboid(2.0, 3.0, 4.0);
+        let mut mesh = cube.clone();
+        assert_eq!(mesh.orient(), 0);
+        for i in [0, 5, 6] {
+            mesh.triangles[i].swap(1, 2);
+        }
+        assert!(mesh.open_edge_count() > 0);
+        assert_eq!(mesh.orient(), 3);
+        assert_eq!(mesh, cube);
+        // A mesh that is inside out as a whole agrees with itself.
+        mesh.flip();
+        assert_eq!(mesh.orient(), 0);
     }
 
     #[test]

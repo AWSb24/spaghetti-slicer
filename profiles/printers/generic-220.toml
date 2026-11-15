@@ -1,4 +1,5 @@
 # Generic Marlin printer, 220 x 220 x 250 mm, 0.4 mm nozzle.
+technology = "fdm"
 bed_size_x = 220.0
 bed_size_y = 220.0
 max_print_height = 250.0

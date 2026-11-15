@@ -67,6 +67,7 @@ fn settings_reference_is_current() {
                 format!("{min} to {max}{}", if moved { " *" } else { "" })
             }
             None => match name.as_str() {
+                "technology" => "`fdm`".to_string(),
                 "flavor" => "`marlin`, `klipper`".to_string(),
                 "infill_pattern" => "`rectilinear`, `grid`".to_string(),
                 "wall_order" => "`inner_outer`, `outer_inner`".to_string(),

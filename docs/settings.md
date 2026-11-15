@@ -6,6 +6,7 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 
 | Key | Default | Allowed | Meaning |
 |---|---|---|---|
+| `technology` | fdm | `fdm` | The kind of printer these settings are for. Only filament printers exist so far; settings for anything else are rejected. |
 | `bed_size_x` | 220 | 10 to 2000 | Printable bed width (X). |
 | `bed_size_y` | 220 | 10 to 2000 | Printable bed depth (Y). |
 | `max_print_height` | 250 | 1 to 2000 | Maximum print height (Z). |
@@ -31,6 +32,7 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `bottom_layers` | 4 | 0 to 1000 | Number of solid layers at the bottom. |
 | `infill_density` | 15 | 0 to 100 | Sparse infill density in percent. |
 | `infill_pattern` | grid | `rectilinear`, `grid` | Sparse infill pattern. |
+| `infill_angle` | 45 | 0 to 180 | Direction of the infill lines in degrees from the X axis; every other layer is turned by 90 degrees. |
 | `infill_overlap` | 15 | 0 to 50 | How far infill reaches into the innermost wall, in percent of the line width. |
 | `skirt_loops` | 2 | 0 to 20 | Number of skirt loops around the first layer. |
 | `skirt_distance` | 4 | 0 to 50 | Distance between skirt and model. |

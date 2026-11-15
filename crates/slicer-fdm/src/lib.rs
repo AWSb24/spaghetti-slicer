@@ -181,6 +181,18 @@ pub fn generate_reporting(
     diagnostics: &mut Diagnostics,
 ) -> Result<Toolpaths, FdmError> {
     let mut mesh = mesh.clone();
+    let turned = mesh.orient();
+    if turned > 0 {
+        diagnostics.push(
+            Diagnostic::warning(
+                "mesh.reoriented",
+                format!(
+                    "{turned} triangle(s) of the mesh faced the wrong way and were turned around"
+                ),
+            )
+            .with("triangles", turned),
+        );
+    }
     let closed = mesh.close_holes(MAX_HOLE_EDGES);
     if closed > 0 {
         diagnostics.push(
@@ -542,16 +554,9 @@ fn layer_work(
     }
     let (solid, sparse) = split_solid_sparse(slices, index, &fill_area, settings);
 
-    let direction = if index.is_multiple_of(2) {
-        HatchDirection::Diagonal45
-    } else {
-        HatchDirection::Diagonal135
-    };
-    let other = if index.is_multiple_of(2) {
-        HatchDirection::Diagonal135
-    } else {
-        HatchDirection::Diagonal45
-    };
+    let turn = if index.is_multiple_of(2) { 0.0 } else { 90.0 };
+    let direction = HatchDirection::degrees(settings.infill_angle + turn);
+    let other = HatchDirection::degrees(settings.infill_angle + turn + 90.0);
     let min_length = 0.5 * width;
 
     let (solid, sparse) = if index > 0 {
@@ -1205,6 +1210,31 @@ mod tests {
             "{:?}",
             starts[0]
         );
+    }
+
+    #[test]
+    fn infill_follows_the_chosen_angle() {
+        let mut settings = Settings::default();
+        settings.infill_pattern = InfillPattern::Rectilinear;
+        settings.infill_angle = 30.0;
+        let toolpaths = generate(&Mesh::cuboid(30.0, 30.0, 6.0), &settings).unwrap();
+        // Layer 10 runs at 30 degrees, layer 11 across it.
+        for (layer, along) in [(10, [0.75_f64.sqrt(), 0.5]), (11, [-0.5, 0.75_f64.sqrt()])] {
+            let mut long = 0;
+            for path in &toolpaths.layers[layer].paths {
+                if path.kind != PathKind::SparseInfill {
+                    continue;
+                }
+                for pair in path.points.windows(2) {
+                    let (dx, dy) = (pair[1][0] - pair[0][0], pair[1][1] - pair[0][1]);
+                    if distance(pair[0], pair[1]) > 5.0 {
+                        long += 1;
+                        assert!((dx * along[1] - dy * along[0]).abs() < 1e-6, "{dx} {dy}");
+                    }
+                }
+            }
+            assert!(long > 3, "{long}");
+        }
     }
 
     #[test]

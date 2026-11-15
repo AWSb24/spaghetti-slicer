@@ -347,3 +347,20 @@ fn configuration_comes_from_the_environment() {
     assert!(Config::from_lookup(|name| (name == "SPAGHETTI_WORKERS").then(|| "0".into())).is_err());
     assert_eq!(Config::from_lookup(|_| None).unwrap(), Config::default());
 }
+
+#[tokio::test]
+async fn server_stops_when_asked() {
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let config = Config {
+        listen: ([127, 0, 0, 1], 0).into(),
+        ..Config::default()
+    };
+    let server = tokio::spawn(slicer_server::serve(config, async {
+        let _ = stopped.await;
+    }));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!server.is_finished());
+    stop.send(()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), server).await;
+    assert!(result.unwrap().unwrap().is_ok());
+}

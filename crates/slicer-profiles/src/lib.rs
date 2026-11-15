@@ -57,6 +57,14 @@ pub enum SeamPosition {
     Nearest,
 }
 
+/// The kind of printer settings are meant for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Technology {
+    /// Printers that melt filament and lay it down in lines.
+    Fdm,
+}
+
 /// How the amount of filament is written to the G-code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -73,6 +81,9 @@ pub enum ExtrusionMode {
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     // Printer
+    /// The kind of printer these settings are for. Only filament printers
+    /// exist so far; settings for anything else are rejected.
+    pub technology: Technology,
     /// Printable bed width (X).
     pub bed_size_x: f64,
     /// Printable bed depth (Y).
@@ -127,6 +138,9 @@ pub struct Settings {
     pub infill_density: f64,
     /// Sparse infill pattern.
     pub infill_pattern: InfillPattern,
+    /// Direction of the infill lines in degrees from the X axis; every
+    /// other layer is turned by 90 degrees.
+    pub infill_angle: f64,
     /// How far infill reaches into the innermost wall, in percent of the line width.
     pub infill_overlap: f64,
     /// Number of skirt loops around the first layer.
@@ -185,6 +199,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            technology: Technology::Fdm,
             bed_size_x: 220.0,
             bed_size_y: 220.0,
             max_print_height: 250.0,
@@ -210,6 +225,7 @@ impl Default for Settings {
             bottom_layers: 4,
             infill_density: 15.0,
             infill_pattern: InfillPattern::Grid,
+            infill_angle: 45.0,
             infill_overlap: 15.0,
             skirt_loops: 2,
             skirt_distance: 4.0,
@@ -451,6 +467,7 @@ impl Settings {
             ("skirt_loops", f64::from(self.skirt_loops), 0.0, 20.0),
             ("skirt_distance", self.skirt_distance, 0.0, 50.0),
             ("brim_width", self.brim_width, 0.0, 50.0),
+            ("infill_angle", self.infill_angle, 0.0, 180.0),
             ("support_spacing", self.support_spacing, 0.5, 20.0),
             (
                 "support_bridge_length",
@@ -564,6 +581,8 @@ mod tests {
             Err(SettingsError::UnknownKey("nope".into()))
         );
         assert!(s.set("wall_loops", "many").is_err());
+        assert!(s.set("technology", "fdm").is_ok());
+        assert!(s.set("technology", "sla").is_err());
         assert!(s.set("infill_density", "150").is_err());
         assert_eq!(s.infill_density, 100.0);
     }
