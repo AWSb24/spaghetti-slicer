@@ -69,6 +69,10 @@ All three must pass. New behaviour needs a test.
 | G-code commands | Marlin and RepRap G-code documentation |
 | `;TYPE:` and `;LAYER_CHANGE` comments | Naming convention read by common G-code viewers, used for interoperability |
 | Default start and end G-code | Generic Marlin commands, not taken from any profile |
+| Resin layer images (scanline fill with non-zero winding, supersampling) | Standard scanline fill, own design |
+| PNG writer for resin layers | PNG specification (ISO/IEC 15948); `flate2` and `crc32fast` crates (MIT OR Apache-2.0) |
+| Resin print archive (`.sla.zip`) | Own design, described in `docs/sla-format.md` |
+| Anycubic Photon Mono X screen and build volume | Manufacturer's product page |
 | Import of Orca Slicer profiles | Key names and value formats read from profiles a user saved in Orca Slicer, as data files; no source code or shipped profile read |
 
 The initial implementation was written with an AI coding assistant, without consulting the source code of other slicers.

@@ -321,3 +321,37 @@ fn orca_profiles_become_a_settings_file() {
     let out = run(&["import-orca", stl.to_str().unwrap()]);
     assert!(!out.status.success());
 }
+
+#[test]
+fn slices_a_cube_for_a_resin_printer() {
+    let dir = workdir("sla");
+    let stl = dir.join("cube.stl");
+    fs::write(
+        &stl,
+        slicer_formats::write_stl_binary(&Mesh::cuboid(10.0, 10.0, 10.0)),
+    )
+    .unwrap();
+
+    let out = run(&[
+        "slice-sla",
+        stl.to_str().unwrap(),
+        "--set",
+        "layer_height=0.1",
+        "--set",
+        "bottom_layers=4",
+        "--json",
+    ]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["stats"]["layers"], 100);
+    let resin = report["stats"]["resin_volume_ml"].as_f64().unwrap();
+    assert!((resin - 1.0).abs() < 0.01, "{resin}");
+    // 4 x 40 s + 96 x 2 s exposure, 100 x 5 s plate moves.
+    assert_eq!(report["stats"]["print_time_s"], 852.0);
+    let archive = fs::read(dir.join("cube.sla.zip")).unwrap();
+    assert_eq!(&archive[..2], b"PK");
+
+    let out = run(&["slice-sla", stl.to_str().unwrap(), "-s", "nozzle_temp=200"]);
+    assert!(!out.status.success());
+    assert!(text(&out.stderr).contains("unknown resin setting 'nozzle_temp'"));
+}
