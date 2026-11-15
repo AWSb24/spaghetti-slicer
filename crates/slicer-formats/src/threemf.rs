@@ -739,7 +739,7 @@ pub fn write_3mf(mesh: &Mesh) -> Result<Vec<u8>, ThreeMfError> {
 }
 
 /// Packs named parts into a ZIP archive.
-pub(crate) fn write_package(parts: &[(&str, &str)]) -> Result<Vec<u8>, ThreeMfError> {
+pub fn write_package(parts: &[(&str, &str)]) -> Result<Vec<u8>, ThreeMfError> {
     let archive = |e: zip::result::ZipError| ThreeMfError::Archive(e.to_string());
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
@@ -777,6 +777,13 @@ mod tests {
     fn parse(parts: &[(&str, &str)]) -> Result<(Mesh, Diagnostics), ThreeMfError> {
         let mut diagnostics = Diagnostics::new();
         parse_3mf(&package(parts), &mut diagnostics).map(|mesh| (mesh, diagnostics))
+    }
+
+    #[test]
+    fn fuzz_seed_is_a_valid_model() {
+        let seed = include_str!("../../../fuzz/seeds/threemf_model/tetrahedron.model");
+        let (mesh, _) = parse(&[("3D/3dmodel.model", seed)]).unwrap();
+        assert_eq!(mesh.triangles.len(), 4);
     }
 
     #[test]

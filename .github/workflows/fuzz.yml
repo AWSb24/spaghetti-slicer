@@ -1,7 +1,9 @@
-name: Fuzz
+name: Fuzz and arm64
 
 # Runs the importers against generated input for a few minutes, once a
 # week and on demand. A crash fails the run and is kept as an artifact.
+# The same schedule builds the container image on an arm64 machine and
+# slices a model with it; too slow for every push.
 on:
   schedule:
     - cron: "17 3 * * 1"
@@ -17,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [stl, threemf]
+        target: [stl, threemf, threemf_model]
     steps:
       - uses: actions/checkout@v7
 
@@ -30,6 +32,8 @@ jobs:
         run: |
           mkdir -p fuzz/corpus/stl
           cp examples/cube_20mm.stl examples/steps.stl fuzz/corpus/stl/
+          mkdir -p fuzz/corpus/threemf_model
+          cp fuzz/seeds/threemf_model/* fuzz/corpus/threemf_model/
 
       - name: Fuzz for three minutes
         run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=180 -max_len=65536
@@ -39,3 +43,34 @@ jobs:
         with:
           name: crash-${{ matrix.target }}
           path: fuzz/artifacts/
+
+  arm64:
+    name: Container image on arm64
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build
+        run: docker build -t spaghetti-slicer .
+
+      - name: Slice through the API
+        run: |
+          test "$(docker image inspect spaghetti-slicer --format '{{.Architecture}}')" = arm64
+          docker run -d --name slicer -p 8080:8080 spaghetti-slicer
+          for _ in $(seq 30); do curl -fs localhost:8080/health && break; sleep 1; done
+          id=$(curl -fs -F model=@examples/gear_with_hub.stl localhost:8080/v1/jobs | jq -r .id)
+          for _ in $(seq 60); do
+            status=$(curl -fs "localhost:8080/v1/jobs/$id" | jq -r .status)
+            [ "$status" = queued ] || [ "$status" = running ] || break
+            sleep 1
+          done
+          test "$status" = done
+          curl -fs "localhost:8080/v1/jobs/$id/gcode" -o arm64.gcode
+          docker stop slicer
+          test "$(docker inspect slicer --format '{{.State.ExitCode}}')" = 0
+
+      - name: Same G-code as the expected values
+        run: |
+          size=$(stat -c %s arm64.gcode)
+          lines=$(wc -l < arm64.gcode)
+          grep -P "^gear_with_hub	$size	$lines	" examples/golden.tsv

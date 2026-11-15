@@ -28,5 +28,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "threemf_model"
+path = "fuzz_targets/threemf_model.rs"
+test = false
+doc = false
+bench = false
+
 # Not part of the main workspace: it needs a nightly toolchain.
 [workspace]
