@@ -688,13 +688,34 @@ fn point_inside(shapes: &Shapes, point: Point) -> bool {
     inside
 }
 
-/// The directions lines can run in.
-const DIRECTIONS: [HatchDirection; 4] = [
-    HatchDirection::Horizontal,
-    HatchDirection::Vertical,
-    HatchDirection::Diagonal45,
-    HatchDirection::Diagonal135,
-];
+/// The directions the lines of a bridge can run in: every 15 degrees, the
+/// four with exact arithmetic first, then along and across the longest edge
+/// of the area, so a straight bridge at any angle gets lines straight across.
+// ponytail: an area whose longest edge says nothing about how it is carried
+// (a curved one, say) gets the best of the 15 degree steps.
+fn bridge_directions(shape: &[Contour]) -> Vec<HatchDirection> {
+    let mut directions: Vec<HatchDirection> = [
+        0.0, 90.0, 45.0, 135.0, 15.0, 30.0, 60.0, 75.0, 105.0, 120.0, 150.0, 165.0,
+    ]
+    .into_iter()
+    .map(HatchDirection::degrees)
+    .collect();
+    // Unit vector of the first longest edge: square root only, no angles.
+    let mut longest = (0.0, [1.0, 0.0]);
+    for contour in shape {
+        for (i, &p) in contour.iter().enumerate() {
+            let q = contour[(i + 1) % contour.len()];
+            let length = distance(p, q);
+            if length > longest.0 {
+                longest = (length, [(q[0] - p[0]) / length, (q[1] - p[1]) / length]);
+            }
+        }
+    }
+    let [cos, sin] = longest.1;
+    directions.push(HatchDirection::Angle(cos, sin));
+    directions.push(HatchDirection::Angle(-sin, cos));
+    directions
+}
 
 /// Whether an area that hangs free is a bridge short enough to print
 /// without supports: in one direction nearly all lines across it go on over
@@ -702,7 +723,7 @@ const DIRECTIONS: [HatchDirection; 4] = [
 fn spans_freely(shape: &[Contour], below: &Shapes, settings: &Settings) -> bool {
     let width = settings.line_width;
     let area = vec![shape.to_vec()];
-    DIRECTIONS.iter().any(|&direction| {
+    bridge_directions(shape).into_iter().any(|direction| {
         let (mut total, mut loose, mut longest) = (0.0, 0.0, 0.0_f64);
         for [a, b] in polygon::hatch(&area, width, direction, 0.0) {
             let length = distance(a, b);
@@ -730,10 +751,9 @@ fn spans_freely(shape: &[Contour], below: &Shapes, settings: &Settings) -> bool 
 /// Takes the bridges out of the solid and sparse areas of a layer: solid
 /// areas at least a line wide with nothing below, grown a little onto what
 /// carries them. Every bridge comes with the direction in which most of its
-/// lines rest on the layer below at both ends.
-// ponytail: four directions (along X, along Y, both diagonals). A bridge at
-// another angle gets the best of the four. Bridges have their own speed but
-// the flow and cooling of everything else; free angles and those come later.
+/// lines rest on the layer below at both ends (see `bridge_directions`).
+// ponytail: bridges have their own speed but the flow and cooling of
+// everything else; those come later.
 fn split_bridges(
     below: &Shapes,
     fill_area: &Shapes,
@@ -757,7 +777,7 @@ fn split_bridges(
         .map(|shape| {
             let bridge = vec![shape.clone()];
             let mut best = (f64::INFINITY, HatchDirection::Diagonal45);
-            for direction in DIRECTIONS {
+            for direction in bridge_directions(shape) {
                 // Length of the lines with an end in the air.
                 let loose: f64 = polygon::hatch(&bridge, width, direction, 0.0)
                     .iter()
@@ -1074,9 +1094,9 @@ mod tests {
 
     #[test]
     fn bridges_run_from_support_to_support() {
-        // Two pillars 20 mm apart carry a deck. Turned by a quarter, the
-        // lines of the bridge must turn with it.
-        for turned in [false, true] {
+        // Two pillars 20 mm apart carry a deck. Turned by a quarter or by
+        // 30 or 20 degrees, the lines of the bridge must turn with it.
+        for degrees in [0.0_f64, 90.0, 30.0, 20.0] {
             let mut mesh = Mesh::cuboid(5.0, 20.0, 5.0);
             let mut pillar = Mesh::cuboid(5.0, 20.0, 5.0);
             pillar.translate([25.0, 0.0, 0.0]);
@@ -1084,9 +1104,8 @@ mod tests {
             let mut deck = Mesh::cuboid(30.0, 20.0, 2.0);
             deck.translate([0.0, 0.0, 5.0]);
             mesh.merge(&deck);
-            if turned {
-                mesh.rotate_z(std::f64::consts::FRAC_PI_2);
-            }
+            mesh.rotate_z(degrees.to_radians());
+            let (sin, cos) = degrees.to_radians().sin_cos();
             let toolpaths = generate(&mesh, &Settings::default()).unwrap();
             // Supports go under a bridge only if it is longer than allowed.
             for (limit, expected) in [(10.0, true), (25.0, false)] {
@@ -1099,7 +1118,7 @@ mod tests {
                     .iter()
                     .flat_map(|layer| &layer.paths)
                     .any(|path| path.kind == PathKind::Support);
-                assert_eq!(supported, expected, "limit {limit}");
+                assert_eq!(supported, expected, "{degrees} degrees, limit {limit}");
             }
             // Layer 25 is the lowest layer of the deck.
             let mut along = 0.0;
@@ -1114,16 +1133,16 @@ mod tests {
                         continue;
                     }
                     long += length;
-                    let across = usize::from(!turned);
-                    if (pair[0][across] - pair[1][across]).abs() < 1e-6 {
+                    let (dx, dy) = (pair[1][0] - pair[0][0], pair[1][1] - pair[0][1]);
+                    if (dx * sin - dy * cos).abs() < 1e-6 * length {
                         along += length;
                         // From pillar to pillar, and a little onto both.
-                        assert!(length > 20.5, "{length}");
+                        assert!(length > 20.5, "{degrees} degrees: {length}");
                     }
                 }
             }
-            assert!(long > 500.0, "{long}");
-            assert!(along > 0.95 * long, "{along} of {long}");
+            assert!(long > 500.0, "{degrees} degrees: {long}");
+            assert!(along > 0.95 * long, "{degrees} degrees: {along} of {long}");
         }
     }
 
