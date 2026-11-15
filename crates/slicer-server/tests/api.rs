@@ -1,7 +1,7 @@
 //! Tests of the HTTP API, driven through the router without a socket.
 #![allow(clippy::unwrap_used, missing_docs)]
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Body;
@@ -265,6 +265,43 @@ async fn jobs_wait_for_a_free_worker_and_can_be_cancelled() {
     let (status, _) = create(&router, &[("model", &stl)]).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(second["status"], "queued");
+}
+
+#[tokio::test]
+async fn cancelling_stops_a_running_slice() {
+    let router = App::new(Config {
+        workers: 1,
+        ..Config::default()
+    })
+    .router();
+    // 2000 layers of a large cube keep the only worker busy for a while.
+    let large = slicer_formats::write_stl_binary(&Mesh::cuboid(200.0, 200.0, 200.0));
+    let fields: [(&str, &[u8]); 2] = [("model", &large), ("set", b"layer_height=0.1")];
+
+    // How long the slice takes when left alone.
+    let started = Instant::now();
+    let (_, job) = create(&router, &fields).await;
+    let job = finished(&router, job["id"].as_str().unwrap()).await;
+    assert_eq!(job["status"], "done");
+    let alone = started.elapsed();
+
+    // The same again, cancelled as soon as it runs.
+    let (_, job) = create(&router, &fields).await;
+    let path = format!("/v1/jobs/{}", job["id"].as_str().unwrap());
+    while call(&router, "GET", &path).await.1["status"] != "running" {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let cancelled = Instant::now();
+    let (_, job) = call(&router, "DELETE", &path).await;
+    assert_eq!(job["status"], "cancelled");
+
+    // The worker is free long before the slice would have ended.
+    let (_, small) = create(&router, &[("model", &cube())]).await;
+    let small = finished(&router, small["id"].as_str().unwrap()).await;
+    assert_eq!(small["status"], "done");
+    let waited = cancelled.elapsed();
+    assert!(waited < alone / 2, "{waited:?} of {alone:?}");
+    println!("alone {alone:?}, after cancelling {waited:?}");
 }
 
 #[tokio::test]

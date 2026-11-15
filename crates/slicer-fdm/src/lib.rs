@@ -190,9 +190,9 @@ pub fn generate_reporting(
 
 /// Like [`generate_reporting`], and gives up with [`FdmError::Cancelled`]
 /// soon after `stop` is set.
-// ponytail: looked at between the steps and before every layer of the
-// longest one. Cutting the mesh and putting the paths in order run to their
-// end; on a large model that can be a second or two.
+// ponytail: looked at between the steps and before every layer of the two
+// longest ones. Cutting the mesh runs to its end; on a large model that can
+// be a second or two.
 pub fn generate_cancellable(
     mesh: &Mesh,
     settings: &Settings,
@@ -322,6 +322,7 @@ pub fn generate_cancellable(
         .enumerate()
         .map(|(index, (work, mut thin))| {
             let mut paths = Vec::new();
+            let work = if stopped() { Vec::new() } else { work };
             for piece in work {
                 match piece {
                     Work::Loops(loops, kind, min_length) => {
@@ -352,6 +353,9 @@ pub fn generate_cancellable(
             }
         })
         .collect();
+    if stopped() {
+        return Err(FdmError::Cancelled);
+    }
     // Which travel moves stay over the part depends only on the finished
     // order of a layer, so all cores can work on it again.
     let inside = parallel_map(layers.len(), |index| {
