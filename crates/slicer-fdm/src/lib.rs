@@ -48,6 +48,11 @@ const BRIDGE_ANCHOR: f64 = 2.0;
 /// Longest rim of a hole in the mesh that is closed before slicing.
 const MAX_HOLE_EDGES: usize = 64;
 
+/// Triangles whose corners lie this close to a line (mm) count as having
+/// no area and are removed before slicing. A tenth of the 10 nm polygon
+/// grid, so the surface moves by far less than the contours resolve.
+const DEGENERATE_HEIGHT: f64 = 1e-6;
+
 /// What a path is for. Determines speed and the label in the G-code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathKind {
@@ -211,6 +216,16 @@ pub fn generate_cancellable(
                 ),
             )
             .with("triangles", turned),
+        );
+    }
+    let removed = mesh.remove_degenerate(DEGENERATE_HEIGHT);
+    if removed > 0 {
+        diagnostics.push(
+            Diagnostic::warning(
+                "mesh.degenerate_removed",
+                format!("{removed} triangle(s) of the mesh without area were removed"),
+            )
+            .with("triangles", removed),
         );
     }
     let closed = mesh.close_holes(MAX_HOLE_EDGES);
