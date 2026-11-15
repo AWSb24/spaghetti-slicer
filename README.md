@@ -120,6 +120,7 @@ The server is configured through environment variables only:
 | `SPAGHETTI_MAX_UPLOAD_BYTES` | `268435456` | Largest request body |
 | `SPAGHETTI_RESULT_TTL_SECONDS` | `3600` | How long finished jobs are kept |
 | `SPAGHETTI_TOKEN` | unset | If set, `/v1/` requires `Authorization: Bearer <token>` |
+| `SPAGHETTI_DATA_DIR` | unset | If set, finished jobs (status and G-code) are kept in this directory and survive a restart, until they expire. Jobs still queued or running when the server stops are lost. In the container, mount a volume writable by user 65532 |
 
 Without a token anyone who can reach the port can submit jobs. Logs are JSON lines on standard output.
 

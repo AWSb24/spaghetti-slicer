@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -38,6 +39,9 @@ pub struct Config {
     pub result_ttl: Duration,
     /// If set, requests to `/v1/` need this bearer token (`SPAGHETTI_TOKEN`).
     pub token: Option<String>,
+    /// If set, finished jobs are kept in this directory and survive a
+    /// restart (`SPAGHETTI_DATA_DIR`).
+    pub data_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -49,6 +53,7 @@ impl Default for Config {
             max_upload_bytes: 256 << 20,
             result_ttl: Duration::from_secs(3600),
             token: None,
+            data_dir: None,
         }
     }
 }
@@ -91,6 +96,9 @@ impl Config {
                 defaults.result_ttl.as_secs(),
             )?),
             token: lookup("SPAGHETTI_TOKEN").filter(|token| !token.is_empty()),
+            data_dir: lookup("SPAGHETTI_DATA_DIR")
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from),
         };
         if config.workers == 0 {
             return Err("SPAGHETTI_WORKERS must be at least 1".to_string());
@@ -99,11 +107,16 @@ impl Config {
     }
 }
 
+/// Seconds since 1970.
+fn unix_now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
+}
+
 /// Writes one structured log line (JSON) to standard output.
 pub fn log(level: &str, event: &str, fields: Value) {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0.0, |d| d.as_secs_f64());
+    let seconds = unix_now();
     let mut line =
         json!({ "ts": (seconds * 1000.0).round() / 1000.0, "level": level, "event": event });
     if let (Some(line), Value::Object(fields)) = (line.as_object_mut(), fields) {
@@ -137,12 +150,13 @@ impl Status {
     }
 }
 
+#[derive(Clone)]
 struct Job {
     status: Status,
     finished_at: Option<Instant>,
     stats: Option<Value>,
-    warnings: Vec<Diagnostic>,
-    error: Option<Diagnostic>,
+    warnings: Value,
+    error: Option<Value>,
     gcode: Option<Arc<String>>,
     /// What the project file for Bambu Lab printers says about the print.
     info: Option<slicer_formats::PrintInfo>,
@@ -155,14 +169,138 @@ impl Job {
         let mut out = json!({ "id": id.to_string(), "status": self.status.name() });
         if self.status == Status::Done {
             out["stats"] = self.stats.clone().unwrap_or(Value::Null);
-            out["warnings"] = json!(self.warnings);
+            out["warnings"] = self.warnings.clone();
             out["gcode_url"] = json!(format!("/v1/jobs/{id}/gcode"));
             out["gcode_3mf_url"] = json!(format!("/v1/jobs/{id}/gcode.3mf"));
         }
         if let Some(error) = &self.error {
-            out["error"] = json!(error);
+            out["error"] = error.clone();
         }
         out
+    }
+
+    /// Writes a finished job to `dir`: the G-code, then a record of
+    /// everything else. The record is renamed into place last, so a record
+    /// on disk always has its G-code.
+    fn save(&self, dir: &std::path::Path, id: Uuid) -> std::io::Result<()> {
+        if let Some(gcode) = &self.gcode {
+            std::fs::write(dir.join(format!("{id}.gcode")), gcode.as_bytes())?;
+        }
+        let age = self
+            .finished_at
+            .map_or(0.0, |at| at.elapsed().as_secs_f64());
+        let info = self.info.as_ref().map(|info| {
+            json!({
+                "seconds": info.seconds,
+                "weight_g": info.weight_g,
+                "filament_m": info.filament_m,
+                "layers": info.layers,
+                "nozzle_diameter": info.nozzle_diameter,
+            })
+        });
+        let record = json!({
+            "status": self.status.name(),
+            "finished": unix_now() - age,
+            "stats": self.stats,
+            "warnings": self.warnings,
+            "error": self.error,
+            "info": info,
+        });
+        let temporary = dir.join(format!("{id}.json.tmp"));
+        std::fs::write(&temporary, record.to_string())?;
+        std::fs::rename(temporary, dir.join(format!("{id}.json")))
+    }
+
+    /// Reads a job written by [`Job::save`]. `None` for a record that cannot
+    /// be read, and for one older than `ttl`.
+    fn load(dir: &std::path::Path, id: Uuid, ttl: Duration) -> Option<Self> {
+        let text = std::fs::read_to_string(dir.join(format!("{id}.json"))).ok()?;
+        let record: Value = serde_json::from_str(&text).ok()?;
+        let status = match record["status"].as_str()? {
+            "done" => Status::Done,
+            "failed" => Status::Failed,
+            _ => return None,
+        };
+        let age = Duration::try_from_secs_f64((unix_now() - record["finished"].as_f64()?).max(0.0))
+            .ok()?;
+        if age >= ttl {
+            return None;
+        }
+        let (gcode, info) = if status == Status::Done {
+            let gcode = std::fs::read_to_string(dir.join(format!("{id}.gcode"))).ok()?;
+            let info = &record["info"];
+            let info = slicer_formats::PrintInfo {
+                seconds: info["seconds"].as_f64()?,
+                weight_g: info["weight_g"].as_f64()?,
+                filament_m: info["filament_m"].as_f64()?,
+                layers: usize::try_from(info["layers"].as_u64()?).ok()?,
+                nozzle_diameter: info["nozzle_diameter"].as_f64()?,
+            };
+            (Some(Arc::new(gcode)), Some(info))
+        } else {
+            (None, None)
+        };
+        Some(Job {
+            status,
+            // A machine that has been running for less time than the job is
+            // old cannot go back that far; the job then counts as new.
+            finished_at: Some(Instant::now().checked_sub(age).unwrap_or_else(Instant::now)),
+            stats: Some(record["stats"].clone()).filter(|stats| !stats.is_null()),
+            warnings: record["warnings"].clone(),
+            error: Some(record["error"].clone()).filter(|error| !error.is_null()),
+            gcode,
+            info,
+            stop: Arc::default(),
+        })
+    }
+}
+
+/// Jobs kept in `dir` by an earlier run. Records that are unreadable or
+/// expired are deleted.
+fn load_jobs(dir: &std::path::Path, ttl: Duration) -> HashMap<Uuid, Job> {
+    let mut jobs = HashMap::new();
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        log(
+            "error",
+            "store.unavailable",
+            json!({ "dir": dir.display().to_string(), "message": error.to_string() }),
+        );
+        return jobs;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return jobs;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let Some(id) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.parse::<Uuid>().ok())
+        else {
+            continue;
+        };
+        match Job::load(dir, id, ttl) {
+            Some(job) => {
+                jobs.insert(id, job);
+            }
+            None => forget(dir, id),
+        }
+    }
+    log(
+        "info",
+        "store.loaded",
+        json!({ "dir": dir.display().to_string(), "jobs": jobs.len() }),
+    );
+    jobs
+}
+
+/// Deletes what [`Job::save`] wrote; missing files are no error.
+fn forget(dir: &std::path::Path, id: Uuid) {
+    for extension in ["json", "gcode", "json.tmp"] {
+        let _ = std::fs::remove_file(dir.join(format!("{id}.{extension}")));
     }
 }
 
@@ -176,11 +314,16 @@ pub struct App {
 
 impl App {
     /// Creates the state for a server with the given configuration.
+    /// With a data directory, the jobs kept there are loaded.
     pub fn new(config: Config) -> Self {
+        let jobs = match &config.data_dir {
+            Some(dir) => load_jobs(dir, config.result_ttl),
+            None => HashMap::new(),
+        };
         Self {
             slots: Arc::new(Semaphore::new(config.workers)),
             config: Arc::new(config),
-            jobs: Arc::default(),
+            jobs: Arc::new(Mutex::new(jobs)),
         }
     }
 
@@ -191,8 +334,19 @@ impl App {
     /// Removes finished jobs older than the configured lifetime.
     pub fn expire(&self) {
         let ttl = self.config.result_ttl;
-        self.jobs()
-            .retain(|_, job| job.finished_at.is_none_or(|at| at.elapsed() < ttl));
+        let mut gone = Vec::new();
+        self.jobs().retain(|id, job| {
+            let keep = job.finished_at.is_none_or(|at| at.elapsed() < ttl);
+            if !keep {
+                gone.push(*id);
+            }
+            keep
+        });
+        if let Some(dir) = &self.config.data_dir {
+            for id in gone {
+                forget(dir, id);
+            }
+        }
     }
 
     /// Builds the HTTP routes.
@@ -507,7 +661,7 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
                 status: Status::Queued,
                 finished_at: None,
                 stats: None,
-                warnings: Vec::new(),
+                warnings: json!([]),
                 error: None,
                 gcode: None,
                 info: None,
@@ -580,12 +734,14 @@ async fn run_job(
             ))
         });
 
-    let mut jobs = app.jobs();
-    let Some(job) = jobs.get_mut(&id) else { return };
-    if job.status != Status::Running {
-        // Cancelled while slicing: the result is discarded.
-        return;
-    }
+    let mut job = {
+        let jobs = app.jobs();
+        match jobs.get(&id) {
+            Some(job) if job.status == Status::Running => job.clone(),
+            // Cancelled while slicing: the result is discarded.
+            _ => return,
+        }
+    };
     job.finished_at = Some(Instant::now());
     match outcome {
         Ok((output, warnings)) => {
@@ -598,12 +754,12 @@ async fn run_job(
                 layers: output.stats.layers,
                 nozzle_diameter,
             });
-            job.warnings = warnings.as_slice().to_vec();
+            job.warnings = json!(warnings.as_slice());
             job.gcode = Some(Arc::new(output.gcode));
         }
         Err(error) => {
             job.status = Status::Failed;
-            job.error = Some(error);
+            job.error = Some(json!(error));
         }
     }
     log(
@@ -617,9 +773,33 @@ async fn run_job(
             "job": id.to_string(),
             "status": job.status.name(),
             "ms": started.elapsed().as_millis() as u64,
-            "error": job.error.as_ref().map(|e| e.code),
+            "error": job.error.as_ref().map(|e| e["code"].clone()),
         }),
     );
+    // Written before the result is shown, so a client that sees the job
+    // finished can rely on it surviving a restart.
+    let dir = app.config.data_dir.clone();
+    if let Some(dir) = dir.clone() {
+        let record = job.clone();
+        let saved = tokio::task::spawn_blocking(move || record.save(&dir, id)).await;
+        if let Ok(Err(error)) = saved {
+            log(
+                "error",
+                "store.write",
+                json!({ "job": id.to_string(), "message": error.to_string() }),
+            );
+        }
+    }
+    let mut jobs = app.jobs();
+    match jobs.get_mut(&id) {
+        Some(current) if current.status == Status::Running => *current = job,
+        // Cancelled while the result was written.
+        _ => {
+            if let Some(dir) = dir {
+                forget(&dir, id);
+            }
+        }
+    }
 }
 
 async fn job_status(State(app): State<App>, Path(id): Path<String>) -> Response {
@@ -702,6 +882,9 @@ async fn cancel_job(State(app): State<App>, Path(id): Path<String>) -> Response 
     };
     if job.status.finished() {
         jobs.remove(&id);
+        if let Some(dir) = &app.config.data_dir {
+            forget(dir, id);
+        }
         return StatusCode::NO_CONTENT.into_response();
     }
     job.status = Status::Cancelled;

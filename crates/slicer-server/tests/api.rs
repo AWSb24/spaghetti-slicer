@@ -305,6 +305,64 @@ async fn cancelling_stops_a_running_slice() {
 }
 
 #[tokio::test]
+async fn finished_jobs_survive_a_restart() {
+    let dir = std::env::temp_dir().join(format!("spaghetti-store-{}", uuid::Uuid::new_v4()));
+    let config = Config {
+        data_dir: Some(dir.clone()),
+        ..Config::default()
+    };
+    let router = App::new(config.clone()).router();
+    let (_, done) = create(&router, &[("model", &cube())]).await;
+    let done = finished(&router, done["id"].as_str().unwrap()).await;
+    assert_eq!(done["status"], "done");
+    let (_, failed) = create(&router, &[("model", b"not a model")]).await;
+    let failed = finished(&router, failed["id"].as_str().unwrap()).await;
+    assert_eq!(failed["status"], "failed");
+    let gcode_url = done["gcode_url"].as_str().unwrap().to_string();
+    let request = |uri: &str| Request::builder().uri(uri).body(Body::empty()).unwrap();
+    let (_, gcode) = send(&router, request(&gcode_url)).await;
+
+    // A new server on the same directory knows both jobs.
+    let router = App::new(config.clone()).router();
+    for job in [&done, &failed] {
+        let (status, again) = call(
+            &router,
+            "GET",
+            &format!("/v1/jobs/{}", job["id"].as_str().unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&again, job);
+    }
+    assert_eq!(
+        send(&router, request(&gcode_url)).await,
+        (StatusCode::OK, gcode)
+    );
+
+    // Deleting a job deletes its files.
+    let path = format!("/v1/jobs/{}", done["id"].as_str().unwrap());
+    assert_eq!(
+        call(&router, "DELETE", &path).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let router = App::new(config.clone()).router();
+    assert_eq!(call(&router, "GET", &path).await.0, StatusCode::NOT_FOUND);
+
+    // Expired records are dropped when the server starts.
+    let app = App::new(Config {
+        result_ttl: Duration::ZERO,
+        ..config
+    });
+    let path = format!("/v1/jobs/{}", failed["id"].as_str().unwrap());
+    assert_eq!(
+        call(&app.router(), "GET", &path).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    std::fs::remove_dir(&dir).unwrap();
+}
+
+#[tokio::test]
 async fn finished_jobs_expire() {
     let app = App::new(Config {
         result_ttl: Duration::ZERO,
