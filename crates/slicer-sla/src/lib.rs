@@ -4,11 +4,13 @@
 //!
 //! All lengths are millimetres, times seconds.
 
-// ponytail: no supports, no hollowing, no drain holes yet; the model is
-// printed solid exactly as cut. Vendor formats (.pwmx and similar) are not
-// written, only the open archive.
+// ponytail: the model is printed in the orientation it was loaded in (no
+// auto-orientation). Vendor formats (.pwmx and similar) are not written,
+// only the open archive.
 
+mod hollow;
 pub mod raster;
+mod supports;
 
 use std::fmt;
 use std::io::{Cursor, Write};
@@ -50,6 +52,33 @@ pub struct SlaSettings {
     pub retract_speed: f64,
     /// Samples per pixel along each axis for anti-aliasing; 1 turns it off.
     pub antialiasing: u32,
+    /// Gap in mm between the top of the raft (or the build plate) and the
+    /// lowest point of the model; supports bridge it. 0 puts the model down.
+    pub elevation: f64,
+    /// Thickness in mm of the raft printed under the model and its
+    /// supports; 0 prints no raft.
+    pub raft_thickness: f64,
+    /// Whether to print supports from the raft up to overhangs.
+    pub supports: bool,
+    /// Downward-facing surfaces tilted further than this from the vertical
+    /// (degrees) get supports; 0 supports every downward-facing surface.
+    pub support_overhang_angle: f64,
+    /// Distance in mm between the support points on an overhang.
+    pub support_spacing: f64,
+    /// Diameter in mm where a support touches the model.
+    pub support_tip_diameter: f64,
+    /// Length in mm of the cone between the tip and the pillar.
+    pub support_tip_length: f64,
+    /// Diameter of a support pillar in mm.
+    pub support_pillar_diameter: f64,
+    /// Neighbouring pillars whose straight part is at least this tall (mm)
+    /// get diagonal cross braces; 0 never braces.
+    pub support_brace_height: f64,
+    /// Wall thickness in mm of a hollowed model; 0 prints it solid.
+    pub hollow_wall: f64,
+    /// Diameter in mm of the drain holes at the lowest points of every
+    /// cavity; 0 leaves cavities closed.
+    pub drain_hole_diameter: f64,
 }
 
 impl Default for SlaSettings {
@@ -68,12 +97,24 @@ impl Default for SlaSettings {
             lift_speed: 2.0,
             retract_speed: 3.0,
             antialiasing: 4,
+            elevation: 0.0,
+            raft_thickness: 0.0,
+            supports: false,
+            support_overhang_angle: 45.0,
+            support_spacing: 3.0,
+            support_tip_diameter: 0.4,
+            support_tip_length: 2.0,
+            support_pillar_diameter: 1.2,
+            support_brace_height: 10.0,
+            hollow_wall: 0.0,
+            drain_hole_diameter: 2.0,
         }
     }
 }
 
 /// Allowed range of every setting and whether it must be a whole number.
-const LIMITS: [(&str, f64, f64, bool); 13] = [
+/// `supports` is a switch: 0 or 1.
+const LIMITS: [(&str, f64, f64, bool); 24] = [
     ("resolution_x", 1.0, 20000.0, true),
     ("resolution_y", 1.0, 20000.0, true),
     ("display_width", 1.0, 1000.0, false),
@@ -87,7 +128,30 @@ const LIMITS: [(&str, f64, f64, bool); 13] = [
     ("lift_speed", 0.01, 100.0, false),
     ("retract_speed", 0.01, 100.0, false),
     ("antialiasing", 1.0, 16.0, true),
+    ("elevation", 0.0, 100.0, false),
+    ("raft_thickness", 0.0, 10.0, false),
+    ("supports", 0.0, 1.0, true),
+    ("support_overhang_angle", 0.0, 89.0, false),
+    ("support_spacing", 0.5, 20.0, false),
+    ("support_tip_diameter", 0.05, 5.0, false),
+    ("support_tip_length", 0.1, 20.0, false),
+    ("support_pillar_diameter", 0.2, 10.0, false),
+    ("support_brace_height", 0.0, 1000.0, false),
+    ("hollow_wall", 0.0, 20.0, false),
+    ("drain_hole_diameter", 0.0, 20.0, false),
 ];
+
+/// Settings that belong to a feature that is switched off. The manifest
+/// leaves them out, so a print without raft, supports and hollowing gives
+/// the same archive as before these features existed.
+fn unused(settings: &SlaSettings, key: &str) -> bool {
+    match key {
+        "elevation" => settings.elevation == 0.0,
+        "raft_thickness" => settings.raft_thickness == 0.0,
+        "hollow_wall" | "drain_hole_diameter" => settings.hollow_wall == 0.0,
+        _ => (key == "supports" || key.starts_with("support_")) && !settings.supports,
+    }
+}
 
 impl SlaSettings {
     /// Width and height of one pixel in mm.
@@ -115,7 +179,9 @@ impl SlaSettings {
         }
         let mut fields =
             serde_json::to_value(&*self).map_err(|e| SlaError::Output(e.to_string()))?;
-        fields[key] = if whole {
+        fields[key] = if fields[key].is_boolean() {
+            json!(number != 0.0)
+        } else if whole {
             json!(number as u32)
         } else {
             json!(number)
@@ -128,7 +194,10 @@ impl SlaSettings {
     pub fn validate(&self) -> Result<(), SlaError> {
         let fields = serde_json::to_value(self).map_err(|e| SlaError::Output(e.to_string()))?;
         for &(key, min, max, whole) in &LIMITS {
-            let number = fields[key].as_f64().unwrap_or(f64::NAN);
+            let number = fields[key]
+                .as_f64()
+                .or_else(|| fields[key].as_bool().map(f64::from))
+                .unwrap_or(f64::NAN);
             if !(min..=max).contains(&number) {
                 return Err(SlaError::OutOfRange {
                     key,
@@ -303,7 +372,9 @@ pub fn slice(
     }
     mesh.check(diagnostics);
     let (min, max) = mesh.bounds().ok_or(SlaError::EmptyModel)?;
-    let size = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+    // The model's lowest point sits this high above the build plate.
+    let base = settings.raft_thickness + settings.elevation;
+    let size = [max[0] - min[0], max[1] - min[1], max[2] - min[2] + base];
     let volume = [
         settings.display_width,
         settings.display_height,
@@ -318,21 +389,39 @@ pub fn slice(
     mesh.translate([
         volume[0] / 2.0 - (min[0] + max[0]) / 2.0,
         volume[1] / 2.0 - (min[1] + max[1]) / 2.0,
-        -min[2],
+        base - min[2],
     ]);
 
     // Layer i ends at (i + 1) * layer_height and is cut at its mid-height.
     let height = settings.layer_height;
     let count = (size[2] / height + 1e-6).floor() as usize;
     let cuts: Vec<f64> = (0..count).map(|i| (i as f64 + 0.5) * height).collect();
-    let slices: Vec<Shapes> = slice_mesh_reporting(&mesh, &cuts, diagnostics);
+    let mut slices: Vec<Shapes> = slice_mesh_reporting(&mesh, &cuts, diagnostics);
     if slices.iter().all(Vec::is_empty) {
         return Err(SlaError::NothingToPrint);
     }
 
+    let drains = if settings.hollow_wall > 0.0 {
+        hollow::hollow(&mut slices, settings, diagnostics)
+    } else {
+        Vec::new()
+    };
+    if settings.elevation > 0.0 && !settings.supports {
+        diagnostics.push(Diagnostic::warning(
+            "sla.floating_model",
+            "the model is raised by `elevation` but has no supports to stand on".to_owned(),
+        ));
+    }
+    let structures = (settings.supports || settings.raft_thickness > 0.0)
+        .then(|| supports::Structures::build(&mesh, &slices, settings, &drains));
+
     let [pixel_x, pixel_y] = settings.pixel_size();
     let layers = parallel_map(slices.len(), |index| {
-        let pixels = raster::rasterize(&slices[index], settings);
+        let shapes = match &structures {
+            Some(structures) => std::borrow::Cow::Owned(structures.add_to(&slices[index], index)),
+            None => std::borrow::Cow::Borrowed(&slices[index]),
+        };
+        let pixels = raster::rasterize(&shapes, settings);
         let lit = pixels.iter().filter(|&&p| p > 0).count() as u64;
         let sum: u64 = pixels.iter().map(|&p| u64::from(p)).sum();
         let png = raster::encode_png(settings.resolution_x, settings.resolution_y, &pixels)
@@ -368,6 +457,29 @@ pub fn slice(
     })
 }
 
+/// Corners of a regular polygon around the origin with circumradius 1,
+/// counter-clockwise, from the platform-independent sine and cosine.
+fn unit_circle(segments: usize) -> Vec<slicer_core::Point> {
+    (0..segments)
+        .map(|i| {
+            let (sin, cos) =
+                slicer_core::polygon::sin_cos_degrees(360.0 * i as f64 / segments as f64);
+            [cos, sin]
+        })
+        .collect()
+}
+
+/// A disc as a polygon with the corners of `unit` scaled and moved.
+fn disc(
+    unit: &[slicer_core::Point],
+    center: slicer_core::Point,
+    radius: f64,
+) -> slicer_core::Contour {
+    unit.iter()
+        .map(|p| [center[0] + radius * p[0], center[1] + radius * p[1]])
+        .collect()
+}
+
 /// Rounds to a multiple of `1 / scale`.
 fn round(value: f64, scale: f64) -> f64 {
     (value * scale).round() / scale
@@ -395,6 +507,10 @@ pub fn manifest(print: &SlaPrint) -> serde_json::Value {
             })
         })
         .collect();
+    let mut used_settings = json!(settings);
+    if let Some(fields) = used_settings.as_object_mut() {
+        fields.retain(|key, _| !unused(settings, key));
+    }
     json!({
         "format": "spaghetti-sla",
         "format_version": 1,
@@ -406,7 +522,7 @@ pub fn manifest(print: &SlaPrint) -> serde_json::Value {
             "encoding": "png-gray8",
             "orientation": "top-view",
         },
-        "settings": settings,
+        "settings": used_settings,
         "stats": print.stats,
         "layers": layers,
     })
