@@ -37,6 +37,17 @@ eframe = { version = "0.37.0", default-features = false, features = ["glow", "de
 # File dialogs: native on Windows and macOS, the desktop portal over D-Bus on
 # Linux (no GTK needed).
 rfd = { version = "0.18.0", default-features = false, features = ["xdg-portal"] }
+# A clock that also works in the browser (the std one panics there); on the
+# desktop it is the std one.
+web-time = "1.1.0"
+
+# The browser build (`tools/build-web.sh`): eframe's web runner, files read
+# and saved through the browser.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2.130"
+wasm-bindgen-futures = "0.4.80"
+js-sys = "0.3.107"
+web-sys = { version = "0.3.107", features = ["Blob", "BlobPropertyBag", "console", "Document", "Element", "HtmlAnchorElement", "HtmlCanvasElement", "Url", "Window"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Load libwayland at run time instead of linking it (eframe leaves winit's

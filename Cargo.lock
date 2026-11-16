@@ -2653,12 +2653,17 @@ name = "slicer-ui"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "js-sys",
  "rfd",
  "slicer-core",
  "slicer-fdm",
  "slicer-formats",
  "slicer-gcode",
  "slicer-profiles",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
  "winit",
 ]
 

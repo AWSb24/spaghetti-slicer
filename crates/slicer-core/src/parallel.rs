@@ -5,7 +5,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Calls `job` for every index below `count` on all available cores and
 /// returns the results in index order.
 pub fn parallel_map<T: Send>(count: usize, job: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    // Without threads (one core, or the browser, where spawning one panics)
+    // the jobs run here, in order.
     let threads = std::thread::available_parallelism().map_or(1, usize::from);
+    if threads <= 1 {
+        return (0..count).map(job).collect();
+    }
     let next = AtomicUsize::new(0);
     let mut results: Vec<(usize, T)> = std::thread::scope(|scope| {
         let workers: Vec<_> = (0..threads.min(count))

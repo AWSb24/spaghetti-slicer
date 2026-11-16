@@ -90,6 +90,67 @@ async fn health_and_unknown_paths() {
 }
 
 #[tokio::test]
+async fn browser_app_without_a_build() {
+    let router = App::new(Config::default()).router();
+    let (status, body) = call(&router, "GET", "/app/").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "web.not_installed");
+}
+
+#[tokio::test]
+async fn browser_app_from_a_directory() {
+    let dir = std::env::temp_dir().join(format!("slicer-web-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("assets")).unwrap();
+    std::fs::write(dir.join("index.html"), "<canvas id=\"slicer\">").unwrap();
+    std::fs::write(dir.join("assets/slicer_bg.wasm"), b"\0asm").unwrap();
+    std::fs::write(dir.with_extension("secret"), "outside").unwrap();
+    let router = App::new(Config {
+        web_dir: Some(dir.clone()),
+        token: Some("secret".to_string()),
+        ..Config::default()
+    })
+    .router();
+
+    let get = |uri: &str| Request::get(uri).body(Body::empty()).unwrap();
+    // No token needed: the page is public, the API it would call is not.
+    let response = router.clone().oneshot(get("/app/")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/html; charset=utf-8"
+    );
+    let response = router.clone().oneshot(get("/app")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(response.headers()[header::LOCATION], "/app/");
+    let response = router
+        .clone()
+        .oneshot(get("/app/assets/slicer_bg.wasm"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/wasm");
+    let (status, body) = send(&router, get("/app/assets/slicer_bg.wasm")).await;
+    assert_eq!((status, body.as_slice()), (StatusCode::OK, &b"\0asm"[..]));
+
+    // Nothing outside the directory, however the path is written.
+    for missing in ["/app/nope.js", "/app/../x", "/app/%2e%2e/x"] {
+        let (status, _) = send(&router, get(missing)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+    }
+    let secret = format!(
+        "/app/..%2f{}",
+        dir.with_extension("secret")
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+    );
+    let (status, _) = send(&router, get(&secret)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_file(dir.with_extension("secret")).unwrap();
+}
+
+#[tokio::test]
 async fn the_api_description_matches_the_router() {
     let router = App::new(Config {
         token: Some("secret".to_string()),

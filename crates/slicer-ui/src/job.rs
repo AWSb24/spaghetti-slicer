@@ -3,8 +3,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use web_time::Instant;
 
 use slicer_core::{Diagnose, Diagnostic, Diagnostics, Mesh};
 use slicer_fdm::{Progress, Step, Toolpaths};
@@ -93,7 +94,7 @@ impl SliceJob {
         let progress = Arc::new(Progress::new());
         let (sender, result) = mpsc::channel();
         let (thread_stop, thread_progress) = (Arc::clone(&stop), Arc::clone(&progress));
-        thread::spawn(move || {
+        spawn(move || {
             let outcome = slice(&request, &thread_stop, &thread_progress);
             // The receiver is gone if the job was dropped; nobody waits then.
             let _ = sender.send(outcome);
@@ -156,6 +157,44 @@ impl Drop for SliceJob {
     fn drop(&mut self) {
         self.cancel();
     }
+}
+
+/// Runs `task` in a background thread.
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn(task: impl FnOnce() + Send + 'static) {
+    std::thread::spawn(task);
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    /// Slices waiting for [`run_waiting`].
+    static WAITING: std::cell::RefCell<Vec<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The browser has no threads: `task` waits until [`run_waiting`] runs it
+/// on the main thread.
+// ponytail: the page freezes while a slice runs and Cancel cannot be
+// clicked; a Web Worker running a second instance of the module would keep
+// it responsive.
+#[cfg(target_arch = "wasm32")]
+fn spawn(task: impl FnOnce() + Send + 'static) {
+    WAITING.with_borrow_mut(|waiting| waiting.push(Box::new(task)));
+}
+
+/// Runs the slices started since the last call, in the calling thread.
+/// Browser build only; the window calls it at the start of a frame.
+#[cfg(target_arch = "wasm32")]
+pub fn run_waiting() {
+    for task in WAITING.take() {
+        task();
+    }
+}
+
+/// Whether a slice waits for [`run_waiting`].
+#[cfg(target_arch = "wasm32")]
+pub fn has_waiting() -> bool {
+    WAITING.with_borrow(|waiting| !waiting.is_empty())
 }
 
 /// Whether a file name asks for the `.gcode.3mf` container of Bambu Lab

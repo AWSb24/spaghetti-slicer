@@ -107,6 +107,49 @@ jobs:
             fi
           done
 
+  web:
+    name: Browser app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain and wasm target
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy for the browser
+        run: cargo clippy -p slicer-ui --target wasm32-unknown-unknown --all-targets --locked -- -D warnings
+
+      # The command line tool must match the wasm-bindgen crate exactly.
+      - name: Install wasm-bindgen
+        env:
+          RUSTFLAGS: ""
+        run: |
+          version=$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')
+          cargo install wasm-bindgen-cli --version "$version" --locked
+
+      - name: Build
+        run: bash tools/build-web.sh web
+
+      - name: Served by the server
+        run: |
+          cargo build --release --locked -p slicer-server
+          SPAGHETTI_WEB_DIR=web SPAGHETTI_LISTEN=127.0.0.1:8080 target/release/spaghetti-slicer-server &
+          for _ in $(seq 30); do curl -fs localhost:8080/health && break; sleep 1; done
+          curl -fs localhost:8080/app/ | grep -q 'id="slicer"'
+          curl -fsI localhost:8080/app/slicer_bg.wasm | grep -qi 'content-type: application/wasm'
+          ls -l web
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: web-app
+          path: web/
+          if-no-files-found: error
+          retention-days: 7
+
   docker:
     name: Docker image
     runs-on: ubuntu-latest

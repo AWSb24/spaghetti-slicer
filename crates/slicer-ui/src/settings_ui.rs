@@ -2,17 +2,24 @@
 //! bar. The logic lives in `slicer_ui::profiles` and
 //! `slicer_ui::settings_list`.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
+use std::path::PathBuf;
 
 use eframe::egui::{self, RichText};
 use slicer_fdm::Step;
 use slicer_profiles::{Settings, ValueKind};
-use slicer_ui::profiles::{ProfileSet, ROLES, find_profiles_dir, import_orca_files, profile_name};
+#[cfg(not(target_arch = "wasm32"))]
+use slicer_ui::profiles::import_orca_files;
+use slicer_ui::profiles::{ProfileSet, ROLES, find_profiles_dir, profile_name};
 use slicer_ui::settings::CommonSettings;
 use slicer_ui::settings_list::{Row, SettingsEditor};
 
 /// What the profile picker asks the window to do.
+// The browser build has no Orca import, so two variants go unused there.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub enum ProfileAction {
     /// Use the profiles `new` instead of `old`, keeping other files.
     Use {
@@ -86,6 +93,9 @@ impl Profiles {
         } else {
             ui.weak("No profile folder found.");
         }
+        // ponytail: the browser has no folders to choose and no files to
+        // save next to the profiles; both stay on the desktop for now.
+        #[cfg(not(target_arch = "wasm32"))]
         ui.horizontal(|ui| {
             let folder = self.set.as_ref().map(|set| set.dir.clone());
             if ui
@@ -110,6 +120,7 @@ impl Profiles {
         action
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn import_orca(&mut self, folder: Option<&Path>) -> Option<ProfileAction> {
         let paths = rfd::FileDialog::new()
             .add_filter("Orca Slicer profiles", &["json"])

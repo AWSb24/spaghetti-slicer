@@ -1,7 +1,6 @@
 //! The window: side panel with model, settings and slicing, and a plate
 //! view that shows either the model's outline or one sliced layer.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{
@@ -21,6 +20,7 @@ use slicer_ui::settings::{CommonSettings, SettingsFile, load_settings};
 use slicer_ui::settings_list::SettingsEditor;
 use slicer_ui::view::{PlateView, kind_name, kinds_in, path_color};
 
+use crate::platform;
 use crate::settings_ui::{ProfileAction, Profiles, progress_bar, settings_window};
 use crate::view3d::{Scene, View3d};
 
@@ -160,7 +160,7 @@ impl App {
 
     fn open_model(&mut self, path: &Path) {
         let name = file_name(path);
-        let loaded = fs::read(path)
+        let loaded = platform::read(path)
             .map_err(|e| format!("{}: {e}", path.display()))
             .and_then(|bytes| {
                 load_model(&name, &bytes).map_err(|e| format!("{name}: {}", e.message))
@@ -201,7 +201,7 @@ impl App {
     fn read_settings_files(&mut self, paths: &[PathBuf]) {
         let mut files = Vec::new();
         for path in paths {
-            match fs::read_to_string(path) {
+            match platform::read_to_string(path) {
                 Ok(text) => files.push((
                     path.clone(),
                     SettingsFile {
@@ -319,10 +319,7 @@ impl App {
         } else {
             ("G-code", "gcode")
         };
-        let Some(path) = rfd::FileDialog::new()
-            .set_file_name(output_name(model_name, gcode_3mf))
-            .add_filter(label, &[extension])
-            .save_file()
+        let Some(path) = platform::save_path(&output_name(model_name, gcode_3mf), label, extension)
         else {
             return;
         };
@@ -330,7 +327,7 @@ impl App {
         let name = path.to_string_lossy().into_owned();
         let written = encode_output(&sliced.result.output, &sliced.settings, &name)
             .map_err(|e| e.message)
-            .and_then(|bytes| fs::write(&path, bytes).map_err(|e| format!("{name}: {e}")));
+            .and_then(|bytes| platform::write(&path, &bytes).map_err(|e| format!("{name}: {e}")));
         match written {
             Ok(()) => self.note(Level::Info, format!("Saved {name}")),
             Err(text) => self.note(Level::Error, text),
@@ -338,13 +335,7 @@ impl App {
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
-        let dropped: Vec<PathBuf> = ctx.input(|i| {
-            i.raw
-                .dropped_files
-                .iter()
-                .map(|file| file.path().to_path_buf())
-                .collect()
-        });
+        let dropped = platform::opened_files(ctx);
         if !dropped.is_empty() {
             self.open_paths(&dropped);
         }
@@ -354,11 +345,8 @@ impl App {
         ui.heading("Models");
         let bed = self.bed();
         ui.horizontal(|ui| {
-            if ui.button("Add…").clicked()
-                && let Some(paths) = rfd::FileDialog::new()
-                    .add_filter("Models", &["stl", "3mf"])
-                    .pick_files()
-            {
+            if ui.button("Add…").clicked() {
+                let paths = platform::pick_files(ui.ctx(), "Models", &["stl", "3mf"], true);
                 for path in paths {
                     self.open_model(&path);
                 }
@@ -503,11 +491,11 @@ impl App {
                 .button("Add file…")
                 .on_hover_text("Settings in TOML; later files override earlier ones")
                 .clicked()
-                && let Some(paths) = rfd::FileDialog::new()
-                    .add_filter("Settings", &["toml"])
-                    .pick_files()
             {
-                self.add_settings_files(&paths);
+                let paths = platform::pick_files(ui.ctx(), "Settings", &["toml"], true);
+                if !paths.is_empty() {
+                    self.add_settings_files(&paths);
+                }
             }
             if !self.files.is_empty() && ui.button("Reload").clicked() {
                 self.reload_settings_files();
