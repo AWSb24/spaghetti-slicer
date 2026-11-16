@@ -115,6 +115,7 @@ fn label(kind: PathKind) -> &'static str {
         PathKind::Support => "Support",
         PathKind::OuterWall => "Outer wall",
         PathKind::InnerWall => "Inner wall",
+        PathKind::GapFill => "Gap infill",
         PathKind::SolidInfill => "Solid infill",
         PathKind::Bridge => "Bridge",
         PathKind::SparseInfill => "Sparse infill",
@@ -429,6 +430,11 @@ pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output,
             } else {
                 filament_per_mm
             };
+            // Lines of their own width get material in proportion to it.
+            let filament_per_mm = match path.width {
+                Some(width) => filament_per_mm * width / settings.line_width,
+                None => filament_per_mm,
+            };
             if current_kind != Some(path.kind) {
                 current_kind = Some(path.kind);
                 let _ = writeln!(w.out, ";TYPE:{}", label(path.kind));
@@ -438,7 +444,7 @@ pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output,
             } else {
                 match path.kind {
                     PathKind::OuterWall => settings.outer_wall_speed,
-                    PathKind::InnerWall => settings.inner_wall_speed,
+                    PathKind::InnerWall | PathKind::GapFill => settings.inner_wall_speed,
                     PathKind::SolidInfill | PathKind::SparseInfill | PathKind::Support => {
                         settings.infill_speed
                     }
@@ -647,6 +653,32 @@ mod tests {
             .stats
             .print_time_s;
         assert!(fast.is_finite() && slow > fast, "{fast} {slow}");
+    }
+
+    #[test]
+    fn lines_of_their_own_width_extrude_in_proportion() {
+        let mut settings = Settings::default();
+        settings.retraction_length = 0.0;
+        let mut toolpaths =
+            slicer_fdm::generate(&Mesh::cuboid(10.0, 10.0, 1.0), &settings).unwrap();
+        let full = write_gcode(&toolpaths, &settings).unwrap();
+        for path in toolpaths.layers.iter_mut().flat_map(|l| &mut l.paths) {
+            path.width = Some(settings.line_width / 4.0);
+        }
+        let quarter = write_gcode(&toolpaths, &settings).unwrap();
+        let ratio = quarter.stats.filament_length_mm / full.stats.filament_length_mm;
+        assert!((ratio - 0.25).abs() < 1e-3, "{ratio}");
+    }
+
+    #[test]
+    fn thin_fin_extrudes_its_volume() {
+        // 0.3 mm thick, narrower than a line: one line of its own width.
+        let mut settings = Settings::default();
+        settings.skirt_loops = 0;
+        let output = slice(&Mesh::cuboid(20.0, 0.3, 5.0), &settings);
+        let ratio = output.stats.filament_volume_cm3 * 1000.0 / (20.0 * 0.3 * 5.0);
+        assert!((ratio - 1.0).abs() < 0.25, "{ratio}");
+        assert!(output.gcode.contains(";TYPE:Outer wall\n"));
     }
 
     #[test]

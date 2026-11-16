@@ -48,6 +48,16 @@ const BRIDGE_ANCHOR: f64 = 2.0;
 /// Longest rim of a hole in the mesh that is closed before slicing.
 const MAX_HOLE_EDGES: usize = 64;
 
+/// Narrowest region that a wall misses and that still gets a line along its
+/// middle, in line widths. Narrower regions stay empty.
+const MIN_THIN_WIDTH: f64 = 0.5;
+
+/// Upper limit of the area, per contour and per millimetre of growth, by
+/// which the polygonal arcs of an offset fall short of circular ones, in
+/// mm² / mm. Twice the 4π/3 times 0.0025 mm (the arc tolerance of the
+/// polygon operations) that a full turn of arc loses.
+const ARC_SHORTFALL: f64 = 0.02;
+
 /// What a path is for. Determines speed and the label in the G-code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathKind {
@@ -61,6 +71,9 @@ pub enum PathKind {
     OuterWall,
     /// Walls behind the outer wall.
     InnerWall,
+    /// Lines in gaps between walls, or between the walls and the infill,
+    /// too narrow for another wall.
+    GapFill,
     /// Dense fill of top and bottom surfaces.
     SolidInfill,
     /// Solid infill with nothing below it, spanning from side to side.
@@ -81,16 +94,25 @@ pub struct Path {
     /// Whether the move from the end of the previous path to the start of
     /// this one stays over the part, so that it needs no retraction.
     pub travel_inside: bool,
+    /// Width of the extruded line in millimetres where it differs from the
+    /// line width setting: lines along the middle of regions too narrow for
+    /// a wall.
+    pub width: Option<f64>,
 }
 
 impl Path {
     /// Extruded length in millimetres.
     pub fn length(&self) -> f64 {
-        let open: f64 = self.points.windows(2).map(|w| distance(w[0], w[1])).sum();
-        match (self.closed, self.points.first(), self.points.last()) {
-            (true, Some(&first), Some(&last)) => open + distance(last, first),
-            _ => open,
-        }
+        line_length(&self.points, self.closed)
+    }
+}
+
+/// Length of a line through `points`, back to the first one if `closed`.
+fn line_length(points: &[Point], closed: bool) -> f64 {
+    let open: f64 = points.windows(2).map(|w| distance(w[0], w[1])).sum();
+    match (closed, points.first(), points.last()) {
+        (true, Some(&first), Some(&last)) => open + distance(last, first),
+        _ => open,
     }
 }
 
@@ -337,6 +359,9 @@ pub fn generate_cancellable(
                     Work::Lines(lines, kind, join_distance) => {
                         push_lines(lines, kind, join_distance, &mut position, &mut paths);
                     }
+                    Work::Centred(lines, kind) => {
+                        push_centred(lines, kind, &mut position, &mut paths);
+                    }
                 }
             }
             // A layer with material but without any outer wall prints nothing.
@@ -419,7 +444,11 @@ fn travels_inside(layer: &Layer, slice: &Shapes) -> Vec<bool> {
         let (previous, path) = (&pair[0], &pair[1]);
         let hidden = matches!(
             path.kind,
-            PathKind::InnerWall | PathKind::SolidInfill | PathKind::Bridge | PathKind::SparseInfill
+            PathKind::InnerWall
+                | PathKind::GapFill
+                | PathKind::SolidInfill
+                | PathKind::Bridge
+                | PathKind::SparseInfill
         );
         let from = if previous.closed {
             previous.points.first()
@@ -499,7 +528,14 @@ enum Work {
     /// Line segments, their kind and the distance up to which consecutive
     /// segments are joined into one path.
     Lines(Vec<[Point; 2]>, PathKind, f64),
+    /// Lines along the middle of narrow regions, and their kind.
+    Centred(Vec<CentreLine>, PathKind),
 }
+
+/// A line along the middle of a region too narrow for a wall: its points,
+/// whether it returns to its first point, and the width it is extruded
+/// with.
+type CentreLine = (Vec<Point>, bool, f64);
 
 /// Generates the geometry of one layer in the order it is printed. The flag
 /// tells whether a noticeable part of the layer is too narrow to be covered
@@ -552,11 +588,73 @@ fn layer_work(
         .map(|k| polygon::offset(slice, -(0.5 + k as f64) * width))
         .collect();
 
-    // What the outer wall covers is its centre line grown back by half a
-    // width. Anything of the slice beyond that is lost. Rounded corners
-    // always lose a little, so only report a noticeable share.
+    // Infill centre lines stay half a width away from the inner edge of the
+    // innermost wall, so line ends and the links between lines do not
+    // deposit material twice. The overlap setting pushes them back out.
+    let overlap = settings.infill_overlap / 100.0;
+    let inset = (walls as f64 + 0.5 - overlap) * width;
+    let fill_area = polygon::offset(slice, -inset);
+
+    // Wall k covers its centre line grown by half a width, but nothing of
+    // the area k + 1 widths inside the contour; the infill covers the fill
+    // area grown back to the innermost wall. So what the area k widths
+    // inside (the slice itself for k = 0) has beyond the grown wall k, or
+    // beyond the grown fill area for k = walls, is covered by nothing:
+    // regions too narrow for the outer wall (thin walls), gaps between
+    // walls and gaps between the walls and the infill. Rounded corners
+    // always lose a little; only regions wide and long enough get a line.
+    let reaches = wall_shapes
+        .iter()
+        .map(|centre| (centre, 0.5 * width))
+        .chain(std::iter::once((
+            &fill_area,
+            (0.5 - overlap).max(0.0) * width,
+        )));
+    let mut thin_lines = Vec::new();
+    let mut gap_lines = Vec::new();
     let total = polygon::area(slice);
-    let covered = polygon::area(&polygon::offset(&wall_shapes[0], 0.5 * width));
+    let mut covered = total;
+    for (k, (centre, reach)) in reaches.enumerate() {
+        let eroded;
+        let inside = if k == 0 {
+            slice
+        } else {
+            eroded = polygon::offset(slice, -(k as f64) * width);
+            &eroded
+        };
+        // Further in there is nothing either.
+        if inside.is_empty() {
+            break;
+        }
+        let inside_area = polygon::area(inside);
+        // Growing a shape is slow; most of the time an estimate shows that
+        // nothing worth a line is missed.
+        let least = MIN_THIN_WIDTH * width * width;
+        let estimate = inside_area - grown_area(centre, reach) - corner_loss(inside, reach);
+        let reached = if estimate < least {
+            None
+        } else {
+            Some(polygon::offset(centre, reach))
+        };
+        let missed_area = reached
+            .as_ref()
+            .map_or(estimate, |r| inside_area - polygon::area(r));
+        if k == 0 {
+            covered = total - missed_area.max(0.0);
+        }
+        let Some(reached) = reached.filter(|_| missed_area >= least) else {
+            continue;
+        };
+        let (lines, regions) = centre_lines(polygon::difference(inside, &reached), width);
+        if k == 0 {
+            covered += polygon::area(&regions);
+            thin_lines = lines;
+        } else {
+            gap_lines.extend(lines);
+        }
+    }
+    // What the outer wall and the lines in narrow regions do not cover is
+    // lost. Report only a noticeable share.
     let thin = total - covered > (0.02 * total).max(width * width);
 
     // Wall 0 is the outer one.
@@ -575,13 +673,14 @@ fn layer_work(
             .map(|contour| polygon::simplify(contour, PATH_RESOLUTION))
             .collect();
         work.push(Work::Loops(loops, kind, width));
+        if k == 0 && !thin_lines.is_empty() {
+            work.push(Work::Centred(std::mem::take(&mut thin_lines), kind));
+        }
+    }
+    if !gap_lines.is_empty() {
+        work.push(Work::Centred(gap_lines, PathKind::GapFill));
     }
 
-    // Infill centre lines stay half a width away from the inner edge of the
-    // innermost wall, so line ends and the links between lines do not
-    // deposit material twice. The overlap setting pushes them back out.
-    let inset = (walls as f64 + 0.5 - settings.infill_overlap / 100.0) * width;
-    let fill_area = polygon::offset(slice, -inset);
     if fill_area.is_empty() {
         return (work, thin);
     }
@@ -827,6 +926,165 @@ fn outer_contours(shapes: &Shapes) -> Vec<Contour> {
     shapes.iter().filter_map(|s| s.first().cloned()).collect()
 }
 
+/// About the area of `shapes` grown by `reach` (Steiner's formula: area,
+/// plus contour length times the reach, plus a disc of that radius per
+/// shape and minus one per hole), less what the polygonal arcs of a real
+/// offset may fall short of round ones.
+// ponytail: exact only where the grown shape neither merges with itself nor
+// fills a sharp inward corner; there it comes out too large, and a missed
+// region of up to about reach² per such place goes unnoticed.
+fn grown_area(shapes: &Shapes, reach: f64) -> f64 {
+    let mut grown = polygon::area(shapes);
+    for shape in shapes {
+        for (i, contour) in shape.iter().enumerate() {
+            let disc = std::f64::consts::PI * reach * reach;
+            let disc = if i == 0 { disc } else { -disc };
+            grown += reach * line_length(contour, true) + disc - ARC_SHORTFALL * reach;
+        }
+    }
+    grown
+}
+
+/// At least two thirds of the area that rounding the outward corners of
+/// `shapes` to a radius of `reach` cuts off, counting only corners where
+/// the outline turns by up to 90 degrees. No line fits in what those lose.
+fn corner_loss(shapes: &Shapes, reach: f64) -> f64 {
+    let mut loss = 0.0;
+    for contour in shapes.iter().flatten() {
+        let n = contour.len();
+        for j in 0..n {
+            let (p, q, r) = (contour[(j + n - 1) % n], contour[j], contour[(j + 1) % n]);
+            let (a, b) = ([q[0] - p[0], q[1] - p[1]], [r[0] - q[0], r[1] - q[1]]);
+            let (cross, dot) = (a[0] * b[1] - a[1] * b[0], a[0] * b[0] + a[1] * b[1]);
+            let lengths = distance(p, q) * distance(q, r);
+            // Material lies to the left: a left turn is an outward corner.
+            if cross <= 0.0 || dot < 0.0 || lengths == 0.0 {
+                continue;
+            }
+            // Between corner and arc: reach² (tan x - x) for a turn by 2x.
+            // As x < (2 sin x + tan x) / 3, two thirds of tan x - sin x are
+            // less, and need no trigonometry.
+            let tan = cross / (lengths + dot);
+            let sin = ((1.0 - dot / lengths) / 2.0).max(0.0).sqrt();
+            loss += reach * reach * (tan - sin) * 2.0 / 3.0;
+        }
+    }
+    loss
+}
+
+/// Lines along the middle of the regions in `missed` that are at least
+/// [`MIN_THIN_WIDTH`] line widths wide and give a line at least one line
+/// width long, and the regions that got one. A region's lines are as wide
+/// as its area divided by their length (at most one line width), so they
+/// deposit its volume.
+// ponytail: an approximate centre line, not a medial axis. A region is
+// shrunk by half the minimum width; one without holes is cut at its two
+// points farthest apart and its two sides are averaged, one with holes gets
+// a loop halfway between its outer contour and its holes. A branching
+// region (T, Y) gets a line along one side of the shrunk region instead,
+// into the branch and back; a grid of thin walls gets only its outer loop;
+// a region wider than a line in places still gets a single line.
+fn centre_lines(missed: Shapes, width: f64) -> (Vec<CentreLine>, Shapes) {
+    let least = MIN_THIN_WIDTH * width;
+    let mut lines = Vec::new();
+    let mut regions = Vec::new();
+    for region in polygon::clean(missed, least * width, 0.0) {
+        let region = vec![region];
+        let mut found: Vec<(Vec<Point>, bool)> = Vec::new();
+        for core in polygon::offset(&region, -0.5 * least) {
+            if core.len() > 1 {
+                // In a thin band, area over the length of all contours is
+                // half its width.
+                let contour_length: f64 = core.iter().map(|c| line_length(c, true)).sum();
+                let half = polygon::area(std::slice::from_ref(&core)) / contour_length;
+                let outline = vec![vec![core[0].clone()]];
+                for shape in polygon::offset(&outline, -half) {
+                    found.push((polygon::simplify(&shape[0], PATH_RESOLUTION), true));
+                }
+            } else {
+                let outline = polygon::simplify(&core[0], PATH_RESOLUTION);
+                found.push((midline(&outline, &region), false));
+            }
+        }
+        found.retain(|(points, closed)| line_length(points, *closed) >= width);
+        let length: f64 = found
+            .iter()
+            .map(|(p, closed)| line_length(p, *closed))
+            .sum();
+        if length > 0.0 {
+            let line_width = (polygon::area(&region) / length).min(width);
+            lines.extend(found.into_iter().map(|(p, closed)| (p, closed, line_width)));
+            regions.extend(region);
+        }
+    }
+    (lines, regions)
+}
+
+/// Middle line of a strip given by its outline: the outline is cut at its
+/// two points farthest apart (found by two sweeps), and its two sides are
+/// averaged at equal shares of their length. Where the average leaves
+/// `region`, the strip branches, and the longer side is used instead.
+fn midline(outline: &[Point], region: &Shapes) -> Vec<Point> {
+    let n = outline.len();
+    let farthest = |from: Point| {
+        (0..n)
+            .max_by(|&i, &j| distance(from, outline[i]).total_cmp(&distance(from, outline[j])))
+            .unwrap_or(0)
+    };
+    let (Some(&start), true) = (outline.first(), n > 2) else {
+        return outline.to_vec();
+    };
+    let a = farthest(start);
+    let b = farthest(outline[a]);
+    let steps = (b + n - a) % n;
+    let one: Vec<Point> = (0..=steps).map(|i| outline[(a + i) % n]).collect();
+    let other: Vec<Point> = (0..=n - steps).map(|i| outline[(a + n - i) % n]).collect();
+    // Position along a side, from 0 at its start to 1 at its end.
+    let shares = |side: &[Point]| {
+        let mut run = vec![0.0];
+        for pair in side.windows(2) {
+            run.push(run[run.len() - 1] + distance(pair[0], pair[1]));
+        }
+        let total = run[run.len() - 1];
+        if total > 0.0 {
+            run.iter_mut().for_each(|s| *s /= total);
+        }
+        run
+    };
+    let (s1, s2) = (shares(&one), shares(&other));
+    let at = |side: &[Point], s: &[f64], t: f64| {
+        let i = s.partition_point(|&x| x < t).clamp(1, side.len() - 1);
+        let span = s[i] - s[i - 1];
+        let f = if span > 0.0 {
+            ((t - s[i - 1]) / span).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (p, q) = (side[i - 1], side[i]);
+        [p[0] + f * (q[0] - p[0]), p[1] + f * (q[1] - p[1])]
+    };
+    let mut ts: Vec<f64> = s1.iter().chain(&s2).copied().collect();
+    ts.sort_by(f64::total_cmp);
+    ts.dedup_by(|x, y| *x - *y < 1e-9);
+    let middle: Vec<Point> = ts
+        .iter()
+        .map(|&t| {
+            let (p, q) = (at(&one, &s1, t), at(&other, &s2, t));
+            [(p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0]
+        })
+        .collect();
+    if middle
+        .windows(2)
+        .all(|w| polygon::segment_inside(region, w[0], w[1]))
+    {
+        middle
+    } else if line_length(&one, false) >= line_length(&other, false) {
+        one
+    } else {
+        other
+    }
+}
+
 /// The rearmost of the points that `allowed` lets through (largest Y, then
 /// smallest X). Points almost as far back as the rearmost one count as
 /// equally far back; otherwise rounding would move the seam along a straight
@@ -908,6 +1166,7 @@ fn push_loops(
             points,
             closed: true,
             travel_inside: false,
+            width: None,
         };
         if path.length() >= min_length {
             *position = path.points[0];
@@ -952,12 +1211,53 @@ fn push_lines(
                     points: line.to_vec(),
                     closed: false,
                     travel_inside: false,
+                    width: None,
                 });
             }
         }
         *position = line[1];
     }
     paths.extend(current);
+}
+
+/// Appends lines along the middle of narrow regions, always continuing with
+/// the nearest end of an open line or the nearest point of a loop.
+fn push_centred(
+    mut lines: Vec<CentreLine>,
+    kind: PathKind,
+    position: &mut Point,
+    paths: &mut Vec<Path>,
+) {
+    while !lines.is_empty() {
+        let mut best = (0, 0, f64::INFINITY);
+        for (i, (points, closed, _)) in lines.iter().enumerate() {
+            for (j, &p) in points.iter().enumerate() {
+                let end = j == 0 || j + 1 == points.len();
+                let d = distance(*position, p);
+                if (*closed || end) && d < best.2 {
+                    best = (i, j, d);
+                }
+            }
+        }
+        let (mut points, closed, width) = lines.remove(best.0);
+        if closed {
+            points.rotate_left(best.1);
+        } else if best.1 > 0 {
+            points.reverse();
+        }
+        *position = if closed {
+            points[0]
+        } else {
+            points[points.len() - 1]
+        };
+        paths.push(Path {
+            kind,
+            points,
+            closed,
+            travel_inside: false,
+            width: Some(width),
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1523,6 +1823,100 @@ mod tests {
         assert_eq!(
             generate(&Mesh::cuboid(10.0, 10.0, 0.1), &settings),
             Err(FdmError::NothingToPrint)
+        );
+    }
+
+    /// Material a layer deposits per millimetre of height, in mm².
+    fn deposited_area(layer: &Layer, settings: &Settings) -> f64 {
+        layer
+            .paths
+            .iter()
+            .map(|p| p.length() * p.width.unwrap_or(settings.line_width))
+            .sum()
+    }
+
+    #[test]
+    fn thin_fin_gets_a_line_on_every_layer() {
+        // A fin 0.3 mm thick on a plate 1 mm thick.
+        let mut mesh = Mesh::cuboid(20.0, 20.0, 1.0);
+        let mut fin = Mesh::cuboid(20.0, 0.3, 5.0);
+        fin.translate([0.0, 10.0, 1.0]);
+        mesh.merge(&fin);
+        let settings = Settings::default();
+        let mut diagnostics = Diagnostics::new();
+        let toolpaths = generate_reporting(&mesh, &settings, &mut diagnostics).unwrap();
+        assert!(diagnostics.is_empty(), "{:?}", diagnostics.codes());
+        let fin_layers: Vec<&Layer> = toolpaths.layers.iter().filter(|l| l.z > 1.01).collect();
+        assert_eq!(fin_layers.len(), 25);
+        for layer in fin_layers {
+            let [line] = layer.paths.as_slice() else {
+                panic!("z {}: {} paths", layer.z, layer.paths.len());
+            };
+            assert_eq!(line.kind, PathKind::OuterWall);
+            assert!(!line.closed);
+            assert!(line.length() > 19.0, "{}", line.length());
+            // Along the middle of the fin, which spans Y 110 to 110.3 on
+            // the bed. The ends may bend off by a few hundredths.
+            let mid = line.points[line.points.len() / 2][1];
+            assert!((mid - 110.15).abs() < 0.01, "{mid}");
+            assert!(line.points.iter().all(|p| (p[1] - 110.15).abs() < 0.05));
+            let width = line.width.unwrap();
+            assert!((0.25..0.35).contains(&width), "{width}");
+            let ratio = deposited_area(layer, &settings) / (20.0 * 0.3);
+            assert!((ratio - 1.0).abs() < 0.25, "z {}: {ratio}", layer.z);
+        }
+    }
+
+    #[test]
+    fn thin_ring_gets_a_closed_line() {
+        let ring = slicer_core::primitives::tube(10.0, 9.7, 2.0, 96);
+        let settings = Settings::default();
+        let toolpaths = generate(&ring, &settings).unwrap();
+        let expected = std::f64::consts::PI * (10.0 * 10.0 - 9.7 * 9.7);
+        for layer in &toolpaths.layers[1..] {
+            let lines: Vec<&Path> = layer
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::OuterWall)
+                .collect();
+            let [line] = lines.as_slice() else {
+                panic!("z {}: {} walls", layer.z, lines.len());
+            };
+            assert!(line.closed && line.width.is_some());
+            let ratio = deposited_area(layer, &settings) / expected;
+            assert!((ratio - 1.0).abs() < 0.1, "z {}: {ratio}", layer.z);
+        }
+    }
+
+    #[test]
+    fn gaps_between_walls_are_filled() {
+        // 1.2 mm leaves a strip of 0.3 mm between the two sides of the
+        // outer wall, too narrow for the second wall.
+        let settings = Settings::default();
+        let toolpaths = generate(&Mesh::cuboid(20.0, 1.2, 2.0), &settings).unwrap();
+        for layer in &toolpaths.layers[1..] {
+            let gaps: Vec<&Path> = layer
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::GapFill)
+                .collect();
+            let [gap] = gaps.as_slice() else {
+                panic!("z {}: {} gap lines", layer.z, gaps.len());
+            };
+            assert!(gap.length() > 18.0, "{}", gap.length());
+            let width = gap.width.unwrap();
+            assert!((0.25..0.35).contains(&width), "{width}");
+            let ratio = deposited_area(layer, &settings) / (20.0 * 1.2);
+            assert!((ratio - 1.0).abs() < 0.05, "z {}: {ratio}", layer.z);
+        }
+        // Walls that fit exactly leave no gap.
+        let toolpaths = generate(&Mesh::cuboid(20.0, 20.0, 2.0), &settings).unwrap();
+        assert!(
+            toolpaths
+                .layers
+                .iter()
+                .flat_map(|l| &l.paths)
+                .all(|p| p.kind != PathKind::GapFill && p.width.is_none())
         );
     }
 
