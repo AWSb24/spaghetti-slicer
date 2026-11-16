@@ -3,6 +3,7 @@
 mod adaptive;
 mod infill;
 pub mod preview;
+mod tree;
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use slicer_core::polygon::{self, HatchDirection, distance};
 use slicer_core::slice::slice_mesh_reporting;
 use slicer_core::{Contour, Diagnostic, Diagnostics, Mesh, Point, Shapes, parallel_map};
-use slicer_profiles::{InfillPattern, SeamPosition, Settings, WallOrder};
+use slicer_profiles::{InfillPattern, SeamPosition, Settings, SupportStyle, WallOrder};
 
 /// Difference in Y below which two points count as equally far back when
 /// placing the seam, in millimetres.
@@ -379,7 +380,7 @@ pub fn generate_cancellable(
                 .cloned()
                 .collect()
         });
-        support_areas(&slices, &carried, settings)
+        support_areas(&slices, &carried, &cut_heights, settings)
     } else {
         Vec::new()
     };
@@ -526,13 +527,15 @@ fn travels_inside(layer: &Layer, slice: &Shapes) -> Vec<bool> {
 /// densely: below everything that hangs free, down to the bed or to the
 /// model, with one empty layer under the surface they carry and above the
 /// model they stand on, and one line width of distance to its sides. The
-/// dense part is what lies right under a carried surface.
-// ponytail: straight columns. No supports that lean or branch. The gaps are
-// one layer whatever its thickness, so with adaptive layers they are as thin
-// as the layers there.
+/// dense part is what lies right under a carried surface. Tree supports
+/// (`support_style = tree`) replace the columns below the dense part by
+/// branches.
+// ponytail: the gaps are one layer whatever its thickness, so with adaptive
+// layers they are as thin as the layers there.
 fn support_areas(
     slices: &[Shapes],
     hanging: &[Shapes],
+    cut_heights: &[f64],
     settings: &Settings,
 ) -> Vec<(Shapes, Shapes)> {
     // Where no support may be depends only on the model, so all cores work
@@ -544,30 +547,10 @@ fn support_areas(
         }
         polygon::offset(&model, settings.line_width)
     });
-    let mut areas: Vec<Shapes> = vec![Vec::new(); slices.len()];
-    for index in (0..slices.len().saturating_sub(2)).rev() {
-        let above = polygon::union(&hanging[index + 2], &areas[index + 1]);
-        if above.is_empty() {
-            continue;
-        }
-        // Every layer adds the points of its own outline. Without thinning
-        // them out a support under a round overhang ends up with tens of
-        // thousands of points and takes seconds per model.
-        areas[index] = polygon::clean(
-            polygon::difference(&above, &keep_out[index]),
-            MIN_SUPPORT_AREA,
-            0.0,
-        )
-        .iter()
-        .map(|shape| {
-            shape
-                .iter()
-                .map(|contour| polygon::simplify(contour, SUPPORT_RESOLUTION))
-                .filter(|contour| contour.len() > 2)
-                .collect()
-        })
-        .collect();
-    }
+    let areas = match settings.support_style {
+        SupportStyle::Normal => column_areas(hanging, &keep_out),
+        SupportStyle::Tree => tree::areas(hanging, &keep_out, cut_heights, settings),
+    };
     let dense_layers = settings.support_interface_layers as usize;
     parallel_map(areas.len(), |index| {
         let area = areas[index].clone();
@@ -580,6 +563,37 @@ fn support_areas(
         let dense = polygon::intersection(&area, &carried);
         (area, dense)
     })
+}
+
+/// Straight columns under everything that hangs free, down to the bed or to
+/// the model, clear of `keep_out`.
+fn column_areas(hanging: &[Shapes], keep_out: &[Shapes]) -> Vec<Shapes> {
+    let mut areas: Vec<Shapes> = vec![Vec::new(); hanging.len()];
+    for index in (0..hanging.len().saturating_sub(2)).rev() {
+        let above = polygon::union(&hanging[index + 2], &areas[index + 1]);
+        if above.is_empty() {
+            continue;
+        }
+        areas[index] = tidy_support(polygon::difference(&above, &keep_out[index]));
+    }
+    areas
+}
+
+/// Drops support pieces too small to print and thins out the outlines.
+/// Every layer adds the points of its own outline. Without thinning them out
+/// a support under a round overhang ends up with tens of thousands of points
+/// and takes seconds per model.
+fn tidy_support(area: Shapes) -> Shapes {
+    polygon::clean(area, MIN_SUPPORT_AREA, 0.0)
+        .iter()
+        .map(|shape| {
+            shape
+                .iter()
+                .map(|contour| polygon::simplify(contour, SUPPORT_RESOLUTION))
+                .filter(|contour| contour.len() > 2)
+                .collect()
+        })
+        .collect()
 }
 
 /// Geometry of one kind that still has to be put in printing order.
@@ -2153,6 +2167,83 @@ mod tests {
                     .iter()
                     .any(|p| p.kind == PathKind::Support)
             })
+            .collect();
+        assert_eq!(layers, (11..59).collect::<Vec<usize>>());
+    }
+
+    #[test]
+    fn tree_supports_branch_and_merge() {
+        // The T of `supports_stand_under_overhangs`.
+        let mut t = Mesh::cuboid(10.0, 10.0, 10.0);
+        t.translate([10.0, 0.0, 0.0]);
+        let mut plate = Mesh::cuboid(30.0, 10.0, 2.0);
+        plate.translate([0.0, 0.0, 10.0]);
+        t.merge(&plate);
+        fn support(layer: &Layer) -> Vec<&Path> {
+            layer
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::Support)
+                .collect()
+        }
+        let length = |toolpaths: &Toolpaths| -> f64 {
+            toolpaths
+                .layers
+                .iter()
+                .flat_map(|layer| support(layer))
+                .map(Path::length)
+                .sum()
+        };
+        let mut settings = Settings::default();
+        settings.supports = true;
+        let normal = length(&generate(&t, &settings).unwrap());
+        settings.support_style = SupportStyle::Tree;
+        let mut warnings = Diagnostics::new();
+        let toolpaths = generate_reporting(&t, &settings, &mut warnings).unwrap();
+        assert!(warnings.is_empty(), "{:?}", warnings.codes());
+        let tree = length(&toolpaths);
+        // Every layer under the plate (layer 50) but the empty one right
+        // below it has support, and it stands on the bed.
+        let layers: Vec<usize> = (0..toolpaths.layers.len())
+            .filter(|&i| !support(&toolpaths.layers[i]).is_empty())
+            .collect();
+        assert_eq!(layers, (0..49).collect::<Vec<usize>>());
+        assert!(
+            tree < 0.5 * normal,
+            "tree {tree:.0} mm, normal {normal:.0} mm"
+        );
+        // No line comes closer to the column (x 105 to 115, y 105 to 115)
+        // than the gap of one line width, measured from its middle.
+        for layer in &toolpaths.layers[..49] {
+            for p in support(layer).iter().flat_map(|path| &path.points) {
+                let dx = (105.0 - p[0]).max(p[0] - 115.0).max(0.0);
+                let dy = (105.0 - p[1]).max(p[1] - 115.0).max(0.0);
+                let gap = (dx * dx + dy * dy).sqrt();
+                assert!(gap >= 0.45 - 1e-3, "{p:?} is {gap} mm from the column");
+            }
+        }
+        // The two dense layers under the plate; below them the branches
+        // start as many thin tips and merge into fewer trunks.
+        let loops = |index: usize| {
+            support(&toolpaths.layers[index])
+                .iter()
+                .filter(|p| p.closed)
+                .count()
+        };
+        assert!(loops(46) >= 16, "{}", loops(46));
+        assert!(loops(0) <= 4 && loops(0) < loops(46) / 4, "{}", loops(0));
+
+        // With a base under the column the branches stand on it, one empty
+        // layer above it (layers 11 to 58 as with straight columns).
+        let mut h = Mesh::cuboid(30.0, 10.0, 2.0);
+        let mut column = Mesh::cuboid(10.0, 10.0, 10.0);
+        column.translate([10.0, 0.0, 2.0]);
+        h.merge(&column);
+        plate.translate([0.0, 0.0, 2.0]);
+        h.merge(&plate);
+        let toolpaths = generate(&h, &settings).unwrap();
+        let layers: Vec<usize> = (0..toolpaths.layers.len())
+            .filter(|&i| !support(&toolpaths.layers[i]).is_empty())
             .collect();
         assert_eq!(layers, (11..59).collect::<Vec<usize>>());
     }

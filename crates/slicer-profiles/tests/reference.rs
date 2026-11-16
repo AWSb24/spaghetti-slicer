@@ -74,6 +74,7 @@ fn settings_reference_is_current() {
                 "infill_pattern" => "`rectilinear`, `grid`, `triangles`, `gyroid`".to_string(),
                 "wall_order" => "`inner_outer`, `outer_inner`".to_string(),
                 "seam_position" => "`rear`, `corner`, `nearest`".to_string(),
+                "support_style" => "`normal`, `tree`".to_string(),
                 "extrusion_mode" => "`relative`, `absolute`".to_string(),
                 "fan_off_layers" => "0 or more".to_string(),
                 "supports" | "adaptive_layers" => "`true`, `false`".to_string(),
