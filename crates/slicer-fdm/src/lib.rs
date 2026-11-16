@@ -65,6 +65,25 @@ const DEGENERATE_HEIGHT: f64 = 1e-6;
 /// middle, in line widths. Narrower regions stay empty.
 const MIN_THIN_WIDTH: f64 = 0.5;
 
+/// Widest line along the middle of a narrow region, in line widths. Regions
+/// up to twice a line width wide get a single line instead of a wall loop
+/// that would fold back onto itself.
+// ponytail: one line up to twice the line width (0.9 mm at the defaults),
+// not two narrower lines side by side. Whether a nozzle lays down a line that
+// wide cleanly is unverified; split regions wider than about 1.5 widths into
+// two lines if prints show it does not.
+const MAX_CENTRED_WIDTH: f64 = 2.0;
+
+/// Shortest part of a wall loop, in line widths, whose two sides lie closer
+/// than a line width and that is printed as a line along the middle of the
+/// region instead. The tips of corners sharper than about 40 degrees count.
+const MIN_FOLD_LENGTH: f64 = 2.0;
+
+/// How much closer than a line width (mm) the two sides of a wall loop may
+/// come before the loop counts as folded. Keeps regions exactly two widths
+/// wide at two lines and rounding noise along the walls out of the folds.
+const FOLD_MARGIN: f64 = 0.01;
+
 /// Upper limit of the area, per contour and per millimetre of growth, by
 /// which the polygonal arcs of an offset fall short of circular ones, in
 /// mm² / mm. Twice the 4π/3 times 0.0025 mm (the arc tolerance of the
@@ -111,7 +130,7 @@ pub struct Path {
     pub extruder: u32,
     /// Width of the extruded line in millimetres where it differs from the
     /// line width setting: lines along the middle of regions too narrow for
-    /// a wall.
+    /// a wall loop (up to two line widths wide).
     pub width: Option<f64>,
 }
 
@@ -662,9 +681,29 @@ fn layer_work(
 
     // Walls: centre lines half a width inside the contour, then one width
     // further in for every additional loop. Printed from the inside out.
-    let wall_shapes: Vec<Shapes> = (0..walls)
+    let mut wall_shapes: Vec<Shapes> = (0..walls)
         .map(|k| polygon::offset(slice, -(0.5 + k as f64) * width))
         .collect();
+    // Where the area a wall has to cover (the slice, or what lies inside the
+    // previous wall) is between one and two widths wide, the wall's centre
+    // area is narrower than a width: its loop runs out and back with its
+    // sides closer than a width and deposits up to twice the material. Those
+    // parts are what shrinking the centre area by half a width and growing it
+    // back does not reach; long ones are taken out of the wall, so that the
+    // missed regions below get a line of their own width instead.
+    for centre in &mut wall_shapes {
+        if centre.is_empty() {
+            break;
+        }
+        let shrunk = polygon::offset(centre, -(0.5 * width - FOLD_MARGIN));
+        let folds: Shapes = polygon::difference(centre, &polygon::offset(&shrunk, 0.5 * width))
+            .into_iter()
+            .filter(|shape| line_length(&shape[0], true) >= 2.0 * MIN_FOLD_LENGTH * width)
+            .collect();
+        if !folds.is_empty() {
+            *centre = polygon::difference(centre, &polygon::offset(&folds, FOLD_MARGIN));
+        }
+    }
 
     // Infill centre lines stay half a width away from the inner edge of the
     // innermost wall, so line ends and the links between lines do not
@@ -1112,7 +1151,8 @@ fn corner_loss(shapes: &Shapes, reach: f64) -> f64 {
 /// Lines along the middle of the regions in `missed` that are at least
 /// [`MIN_THIN_WIDTH`] line widths wide and give a line at least one line
 /// width long, and the regions that got one. A region's lines are as wide
-/// as its area divided by their length (at most one line width), so they
+/// as its area divided by their length (at most [`MAX_CENTRED_WIDTH`] line
+/// widths), so they
 /// deposit its volume.
 // ponytail: an approximate centre line, not a medial axis. A region is
 // shrunk by half the minimum width; one without holes is cut at its two
@@ -1149,7 +1189,7 @@ fn centre_lines(missed: Shapes, width: f64) -> (Vec<CentreLine>, Shapes) {
             .map(|(p, closed)| line_length(p, *closed))
             .sum();
         if length > 0.0 {
-            let line_width = (polygon::area(&region) / length).min(width);
+            let line_width = (polygon::area(&region) / length).min(MAX_CENTRED_WIDTH * width);
             lines.extend(found.into_iter().map(|(p, closed)| (p, closed, line_width)));
             regions.extend(region);
         }
@@ -2370,6 +2410,73 @@ mod tests {
             assert!(line.closed && line.width.is_some());
             let ratio = deposited_area(layer, &settings) / expected;
             assert!((ratio - 1.0).abs() < 0.1, "z {}: {ratio}", layer.z);
+        }
+    }
+
+    #[test]
+    fn walls_do_not_fold_back_onto_themselves() {
+        let settings = Settings::default();
+        // 0.65 mm, about 1.4 line widths: one line of that width, not a wall
+        // loop whose sides overlap; 1.6 mm: two walls would leave 0.25 mm
+        // for the second one, which becomes a line of 0.7 mm instead.
+        for (thickness, kind) in [(0.65, PathKind::OuterWall), (1.6, PathKind::GapFill)] {
+            let toolpaths = generate(&Mesh::cuboid(20.0, thickness, 2.0), &settings).unwrap();
+            for layer in &toolpaths.layers[1..] {
+                let lines: Vec<&Path> = layer.paths.iter().filter(|p| p.kind == kind).collect();
+                let [line] = lines.as_slice() else {
+                    panic!("{thickness} z {}: {} lines", layer.z, lines.len());
+                };
+                assert!(!line.closed && line.length() > 19.0, "{}", line.length());
+                let width = line.width.unwrap();
+                assert!(width > settings.line_width, "{thickness}: {width}");
+                let ratio = deposited_area(layer, &settings) / (20.0 * thickness);
+                assert!(
+                    (ratio - 1.0).abs() < 0.1,
+                    "{thickness} z {}: {ratio}",
+                    layer.z
+                );
+            }
+        }
+        // Exactly two widths: the sides of the loop just touch.
+        let toolpaths = generate(&Mesh::cuboid(20.0, 0.9, 2.0), &settings).unwrap();
+        assert!(
+            toolpaths
+                .layers
+                .iter()
+                .flat_map(|l| &l.paths)
+                .all(|p| p.closed && p.width.is_none())
+        );
+        // A square with a tab of 0.65 mm in the same layers: the square keeps
+        // its wall loops, the tab gets a line of its own.
+        let outline = [
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [10.0, 5.0],
+            [20.0, 5.0],
+            [20.0, 5.65],
+            [10.0, 5.65],
+            [10.0, 10.0],
+            [0.0, 10.0],
+        ];
+        let mesh = slicer_core::primitives::extrude(&outline, [0.0, 0.0], 2.0, 1, 0.0);
+        let toolpaths = generate(&mesh, &settings).unwrap();
+        let alone = generate(&Mesh::cuboid(10.0, 10.0, 2.0), &settings).unwrap();
+        for (layer, alone) in toolpaths.layers.iter().zip(&alone.layers).skip(1) {
+            let tab: Vec<&Path> = layer
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::OuterWall && p.width.is_some())
+                .collect();
+            let [tab] = tab.as_slice() else {
+                panic!("z {}: {} tab lines", layer.z, tab.len());
+            };
+            // The tab spans Y 110 to 110.65 on the bed.
+            assert!(tab.points.iter().all(|p| p[1] > 109.9 && p[1] < 110.75));
+            assert!(tab.length() > 9.0, "{}", tab.length());
+            // Without the tab's line, the square gets as much as before.
+            let square = deposited_area(layer, &settings) - tab.length() * tab.width.unwrap();
+            let ratio = square / deposited_area(alone, &settings);
+            assert!((ratio - 1.0).abs() < 0.05, "z {}: {ratio}", layer.z);
         }
     }
 

@@ -74,6 +74,7 @@ All three must pass. New behaviour needs a test.
 | `;TYPE:` and `;LAYER_CHANGE` comments | Naming convention read by common G-code viewers, used for interoperability |
 | Tree supports (contact points on a grid, branches leaning a bounded step per layer towards their nearest neighbour, pushed out of the model, merged when they touch, radius from the carried area; circles from own sine and cosine) | Idea of supports that start at sampled points and join on the way down within a bounded angle from Vanek, Galicia and Benes, "Clever Support: Efficient Support Structure Generation for Digital Fabrication", Computer Graphics Forum 33(5), 2014; algorithm own design |
 | Thin walls and gap fill | Centre line by shrinking a region and averaging its two sides; skip test by Steiner's formula for parallel sets; own design |
+| Folded walls in regions one to two lines wide | Morphological opening (shrink, then grow back) of a wall's centre area finds where its loop's sides lie closer than a line; textbook mathematical morphology (Serra), own design |
 | Desktop app | `eframe`/`egui` (MIT OR Apache-2.0), `rfd` (MIT); layout own design |
 | Default start and end G-code | Generic Marlin commands, not taken from any profile |
 | Resin layer images (scanline fill with non-zero winding, supersampling) | Standard scanline fill, own design |
