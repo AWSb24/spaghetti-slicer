@@ -16,6 +16,7 @@ slicer-gcode = { path = "crates/slicer-gcode" }
 slicer-formats = { path = "crates/slicer-formats" }
 slicer-profiles = { path = "crates/slicer-profiles" }
 slicer-sla = { path = "crates/slicer-sla" }
+slicer-send = { path = "crates/slicer-send" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

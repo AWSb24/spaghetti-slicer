@@ -1,0 +1,23 @@
+[package]
+name = "slicer-send"
+description = "Sends G-code to a printer over the network (Moonraker, OctoPrint)."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# A stand-in printer API for tests of this and other crates.
+mock = []
+
+[dependencies]
+slicer-core.workspace = true
+serde_json = "1.0.154"
+ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+slicer-send = { path = ".", features = ["mock"] }

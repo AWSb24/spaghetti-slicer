@@ -70,6 +70,7 @@ All three must pass. New behaviour needs a test.
 | Sliced project file for Bambu Lab printers (`.gcode.3mf`) | Worked out from a file exported by Bambu Studio (names of the parts, checksum file, description files); no source code read. MD5 from RFC 1321 |
 | Build plates and object extruders of Bambu Studio projects | Worked out from the `Metadata/model_settings.config` part of project files written by the program; no source code read |
 | HTTP server | `axum` and `tokio` (MIT), `uuid` (MIT OR Apache-2.0); API is an own design |
+| Sending G-code to Moonraker and OctoPrint (`slicer-send`) | Public API documentation: Moonraker file manager and authorization pages (moonraker.readthedocs.io/en/latest/external_api/file_manager/, …/authorization/), OctoPrint file and general API pages (docs.octoprint.org/en/master/api/files.html, …/general.html); multipart body after RFC 7578; HTTP client `ureq` (MIT OR Apache-2.0) with `rustls`/`ring` (Apache-2.0/ISC/MIT) and the Mozilla root certificates from `webpki-roots` (CDLA-Permissive-2.0); never tried against a real printer |
 | G-code commands | Marlin and RepRap G-code documentation |
 | `;TYPE:` and `;LAYER_CHANGE` comments | Naming convention read by common G-code viewers, used for interoperability |
 | Thin walls and gap fill | Centre line by shrinking a region and averaging its two sides; skip test by Steiner's formula for parallel sets; own design |
