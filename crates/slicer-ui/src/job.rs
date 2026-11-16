@@ -11,15 +11,13 @@ use slicer_fdm::Toolpaths;
 use slicer_gcode::Output;
 use slicer_profiles::Settings;
 
-use crate::plate::{shift_toolpaths, toolpath_bounds};
+use crate::plate::toolpath_bounds;
 
 /// Everything a slice needs. Owned, so it can move to another thread.
 #[derive(Debug, Clone)]
 pub struct SliceRequest {
-    /// The model, rotated and scaled; the slicer centres it on the bed.
-    pub mesh: Mesh,
-    /// Shift of the toolpaths from the bed centre to the model's place.
-    pub offset: [f64; 2],
+    /// The models, rotated, scaled and placed in bed coordinates.
+    pub objects: Vec<Mesh>,
     /// Settings to slice with.
     pub settings: Settings,
 }
@@ -65,10 +63,14 @@ pub fn slice(
     let settings = &request.settings;
     phase.store(Phase::Toolpaths as u8, Ordering::Relaxed);
     let mut warnings = Diagnostics::new();
-    let mut toolpaths =
-        slicer_fdm::generate_cancellable(&request.mesh, settings, &mut warnings, stop)
-            .map_err(|e| e.diagnostic())?;
-    shift_toolpaths(&mut toolpaths, request.offset);
+    let toolpaths = slicer_fdm::generate_plate(
+        &request.objects,
+        slicer_fdm::Placement::AsGiven,
+        settings,
+        &mut warnings,
+        stop,
+    )
+    .map_err(|e| e.diagnostic())?;
     let mut warnings = warnings.as_slice().to_vec();
     if let Some((lo, hi)) = toolpath_bounds(&toolpaths) {
         let bed = [settings.bed_size_x, settings.bed_size_y];
@@ -248,10 +250,16 @@ mod tests {
 
     use super::*;
 
+    /// A 10 mm cube centred at `center`.
+    fn cube_at(center: [f64; 2]) -> Mesh {
+        let mut mesh = Mesh::cuboid(10.0, 10.0, 2.0);
+        mesh.translate([center[0] - 5.0, center[1] - 5.0, 0.0]);
+        mesh
+    }
+
     fn request() -> SliceRequest {
         SliceRequest {
-            mesh: Mesh::cuboid(10.0, 10.0, 2.0),
-            offset: [-50.0, 20.0],
+            objects: vec![cube_at([60.0, 130.0])],
             settings: Settings::default(),
         }
     }
@@ -277,9 +285,10 @@ mod tests {
     #[test]
     fn same_gcode_as_the_command_line_when_centred() {
         let mut centred = request();
-        centred.offset = [0.0, 0.0];
+        centred.objects = vec![cube_at([110.0, 110.0])];
         let result = SliceJob::start(centred.clone(), || {}).wait().unwrap();
-        let toolpaths = slicer_fdm::generate(&centred.mesh, &centred.settings).unwrap();
+        let cube = Mesh::cuboid(10.0, 10.0, 2.0);
+        let toolpaths = slicer_fdm::generate(&cube, &centred.settings).unwrap();
         let direct = slicer_gcode::write_gcode(&toolpaths, &centred.settings).unwrap();
         assert_eq!(result.output.gcode, direct.gcode);
     }
@@ -305,7 +314,7 @@ mod tests {
     fn paths_over_the_edge_are_reported() {
         let mut near_edge = request();
         // The 10 mm cube touches the bed edge; the skirt reaches beyond.
-        near_edge.offset = [105.0, 0.0];
+        near_edge.objects = vec![cube_at([215.0, 110.0])];
         let result = SliceJob::start(near_edge, || {}).wait().unwrap();
         assert_eq!(result.warnings[0].code, "ui.paths_off_bed");
     }
@@ -313,7 +322,7 @@ mod tests {
     #[test]
     fn errors_come_back_as_diagnostics() {
         let mut empty = request();
-        empty.mesh = Mesh::default();
+        empty.objects = vec![Mesh::default()];
         assert_eq!(
             SliceJob::start(empty, || {}).wait().unwrap_err().code,
             "slicing.empty_model"

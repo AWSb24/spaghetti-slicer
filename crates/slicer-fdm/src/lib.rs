@@ -2,8 +2,11 @@
 
 mod adaptive;
 mod infill;
+mod plate;
 pub mod preview;
 mod tree;
+
+pub use plate::{ARRANGE_GAP, Placement, arrange};
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -188,6 +191,15 @@ pub enum FdmError {
     NothingToPrint,
     /// The caller asked to stop.
     Cancelled,
+    /// An object placed as given reaches over the edge of the bed.
+    OutsideBed {
+        /// Index of the object in the list, counted from 0.
+        object: usize,
+        /// Smallest X and Y, then largest X and Y of the object.
+        footprint: [f64; 4],
+        /// Bed size in X and Y.
+        bed: [f64; 2],
+    },
 }
 
 impl fmt::Display for FdmError {
@@ -204,6 +216,17 @@ impl fmt::Display for FdmError {
                 "nothing to print: the model is lower than the first layer or has no printable area"
             ),
             Self::Cancelled => write!(f, "slicing was cancelled"),
+            Self::OutsideBed {
+                object,
+                footprint: [x0, y0, x1, y1],
+                bed,
+            } => write!(
+                f,
+                "object {} reaches over the edge of the bed: it spans X {x0:.1} to {x1:.1} and Y {y0:.1} to {y1:.1} mm, the bed {:.1} x {:.1} mm",
+                object + 1,
+                bed[0],
+                bed[1]
+            ),
         }
     }
 }
@@ -217,6 +240,7 @@ impl slicer_core::Diagnose for FdmError {
             Self::TooLarge { .. } => "slicing.too_large",
             Self::NothingToPrint => "slicing.nothing_to_print",
             Self::Cancelled => "slicing.cancelled",
+            Self::OutsideBed { .. } => "slicing.outside_bed",
         }
     }
 
@@ -226,6 +250,18 @@ impl slicer_core::Diagnose for FdmError {
                 let text = |v: &[f64; 3]| format!("{:.3} x {:.3} x {:.3}", v[0], v[1], v[2]);
                 vec![("model_size", text(model)), ("build_volume", text(volume))]
             }
+            Self::OutsideBed {
+                object,
+                footprint: f,
+                bed,
+            } => vec![
+                ("object", (object + 1).to_string()),
+                (
+                    "footprint",
+                    format!("{:.3} {:.3} {:.3} {:.3}", f[0], f[1], f[2], f[3]),
+                ),
+                ("bed_size", format!("{:.3} x {:.3}", bed[0], bed[1])),
+            ],
             _ => Vec::new(),
         }
     }
@@ -258,8 +294,27 @@ pub fn generate_cancellable(
     diagnostics: &mut Diagnostics,
     stop: &AtomicBool,
 ) -> Result<Toolpaths, FdmError> {
+    let objects = std::slice::from_ref(mesh);
+    generate_plate(objects, Placement::Centre, settings, diagnostics, stop)
+}
+
+/// Slices several objects on one build plate and generates toolpaths, like
+/// [`generate_cancellable`] does for one. `placement` says where the objects
+/// go; [`arrange`] finds positions for [`Placement::AsGiven`]. Objects whose
+/// outlines overlap seen from above are reported and printed as one.
+// ponytail: the objects are printed together, layer by layer, with the
+// layer heights of the whole plate. Printing one object after the other
+// and per-object settings are the upgrade.
+pub fn generate_plate(
+    objects: &[Mesh],
+    placement: Placement,
+    settings: &Settings,
+    diagnostics: &mut Diagnostics,
+    stop: &AtomicBool,
+) -> Result<Toolpaths, FdmError> {
     let stopped = || stop.load(Ordering::Relaxed);
-    let mut mesh = mesh.clone();
+    plate::check(objects, placement, settings, diagnostics)?;
+    let mut mesh = plate::merge(objects, placement);
     let turned = mesh.orient();
     if turned > 0 {
         diagnostics.push(
@@ -352,11 +407,15 @@ pub fn generate_cancellable(
             volume,
         });
     }
-    mesh.translate([
-        volume[0] / 2.0 - (min[0] + max[0]) / 2.0,
-        volume[1] / 2.0 - (min[1] + max[1]) / 2.0,
-        -min[2],
-    ]);
+    match placement {
+        Placement::Centre => mesh.translate([
+            volume[0] / 2.0 - (min[0] + max[0]) / 2.0,
+            volume[1] / 2.0 - (min[1] + max[1]) / 2.0,
+            -min[2],
+        ]),
+        // Every object is on the bed already.
+        Placement::AsGiven => {}
+    }
 
     // Without adaptive layers layer i ends at first_layer_height + i *
     // layer_height. Every layer is cut at its mid-height.
@@ -1812,6 +1871,74 @@ mod tests {
             .fold(f64::NEG_INFINITY, f64::max);
         assert!((min_x - (100.0 + 0.225)).abs() < 1e-3, "{min_x}");
         assert!((max_y - (125.0 - 0.225)).abs() < 1e-3, "{max_y}");
+    }
+
+    #[test]
+    fn objects_placed_as_given_keep_their_positions() {
+        let settings = Settings {
+            skirt_loops: 0,
+            ..Settings::default()
+        };
+        // One floats above the bed and is put down; the other is taller.
+        let mut low = Mesh::cuboid(10.0, 10.0, 2.0);
+        low.translate([20.0, 30.0, 7.0]);
+        let mut tall = Mesh::cuboid(10.0, 20.0, 4.0);
+        tall.translate([150.0, 100.0, 0.0]);
+        let stop = AtomicBool::new(false);
+        let mut diagnostics = Diagnostics::new();
+        let objects = [low, tall];
+        let toolpaths = generate_plate(
+            &objects,
+            Placement::AsGiven,
+            &settings,
+            &mut diagnostics,
+            &stop,
+        )
+        .unwrap();
+        assert!(diagnostics.is_empty(), "{:?}", diagnostics.codes());
+        assert_eq!(toolpaths.layers.len(), 20);
+        let centres = |layer: &Layer| -> Vec<Point> {
+            layer
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::OuterWall)
+                .map(|p| {
+                    let (lo, hi) =
+                        p.points
+                            .iter()
+                            .fold(([f64::MAX; 2], [f64::MIN; 2]), |(lo, hi), q| {
+                                (
+                                    [lo[0].min(q[0]), lo[1].min(q[1])],
+                                    [hi[0].max(q[0]), hi[1].max(q[1])],
+                                )
+                            });
+                    [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0]
+                })
+                .collect()
+        };
+        let mut first = centres(&toolpaths.layers[0]);
+        first.sort_by(|a, b| a[0].total_cmp(&b[0]));
+        assert_eq!(first.len(), 2);
+        assert!(distance(first[0], [25.0, 35.0]) < 1e-6, "{first:?}");
+        assert!(distance(first[1], [155.0, 110.0]) < 1e-6, "{first:?}");
+        assert_eq!(centres(&toolpaths.layers[15]).len(), 1);
+
+        // Centred, the two keep their distance and the group moves.
+        let centred = generate_plate(
+            &objects,
+            Placement::Centre,
+            &settings,
+            &mut diagnostics,
+            &stop,
+        )
+        .unwrap();
+        assert_eq!(centres(&centred.layers[0]).len(), 1, "the low one floats");
+
+        let mut off = objects.clone();
+        off[1].translate([70.0, 0.0, 0.0]);
+        let error = generate_plate(&off, Placement::AsGiven, &settings, &mut diagnostics, &stop)
+            .unwrap_err();
+        assert_eq!(slicer_core::Diagnose::code(&error), "slicing.outside_bed");
     }
 
     #[test]

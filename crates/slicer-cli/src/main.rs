@@ -23,14 +23,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Slice an STL or 3MF model into G-code
+    /// Slice STL or 3MF models into G-code
+    ///
+    /// One model is centred on the bed; several are arranged side by side
+    /// unless --keep-positions is given.
     Slice {
-        /// Model file (STL or 3MF)
-        input: PathBuf,
-        /// G-code file to write [default: input with .gcode extension]; a name
-        /// ending in .gcode.3mf writes a project file for Bambu Lab printers
+        /// Model files (STL or 3MF); each file is one object on the plate
+        #[arg(required = true)]
+        input: Vec<PathBuf>,
+        /// G-code file to write [default: first input with .gcode extension];
+        /// a name ending in .gcode.3mf writes a project file for Bambu Lab
+        /// printers
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Keep every object where its file puts it, in bed coordinates
+        /// (only put down on the bed), instead of centring or arranging
+        #[arg(long)]
+        keep_positions: bool,
+        /// Distance between arranged objects in millimetres, plus the brim
+        #[arg(long, value_name = "MM", default_value_t = slicer_fdm::ARRANGE_GAP)]
+        gap: f64,
         /// Settings file in TOML format; may be given several times, later
         /// files override earlier ones, missing keys use defaults
         #[arg(short, long)]
@@ -165,6 +177,8 @@ fn main() -> ExitCode {
         Command::Slice {
             input,
             output,
+            keep_positions,
+            gap,
             config,
             set,
             plate,
@@ -172,13 +186,21 @@ fn main() -> ExitCode {
             send,
             printer,
             json,
-        } => report(
-            send.map(|address| printer.target(&address))
-                .transpose()
-                .and_then(|send| slice(input, output, &config, &set, plate, svg, send)),
-            json,
-            print_summary,
-        ),
+        } => {
+            let placement = Placing {
+                keep_positions,
+                gap,
+            };
+            report(
+                send.map(|address| printer.target(&address))
+                    .transpose()
+                    .and_then(|send| {
+                        slice(&input, output, placement, &config, &set, plate, svg, send)
+                    }),
+                json,
+                print_summary,
+            )
+        }
         Command::Send {
             input,
             to,
@@ -238,9 +260,46 @@ fn split_override(item: &str) -> Result<(&str, &str), Diagnostic> {
     Ok((key.trim(), value.trim()))
 }
 
+/// How the command line puts the objects on the bed.
+#[derive(Clone, Copy)]
+struct Placing {
+    keep_positions: bool,
+    gap: f64,
+}
+
+/// Puts the objects on the bed: as the files place them, centred (one
+/// object) or arranged side by side (several).
+fn place(
+    meshes: &mut [slicer_core::Mesh],
+    placing: Placing,
+    settings: &Settings,
+) -> slicer_fdm::Placement {
+    if placing.keep_positions {
+        return slicer_fdm::Placement::AsGiven;
+    }
+    if meshes.len() < 2 {
+        return slicer_fdm::Placement::Centre;
+    }
+    let bounds: Vec<_> = meshes.iter().map(slicer_core::Mesh::bounds).collect();
+    let sizes: Vec<[f64; 2]> = bounds
+        .iter()
+        .map(|b| b.map_or([0.0, 0.0], |(lo, hi)| [hi[0] - lo[0], hi[1] - lo[1]]))
+        .collect();
+    let corners = slicer_fdm::arrange(&sizes, settings, placing.gap);
+    for ((mesh, bounds), corner) in meshes.iter_mut().zip(&bounds).zip(corners) {
+        if let Some((lo, _)) = bounds {
+            mesh.translate([corner[0] - lo[0], corner[1] - lo[1], 0.0]);
+        }
+    }
+    slicer_fdm::Placement::AsGiven
+}
+
+// The command line arguments of `slice`, passed on one to one.
+#[allow(clippy::too_many_arguments)]
 fn slice(
-    input: PathBuf,
+    inputs: &[PathBuf],
     output: Option<PathBuf>,
+    placing: Placing,
     config: &[PathBuf],
     overrides: &[String],
     plate: Option<u32>,
@@ -259,16 +318,28 @@ fn slice(
         settings.set(key, value).map_err(|e| e.diagnostic())?;
     }
 
-    let bytes = fs::read(&input).map_err(|e| io_error("io.read", &input, &e))?;
     let mut warnings = Diagnostics::new();
-    let mesh =
-        slicer_formats::parse_model(&bytes, plate, &mut warnings).map_err(in_file(&input))?;
-
-    let toolpaths = slicer_fdm::generate_reporting(&mesh, &settings, &mut warnings)
-        .map_err(|e| e.diagnostic())?;
+    let mut meshes = Vec::new();
+    for input in inputs {
+        let bytes = fs::read(input).map_err(|e| io_error("io.read", input, &e))?;
+        meshes.push(
+            slicer_formats::parse_model(&bytes, plate, &mut warnings).map_err(in_file(input))?,
+        );
+    }
+    let placement = place(&mut meshes, placing, &settings);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let toolpaths = slicer_fdm::generate_plate(&meshes, placement, &settings, &mut warnings, &stop)
+        .map_err(|e| match (&e, inputs.len()) {
+            // Name the file rather than its number.
+            (slicer_fdm::FdmError::OutsideBed { object, .. }, 2..) => {
+                in_file(&inputs[*object])(e.diagnostic())
+            }
+            _ => e.diagnostic(),
+        })?;
     let result = slicer_gcode::write_gcode(&toolpaths, &settings).map_err(|e| e.diagnostic())?;
 
-    let output = output.unwrap_or_else(|| input.with_extension("gcode"));
+    let first = inputs.first().map_or_else(PathBuf::new, PathBuf::clone);
+    let output = output.unwrap_or_else(|| first.with_extension("gcode"));
     // A name ending in .gcode.3mf asks for the container of Bambu Lab
     // printers around the same G-code.
     let container = output
