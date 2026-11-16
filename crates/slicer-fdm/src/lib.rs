@@ -18,6 +18,11 @@ const SEAM_TOLERANCE: f64 = 0.001;
 /// angle by which the wall turns there (0.1 is about 26 degrees).
 const MIN_SEAM_CORNER: f64 = 0.1;
 
+/// How far along the wall on either side of a point its turn is measured
+/// when looking for corners, in line widths. Long enough to take in the
+/// rounded inward corners of the outer and the first inner wall.
+const SEAM_CORNER_REACH: f64 = 2.0;
+
 /// Corners this close in sharpness to the sharpest one count as equally
 /// sharp.
 const SEAM_CORNER_TOLERANCE: f64 = 0.05;
@@ -846,33 +851,69 @@ fn rearmost(points: &[Point], allowed: impl Fn(usize) -> bool) -> usize {
     rear.unwrap_or(0)
 }
 
-/// How sharply a closed loop turns at each of its points: one minus the
-/// cosine of the angle between the edges that meet there.
-// ponytail: looks only at the two edges that meet in a point. A corner
-// rounded off by many short edges is not seen, which includes every
-// inward corner of a wall, since walls are rounded there.
-fn sharpness(points: &[Point]) -> Vec<f64> {
+/// How sharply a closed loop turns around each of its points, measured over
+/// `reach` millimetres of path on either side, so that a corner rounded off
+/// by many short edges counts like a sharp one: one minus the cosine of the
+/// angle between the chord from the point `reach` behind to this point and
+/// the chord from this point to the one `reach` ahead. Positive where the
+/// loop turns left, which is an outward corner (outer contours run
+/// counter-clockwise, holes clockwise), negative where it turns right, an
+/// inward corner.
+// ponytail: chords, not the true total turn: a rounded corner measures a
+// little blunter than a sharp one of the same angle, turns of more than
+// 180 degrees within the reach are not told apart from smaller ones, and
+// corners closer together than `reach` blur into one.
+fn corners(points: &[Point], reach: f64) -> Vec<f64> {
     let n = points.len();
+    let perimeter: f64 = (0..n)
+        .map(|j| distance(points[j], points[(j + 1) % n]))
+        .sum();
+    let reach = reach.min(perimeter / 4.0);
+    if reach <= 0.0 {
+        return vec![0.0; n];
+    }
+    // The point `reach` along the loop from point `j`, ahead or behind.
+    let along = |j: usize, ahead: bool| {
+        let mut k = j;
+        let mut left = reach;
+        for _ in 0..n {
+            let next = if ahead { (k + 1) % n } else { (k + n - 1) % n };
+            let (p, q) = (points[k], points[next]);
+            let d = distance(p, q);
+            if d >= left {
+                let t = left / d;
+                return [p[0] + t * (q[0] - p[0]), p[1] + t * (q[1] - p[1])];
+            }
+            left -= d;
+            k = next;
+        }
+        points[k]
+    };
     (0..n)
         .map(|j| {
-            let (p, q, r) = (points[(j + n - 1) % n], points[j], points[(j + 1) % n]);
+            let (p, q, r) = (along(j, false), points[j], along(j, true));
             let (a, b) = ([q[0] - p[0], q[1] - p[1]], [r[0] - q[0], r[1] - q[1]]);
             let lengths = distance(p, q) * distance(q, r);
             if lengths == 0.0 {
                 return 0.0;
             }
-            1.0 - (a[0] * b[0] + a[1] * b[1]) / lengths
+            let sharpness = 1.0 - (a[0] * b[0] + a[1] * b[1]) / lengths;
+            if a[0] * b[1] - a[1] * b[0] < 0.0 {
+                -sharpness
+            } else {
+                sharpness
+            }
         })
         .collect()
 }
 
 /// Appends closed loops, always continuing with the loop whose nearest
 /// vertex is closest to the current position. Where a loop starts is up to
-/// `seam`.
+/// `seam`; loops shorter than the line `width` are dropped.
 fn push_loops(
     mut loops: Vec<Contour>,
     kind: PathKind,
-    min_length: f64,
+    width: f64,
     seam: SeamPosition,
     position: &mut Point,
     paths: &mut Vec<Path>,
@@ -892,12 +933,21 @@ fn push_loops(
         let start = match seam {
             SeamPosition::Rear => rearmost(&points, |_| true),
             SeamPosition::Corner => {
-                let sharp = sharpness(&points);
-                let sharpest = sharp.iter().copied().fold(0.0, f64::max);
+                // Inward corners hide the seam best, so they win over any
+                // outward corner; among the sharpest of one kind, the rearmost.
+                let turn = corners(&points, SEAM_CORNER_REACH * width);
+                let inward = turn.iter().map(|t| -t).fold(0.0, f64::max);
+                let (side, sharpest) = if inward >= MIN_SEAM_CORNER {
+                    (-1.0, inward)
+                } else {
+                    (1.0, turn.iter().copied().fold(0.0, f64::max))
+                };
                 if sharpest < MIN_SEAM_CORNER {
                     rearmost(&points, |_| true)
                 } else {
-                    rearmost(&points, |j| sharp[j] >= sharpest - SEAM_CORNER_TOLERANCE)
+                    rearmost(&points, |j| {
+                        side * turn[j] >= sharpest - SEAM_CORNER_TOLERANCE
+                    })
                 }
             }
             SeamPosition::Nearest => best.1,
@@ -909,7 +959,7 @@ fn push_loops(
             closed: true,
             travel_inside: false,
         };
-        if path.length() >= min_length {
+        if path.length() >= width {
             *position = path.points[0];
             paths.push(path);
         }
@@ -1317,6 +1367,49 @@ mod tests {
         assert_eq!(
             starts(&round, SeamPosition::Corner),
             starts(&round, SeamPosition::Rear)
+        );
+    }
+
+    #[test]
+    fn seams_prefer_inward_corners() {
+        // An L: five outward corners and one inward corner at (8, 8), which
+        // the wall offsets round off.
+        let l = [
+            [0.0, 0.0],
+            [20.0, 0.0],
+            [20.0, 8.0],
+            [8.0, 8.0],
+            [8.0, 20.0],
+            [0.0, 20.0],
+        ];
+        let mesh = slicer_core::primitives::extrude(&l, [4.0, 4.0], 4.0, 1, 0.0);
+        let mut settings = Settings::default();
+        settings.seam_position = SeamPosition::Corner;
+        let toolpaths = generate(&mesh, &settings).unwrap();
+        let walls = |kind| {
+            toolpaths
+                .layers
+                .iter()
+                .flat_map(|layer| &layer.paths)
+                .filter(|path| path.kind == kind)
+                .map(|path| path.points[0])
+                .collect::<Vec<Point>>()
+        };
+        // The model is 20 x 20 mm, centred on the bed at (110, 110), so the
+        // inward corner is at (108, 108).
+        let outer = walls(PathKind::OuterWall);
+        assert_eq!(outer.len(), 20);
+        assert!(
+            outer.iter().all(|p| distance(*p, [108.0, 108.0]) < 0.5),
+            "{outer:?}"
+        );
+        assert!(outer.iter().all(|p| distance(*p, outer[0]) < 0.01));
+        // The inner wall is rounded more widely there but still found.
+        let inner = walls(PathKind::InnerWall);
+        assert_eq!(inner.len(), 20);
+        assert!(
+            inner.iter().all(|p| distance(*p, [108.0, 108.0]) < 1.5),
+            "{inner:?}"
         );
     }
 
