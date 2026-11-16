@@ -857,8 +857,6 @@ fn spans_freely(shape: &[Contour], below: &Shapes, settings: &Settings) -> bool 
 /// areas at least a line wide with nothing below, grown a little onto what
 /// carries them. Every bridge comes with the direction in which most of its
 /// lines rest on the layer below at both ends (see `bridge_directions`).
-// ponytail: bridges have their own speed but the flow and cooling of
-// everything else; those come later.
 fn split_bridges(
     below: &Shapes,
     fill_area: &Shapes,
