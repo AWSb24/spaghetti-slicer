@@ -62,6 +62,8 @@ All three must pass. New behaviour needs a test.
 | Hatch infill (scanline with even-odd pairing) | Standard scanline fill, own design |
 | Triangle infill (three hatchings 60° apart, the middle one shifted by half a spacing so that all three meet in points) | Own design |
 | Gyroid infill (cross-section of sin x cos y + sin y cos z + sin z cos x = 0, traced with marching squares, saddles decided by the cell centre; length per area measured numerically) | Gyroid surface after A. H. Schoen (NASA TN D-5541, 1970) in its common trigonometric approximation; marching squares is the standard contouring method; own design. Clipping of the curves by `i_overlay` |
+| Thinning gyroid polylines (Ramer-Douglas-Peucker on open lines) and turning the pattern by the infill angle | Douglas and Peucker, "Algorithms for the reduction of the number of points required to represent a digitized line or its caricature", The Canadian Cartographer 10(2), 1973; own design |
+| Connected rectilinear infill (each line end joined to the next line end along the boundary of the area, if that stretch is at most two spacings long and its line is not yet taken) | Own design |
 | Top/bottom detection (intersection with neighbouring layers) | Own design |
 | Adaptive layer height (cusp height bounded with the triangle normals, layers ending on flat surfaces) | Cusp height from Dolenc and Mäkelä, "Slicing procedures for layered manufacturing techniques", Computer-Aided Design 26(2), 1994; planning own design |
 | Extrusion amount (line width × layer height per millimetre) | Volume conservation, own design |

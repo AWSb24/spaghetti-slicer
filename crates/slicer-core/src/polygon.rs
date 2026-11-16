@@ -267,11 +267,36 @@ pub fn simplify(contour: &[Point], tolerance: f64) -> Contour {
     let mut keep = vec![false; n + 1];
     keep[0] = true;
     keep[far] = true;
-    let mut pending = vec![(0, far), (far, n)];
+    keep_details(&ring, vec![(0, far), (far, n)], &mut keep, tolerance);
+    (0..n).filter(|&i| keep[i]).map(|i| contour[i]).collect()
+}
+
+/// Thins out an open line like [`simplify`]; both ends stay.
+pub fn simplify_open(line: &[Point], tolerance: f64) -> Vec<Point> {
+    let n = line.len();
+    if n < 3 {
+        return line.to_vec();
+    }
+    let mut keep = vec![false; n];
+    keep[0] = true;
+    keep[n - 1] = true;
+    keep_details(line, vec![(0, n - 1)], &mut keep, tolerance);
+    (0..n).filter(|&i| keep[i]).map(|i| line[i]).collect()
+}
+
+/// Ramer-Douglas-Peucker: within every pending stretch of `line` between
+/// two kept points, keeps the point farthest from their chord if it lies
+/// more than `tolerance` off, and splits the stretch there.
+fn keep_details(
+    line: &[Point],
+    mut pending: Vec<(usize, usize)>,
+    keep: &mut [bool],
+    tolerance: f64,
+) {
     while let Some((lo, hi)) = pending.pop() {
         let mut worst = (lo, 0.0);
         for i in lo + 1..hi {
-            let d = segment_distance(ring[i], ring[lo], ring[hi]);
+            let d = segment_distance(line[i], line[lo], line[hi]);
             if d > worst.1 {
                 worst = (i, d);
             }
@@ -282,7 +307,6 @@ pub fn simplify(contour: &[Point], tolerance: f64) -> Contour {
             pending.push((worst.0, hi));
         }
     }
-    (0..n).filter(|&i| keep[i]).map(|i| contour[i]).collect()
 }
 
 /// Whether the straight line from `a` to `b` stays inside the shapes: it

@@ -767,6 +767,8 @@ fn layer_work(
         (solid, sparse)
     };
     let solid_lines = polygon::hatch(&solid, width, direction, min_length);
+    // Joined by straight links; following the boundary instead (as sparse
+    // rectilinear infill does) saves a few travels but adds many points.
     work.push(Work::Lines(solid_lines, PathKind::SolidInfill, 2.0 * width));
 
     let density = settings.infill_density / 100.0;
@@ -777,8 +779,12 @@ fn layer_work(
         } else {
             match settings.infill_pattern {
                 InfillPattern::Rectilinear => {
-                    let lines = polygon::hatch(&sparse, width / density, direction, min_length);
-                    work.push(Work::Lines(lines, PathKind::SparseInfill, 0.0));
+                    // Line ends up to two spacings apart along the boundary
+                    // are connected; the other patterns would cross lines.
+                    let spacing = width / density;
+                    let lines = polygon::hatch(&sparse, spacing, direction, min_length);
+                    let lines = infill::connect(&sparse, &lines, 2.0 * spacing);
+                    work.push(Work::Polylines(lines, PathKind::SparseInfill, 0.0));
                 }
                 InfillPattern::Grid => {
                     // Two directions share the material, so each is half as dense.
@@ -797,7 +803,8 @@ fn layer_work(
                 InfillPattern::Gyroid => {
                     // Top of the layer, as in `generate_cancellable`.
                     let z = settings.first_layer_height + index as f64 * settings.layer_height;
-                    let lines = infill::gyroid(&sparse, width / density, z, min_length);
+                    let angle = settings.infill_angle;
+                    let lines = infill::gyroid(&sparse, width / density, z, angle, min_length);
                     work.push(Work::Polylines(lines, PathKind::SparseInfill, 0.0));
                 }
             }
@@ -1733,7 +1740,9 @@ mod tests {
                 }
                 for pair in path.points.windows(2) {
                     let (dx, dy) = (pair[1][0] - pair[0][0], pair[1][1] - pair[0][1]);
-                    if distance(pair[0], pair[1]) > 5.0 {
+                    // Longer than the connections along the boundary, which
+                    // are at most two spacings (6 mm).
+                    if distance(pair[0], pair[1]) > 6.5 {
                         long += 1;
                         assert!((dx * along[1] - dy * along[0]).abs() < 1e-6, "{dx} {dy}");
                     }
@@ -1741,6 +1750,51 @@ mod tests {
             }
             assert!(long > 3, "{long}");
         }
+    }
+
+    #[test]
+    fn rectilinear_lines_are_connected_along_the_boundary() {
+        let mut settings = Settings::default();
+        settings.infill_pattern = InfillPattern::Rectilinear;
+        let toolpaths = generate(&Mesh::cuboid(30.0, 30.0, 6.0), &settings).unwrap();
+        // The sparse area is a square around the centre of the bed.
+        let walls = f64::from(settings.wall_loops);
+        let inset = (walls + 0.5 - settings.infill_overlap / 100.0) * settings.line_width;
+        let (centre, half) = (
+            [settings.bed_size_x / 2.0, settings.bed_size_y / 2.0],
+            15.0 - inset,
+        );
+        let edge = |p: Point, axis: usize| ((p[axis] - centre[axis]).abs() - half).abs() < 1e-6;
+        let (mut paths, mut lines, mut connections) = (0, 0, 0);
+        // Between the solid layers at the bottom and the top.
+        for layer in &toolpaths.layers[8..20] {
+            for path in layer
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::SparseInfill)
+            {
+                paths += 1;
+                for w in path.points.windows(2) {
+                    let mid = [(w[0][0] + w[1][0]) / 2.0, (w[0][1] + w[1][1]) / 2.0];
+                    for p in [w[0], mid, w[1]] {
+                        let off = (p[0] - centre[0]).abs().max((p[1] - centre[1]).abs());
+                        assert!(off <= half + 1e-6, "{p:?} is outside the sparse area");
+                    }
+                    // A line runs from one side to another; a connection
+                    // along one side.
+                    if (0..2).any(|axis| edge(w[0], axis) && edge(w[1], axis) && edge(mid, axis)) {
+                        connections += 1;
+                    } else {
+                        lines += 1;
+                    }
+                }
+            }
+        }
+        // Without connections every line is a path of its own, and the
+        // nozzle travels to each.
+        assert!(lines > 100, "{lines}");
+        assert!(paths <= 12 * 2, "{paths} paths for {lines} lines");
+        assert!(connections >= lines - paths, "{connections}");
     }
 
     const PATTERNS: [InfillPattern; 4] = [
@@ -1770,7 +1824,15 @@ mod tests {
         let grid = lengths[1];
         assert!(grid > 1000.0, "{grid}");
         for (pattern, length) in PATTERNS.iter().zip(&lengths) {
+            // Rectilinear lines are as long as the others; the connections
+            // along the boundary come on top (about half the boundary of
+            // every layer, a sixth more on this cube).
             let ratio = length / grid;
+            let ratio = if *pattern == InfillPattern::Rectilinear {
+                ratio - 0.15
+            } else {
+                ratio
+            };
             assert!(
                 (ratio - 1.0).abs() < 0.15,
                 "{pattern:?}: {length} vs {grid}"
