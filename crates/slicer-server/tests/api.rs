@@ -139,6 +139,35 @@ async fn the_api_description_matches_the_router() {
 }
 
 #[tokio::test]
+async fn the_status_shows_the_progress() {
+    let router = App::new(Config::default()).router();
+    let stl = slicer_formats::write_stl_binary(&Mesh::cuboid(30.0, 30.0, 40.0));
+    let (status, created) = create(&router, &[("model", &stl), ("set", b"layer_height=0.1")]).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(created["progress"], 0.0);
+    let id = created["id"].as_str().unwrap();
+    let mut seen = Vec::new();
+    let job = loop {
+        let (_, job) = call(&router, "GET", &format!("/v1/jobs/{id}")).await;
+        let progress = job["progress"].as_f64().unwrap();
+        assert!((0.0..=1.0).contains(&progress), "{job}");
+        assert_eq!(job["step"].is_string(), job["status"] == "running", "{job}");
+        seen.push(progress);
+        if job["status"] != "queued" && job["status"] != "running" {
+            break job;
+        }
+        assert!(seen.len() < 6000, "job did not finish");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert_eq!(job["status"], "done", "{job}");
+    assert_eq!(job["progress"], 1.0);
+    assert!(seen.windows(2).all(|w| w[0] <= w[1]), "{seen:?}");
+    // The description announces both fields.
+    let properties = &slicer_server::openapi()["components"]["schemas"]["Job"]["properties"];
+    assert!(properties["progress"].is_object() && properties["step"].is_object());
+}
+
+#[tokio::test]
 async fn a_job_is_sliced_in_the_background() {
     let router = App::new(Config::default()).router();
     let stl = cube();

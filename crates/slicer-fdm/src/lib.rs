@@ -3,6 +3,9 @@
 mod adaptive;
 mod infill;
 pub mod preview;
+pub mod progress;
+
+pub use progress::{Progress, Step};
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -235,7 +238,24 @@ pub fn generate_cancellable(
     diagnostics: &mut Diagnostics,
     stop: &AtomicBool,
 ) -> Result<Toolpaths, FdmError> {
+    generate_with_progress(mesh, settings, diagnostics, stop, &Progress::new())
+}
+
+/// Like [`generate_cancellable`], and reports how far it has got in
+/// `progress`, up to the end of [`Step::Ordering`]; writing the G-code is
+/// the last step.
+// ponytail: cutting the mesh counts as one part; it is a small share of the
+// time. Reporting from inside `slice_mesh_reporting` is the upgrade.
+pub fn generate_with_progress(
+    mesh: &Mesh,
+    settings: &Settings,
+    diagnostics: &mut Diagnostics,
+    stop: &AtomicBool,
+    progress: &Progress,
+) -> Result<Toolpaths, FdmError> {
     let stopped = || stop.load(Ordering::Relaxed);
+    // Turning, removing degenerate triangles, closing holes, checking.
+    progress.start(Step::Preparing, 4);
     let mut mesh = mesh.clone();
     let turned = mesh.orient();
     if turned > 0 {
@@ -249,6 +269,7 @@ pub fn generate_cancellable(
             .with("triangles", turned),
         );
     }
+    progress.advance();
     let removed = mesh.remove_degenerate(DEGENERATE_HEIGHT);
     if removed > 0 {
         diagnostics.push(
@@ -259,6 +280,7 @@ pub fn generate_cancellable(
             .with("triangles", removed),
         );
     }
+    progress.advance();
     let closed = mesh.close_holes(MAX_HOLE_EDGES);
     if closed > 0 {
         diagnostics.push(
@@ -269,7 +291,9 @@ pub fn generate_cancellable(
             .with("holes", closed),
         );
     }
+    progress.advance();
     mesh.check(diagnostics);
+    progress.advance();
     // ponytail: one extruder prints everything, the lowest one the model
     // asks for. Separate regions per extruder and tool changes are the
     // upgrade.
@@ -338,7 +362,9 @@ pub fn generate_cancellable(
         .zip(&heights)
         .map(|(top, h)| top - h / 2.0)
         .collect();
+    progress.start(Step::Cutting, 1);
     let slices = slice_mesh_reporting(&mesh, &cut_heights, diagnostics);
+    progress.advance();
     if stopped() {
         return Err(FdmError::Cancelled);
     }
@@ -352,6 +378,7 @@ pub fn generate_cancellable(
     // What every layer has beyond the layer below. With supports the limit
     // is half a line width (about 50 degrees from vertical at the default
     // layer height); without, only a full line width is worth a warning.
+    progress.start(Step::Geometry, slices.len());
     let (reach, least) = if settings.supports {
         (0.5 * settings.line_width, 0.01)
     } else {
@@ -387,11 +414,15 @@ pub fn generate_cancellable(
         if stopped() {
             return (Vec::new(), false);
         }
-        layer_work(&slices, &heights, &supports, index, settings)
+        let work = layer_work(&slices, &heights, &supports, index, settings);
+        progress.advance();
+        work
     });
     if stopped() {
         return Err(FdmError::Cancelled);
     }
+    // Every layer is counted twice: once in order, once for the travels.
+    progress.start(Step::Ordering, 2 * slices.len());
     let mut position: Point = [0.0, 0.0];
     let mut thin_layers = Vec::new();
     let mut layers: Vec<Layer> = geometry
@@ -429,6 +460,7 @@ pub fn generate_cancellable(
             if thin {
                 thin_layers.push(index);
             }
+            progress.advance();
             Layer {
                 z: tops[index],
                 height: heights[index],
@@ -442,7 +474,9 @@ pub fn generate_cancellable(
     // Which travel moves stay over the part depends only on the finished
     // order of a layer, so all cores can work on it again.
     let inside = parallel_map(layers.len(), |index| {
-        travels_inside(&layers[index], &slices[index])
+        let flags = travels_inside(&layers[index], &slices[index]);
+        progress.advance();
+        flags
     });
     for (layer, flags) in layers.iter_mut().zip(inside) {
         for (path, flag) in layer.paths.iter_mut().zip(flags) {

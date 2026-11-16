@@ -10,24 +10,10 @@ use slicer_profiles::Settings;
 
 /// Name and doc comment of every field of `Settings`, in source order.
 fn described_fields() -> Vec<(String, String)> {
-    let source = include_str!("../src/lib.rs").replace("\r\n", "\n");
-    let start = source.find("pub struct Settings {").unwrap();
-    let end = start + source[start..].find("\n}\n").unwrap();
-    let mut fields = Vec::new();
-    let mut comment = String::new();
-    // The first line is the struct itself.
-    for line in source[start..end].lines().skip(1).map(str::trim) {
-        if let Some(text) = line.strip_prefix("///") {
-            comment.push_str(text.trim());
-            comment.push(' ');
-        } else if let Some(rest) = line.strip_prefix("pub ") {
-            let name = rest.split(':').next().unwrap().to_string();
-            fields.push((name, std::mem::take(&mut comment).trim().to_string()));
-        } else {
-            comment.clear();
-        }
-    }
-    fields
+    slicer_profiles::SETTINGS_INFO
+        .iter()
+        .map(|info| (info.key.to_string(), info.description.to_string()))
+        .collect()
 }
 
 #[test]

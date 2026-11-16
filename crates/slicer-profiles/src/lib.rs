@@ -10,7 +10,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+pub mod info;
 pub mod orca;
+pub use info::{SETTINGS_INFO, SettingInfo, ValueKind, setting_info};
 pub use orca::{OrcaImport, import_orca};
 
 /// G-code dialect.
@@ -402,25 +404,44 @@ impl Settings {
     /// Overrides a single setting from its textual value, as given on the
     /// command line.
     pub fn set(&mut self, key: &str, value: &str) -> Result<(), SettingsError> {
+        self.set_all([(key, value)])
+    }
+
+    /// Overrides several settings from their textual values, like
+    /// [`Settings::set`], and checks the limits only when all are set, so
+    /// that values that depend on each other can change together. On any
+    /// error nothing is changed.
+    pub fn set_all<'a>(
+        &mut self,
+        values: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Result<(), SettingsError> {
         let mut table = self.table();
-        let Some(current) = table.get(key) else {
-            return Err(SettingsError::UnknownKey(key.to_owned()));
-        };
-        let parsed = if current.is_str() {
-            toml::Value::String(value.to_owned())
-        } else {
-            format!("v = {value}")
-                .parse::<toml::Table>()
-                .ok()
-                .and_then(|mut t| t.remove("v"))
-                .ok_or_else(|| {
-                    SettingsError::Parse(format!("cannot parse '{value}' for '{key}'"))
-                })?
-        };
-        table.insert(key.to_owned(), parsed);
-        let updated: Settings = table.try_into().map_err(|e: toml::de::Error| {
-            SettingsError::Parse(format!("{key}: {}", e.message()))
-        })?;
+        for (key, value) in values {
+            let Some(current) = table.get(key) else {
+                return Err(SettingsError::UnknownKey(key.to_owned()));
+            };
+            let parsed = if current.is_str() {
+                toml::Value::String(value.to_owned())
+            } else {
+                format!("v = {value}")
+                    .parse::<toml::Table>()
+                    .ok()
+                    .and_then(|mut t| t.remove("v"))
+                    .ok_or_else(|| {
+                        SettingsError::Parse(format!("cannot parse '{value}' for '{key}'"))
+                    })?
+            };
+            // A value of the wrong type names the setting.
+            let mut probe = self.table();
+            probe.insert(key.to_owned(), parsed.clone());
+            probe.try_into::<Settings>().map_err(|e: toml::de::Error| {
+                SettingsError::Parse(format!("{key}: {}", e.message()))
+            })?;
+            table.insert(key.to_owned(), parsed);
+        }
+        let updated: Settings = table
+            .try_into()
+            .map_err(|e: toml::de::Error| SettingsError::Parse(e.message().to_owned()))?;
         updated.validate()?;
         *self = updated;
         Ok(())
@@ -433,9 +454,16 @@ impl Settings {
     /// All settings as text, keyed by name. Used to fill `{name}`
     /// placeholders in custom G-code.
     pub fn placeholder_values(&self) -> BTreeMap<String, String> {
+        let mut values = self.values();
+        values.retain(|key, _| key != "start_gcode" && key != "end_gcode");
+        values
+    }
+
+    /// Every setting as text, keyed by name, in the form [`Settings::set`]
+    /// accepts.
+    pub fn values(&self) -> BTreeMap<String, String> {
         self.table()
             .into_iter()
-            .filter(|(key, _)| key != "start_gcode" && key != "end_gcode")
             .map(|(key, value)| {
                 let text = match value {
                     toml::Value::String(s) => s,
@@ -644,6 +672,33 @@ mod tests {
         assert!(s.set("technology", "sla").is_err());
         assert!(s.set("infill_density", "150").is_err());
         assert_eq!(s.infill_density, 100.0);
+    }
+
+    #[test]
+    fn set_all_checks_the_limits_once_at_the_end() {
+        let mut s = Settings::default();
+        // One after the other the layer is too thick for the old nozzle.
+        assert!(s.clone().set("layer_height", "0.5").is_err());
+        s.set_all([
+            ("layer_height", "0.5"),
+            ("line_width", "0.8"),
+            ("nozzle_diameter", "0.8"),
+        ])
+        .unwrap();
+        assert_eq!((s.layer_height, s.nozzle_diameter), (0.5, 0.8));
+        let before = s.clone();
+        let error = s
+            .set_all([("wall_loops", "3"), ("bed_temp", "hot")])
+            .unwrap_err();
+        assert!(error.to_string().contains("bed_temp"), "{error}");
+        assert_eq!(s, before);
+        // Values read back are accepted as they are.
+        let values = Settings::default().values();
+        assert_eq!(values["end_gcode"], Settings::default().end_gcode);
+        let mut copy = s.clone();
+        copy.set_all(values.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .unwrap();
+        assert_eq!(copy, Settings::default());
     }
 
     #[test]

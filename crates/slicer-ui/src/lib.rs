@@ -8,5 +8,7 @@
 
 pub mod job;
 pub mod plate;
+pub mod profiles;
 pub mod settings;
+pub mod settings_list;
 pub mod view;
