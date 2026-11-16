@@ -16,9 +16,12 @@ use slicer_ui::job::{
 use slicer_ui::plate::{
     Placement, Plate, SCALE_RANGE, bed_center, check_placement, load_model, placed_outline,
 };
-use slicer_ui::settings::{CommonSettings, SettingsFile, build_settings, load_settings};
+use slicer_ui::profiles::replace_profiles;
+use slicer_ui::settings::{CommonSettings, SettingsFile, load_settings};
+use slicer_ui::settings_list::SettingsEditor;
 use slicer_ui::view::{PlateView, kind_name, kinds_in, path_color};
 
+use crate::settings_ui::{ProfileAction, Profiles, progress_bar, settings_window};
 use crate::view3d::{Scene, View3d};
 
 /// How serious a message in the side panel is.
@@ -91,6 +94,12 @@ pub struct App {
     /// 3D view instead of the 2D plate.
     three_d: bool,
     view3d: View3d,
+    /// Shipped profiles to pick from.
+    profiles: Profiles,
+    /// Edits in the list of all settings.
+    editor: SettingsEditor,
+    /// Whether the list of all settings is open.
+    all_settings: bool,
 }
 
 impl App {
@@ -114,6 +123,9 @@ impl App {
             notes: Vec::new(),
             three_d: false,
             view3d: View3d::default(),
+            profiles: Profiles::find(),
+            editor: SettingsEditor::default(),
+            all_settings: false,
         };
         app.open_paths(paths);
         app
@@ -456,6 +468,21 @@ impl App {
 
     fn settings_section(&mut self, ui: &mut egui::Ui) {
         ui.heading("Settings");
+        let paths: Vec<PathBuf> = self.files.iter().map(|(path, _)| path.clone()).collect();
+        match self.profiles.ui(ui, &paths) {
+            Some(ProfileAction::Use { old, new }) => {
+                self.read_settings_files(&replace_profiles(&paths, &old, &new));
+            }
+            Some(ProfileAction::Imported { path, notes }) => {
+                self.note(Level::Info, format!("Imported {}", path.display()));
+                for text in notes {
+                    self.note(Level::Warning, text);
+                }
+                self.add_settings_files(&[path]);
+            }
+            Some(ProfileAction::Error(text)) => self.note(Level::Error, text),
+            None => {}
+        }
         let mut remove = None;
         for (index, (path, file)) in self.files.iter().enumerate() {
             ui.horizontal(|ui| {
@@ -537,6 +564,15 @@ impl App {
                 .desired_width(f32::INFINITY)
                 .font(egui::TextStyle::Monospace),
         );
+        let edits = self.editor.edit_count();
+        let label = if edits == 0 {
+            "All settings…".to_owned()
+        } else {
+            format!("All settings… ({edits} edited)")
+        };
+        if ui.button(label).clicked() {
+            self.all_settings = !self.all_settings;
+        }
         if let Err(error) = &self.current {
             ui.colored_label(ui.visuals().error_fg_color, &error.message);
         }
@@ -545,19 +581,15 @@ impl App {
     fn slice_section(&mut self, ui: &mut egui::Ui) {
         ui.heading("Slice");
         if let Some(job) = &self.job {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                let status = if job.is_cancelling() {
-                    "Cancelling".to_owned()
-                } else {
-                    format!(
-                        "{} … {:.0} s",
-                        job.phase().label(),
-                        job.elapsed().as_secs_f64()
-                    )
-                };
-                ui.label(status);
-            });
+            if job.is_cancelling() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Cancelling");
+                });
+            } else {
+                let (step, fraction) = job.progress();
+                progress_bar(ui, step, fraction, job.elapsed().as_secs_f64());
+            }
             if ui
                 .add_enabled(!job.is_cancelling(), egui::Button::new("Cancel"))
                 .clicked()
@@ -850,9 +882,18 @@ impl App {
     /// chosen layer in the preview.
     fn show_3d(&mut self, ui: &mut egui::Ui) {
         let settings = self.current.as_ref().unwrap_or(&self.base);
-        let model = self.model.as_ref().map(|model| {
-            let fits = check_placement(model, &self.placement, settings).is_ok();
-            (model, self.model_serial, self.placement, fits)
+        // ponytail: the 3D view shows one model, the selected one or else the
+        // first; drawing every model of the plate is the upgrade.
+        let shown = self.plate.selected.unwrap_or(0);
+        let model = self.plate.items.get(shown).map(|item| {
+            let fits = check_placement(&item.model, &item.placement, settings).is_ok();
+            // A new upload when the plate or the shown model changes.
+            let serial = self
+                .plate
+                .serial
+                .wrapping_mul(1024)
+                .wrapping_add(shown as u64);
+            (&item.model, serial, item.placement, fits)
         });
         let layer = (self.tab == Tab::Preview && self.sliced.is_some()).then_some(self.layer);
         let scene = Scene {
@@ -895,7 +936,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.poll_job();
         self.handle_dropped_files(&ctx);
-        self.current = build_settings(&self.base, &self.common, &self.overrides);
+        self.current = self.editor.build(&self.base, &self.common, &self.overrides);
 
         egui::Panel::left("side")
             .resizable(true)
@@ -912,6 +953,15 @@ impl eframe::App for App {
                     self.messages_section(ui);
                 });
             });
+        settings_window(
+            &ctx,
+            &mut self.all_settings,
+            &mut self.editor,
+            &self.base,
+            &mut self.common,
+            &self.overrides,
+            self.current.as_ref().ok(),
+        );
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Plate, "Plate");

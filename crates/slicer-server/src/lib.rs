@@ -19,6 +19,7 @@ use axum::routing::{MethodRouter, delete, get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 use slicer_core::{Diagnose, Diagnostic, Diagnostics};
+use slicer_fdm::Progress;
 use slicer_profiles::Settings;
 use slicer_send::Target;
 use tokio::sync::Semaphore;
@@ -211,11 +212,25 @@ struct Job {
     info: Option<slicer_formats::PrintInfo>,
     /// Set when the job is cancelled, so slicing gives up early.
     stop: Arc<AtomicBool>,
+    /// How far slicing has got.
+    progress: Arc<Progress>,
 }
 
 impl Job {
     fn describe(&self, id: Uuid) -> Value {
-        let mut out = json!({ "id": id.to_string(), "status": self.status.name() });
+        let progress = if self.status == Status::Done {
+            1.0
+        } else {
+            self.progress.fraction()
+        };
+        let mut out = json!({
+            "id": id.to_string(),
+            "status": self.status.name(),
+            "progress": progress,
+        });
+        if self.status == Status::Running {
+            out["step"] = json!(self.progress.step().label());
+        }
         if self.status == Status::Done {
             out["stats"] = self.stats.clone().unwrap_or(Value::Null);
             out["warnings"] = self.warnings.clone();
@@ -300,6 +315,7 @@ impl Job {
             gcode,
             info,
             stop: Arc::default(),
+            progress: Arc::default(),
         })
     }
 }
@@ -591,6 +607,8 @@ pub fn openapi() -> Value {
                     "properties": {
                         "id": { "type": "string", "format": "uuid" },
                         "status": { "type": "string", "enum": ["queued", "running", "done", "failed", "cancelled"] },
+                        "progress": { "type": "number", "minimum": 0, "maximum": 1, "description": "Share of the slicing done; never decreases, 1 when done" },
+                        "step": { "type": "string", "description": "What slicing is doing, as text for people; only while running" },
                         "stats": { "type": "object", "properties": {
                             "layers": { "type": "integer" },
                             "filament_length_mm": { "type": "number" },
@@ -684,12 +702,15 @@ fn slice(
     plate: Option<u32>,
     settings: &Settings,
     stop: &AtomicBool,
+    progress: &Progress,
 ) -> Result<(slicer_gcode::Output, Diagnostics), Diagnostic> {
     let mut warnings = Diagnostics::new();
     let mesh = slicer_formats::parse_model(model, plate, &mut warnings)?;
-    let toolpaths = slicer_fdm::generate_cancellable(&mesh, settings, &mut warnings, stop)
+    let toolpaths =
+        slicer_fdm::generate_with_progress(&mesh, settings, &mut warnings, stop, progress)
+            .map_err(|e| e.diagnostic())?;
+    let output = slicer_gcode::write_gcode_with_progress(&toolpaths, settings, progress)
         .map_err(|e| e.diagnostic())?;
-    let output = slicer_gcode::write_gcode(&toolpaths, settings).map_err(|e| e.diagnostic())?;
     Ok((output, warnings))
 }
 
@@ -772,6 +793,7 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
                 gcode: None,
                 info: None,
                 stop: Arc::new(AtomicBool::new(false)),
+                progress: Arc::default(),
             },
         );
     }
@@ -784,7 +806,7 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
 
     let mut response = (
         StatusCode::ACCEPTED,
-        Json(json!({ "id": id.to_string(), "status": Status::Queued.name() })),
+        Json(json!({ "id": id.to_string(), "status": Status::Queued.name(), "progress": 0.0 })),
     )
         .into_response();
     if let Ok(location) = HeaderValue::from_str(&format!("/v1/jobs/{id}")) {
@@ -818,12 +840,12 @@ async fn run_job(
     let Ok(_slot) = app.slots.clone().acquire_owned().await else {
         return;
     };
-    let stop = {
+    let (stop, progress) = {
         let mut jobs = app.jobs();
         match jobs.get_mut(&id) {
             Some(job) if job.status == Status::Queued => {
                 job.status = Status::Running;
-                job.stop.clone()
+                (job.stop.clone(), job.progress.clone())
             }
             // Cancelled or expired while waiting.
             _ => return,
@@ -831,14 +853,15 @@ async fn run_job(
     };
     let started = Instant::now();
     let nozzle_diameter = settings.nozzle_diameter;
-    let outcome = tokio::task::spawn_blocking(move || slice(&model, plate, &settings, &stop))
-        .await
-        .unwrap_or_else(|_| {
-            Err(Diagnostic::error(
-                "server.internal",
-                "slicing stopped unexpectedly",
-            ))
-        });
+    let outcome =
+        tokio::task::spawn_blocking(move || slice(&model, plate, &settings, &stop, &progress))
+            .await
+            .unwrap_or_else(|_| {
+                Err(Diagnostic::error(
+                    "server.internal",
+                    "slicing stopped unexpectedly",
+                ))
+            });
 
     let mut job = {
         let jobs = app.jobs();

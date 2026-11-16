@@ -1,13 +1,13 @@
 //! Slicing in a background thread, and saving the result.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use slicer_core::{Diagnose, Diagnostic, Diagnostics, Mesh};
-use slicer_fdm::Toolpaths;
+use slicer_fdm::{Progress, Step, Toolpaths};
 use slicer_gcode::Output;
 use slicer_profiles::Settings;
 
@@ -33,42 +33,23 @@ pub struct SliceResult {
     pub warnings: Vec<Diagnostic>,
 }
 
-/// What a running slice is doing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Phase {
-    /// Cutting the model and generating paths.
-    Toolpaths,
-    /// Turning the paths into G-code.
-    Gcode,
-}
-
-impl Phase {
-    /// Text for the status line.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Toolpaths => "Generating toolpaths",
-            Self::Gcode => "Writing G-code",
-        }
-    }
-}
-
 /// Slices `request` in the calling thread. Gives up with the
-/// `slicing.cancelled` error soon after `stop` is set. `phase` follows
+/// `slicing.cancelled` error soon after `stop` is set. `progress` follows
 /// the steps.
 pub fn slice(
     request: &SliceRequest,
     stop: &AtomicBool,
-    phase: &AtomicU8,
+    progress: &Progress,
 ) -> Result<SliceResult, Diagnostic> {
     let settings = &request.settings;
-    phase.store(Phase::Toolpaths as u8, Ordering::Relaxed);
     let mut warnings = Diagnostics::new();
-    let toolpaths = slicer_fdm::generate_plate(
+    let toolpaths = slicer_fdm::generate_plate_with_progress(
         &request.objects,
         slicer_fdm::Placement::AsGiven,
         settings,
         &mut warnings,
         stop,
+        progress,
     )
     .map_err(|e| e.diagnostic())?;
     let mut warnings = warnings.as_slice().to_vec();
@@ -84,8 +65,8 @@ pub fn slice(
     if stop.load(Ordering::Relaxed) {
         return Err(slicer_fdm::FdmError::Cancelled.diagnostic());
     }
-    phase.store(Phase::Gcode as u8, Ordering::Relaxed);
-    let output = slicer_gcode::write_gcode(&toolpaths, settings).map_err(|e| e.diagnostic())?;
+    let output = slicer_gcode::write_gcode_with_progress(&toolpaths, settings, progress)
+        .map_err(|e| e.diagnostic())?;
     Ok(SliceResult {
         toolpaths,
         output,
@@ -99,7 +80,7 @@ pub fn slice(
 #[derive(Debug)]
 pub struct SliceJob {
     stop: Arc<AtomicBool>,
-    phase: Arc<AtomicU8>,
+    progress: Arc<Progress>,
     started: Instant,
     result: Receiver<Result<SliceResult, Diagnostic>>,
 }
@@ -109,18 +90,18 @@ impl SliceJob {
     /// the result is ready, for example to wake up the window.
     pub fn start(request: SliceRequest, notify: impl FnOnce() + Send + 'static) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let phase = Arc::new(AtomicU8::new(Phase::Toolpaths as u8));
+        let progress = Arc::new(Progress::new());
         let (sender, result) = mpsc::channel();
-        let (thread_stop, thread_phase) = (Arc::clone(&stop), Arc::clone(&phase));
+        let (thread_stop, thread_progress) = (Arc::clone(&stop), Arc::clone(&progress));
         thread::spawn(move || {
-            let outcome = slice(&request, &thread_stop, &thread_phase);
+            let outcome = slice(&request, &thread_stop, &thread_progress);
             // The receiver is gone if the job was dropped; nobody waits then.
             let _ = sender.send(outcome);
             notify();
         });
         Self {
             stop,
-            phase,
+            progress,
             started: Instant::now(),
             result,
         }
@@ -137,13 +118,10 @@ impl SliceJob {
         self.stop.load(Ordering::Relaxed)
     }
 
-    /// The step the slice is in.
-    pub fn phase(&self) -> Phase {
-        if self.phase.load(Ordering::Relaxed) == Phase::Gcode as u8 {
-            Phase::Gcode
-        } else {
-            Phase::Toolpaths
-        }
+    /// The step the slice is in and the share of the whole that is done,
+    /// from 0 to 1.
+    pub fn progress(&self) -> (Step, f64) {
+        (self.progress.step(), self.progress.fraction())
     }
 
     /// Time since the slice started.
@@ -286,7 +264,11 @@ mod tests {
     fn same_gcode_as_the_command_line_when_centred() {
         let mut centred = request();
         centred.objects = vec![cube_at([110.0, 110.0])];
-        let result = SliceJob::start(centred.clone(), || {}).wait().unwrap();
+        let job = SliceJob::start(centred.clone(), || {});
+        let progress = Arc::clone(&job.progress);
+        let result = job.wait().unwrap();
+        // The progress bar of the window ends full.
+        assert_eq!((progress.step(), progress.fraction()), (Step::Done, 1.0));
         let cube = Mesh::cuboid(10.0, 10.0, 2.0);
         let toolpaths = slicer_fdm::generate(&cube, &centred.settings).unwrap();
         let direct = slicer_gcode::write_gcode(&toolpaths, &centred.settings).unwrap();
@@ -296,8 +278,7 @@ mod tests {
     #[test]
     fn cancelled_slice_reports_cancellation() {
         let stop = AtomicBool::new(true);
-        let phase = AtomicU8::new(0);
-        let error = slice(&request(), &stop, &phase).unwrap_err();
+        let error = slice(&request(), &stop, &Progress::new()).unwrap_err();
         assert_eq!(error.code, "slicing.cancelled");
 
         let job = SliceJob::start(request(), || {});
@@ -353,6 +334,5 @@ mod tests {
         assert_eq!(with_output_extension("a.gcode.3mf", true), "a.gcode.3mf");
         assert_eq!(format_duration(3723.4), "1h 02m 03s");
         assert_eq!(format_duration(-5.0), "0h 00m 00s");
-        assert_eq!(Phase::Gcode.label(), "Writing G-code");
     }
 }

@@ -10,7 +10,7 @@ use std::fmt::{self, Write};
 use serde::Serialize;
 use slicer_core::Point;
 use slicer_core::polygon::distance;
-use slicer_fdm::{PathKind, Toolpaths};
+use slicer_fdm::{PathKind, Progress, Step, Toolpaths};
 use slicer_profiles::{ExtrusionMode, Flavor, Settings};
 
 /// Summary of a generated print.
@@ -416,6 +416,18 @@ impl Writer<'_> {
 /// follows, then `T<n>`, the travel to the next path and the move back to
 /// the height of the layer (the custom G-code may have moved the nozzle).
 pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output, GcodeError> {
+    write_gcode_with_progress(toolpaths, settings, &Progress::new())
+}
+
+/// Like [`write_gcode`], and reports how far it has got in `progress`,
+/// which is finished at the end.
+pub fn write_gcode_with_progress(
+    toolpaths: &Toolpaths,
+    settings: &Settings,
+    progress: &Progress,
+) -> Result<Output, GcodeError> {
+    // One part per layer and one for the time estimate.
+    progress.start(Step::Gcode, toolpaths.layers.len() + 1);
     let values = settings.placeholder_values();
     let start = expand(&settings.start_gcode, "start_gcode", &values)?;
     let end = expand(&settings.end_gcode, "end_gcode", &values)?;
@@ -563,6 +575,7 @@ pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output,
                 w.extrude(first, filament_per_mm, speed);
             }
         }
+        progress.advance();
     }
     w.retract();
     w.out.push_str(&end);
@@ -650,6 +663,7 @@ pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output,
     for (key, value) in settings.placeholder_values() {
         let _ = writeln!(gcode, "; {key} = {value}");
     }
+    progress.finish();
     Ok(Output { gcode, stats })
 }
 
@@ -670,6 +684,47 @@ mod tests {
             .split_whitespace()
             .skip(1)
             .find_map(|w| w.strip_prefix(letter).and_then(|v| v.parse().ok()))
+    }
+
+    #[test]
+    fn progress_grows_to_the_end_and_leaves_the_output_alone() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mesh = Mesh::cuboid(20.0, 20.0, 30.0);
+        let mut settings = Settings::default();
+        settings.layer_height = 0.1;
+        let progress = Progress::new();
+        let finished = AtomicBool::new(false);
+        let (output, samples) = std::thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                let mut samples = vec![progress.fraction()];
+                while !finished.load(Ordering::Relaxed) {
+                    samples.push(progress.fraction());
+                    std::thread::yield_now();
+                }
+                samples.push(progress.fraction());
+                samples
+            });
+            let stop = AtomicBool::new(false);
+            let mut warnings = slicer_core::Diagnostics::new();
+            let toolpaths = slicer_fdm::generate_with_progress(
+                &mesh,
+                &settings,
+                &mut warnings,
+                &stop,
+                &progress,
+            )
+            .unwrap();
+            assert_eq!(progress.step(), Step::Ordering);
+            assert_eq!(progress.fraction(), 0.91);
+            let output = write_gcode_with_progress(&toolpaths, &settings, &progress).unwrap();
+            finished.store(true, Ordering::Relaxed);
+            (output, watcher.join().unwrap())
+        });
+        assert!(samples.windows(2).all(|w| w[0] <= w[1]), "{samples:?}");
+        assert_eq!(samples.last(), Some(&1.0));
+        assert!(samples.iter().any(|&s| s > 0.0 && s < 1.0));
+        assert_eq!(progress.step(), Step::Done);
+        assert_eq!(output, slice(&mesh, &settings));
     }
 
     #[test]

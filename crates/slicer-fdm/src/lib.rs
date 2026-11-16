@@ -7,6 +7,9 @@ pub mod preview;
 mod tree;
 
 pub use plate::{ARRANGE_GAP, Placement, arrange};
+pub mod progress;
+
+pub use progress::{Progress, Step};
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -294,17 +297,40 @@ pub fn generate_cancellable(
     diagnostics: &mut Diagnostics,
     stop: &AtomicBool,
 ) -> Result<Toolpaths, FdmError> {
+    generate_with_progress(mesh, settings, diagnostics, stop, &Progress::new())
+}
+
+/// Like [`generate_cancellable`], and reports how far it has got in
+/// `progress`, up to the end of [`Step::Ordering`]; writing the G-code is
+/// the last step.
+pub fn generate_with_progress(
+    mesh: &Mesh,
+    settings: &Settings,
+    diagnostics: &mut Diagnostics,
+    stop: &AtomicBool,
+    progress: &Progress,
+) -> Result<Toolpaths, FdmError> {
     let objects = std::slice::from_ref(mesh);
-    generate_plate(objects, Placement::Centre, settings, diagnostics, stop)
+    generate_plate_with_progress(
+        objects,
+        Placement::Centre,
+        settings,
+        diagnostics,
+        stop,
+        progress,
+    )
 }
 
 /// Slices several objects on one build plate and generates toolpaths, like
-/// [`generate_cancellable`] does for one. `placement` says where the objects
-/// go; [`arrange`] finds positions for [`Placement::AsGiven`]. Objects whose
-/// outlines overlap seen from above are reported and printed as one.
+/// [`generate_with_progress`] does for one. `placement` says where the
+/// objects go; [`arrange`] finds positions for [`Placement::AsGiven`].
+/// Objects whose outlines overlap seen from above are reported and printed
+/// as one.
 // ponytail: the objects are printed together, layer by layer, with the
 // layer heights of the whole plate. Printing one object after the other
-// and per-object settings are the upgrade.
+// and per-object settings are the upgrade. Cutting the mesh counts as one
+// part of the progress; reporting from inside `slice_mesh_reporting` is
+// the upgrade there.
 pub fn generate_plate(
     objects: &[Mesh],
     placement: Placement,
@@ -312,7 +338,22 @@ pub fn generate_plate(
     diagnostics: &mut Diagnostics,
     stop: &AtomicBool,
 ) -> Result<Toolpaths, FdmError> {
+    let progress = Progress::new();
+    generate_plate_with_progress(objects, placement, settings, diagnostics, stop, &progress)
+}
+
+/// Like [`generate_plate`], and reports how far it has got in `progress`.
+pub fn generate_plate_with_progress(
+    objects: &[Mesh],
+    placement: Placement,
+    settings: &Settings,
+    diagnostics: &mut Diagnostics,
+    stop: &AtomicBool,
+    progress: &Progress,
+) -> Result<Toolpaths, FdmError> {
     let stopped = || stop.load(Ordering::Relaxed);
+    // Turning, removing degenerate triangles, closing holes, checking.
+    progress.start(Step::Preparing, 4);
     plate::check(objects, placement, settings, diagnostics)?;
     let mut mesh = plate::merge(objects, placement);
     let turned = mesh.orient();
@@ -327,6 +368,7 @@ pub fn generate_plate(
             .with("triangles", turned),
         );
     }
+    progress.advance();
     let removed = mesh.remove_degenerate(DEGENERATE_HEIGHT);
     if removed > 0 {
         diagnostics.push(
@@ -337,6 +379,7 @@ pub fn generate_plate(
             .with("triangles", removed),
         );
     }
+    progress.advance();
     let closed = mesh.close_holes(MAX_HOLE_EDGES);
     if closed > 0 {
         diagnostics.push(
@@ -347,7 +390,9 @@ pub fn generate_plate(
             .with("holes", closed),
         );
     }
+    progress.advance();
     mesh.check(diagnostics);
+    progress.advance();
     let count = settings.extruder_count;
     let mut used = mesh.used_extruders();
     // Objects asking for an extruder the printer does not have print with
@@ -446,7 +491,9 @@ pub fn generate_plate(
         .zip(&heights)
         .map(|(top, h)| top - h / 2.0)
         .collect();
+    progress.start(Step::Cutting, 1);
     let slices = slice_mesh_reporting(&mesh, &cut_heights, diagnostics);
+    progress.advance();
     if stopped() {
         return Err(FdmError::Cancelled);
     }
@@ -460,6 +507,7 @@ pub fn generate_plate(
     // What every layer has beyond the layer below. With supports the limit
     // is half a line width (about 50 degrees from vertical at the default
     // layer height); without, only a full line width is worth a warning.
+    progress.start(Step::Geometry, slices.len());
     let (reach, least) = if settings.supports {
         (0.5 * settings.line_width, 0.01)
     } else {
@@ -524,6 +572,7 @@ pub fn generate_plate(
         if stopped() {
             return (Vec::new(), false);
         }
+        progress.advance();
         let mut groups = vec![(extruder, shared_work(&slices, &supports, index, settings))];
         if regions.is_empty() {
             let (work, thin) = region_work(&slices, &slices, &heights, index, settings);
@@ -578,6 +627,8 @@ pub fn generate_plate(
             .with("y", settings.prime_tower_y),
         );
     }
+    // Every layer is counted twice: once in order, once for the travels.
+    progress.start(Step::Ordering, 2 * slices.len());
     let mut position: Point = [0.0, 0.0];
     let mut thin_layers = Vec::new();
     let mut layers: Vec<Layer> = geometry
@@ -612,6 +663,7 @@ pub fn generate_plate(
             if thin {
                 thin_layers.push(index);
             }
+            progress.advance();
             Layer {
                 z: tops[index],
                 height: heights[index],
@@ -625,7 +677,9 @@ pub fn generate_plate(
     // Which travel moves stay over the part depends only on the finished
     // order of a layer, so all cores can work on it again.
     let inside = parallel_map(layers.len(), |index| {
-        travels_inside(&layers[index], &slices[index])
+        let flags = travels_inside(&layers[index], &slices[index]);
+        progress.advance();
+        flags
     });
     for (layer, flags) in layers.iter_mut().zip(inside) {
         for (path, flag) in layer.paths.iter_mut().zip(flags) {
