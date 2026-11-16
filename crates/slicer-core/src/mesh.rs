@@ -271,7 +271,9 @@ impl Mesh {
         }
     }
 
-    /// Enclosed volume in mm³. Only meaningful for closed meshes.
+    /// Enclosed volume in mm³. Only meaningful for closed meshes. Shells
+    /// that overlap count twice where they overlap, although the slicer
+    /// prints that space once.
     pub fn volume(&self) -> f64 {
         self.signed_volume().abs()
     }

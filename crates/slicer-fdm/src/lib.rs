@@ -1996,6 +1996,38 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_shells_extrude_their_union_once() {
+        // The gear of the reference models: a hub cylinder runs through the
+        // gear. The mesh volume counts the overlap twice; the print must not.
+        let mut gear = slicer_core::primitives::extrude(
+            &slicer_core::primitives::gear_contour(16, 18.0, 3.0),
+            [0.0, 0.0],
+            6.0,
+            1,
+            0.0,
+        );
+        let hub = slicer_core::primitives::cylinder(8.0, 10.0, 48);
+        let overlap = hub.volume() * 6.0 / 10.0;
+        gear.merge(&hub);
+        let mut settings = Settings::default();
+        settings.infill_density = 100.0;
+        settings.skirt_loops = 0;
+        let toolpaths = generate(&gear, &settings).unwrap();
+        let volume: f64 = toolpaths
+            .layers
+            .iter()
+            .flat_map(|l| l.paths.iter().map(move |p| (l.height, p)))
+            .map(|(h, p)| p.length() * p.width.unwrap_or(settings.line_width) * h)
+            .sum();
+        let union = gear.volume() - overlap;
+        assert!((volume / union - 1.0).abs() < 0.03, "{volume} of {union}");
+        assert!(
+            volume / gear.volume() < 0.9,
+            "the overlap was printed twice"
+        );
+    }
+
+    #[test]
     fn solid_cube_extrudes_its_own_volume() {
         let mut settings = Settings::default();
         settings.infill_density = 100.0;
