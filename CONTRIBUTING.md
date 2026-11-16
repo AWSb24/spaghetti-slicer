@@ -75,6 +75,7 @@ All three must pass. New behaviour needs a test.
 | G-code commands | Marlin and RepRap G-code documentation |
 | `;TYPE:` and `;LAYER_CHANGE` comments | Naming convention read by common G-code viewers, used for interoperability |
 | Tree supports (contact points on a grid, branches leaning a bounded step per layer towards their nearest neighbour, pushed out of the model, merged when they touch, radius from the carried area; circles from own sine and cosine) | Idea of supports that start at sampled points and join on the way down within a bounded angle from Vanek, Galicia and Benes, "Clever Support: Efficient Support Structure Generation for Digital Fabrication", Computer Graphics Forum 33(5), 2014; algorithm own design |
+| Several extruders: a region per extruder (the higher extruder takes overlaps), ordering that starts each layer with the extruder that ended the last one, tool change with `T<n>` and custom G-code, square prime tower shared line by line among the extruders changed to | `T<n>` from the Marlin G-code documentation; everything else own design |
 | Thin walls and gap fill | Centre line by shrinking a region and averaging its two sides; skip test by Steiner's formula for parallel sets; own design |
 | Folded walls in regions one to two lines wide | Morphological opening (shrink, then grow back) of a wall's centre area finds where its loop's sides lie closer than a line; textbook mathematical morphology (Serra), own design |
 | Desktop app | `eframe`/`egui` (MIT OR Apache-2.0), `rfd` (MIT); layout own design |

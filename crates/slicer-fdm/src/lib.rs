@@ -9,7 +9,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use slicer_core::polygon::{self, HatchDirection, distance};
-use slicer_core::slice::slice_mesh_reporting;
+use slicer_core::slice::{slice_mesh, slice_mesh_reporting};
 use slicer_core::{Contour, Diagnostic, Diagnostics, Mesh, Point, Shapes, parallel_map};
 use slicer_profiles::{InfillPattern, SeamPosition, Settings, SupportStyle, WallOrder};
 
@@ -112,6 +112,9 @@ pub enum PathKind {
     Bridge,
     /// Low-density fill of the interior.
     SparseInfill,
+    /// Tower beside the model that an extruder primes into after a tool
+    /// change.
+    PrimeTower,
 }
 
 /// A continuous extrusion.
@@ -290,18 +293,44 @@ pub fn generate_cancellable(
         );
     }
     mesh.check(diagnostics);
-    // ponytail: one extruder prints everything, the lowest one the model
-    // asks for. Separate regions per extruder and tool changes are the
-    // upgrade.
-    let used = mesh.used_extruders();
+    let count = settings.extruder_count;
+    let mut used = mesh.used_extruders();
+    // Objects asking for an extruder the printer does not have print with
+    // the first one.
+    let missing: Vec<String> = used
+        .iter()
+        .filter(|&&e| count > 1 && e >= count)
+        .map(|e| (e + 1).to_string())
+        .collect();
+    if !missing.is_empty() {
+        diagnostics.push(
+            Diagnostic::warning(
+                "slicing.missing_extruder",
+                format!(
+                    "objects of the model ask for extruder(s) {}, but the printer has {count} (extruder_count); they are printed with extruder 1",
+                    missing.join(", ")
+                ),
+            )
+            .with("extruders", missing.join(" "))
+            .with("extruder_count", count),
+        );
+        for e in &mut mesh.extruders {
+            if *e >= count {
+                *e = 0;
+            }
+        }
+        used = mesh.used_extruders();
+    }
+    // With one extruder it prints everything, the lowest one the model asks
+    // for. Otherwise this one prints skirt, brim and supports.
     let extruder = used.first().copied().unwrap_or(0);
-    if used.len() > 1 {
+    if used.len() > 1 && count == 1 {
         let list: Vec<String> = used.iter().map(|e| (e + 1).to_string()).collect();
         diagnostics.push(
             Diagnostic::warning(
                 "slicing.multiple_extruders",
                 format!(
-                    "the objects of the model ask for extruders {}; only one extruder is supported, everything is printed with extruder {}",
+                    "the objects of the model ask for extruders {}; the printer has one extruder (extruder_count), everything is printed with extruder {}",
                     list.join(", "),
                     extruder + 1
                 ),
@@ -403,43 +432,118 @@ pub fn generate_cancellable(
     } else {
         Vec::new()
     };
+    // With several extruders every one of them gets its own region: the
+    // part of the layer that its objects cover. Where objects of different
+    // extruders overlap, the higher extruder takes the overlap, so that a
+    // part placed into another one (an inlay, a label) keeps its colour.
+    let regions: Vec<(u32, Vec<Shapes>)> = if count > 1 && used.len() > 1 {
+        let own: Vec<Vec<Shapes>> = used
+            .iter()
+            .map(|&e| slice_mesh(&with_extruder(&mesh, e), &cut_heights))
+            .collect();
+        (0..own.len())
+            .map(|i| {
+                let region = parallel_map(slices.len(), |index| {
+                    own[i + 1..]
+                        .iter()
+                        .fold(own[i][index].clone(), |region, later| {
+                            polygon::difference(&region, &later[index])
+                        })
+                });
+                (used[i], region)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if stopped() {
+        return Err(FdmError::Cancelled);
+    }
+    // What every extruder prints on a layer, in ascending order of the
+    // extruders; skirt, brim and supports go first with the lowest one.
     let geometry = parallel_map(slices.len(), |index| {
         if stopped() {
             return (Vec::new(), false);
         }
-        layer_work(&slices, &heights, &supports, index, settings)
+        let mut groups = vec![(extruder, shared_work(&slices, &supports, index, settings))];
+        if regions.is_empty() {
+            let (work, thin) = region_work(&slices, &slices, &heights, index, settings);
+            groups[0].1.extend(work);
+            return (groups, thin);
+        }
+        let mut thin = false;
+        for (e, region) in &regions {
+            if region[index].is_empty() {
+                continue;
+            }
+            let (work, region_thin) = region_work(region, &slices, &heights, index, settings);
+            thin |= region_thin;
+            match groups.iter_mut().find(|(g, _)| g == e) {
+                Some(group) => group.1.extend(work),
+                None => groups.push((*e, work)),
+            }
+        }
+        groups.retain(|(_, work)| !work.is_empty());
+        (groups, thin)
     });
     if stopped() {
         return Err(FdmError::Cancelled);
+    }
+    // The extruder that finished a layer starts the next one; the others
+    // follow in ascending order.
+    let mut tool = extruder;
+    let mut orders: Vec<Vec<u32>> = Vec::new();
+    for (groups, _) in &geometry {
+        let mut order: Vec<u32> = groups.iter().map(|(e, _)| *e).collect();
+        if let Some(at) = order.iter().position(|&e| e == tool) {
+            order[..=at].rotate_right(1);
+        }
+        tool = order.last().copied().unwrap_or(tool);
+        orders.push(order);
+    }
+    let tower = PrimeTower::plan(&orders, settings);
+    if let Some(tower) = &tower
+        && slices[..tower.layers]
+            .iter()
+            .any(|slice| !polygon::intersection(slice, &tower.footprint).is_empty())
+    {
+        diagnostics.push(
+            Diagnostic::warning(
+                "slicing.prime_tower_overlap",
+                format!(
+                    "the prime tower at X {} Y {} overlaps the model; move it with prime_tower_x and prime_tower_y",
+                    settings.prime_tower_x, settings.prime_tower_y
+                ),
+            )
+            .with("x", settings.prime_tower_x)
+            .with("y", settings.prime_tower_y),
+        );
     }
     let mut position: Point = [0.0, 0.0];
     let mut thin_layers = Vec::new();
     let mut layers: Vec<Layer> = geometry
         .into_iter()
+        .zip(orders)
         .enumerate()
-        .map(|(index, (work, mut thin))| {
+        .map(|(index, ((mut groups, mut thin), order))| {
             let mut paths = Vec::new();
-            let work = if stopped() { Vec::new() } else { work };
-            for piece in work {
-                match piece {
-                    Work::Loops(loops, kind, min_length) => {
-                        let wall = matches!(kind, PathKind::OuterWall | PathKind::InnerWall);
-                        let seam = if wall {
-                            settings.seam_position
-                        } else {
-                            SeamPosition::Nearest
-                        };
-                        push_loops(loops, kind, min_length, seam, &mut position, &mut paths);
-                    }
-                    Work::Lines(lines, kind, join_distance) => {
-                        push_lines(lines, kind, join_distance, &mut position, &mut paths);
-                    }
-                    Work::Polylines(lines, kind, join_distance) => {
-                        push_lines(lines, kind, join_distance, &mut position, &mut paths);
-                    }
-                    Work::Centred(lines, kind) => {
-                        push_centred(lines, kind, &mut position, &mut paths);
-                    }
+            if stopped() {
+                groups.clear();
+            }
+            for e in order {
+                let Some(at) = groups.iter().position(|(g, _)| *g == e) else {
+                    continue;
+                };
+                let (_, work) = groups.swap_remove(at);
+                let start = paths.len();
+                if let Some(tower) = &tower {
+                    tower.push(index, e, &mut position, &mut paths);
+                }
+                for piece in work {
+                    push_work(piece, settings, &mut position, &mut paths);
+                }
+                for path in &mut paths[start..] {
+                    path.extruder = e;
                 }
             }
             // A layer with material but without any outer wall prints nothing.
@@ -467,7 +571,6 @@ pub fn generate_cancellable(
     for (layer, flags) in layers.iter_mut().zip(inside) {
         for (path, flag) in layer.paths.iter_mut().zip(flags) {
             path.travel_inside = flag;
-            path.extruder = extruder;
         }
     }
     // Without supports, say where they would be needed.
@@ -510,6 +613,137 @@ pub fn generate_cancellable(
         );
     }
     Ok(Toolpaths { layers })
+}
+
+/// The triangles of `mesh` that `extruder` prints, with all vertices.
+fn with_extruder(mesh: &Mesh, extruder: u32) -> Mesh {
+    Mesh {
+        vertices: mesh.vertices.clone(),
+        triangles: (0..mesh.triangles.len())
+            .filter(|&i| mesh.extruder(i) == extruder)
+            .map(|i| mesh.triangles[i])
+            .collect(),
+        extruders: Vec::new(),
+    }
+}
+
+/// Puts one piece of geometry in printing order and appends it to `paths`.
+fn push_work(piece: Work, settings: &Settings, position: &mut Point, paths: &mut Vec<Path>) {
+    match piece {
+        Work::Loops(loops, kind, min_length) => {
+            let wall = matches!(kind, PathKind::OuterWall | PathKind::InnerWall);
+            let seam = if wall {
+                settings.seam_position
+            } else {
+                SeamPosition::Nearest
+            };
+            push_loops(loops, kind, min_length, seam, position, paths);
+        }
+        Work::Lines(lines, kind, join_distance) => {
+            push_lines(lines, kind, join_distance, position, paths);
+        }
+        Work::Polylines(lines, kind, join_distance) => {
+            push_lines(lines, kind, join_distance, position, paths);
+        }
+        Work::Centred(lines, kind) => push_centred(lines, kind, position, paths),
+    }
+}
+
+/// A square tower beside the model that every tool change primes the new
+/// extruder into, so that it extrudes evenly again before it reaches the
+/// model. It stands on every layer up to the last tool change; on a layer
+/// with tool changes the extruders changed to share its lines, on a layer
+/// without the extruder that starts the layer prints all of it.
+// ponytail: solid on every layer whatever the extruders need to purge, and
+// the skirt does not go around it. Purge volumes per pair of filaments and a
+// sparse tower are the upgrade.
+struct PrimeTower {
+    /// The square on the bed.
+    footprint: Shapes,
+    /// For every layer of the tower, the extruders that print a share of
+    /// it, in printing order. The first one also prints the outline.
+    shares: Vec<Vec<u32>>,
+    /// Number of layers the tower reaches up.
+    layers: usize,
+    /// Line width.
+    width: f64,
+}
+
+impl PrimeTower {
+    /// The tower for the extruders printing every layer in the given order,
+    /// or `None` if there is no tool change or no tower.
+    fn plan(orders: &[Vec<u32>], settings: &Settings) -> Option<Self> {
+        if settings.extruder_count < 2 || settings.prime_tower_width <= 0.0 {
+            return None;
+        }
+        let mut tool = orders.iter().flatten().next().copied()?;
+        let mut shares = Vec::new();
+        let mut layers = 0;
+        for (index, order) in orders.iter().enumerate() {
+            let changed: Vec<u32> = order
+                .iter()
+                .copied()
+                .filter(|&e| std::mem::replace(&mut tool, e) != e)
+                .collect();
+            if changed.is_empty() {
+                shares.push(order.first().copied().into_iter().collect());
+            } else {
+                layers = index + 1;
+                shares.push(changed);
+            }
+        }
+        if layers == 0 {
+            return None;
+        }
+        shares.truncate(layers);
+        let half = settings.prime_tower_width / 2.0;
+        let (x, y) = (settings.prime_tower_x, settings.prime_tower_y);
+        let square = vec![
+            [x - half, y - half],
+            [x + half, y - half],
+            [x + half, y + half],
+            [x - half, y + half],
+        ];
+        Some(Self {
+            footprint: vec![vec![square]],
+            shares,
+            layers,
+            width: settings.line_width,
+        })
+    }
+
+    /// Appends the share of the tower that `extruder` prints on layer
+    /// `index`, if any: every n-th line of a solid fill when n extruders
+    /// share the layer.
+    fn push(&self, index: usize, extruder: u32, position: &mut Point, paths: &mut Vec<Path>) {
+        let Some(shares) = self.shares.get(index) else {
+            return;
+        };
+        let Some(share) = shares.iter().position(|&e| e == extruder) else {
+            return;
+        };
+        let width = self.width;
+        if share == 0 {
+            let outline = contours(&polygon::offset(&self.footprint, -0.5 * width));
+            let kind = PathKind::PrimeTower;
+            push_loops(outline, kind, width, SeamPosition::Nearest, position, paths);
+        }
+        let direction = if index.is_multiple_of(2) {
+            HatchDirection::Diagonal45
+        } else {
+            HatchDirection::Diagonal135
+        };
+        let fill = polygon::offset(&self.footprint, -width);
+        let lines: Vec<[Point; 2]> = polygon::hatch(&fill, width, direction, 0.5 * width)
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| i % shares.len() == share)
+            .map(|(_, line)| line)
+            .collect();
+        // Neighbouring lines of a share are joined along the edge.
+        let join = 2.0 * shares.len() as f64 * width;
+        push_lines(lines, PathKind::PrimeTower, join, position, paths);
+    }
 }
 
 /// For every path of a layer: whether the move to its start stays inside
@@ -633,24 +867,24 @@ enum Work {
 /// with.
 type CentreLine = (Vec<Point>, bool, f64);
 
-/// Generates the geometry of one layer in the order it is printed. The flag
-/// tells whether a noticeable part of the layer is too narrow to be covered
-/// by a wall.
-fn layer_work(
+/// Generates what a layer prints for the whole model, whatever extruder its
+/// parts take: skirt and brim on the first layer, and supports.
+fn shared_work(
     slices: &[Shapes],
-    heights: &[f64],
     supports: &[(Shapes, Shapes)],
     index: usize,
     settings: &Settings,
-) -> (Vec<Work>, bool) {
-    let slice = &slices[index];
+) -> Vec<Work> {
     let width = settings.line_width;
-    let walls = settings.wall_loops as usize;
     let mut work = Vec::new();
-
     let support = supports.get(index).filter(|(area, _)| !area.is_empty());
     if index == 0 {
-        adhesion_work(slice, support.map(|(area, _)| area), settings, &mut work);
+        adhesion_work(
+            &slices[0],
+            support.map(|(area, _)| area),
+            settings,
+            &mut work,
+        );
     }
     if let Some((area, dense)) = support {
         // A loop around every support holds its lines together and makes
@@ -678,6 +912,25 @@ fn layer_work(
         );
         work.push(Work::Lines(lines, PathKind::Support, 0.0));
     }
+    work
+}
+
+/// Generates the walls and infill of one layer of a region, in the order
+/// they are printed. `slices` is the region on every layer, `model` the
+/// whole model, which carries the region where it bridges. The flag tells
+/// whether a noticeable part of the layer is too narrow to be covered by a
+/// wall.
+fn region_work(
+    slices: &[Shapes],
+    model: &[Shapes],
+    heights: &[f64],
+    index: usize,
+    settings: &Settings,
+) -> (Vec<Work>, bool) {
+    let slice = &slices[index];
+    let width = settings.line_width;
+    let walls = settings.wall_loops as usize;
+    let mut work = Vec::new();
 
     // Walls: centre lines half a width inside the contour, then one width
     // further in for every additional loop. Printed from the inside out.
@@ -810,7 +1063,7 @@ fn layer_work(
 
     let (solid, sparse) = if index > 0 {
         let (bridges, solid, sparse) =
-            split_bridges(&slices[index - 1], &fill_area, solid, sparse, width);
+            split_bridges(&model[index - 1], &fill_area, solid, sparse, width);
         for (bridge, across) in bridges {
             let lines = polygon::hatch(&bridge, width, across, min_length);
             work.push(Work::Lines(lines, PathKind::Bridge, 2.0 * width));
@@ -2171,6 +2424,139 @@ mod tests {
         assert_eq!(diagnostics.codes(), ["slicing.multiple_extruders"]);
         assert_eq!(diagnostics.as_slice()[0].context["extruders"], "2 3");
         assert_eq!(diagnostics.as_slice()[0].context["extruder"], "2");
+    }
+
+    /// Two 10 mm cubes, the second `gap` mm to the right of the first and
+    /// on extruder 2.
+    fn two_cubes(gap: f64, height: f64) -> Mesh {
+        let mut mesh = Mesh::cuboid(10.0, 10.0, height);
+        let mut other = Mesh::cuboid(10.0, 10.0, height);
+        other.translate([10.0 + gap, 0.0, 0.0]);
+        other.set_extruder(0, 1);
+        mesh.merge(&other);
+        mesh
+    }
+
+    #[test]
+    fn every_extruder_prints_its_own_objects() {
+        let mut settings = Settings::default();
+        settings.extruder_count = 2;
+        let mut diagnostics = Diagnostics::new();
+        let toolpaths = generate_reporting(&two_cubes(10.0, 2.0), &settings, &mut diagnostics);
+        let toolpaths = toolpaths.unwrap();
+        assert!(diagnostics.is_empty(), "{:?}", diagnostics.codes());
+        // The model is centred: the cubes span X 95..105 and 115..125.
+        let mut tool = 0;
+        for (index, layer) in toolpaths.layers.iter().enumerate() {
+            for path in &layer.paths {
+                let model = !matches!(path.kind, PathKind::Skirt | PathKind::PrimeTower);
+                for p in path.points.iter().filter(|_| model) {
+                    let expected = u32::from(p[0] > 110.0);
+                    assert_eq!(path.extruder, expected, "layer {index}: {p:?}");
+                }
+            }
+            // The extruder that ended a layer starts the next one, so every
+            // layer changes tools once.
+            let mut order: Vec<u32> = layer.paths.iter().map(|p| p.extruder).collect();
+            order.dedup();
+            assert_eq!(order, [tool, 1 - tool], "layer {index}");
+            tool = 1 - tool;
+            // The extruder changed to primes into the tower first.
+            let first_of_new = layer.paths.iter().find(|p| p.extruder == order[1]).unwrap();
+            assert_eq!(first_of_new.kind, PathKind::PrimeTower, "layer {index}");
+            // The tower stands at its place and fills its square.
+            let tower: Vec<&Path> = layer
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::PrimeTower)
+                .collect();
+            for p in tower.iter().flat_map(|path| &path.points) {
+                assert!(
+                    (p[0] - 190.0).abs() < 7.5 && (p[1] - 190.0).abs() < 7.5,
+                    "{p:?}"
+                );
+            }
+            let length: f64 = tower.iter().map(|path| path.length()).sum();
+            let area = length * settings.line_width;
+            assert!((area / 225.0 - 1.0).abs() < 0.1, "layer {index}: {area}");
+        }
+
+        // Without a tower nothing but the cubes and the skirt is printed.
+        settings.prime_tower_width = 0.0;
+        let plain = generate(&two_cubes(10.0, 2.0), &settings).unwrap();
+        assert!(
+            plain
+                .layers
+                .iter()
+                .flat_map(|l| &l.paths)
+                .all(|p| p.kind != PathKind::PrimeTower)
+        );
+        // Over the top of the lower cube nothing changes tools any more,
+        // and the tower ends with the last tool change.
+        let mut taller = Mesh::cuboid(10.0, 10.0, 4.0);
+        let mut lower = Mesh::cuboid(10.0, 10.0, 2.0);
+        lower.translate([20.0, 0.0, 0.0]);
+        lower.set_extruder(0, 1);
+        taller.merge(&lower);
+        settings.prime_tower_width = 15.0;
+        let toolpaths = generate(&taller, &settings).unwrap();
+        let towers: Vec<bool> = (toolpaths.layers.iter())
+            .map(|l| l.paths.iter().any(|p| p.kind == PathKind::PrimeTower))
+            .collect();
+        // Layer 9, the last one of the lower cube, ends with extruder 1, so
+        // layer 10 starts without a change.
+        assert_eq!(towers.iter().filter(|&&t| t).count(), 10, "{towers:?}");
+        assert!(towers[..10].iter().all(|&t| t));
+    }
+
+    #[test]
+    fn the_higher_extruder_takes_where_objects_overlap() {
+        // The second cube reaches 4 mm into the first one.
+        let mut settings = Settings::default();
+        settings.extruder_count = 2;
+        settings.prime_tower_width = 0.0;
+        let toolpaths = generate(&two_cubes(-4.0, 2.0), &settings).unwrap();
+        // The cubes span X 102..112 and 108..118; extruder 2 takes 108..118.
+        let w = settings.line_width;
+        for path in &toolpaths.layers[5].paths {
+            for p in &path.points {
+                match path.extruder {
+                    0 => assert!(p[0] < 108.0 - 0.5 * w + 1e-6, "{p:?}"),
+                    _ => assert!(p[0] > 108.0 + 0.5 * w - 1e-6, "{p:?}"),
+                }
+            }
+        }
+        // Both regions together are filled like one solid: as much path as
+        // the same block on one extruder, give or take the walls between.
+        let length = |toolpaths: &Toolpaths| -> f64 {
+            toolpaths.layers[5].paths.iter().map(Path::length).sum()
+        };
+        let mut one = two_cubes(-4.0, 2.0);
+        one.extruders.clear();
+        let single = generate(&one, &settings).unwrap();
+        let ratio = length(&toolpaths) / length(&single);
+        assert!(ratio > 1.0 && ratio < 1.3, "{ratio}");
+    }
+
+    #[test]
+    fn objects_on_missing_extruders_print_with_the_first() {
+        let mut settings = Settings::default();
+        settings.extruder_count = 2;
+        let mut mesh = two_cubes(10.0, 1.0);
+        let mut third = Mesh::cuboid(10.0, 10.0, 1.0);
+        third.translate([0.0, 20.0, 0.0]);
+        third.set_extruder(0, 4);
+        mesh.merge(&third);
+        let mut diagnostics = Diagnostics::new();
+        let toolpaths = generate_reporting(&mesh, &settings, &mut diagnostics).unwrap();
+        assert_eq!(diagnostics.codes(), ["slicing.missing_extruder"]);
+        assert_eq!(diagnostics.as_slice()[0].context["extruders"], "5");
+        let mut used: Vec<u32> = (toolpaths.layers.iter().flat_map(|l| &l.paths))
+            .map(|p| p.extruder)
+            .collect();
+        used.sort_unstable();
+        used.dedup();
+        assert_eq!(used, [0, 1]);
     }
 
     #[test]

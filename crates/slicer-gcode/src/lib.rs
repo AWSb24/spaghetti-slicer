@@ -3,6 +3,7 @@
 //! Marlin and Klipper are implemented and currently produce the same
 //! commands; the Bambu flavor does not exist yet.
 
+use std::collections::BTreeMap;
 use std::f64::consts::PI;
 use std::fmt::{self, Write};
 
@@ -27,6 +28,26 @@ pub struct Stats {
     /// at corners. Ignores heating and everything the start and end G-code
     /// do. Not yet compared with a real print.
     pub print_time_s: f64,
+    /// The same figures for every extruder the print uses, with more than
+    /// one extruder (`extruder_count`); empty otherwise.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub extruders: Vec<ExtruderStats>,
+}
+
+/// Summary of what one extruder prints.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ExtruderStats {
+    /// The extruder, counted from 0 as in `T<n>`.
+    pub extruder: u32,
+    /// Filament consumed, in millimetres of filament.
+    pub filament_length_mm: f64,
+    /// Filament consumed, in cm³.
+    pub filament_volume_cm3: f64,
+    /// Filament consumed, in grams.
+    pub filament_weight_g: f64,
+    /// Estimated time in seconds while this extruder is selected, travel
+    /// moves included; tool changes themselves take no time here.
+    pub print_time_s: f64,
 }
 
 /// Generated G-code with its statistics.
@@ -43,7 +64,8 @@ pub struct Output {
 pub enum GcodeError {
     /// Custom G-code refers to a setting that does not exist.
     UnknownPlaceholder {
-        /// Setting that contains the placeholder (`start_gcode` or `end_gcode`).
+        /// Setting that contains the placeholder (`start_gcode`, `end_gcode`
+        /// or `toolchange_gcode`).
         setting: &'static str,
         /// The unknown name.
         name: String,
@@ -119,15 +141,28 @@ fn label(kind: PathKind) -> &'static str {
         PathKind::SolidInfill => "Solid infill",
         PathKind::Bridge => "Bridge",
         PathKind::SparseInfill => "Sparse infill",
+        PathKind::PrimeTower => "Prime tower",
     }
+}
+
+/// Values for the placeholders of `toolchange_gcode`: the settings and the
+/// extruders before and after the change.
+fn toolchange_values(
+    settings: &BTreeMap<String, String>,
+    previous: u32,
+    next: u32,
+) -> BTreeMap<String, String> {
+    let mut values = settings.clone();
+    values.insert("previous_extruder".to_owned(), previous.to_string());
+    values.insert("next_extruder".to_owned(), next.to_string());
+    values
 }
 
 fn expand(
     template: &str,
     setting: &'static str,
-    settings: &Settings,
+    values: &BTreeMap<String, String>,
 ) -> Result<String, GcodeError> {
-    let values = settings.placeholder_values();
     let mut out = String::new();
     for (index, text) in template.lines().enumerate() {
         let line = index + 1;
@@ -164,17 +199,25 @@ struct Move {
     length: f64,
     /// Requested speed in mm/s.
     speed: f64,
+    /// Extruder selected during the move (its slot in the writer).
+    tool: usize,
 }
 
 /// Time in seconds the moves take when the printer starts and ends at rest,
 /// changes its speed by at most `acceleration` (mm/s²) and may change its
 /// velocity at once by at most `jerk` (mm/s) where two moves meet.
+#[cfg(test)]
+fn planned_time(moves: &[Move], acceleration: f64, jerk: f64) -> f64 {
+    move_times(moves, acceleration, jerk).iter().sum()
+}
+
+/// Time in seconds every move takes, as for [`planned_time`].
 ///
 /// The speeds where moves meet are limited three ways: by the requested
 /// speeds, by the change of direction, and by what the neighbouring moves can
 /// reach or shed over their length. Each move then accelerates, cruises and
 /// brakes.
-fn planned_time(moves: &[Move], acceleration: f64, jerk: f64) -> f64 {
+fn move_times(moves: &[Move], acceleration: f64, jerk: f64) -> Vec<f64> {
     let reachable = |from: f64, m: &Move| (from * from + 2.0 * acceleration * m.length).sqrt();
     // junction[i] is the speed at the start of move i; both ends are at rest.
     let mut junction = vec![0.0; moves.len() + 1];
@@ -207,7 +250,7 @@ fn planned_time(moves: &[Move], acceleration: f64, jerk: f64) -> f64 {
             let ramps = (2.0 * peak * peak - start * start - end * end) / (2.0 * acceleration);
             (2.0 * peak - start - end) / acceleration + (m.length - ramps).max(0.0) / peak
         })
-        .sum()
+        .collect()
 }
 
 struct Writer<'a> {
@@ -216,8 +259,13 @@ struct Writer<'a> {
     position: Option<Point>,
     z: f64,
     feed: f64,
-    retracted: bool,
-    filament: f64,
+    /// Slot of the selected extruder in `retracted` and `filament`: its
+    /// number with several extruders, otherwise 0.
+    tool: usize,
+    /// Per extruder: whether its filament is pulled back.
+    retracted: Vec<bool>,
+    /// Per extruder: filament pushed through so far, in millimetres.
+    filament: Vec<f64>,
     /// Filament extruded since the last `G92 E0`; only used for absolute
     /// extrusion.
     e: f64,
@@ -252,26 +300,37 @@ impl Writer<'_> {
 
     fn retract(&mut self) {
         let length = self.settings.retraction_length;
-        if length > 0.0 && !self.retracted {
+        if length > 0.0 && !self.retracted[self.tool] {
             let f = self.feed_word(self.settings.retraction_speed);
             let e = self.e_word(-length);
             let _ = writeln!(self.out, "G1{e}{f}");
-            self.retracted = true;
-            self.filament -= length;
+            self.retracted[self.tool] = true;
+            self.filament[self.tool] -= length;
             self.record([0.0, 0.0], length, self.settings.retraction_speed);
         }
     }
 
     fn unretract(&mut self) {
-        if self.retracted {
+        if self.retracted[self.tool] {
             let length = self.settings.retraction_length;
             let f = self.feed_word(self.settings.retraction_speed);
             let e = self.e_word(length);
             let _ = writeln!(self.out, "G1{e}{f}");
-            self.retracted = false;
-            self.filament += length;
+            self.retracted[self.tool] = false;
+            self.filament[self.tool] += length;
             self.record([0.0, 0.0], length, self.settings.retraction_speed);
         }
+    }
+
+    /// Makes `tool` the selected extruder. An extruder used for the first
+    /// time starts with its filament not pulled back; one used before
+    /// stays retracted until it extrudes.
+    fn select(&mut self, tool: usize) {
+        if tool >= self.retracted.len() {
+            self.retracted.resize(tool + 1, false);
+            self.filament.resize(tool + 1, 0.0);
+        }
+        self.tool = tool;
     }
 
     fn record(&mut self, direction: Point, length: f64, speed: f64) {
@@ -280,6 +339,7 @@ impl Writer<'_> {
                 direction,
                 length,
                 speed,
+                tool: self.tool,
             });
         }
     }
@@ -336,7 +396,7 @@ impl Writer<'_> {
         let f = self.feed_word(speed);
         let word = self.e_word(e);
         let _ = writeln!(self.out, "G1 X{:.3} Y{:.3}{word}{f}", to[0], to[1]);
-        self.filament += e;
+        self.filament[self.tool] += e;
         let direction = [(to[0] - from[0]) / length, (to[1] - from[1]) / length];
         self.record(direction, length, speed);
         self.position = Some(to);
@@ -349,9 +409,22 @@ impl Writer<'_> {
 /// values (`M82`, reset with `G92 E0` on every layer). Every millimetre of path deposits a volume
 /// of line width times layer height, so parallel lines one line width apart
 /// fill a layer completely.
+///
+/// With more than one extruder (`extruder_count`) every path prints with its
+/// own extruder. The first one is selected with `T<n>` before the first
+/// move; at every later change the old extruder retracts, `toolchange_gcode`
+/// follows, then `T<n>`, the travel to the next path and the move back to
+/// the height of the layer (the custom G-code may have moved the nozzle).
 pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output, GcodeError> {
-    let start = expand(&settings.start_gcode, "start_gcode", settings)?;
-    let end = expand(&settings.end_gcode, "end_gcode", settings)?;
+    let values = settings.placeholder_values();
+    let start = expand(&settings.start_gcode, "start_gcode", &values)?;
+    let end = expand(&settings.end_gcode, "end_gcode", &values)?;
+    let several = settings.extruder_count > 1;
+    if several {
+        // Mistakes in the tool change G-code show up even without a change.
+        let check = toolchange_values(&values, 0, 1);
+        expand(&settings.toolchange_gcode, "toolchange_gcode", &check)?;
+    }
     let filament_area = PI * (settings.filament_diameter / 2.0).powi(2);
 
     let mut w = Writer {
@@ -360,8 +433,9 @@ pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output,
         position: None,
         z: 0.0,
         feed: 0.0,
-        retracted: false,
-        filament: 0.0,
+        tool: 0,
+        retracted: vec![false],
+        filament: vec![0.0],
         e: 0.0,
         moves: Vec::new(),
         nozzle_z: None,
@@ -376,6 +450,10 @@ pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output,
 
     // What the fan was last told, in percent.
     let mut fan = 0.0;
+    // The extruder selected with `T<n>`, none before the first one.
+    let mut selected: Option<u32> = None;
+    // A tool change may have moved the nozzle away from the layer.
+    let mut restore_z = false;
     for (index, layer) in toolpaths.layers.iter().enumerate() {
         let _ = writeln!(
             w.out,
@@ -414,7 +492,32 @@ pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output,
             let Some(&first) = path.points.first() else {
                 continue;
             };
+            if several && selected != Some(path.extruder) {
+                let next = path.extruder;
+                if let Some(previous) = selected {
+                    w.retract();
+                    let values = toolchange_values(&values, previous, next);
+                    let block = expand(&settings.toolchange_gcode, "toolchange_gcode", &values)?;
+                    w.out.push_str(&block);
+                    let _ = writeln!(w.out, "T{next}");
+                    if absolute {
+                        w.out.push_str("G92 E0\n");
+                        w.e = 0.0;
+                    }
+                    // Where the custom G-code left the nozzle is unknown.
+                    w.position = None;
+                    restore_z = true;
+                } else {
+                    let _ = writeln!(w.out, "T{next}");
+                }
+                selected = Some(next);
+                w.select(next as usize);
+            }
             w.travel(first, path.travel_inside);
+            if restore_z {
+                w.move_z(layer.z);
+                restore_z = false;
+            }
             let bridge = path.kind == PathKind::Bridge;
             let wanted = if bridge {
                 settings.bridge_fan_speed
@@ -445,9 +548,10 @@ pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output,
                 match path.kind {
                     PathKind::OuterWall => settings.outer_wall_speed,
                     PathKind::InnerWall | PathKind::GapFill => settings.inner_wall_speed,
-                    PathKind::SolidInfill | PathKind::SparseInfill | PathKind::Support => {
-                        settings.infill_speed
-                    }
+                    PathKind::SolidInfill
+                    | PathKind::SparseInfill
+                    | PathKind::Support
+                    | PathKind::PrimeTower => settings.infill_speed,
                     PathKind::Bridge => settings.bridge_speed,
                     PathKind::Skirt | PathKind::Brim => settings.first_layer_speed,
                 }
@@ -463,20 +567,47 @@ pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output,
     w.retract();
     w.out.push_str(&end);
 
-    // The final retraction is not consumed filament.
-    let used = w.filament
-        + if w.retracted {
-            settings.retraction_length
-        } else {
-            0.0
-        };
-    let volume_cm3 = used * filament_area / 1000.0;
+    // The final retraction of every extruder is not consumed filament.
+    let used: Vec<f64> = w
+        .filament
+        .iter()
+        .zip(&w.retracted)
+        .map(|(&filament, &retracted)| {
+            filament
+                + if retracted {
+                    settings.retraction_length
+                } else {
+                    0.0
+                }
+        })
+        .collect();
+    let times = move_times(&w.moves, settings.acceleration, settings.jerk);
+    let volume = |length: f64| length * filament_area / 1000.0;
+    let extruders = if several {
+        (0..used.len())
+            .filter(|&tool| w.moves.iter().any(|m| m.tool == tool))
+            .map(|tool| ExtruderStats {
+                extruder: tool as u32,
+                filament_length_mm: used[tool],
+                filament_volume_cm3: volume(used[tool]),
+                filament_weight_g: volume(used[tool]) * settings.filament_density,
+                print_time_s: (w.moves.iter().zip(&times))
+                    .filter(|(m, _)| m.tool == tool)
+                    .map(|(_, t)| t)
+                    .sum(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let total: f64 = used.iter().sum();
     let stats = Stats {
         layers: toolpaths.layers.len(),
-        filament_length_mm: used,
-        filament_volume_cm3: volume_cm3,
-        filament_weight_g: volume_cm3 * settings.filament_density,
-        print_time_s: planned_time(&w.moves, settings.acceleration, settings.jerk),
+        filament_length_mm: total,
+        filament_volume_cm3: volume(total),
+        filament_weight_g: volume(total) * settings.filament_density,
+        print_time_s: times.iter().sum(),
+        extruders,
     };
 
     let flavor = match settings.flavor {
@@ -507,6 +638,13 @@ pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output,
         "; estimated printing time [s]: {:.0} (with acceleration, without heating)",
         stats.print_time_s
     );
+    for e in &stats.extruders {
+        let _ = writeln!(
+            gcode,
+            "; extruder T{}: filament {:.2} mm, {:.2} g, {:.0} s",
+            e.extruder, e.filament_length_mm, e.filament_weight_g, e.print_time_s
+        );
+    }
     gcode.push_str(&w.out);
     gcode.push_str("; settings\n");
     for (key, value) in settings.placeholder_values() {
@@ -616,6 +754,7 @@ mod tests {
             direction,
             length,
             speed,
+            tool: 0,
         };
         let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
         // 100 mm at 50 mm/s with 1000 mm/s²: 0.05 s and 1.25 mm for each
@@ -747,6 +886,112 @@ mod tests {
         settings.z_hop = 0.4;
         let gcode = slice(&mesh, &settings).gcode;
         assert!(gcode.contains("G1 Z0.600"), "first layer hop missing");
+    }
+
+    /// Two 10 x 10 x 5 mm cubes 10 mm apart, the second one on extruder 2.
+    fn two_cubes() -> Mesh {
+        let mut mesh = Mesh::cuboid(10.0, 10.0, 5.0);
+        let mut other = Mesh::cuboid(10.0, 10.0, 5.0);
+        other.translate([20.0, 0.0, 0.0]);
+        other.set_extruder(0, 1);
+        mesh.merge(&other);
+        mesh
+    }
+
+    #[test]
+    fn two_extruders_change_tools_once_per_layer() {
+        let mut settings = Settings::default();
+        settings.extruder_count = 2;
+        settings.toolchange_gcode = "; change {previous_extruder} to {next_extruder}".into();
+        // Solid cubes without skirt and tower, so the filament of every
+        // extruder is the volume of its cube.
+        settings.infill_density = 100.0;
+        settings.infill_overlap = 0.0;
+        settings.skirt_loops = 0;
+        settings.prime_tower_width = 0.0;
+        let output = slice(&two_cubes(), &settings);
+        let lines: Vec<&str> = output.gcode.lines().collect();
+        let changes: Vec<(usize, &str)> = (lines.iter().enumerate())
+            .filter(|(_, l)| l.starts_with('T'))
+            .map(|(i, l)| (i, *l))
+            .collect();
+        // T0 to start with, then one change on each of the 25 layers.
+        assert_eq!(changes.len(), 26);
+        for (k, &(at, tool)) in changes.iter().enumerate() {
+            assert_eq!(tool, if k % 2 == 0 { "T0" } else { "T1" });
+            if k > 0 {
+                let previous = if k % 2 == 0 { 1 } else { 0 };
+                let block = format!("; change {previous} to {}", 1 - previous);
+                assert_eq!(lines[at - 1], block);
+                // Retracted before, travel to the next path after, then
+                // back to the layer.
+                assert!(lines[at - 2].starts_with("G1 E-0.8"), "{}", lines[at - 2]);
+                assert!(lines[at + 1].starts_with("G0 X"), "{}", lines[at + 1]);
+                assert!(lines[at + 2].starts_with("G1 Z"), "{}", lines[at + 2]);
+            }
+        }
+        // Every layer holds exactly one change; the first one also selects
+        // the first extruder.
+        let layers: Vec<&str> = output.gcode.split(";LAYER_CHANGE").skip(1).collect();
+        assert_eq!(layers.len(), 25);
+        assert_eq!(layers[0].matches("\nT").count(), 2);
+        assert!(layers[1..].iter().all(|l| l.matches("\nT").count() == 1));
+
+        // Filament and time per extruder.
+        let [first, second] = output.stats.extruders.as_slice() else {
+            panic!("{:?}", output.stats.extruders)
+        };
+        assert_eq!((first.extruder, second.extruder), (0, 1));
+        for e in [first, second] {
+            let ratio = e.filament_volume_cm3 / 0.5;
+            assert!((ratio - 1.0).abs() < 0.03, "T{}: {ratio}", e.extruder);
+        }
+        let sum = first.filament_length_mm + second.filament_length_mm;
+        assert!((sum - output.stats.filament_length_mm).abs() < 1e-6);
+        let time = first.print_time_s + second.print_time_s;
+        assert!((time - output.stats.print_time_s).abs() < 1e-6);
+        assert!(output.gcode.contains("\n; extruder T1: filament "));
+
+        // The prime tower adds its volume on every layer, shared by both.
+        settings.prime_tower_width = 15.0;
+        let tower = slice(&two_cubes(), &settings);
+        let added = tower.stats.filament_volume_cm3 - output.stats.filament_volume_cm3;
+        let expected = 15.0 * 15.0 * 5.0 / 1000.0;
+        assert!((added / expected - 1.0).abs() < 0.1, "{added} {expected}");
+        assert!(tower.gcode.contains(";TYPE:Prime tower\n"));
+        for e in &tower.stats.extruders {
+            assert!(e.filament_volume_cm3 > 0.5 + 0.3 * expected, "{e:?}");
+        }
+    }
+
+    #[test]
+    fn one_extruder_ignores_the_extruders_of_the_model() {
+        let settings = Settings::default();
+        let mut plain = two_cubes();
+        plain.extruders.clear();
+        let output = slice(&two_cubes(), &settings);
+        assert_eq!(output.gcode, slice(&plain, &settings).gcode);
+        assert!(!output.gcode.lines().any(|l| l.starts_with('T')));
+        assert!(output.stats.extruders.is_empty());
+    }
+
+    #[test]
+    fn tool_changes_restart_absolute_extrusion_and_check_placeholders() {
+        let mut settings = Settings::default();
+        settings.extruder_count = 2;
+        settings.extrusion_mode = ExtrusionMode::Absolute;
+        let toolpaths = slicer_fdm::generate(&two_cubes(), &settings).unwrap();
+        let gcode = write_gcode(&toolpaths, &settings).unwrap().gcode;
+        assert!(gcode.contains("\nT1\nG92 E0\n"));
+        assert!(gcode.contains("\nT0\nG92 E0\n"));
+
+        // Mistakes show up even where no tool changes.
+        settings.toolchange_gcode = "M117 {next_extruder}\nM117 {next_extrudr}".into();
+        let one = slicer_fdm::generate(&Mesh::cuboid(5.0, 5.0, 1.0), &settings).unwrap();
+        assert_eq!(
+            write_gcode(&one, &settings).unwrap_err().to_string(),
+            "toolchange_gcode, line 2: unknown placeholder '{next_extrudr}'"
+        );
     }
 
     #[test]
