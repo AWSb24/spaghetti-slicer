@@ -82,6 +82,16 @@ fn corpus() -> Vec<Model> {
         m.triangles.push([0, 2, 1]); // duplicate of a bottom triangle
         m
     };
+    // A corner in the middle of a bottom edge, joined to the side by a
+    // triangle without area.
+    let sliver = {
+        let mut m = Mesh::cuboid(15.0, 15.0, 5.0);
+        m.vertices.push([7.5, 0.0, 0.0]);
+        m.triangles[0] = [0, 2, 8];
+        m.triangles.push([8, 2, 1]);
+        m.triangles.push([0, 8, 1]);
+        m
+    };
     let open_top = {
         let mut m = Mesh::cuboid(15.0, 15.0, 5.0);
         m.triangles.retain(|t| *t != [4, 5, 6] && *t != [4, 6, 7]);
@@ -232,6 +242,12 @@ fn corpus() -> Vec<Model> {
             "duplicate_triangle",
             with_junk,
             &["mesh.non_manifold", "mesh.not_watertight"],
+            Some(0.03),
+        ),
+        model(
+            "sliver_triangle",
+            sliver,
+            &["mesh.degenerate_removed"],
             Some(0.03),
         ),
         // The volume of the open mesh is not that of the box it encloses.
@@ -534,8 +550,12 @@ fn real_world_models() {
         if name == "3dbenchy.stl" {
             // 48 mm tall, closed, and nothing in it is thinner than a line.
             // Its roof, windows and bow hang free; there are no supports.
+            // A dozen of its triangles have no area and are removed.
             assert_eq!(toolpaths.layers.len(), 240);
-            assert_eq!(warnings.codes(), ["slicing.unsupported_overhangs"]);
+            assert_eq!(
+                warnings.codes(),
+                ["mesh.degenerate_removed", "slicing.unsupported_overhangs"]
+            );
             let grams = output.stats.filament_weight_g;
             assert!((9.0..14.0).contains(&grams), "{grams} g");
         }
