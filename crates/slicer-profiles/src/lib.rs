@@ -174,8 +174,8 @@ pub struct Settings {
     /// Sparse infill pattern.
     pub infill_pattern: InfillPattern,
     /// Direction of the infill lines in degrees from the X axis; every
-    /// other layer is turned by 90 degrees. Triangles keep it on every
-    /// layer; the gyroid ignores it.
+    /// other layer is turned by 90 degrees. Triangles and the gyroid keep
+    /// it on every layer.
     pub infill_angle: f64,
     /// How far infill reaches into the innermost wall, in percent of the line width.
     pub infill_overlap: f64,
