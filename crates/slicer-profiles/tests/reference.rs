@@ -58,6 +58,8 @@ fn settings_reference_is_current() {
                     nozzle_diameter: 0.8,
                     layer_height: 0.3,
                     first_layer_height: 0.3,
+                    adaptive_layers: true,
+                    max_layer_height: 0.5,
                     ..Settings::default()
                 };
                 let moved = other
@@ -74,7 +76,7 @@ fn settings_reference_is_current() {
                 "seam_position" => "`rear`, `corner`, `nearest`".to_string(),
                 "extrusion_mode" => "`relative`, `absolute`".to_string(),
                 "fan_off_layers" => "0 or more".to_string(),
-                "supports" => "`true`, `false`".to_string(),
+                "supports" | "adaptive_layers" => "`true`, `false`".to_string(),
                 "start_gcode" | "end_gcode" => "text with `{key}` placeholders".to_string(),
                 other => panic!("'{other}' has neither limits nor a description of its values"),
             },

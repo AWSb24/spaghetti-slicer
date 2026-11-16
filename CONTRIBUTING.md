@@ -61,6 +61,7 @@ All three must pass. New behaviour needs a test.
 | Polygon booleans and offsetting | `i_overlay` crate (MIT OR Apache-2.0); see `docs/decisions/0001-polygon-library.md` |
 | Hatch infill (scanline with even-odd pairing) | Standard scanline fill, own design |
 | Top/bottom detection (intersection with neighbouring layers) | Own design |
+| Adaptive layer height (cusp height bounded with the triangle normals, layers ending on flat surfaces) | Cusp height from Dolenc and Mäkelä, "Slicing procedures for layered manufacturing techniques", Computer-Aided Design 26(2), 1994; planning own design |
 | Extrusion amount (line width × layer height per millimetre) | Volume conservation, own design |
 | STL parsing | Public STL format description |
 | 3MF parsing | 3MF Core Specification and Production Extension (3MF Consortium, public); `zip` (MIT) and `quick-xml` (MIT) crates |
