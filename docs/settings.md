@@ -25,6 +25,9 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `bridge_fan_speed` | 100 | 0 to 100 | Part cooling fan speed in percent while printing bridges. |
 | `layer_height` | 0.2 | 0.02 to 0.4 * | Layer height. |
 | `first_layer_height` | 0.2 | 0.02 to 0.4 * | Height of the first layer. |
+| `adaptive_layers` | false | `true`, `false` | Whether layers after the first one get thinner where the surface of the model is shallow and thicker where it is steep, between `min_layer_height` and `max_layer_height`. `layer_height` then only sets the thickness of the top and bottom shells (`top_layers` or `bottom_layers` times `layer_height`) and the steepest overhang that needs no support. |
+| `min_layer_height` | 0.1 | 0.02 to 0.3 * | Thinnest layer with adaptive layers, used where the surface is nearly flat. On a sloped surface layers are only so thick that the steps they leave are no higher than on a flat one printed at this height. |
+| `max_layer_height` | 0.3 | 0.02 to 0.4 * | Thickest layer with adaptive layers, used where the walls are steep. |
 | `line_width` | 0.45 | 0.24 to 1 * | Width of one extruded line. |
 | `wall_loops` | 2 | 1 to 50 | Number of wall loops. |
 | `wall_order` | inner_outer | `inner_outer`, `outer_inner` | Order in which the walls of a layer are printed. |
@@ -32,8 +35,8 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `top_layers` | 5 | 0 to 1000 | Number of solid layers at the top. |
 | `bottom_layers` | 4 | 0 to 1000 | Number of solid layers at the bottom. |
 | `infill_density` | 15 | 0 to 100 | Sparse infill density in percent. |
-| `infill_pattern` | grid | `rectilinear`, `grid` | Sparse infill pattern. |
-| `infill_angle` | 45 | 0 to 180 | Direction of the infill lines in degrees from the X axis; every other layer is turned by 90 degrees. |
+| `infill_pattern` | grid | `rectilinear`, `grid`, `triangles`, `gyroid` | Sparse infill pattern. |
+| `infill_angle` | 45 | 0 to 180 | Direction of the infill lines in degrees from the X axis; every other layer is turned by 90 degrees. Triangles keep it on every layer; the gyroid ignores it. |
 | `infill_overlap` | 15 | 0 to 50 | How far infill reaches into the innermost wall, in percent of the line width. |
 | `skirt_loops` | 2 | 0 to 20 | Number of skirt loops around the first layer. |
 | `skirt_distance` | 4 | 0 to 50 | Distance between skirt and model. |

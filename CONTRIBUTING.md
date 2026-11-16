@@ -60,6 +60,8 @@ All three must pass. New behaviour needs a test.
 | Mesh repair: closing holes (ear clipping after Meisters' two-ears theorem, plane normal by Newell's method), removing triangles without area (edge collapse and edge flip) | Textbook methods (O'Rourke, *Computational Geometry in C*; Botsch et al., *Polygon Mesh Processing*), own design |
 | Polygon booleans and offsetting | `i_overlay` crate (MIT OR Apache-2.0); see `docs/decisions/0001-polygon-library.md` |
 | Hatch infill (scanline with even-odd pairing) | Standard scanline fill, own design |
+| Triangle infill (three hatchings 60° apart, the middle one shifted by half a spacing so that all three meet in points) | Own design |
+| Gyroid infill (cross-section of sin x cos y + sin y cos z + sin z cos x = 0, traced with marching squares, saddles decided by the cell centre; length per area measured numerically) | Gyroid surface after A. H. Schoen (NASA TN D-5541, 1970) in its common trigonometric approximation; marching squares is the standard contouring method; own design. Clipping of the curves by `i_overlay` |
 | Top/bottom detection (intersection with neighbouring layers) | Own design |
 | Adaptive layer height (cusp height bounded with the triangle normals, layers ending on flat surfaces) | Cusp height from Dolenc and Mäkelä, "Slicing procedures for layered manufacturing techniques", Computer-Aided Design 26(2), 1994; planning own design |
 | Extrusion amount (line width × layer height per millimetre) | Volume conservation, own design |

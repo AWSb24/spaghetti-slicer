@@ -1,6 +1,7 @@
 //! FDM toolpath generation: perimeters, infill, supports and path planning.
 
 mod adaptive;
+mod infill;
 pub mod preview;
 
 use std::fmt;
@@ -391,6 +392,9 @@ pub fn generate_cancellable(
                     Work::Lines(lines, kind, join_distance) => {
                         push_lines(lines, kind, join_distance, &mut position, &mut paths);
                     }
+                    Work::Polylines(lines, kind, join_distance) => {
+                        push_lines(lines, kind, join_distance, &mut position, &mut paths);
+                    }
                 }
             }
             // A layer with material but without any outer wall prints nothing.
@@ -556,6 +560,8 @@ enum Work {
     /// Line segments, their kind and the distance up to which consecutive
     /// segments are joined into one path.
     Lines(Vec<[Point; 2]>, PathKind, f64),
+    /// Open polylines, like `Lines`.
+    Polylines(Vec<Vec<Point>>, PathKind, f64),
 }
 
 /// Generates the geometry of one layer in the order it is printed. The flag
@@ -681,6 +687,19 @@ fn layer_work(
                         let lines = polygon::hatch(&sparse, 2.0 * width / density, d, min_length);
                         work.push(Work::Lines(lines, PathKind::SparseInfill, 0.0));
                     }
+                }
+                InfillPattern::Triangles => {
+                    let spacing = 3.0 * width / density;
+                    let angle = settings.infill_angle;
+                    for lines in infill::triangles(&sparse, spacing, angle, min_length) {
+                        work.push(Work::Lines(lines, PathKind::SparseInfill, 0.0));
+                    }
+                }
+                InfillPattern::Gyroid => {
+                    // Top of the layer, as in `generate_cancellable`.
+                    let z = settings.first_layer_height + index as f64 * settings.layer_height;
+                    let lines = infill::gyroid(&sparse, width / density, z, min_length);
+                    work.push(Work::Polylines(lines, PathKind::SparseInfill, 0.0));
                 }
             }
         }
@@ -1068,21 +1087,23 @@ fn push_loops(
     }
 }
 
-/// Appends line segments, always continuing with the nearest end. Segments
-/// starting within `join_distance` of the previous end are joined into one
-/// path.
-fn push_lines(
-    mut lines: Vec<[Point; 2]>,
+/// Appends open lines (segments or polylines), always continuing with the
+/// nearest end. Lines starting within `join_distance` of the previous end
+/// are joined into one path.
+fn push_lines<L: AsRef<[Point]>>(
+    mut lines: Vec<L>,
     kind: PathKind,
     join_distance: f64,
     position: &mut Point,
     paths: &mut Vec<Path>,
 ) {
+    lines.retain(|line| !line.as_ref().is_empty());
     let mut current: Option<Path> = None;
     while !lines.is_empty() {
         let mut best = (0, false, f64::INFINITY);
         for (i, line) in lines.iter().enumerate() {
-            for (reversed, end) in [(false, line[0]), (true, line[1])] {
+            let line = line.as_ref();
+            for (reversed, end) in [(false, line[0]), (true, line[line.len() - 1])] {
                 let d = distance(*position, end);
                 if d < best.2 {
                     best = (i, reversed, d);
@@ -1091,24 +1112,25 @@ fn push_lines(
         }
         // Keep the order of the remaining lines stable so ties resolve the
         // same way on every run.
-        let mut line = lines.remove(best.0);
+        let mut line = lines.remove(best.0).as_ref().to_vec();
         if best.1 {
-            line.swap(0, 1);
+            line.reverse();
         }
+        let end = line[line.len() - 1];
         match &mut current {
             Some(path) if best.2 <= join_distance => path.points.extend(line),
             _ => {
                 paths.extend(current.take());
                 current = Some(Path {
                     kind,
-                    points: line.to_vec(),
+                    points: line,
                     closed: false,
                     travel_inside: false,
                     extruder: 0,
                 });
             }
         }
-        *position = line[1];
+        *position = end;
     }
     paths.extend(current);
 }
@@ -1420,6 +1442,146 @@ mod tests {
             }
             assert!(long > 3, "{long}");
         }
+    }
+
+    const PATTERNS: [InfillPattern; 4] = [
+        InfillPattern::Rectilinear,
+        InfillPattern::Grid,
+        InfillPattern::Triangles,
+        InfillPattern::Gyroid,
+    ];
+
+    #[test]
+    fn sparse_patterns_use_as_much_material_as_grid() {
+        let mesh = Mesh::cuboid(30.0, 30.0, 30.0);
+        let lengths: Vec<f64> = PATTERNS
+            .iter()
+            .map(|&pattern| {
+                let mut settings = Settings::default();
+                settings.infill_density = 20.0;
+                settings.infill_pattern = pattern;
+                let toolpaths = generate(&mesh, &settings).unwrap();
+                toolpaths
+                    .layers
+                    .iter()
+                    .map(|layer| extruded_length(layer, PathKind::SparseInfill))
+                    .sum()
+            })
+            .collect();
+        let grid = lengths[1];
+        assert!(grid > 1000.0, "{grid}");
+        for (pattern, length) in PATTERNS.iter().zip(&lengths) {
+            let ratio = length / grid;
+            assert!(
+                (ratio - 1.0).abs() < 0.15,
+                "{pattern:?}: {length} vs {grid}"
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_patterns_stay_inside_and_repeat() {
+        let mesh = frame(30.0, 10.0, 4.0);
+        for pattern in PATTERNS {
+            let mut settings = Settings::default();
+            settings.infill_pattern = pattern;
+            let toolpaths = generate(&mesh, &settings).unwrap();
+            assert_eq!(toolpaths, generate(&mesh, &settings).unwrap());
+            // The sparse area: the frame (95 to 125 mm, hole 105 to 115 mm)
+            // moved inwards by the walls; around the hole the corners are
+            // round. Offsets approximate arcs by chords.
+            let walls = f64::from(settings.wall_loops);
+            let inset = (walls + 0.5 - settings.infill_overlap / 100.0) * settings.line_width;
+            let tolerance = 0.005;
+            let inside = |p: Point| {
+                let outer = (p[0] - 110.0).abs().max((p[1] - 110.0).abs());
+                let gap = |v: f64| ((v - 110.0).abs() - 5.0).max(0.0);
+                outer <= 15.0 - inset + tolerance
+                    && distance([gap(p[0]), gap(p[1])], [0.0, 0.0]) >= inset - tolerance
+            };
+            let sparse: Vec<&Path> = toolpaths
+                .layers
+                .iter()
+                .flat_map(|layer| &layer.paths)
+                .filter(|path| path.kind == PathKind::SparseInfill)
+                .collect();
+            assert!(sparse.len() > 20, "{pattern:?}");
+            for path in sparse {
+                for pair in path.points.windows(2) {
+                    let mid = [
+                        (pair[0][0] + pair[1][0]) / 2.0,
+                        (pair[0][1] + pair[1][1]) / 2.0,
+                    ];
+                    for p in [pair[0], mid, pair[1]] {
+                        assert!(inside(p), "{pattern:?} leaves the sparse area at {p:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn triangles_meet_in_points_and_gyroid_turns_with_height() {
+        let mut settings = Settings::default();
+        settings.skirt_loops = 0;
+        settings.infill_pattern = InfillPattern::Triangles;
+        let mesh = Mesh::cuboid(30.0, 30.0, 6.0);
+        let toolpaths = generate(&mesh, &settings).unwrap();
+        let sparse = |layer: &Layer| -> Vec<Vec<Point>> {
+            layer
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::SparseInfill)
+                .map(|p| p.points.clone())
+                .collect()
+        };
+        // Every layer alike.
+        assert_eq!(sparse(&toolpaths.layers[10]), sparse(&toolpaths.layers[11]));
+        // Lines of the first and the last direction cross on a line of the
+        // middle one: the crossing of two lines through the centre region
+        // lies on a third.
+        let lines: Vec<[Point; 2]> = sparse(&toolpaths.layers[10])
+            .iter()
+            .flat_map(|points| points.windows(2).map(|w| [w[0], w[1]]))
+            .filter(|s| distance(s[0], s[1]) > 5.0)
+            .collect();
+        let angle = |s: &[Point; 2]| {
+            let deg = (s[1][1] - s[0][1]).atan2(s[1][0] - s[0][0]).to_degrees();
+            deg.rem_euclid(180.0)
+        };
+        let family = |deg: f64| lines.iter().filter(move |s| (angle(s) - deg).abs() < 0.01);
+        let crossing = |a: &[Point; 2], b: &[Point; 2]| -> Option<Point> {
+            let (d1, d2) = (
+                [a[1][0] - a[0][0], a[1][1] - a[0][1]],
+                [b[1][0] - b[0][0], b[1][1] - b[0][1]],
+            );
+            let den = d1[0] * d2[1] - d1[1] * d2[0];
+            let t = ((b[0][0] - a[0][0]) * d2[1] - (b[0][1] - a[0][1]) * d2[0]) / den;
+            let u = ((b[0][0] - a[0][0]) * d1[1] - (b[0][1] - a[0][1]) * d1[0]) / den;
+            ((0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u))
+                .then(|| [a[0][0] + t * d1[0], a[0][1] + t * d1[1]])
+        };
+        let near_line = |p: Point, s: &[Point; 2]| {
+            let d = [s[1][0] - s[0][0], s[1][1] - s[0][1]];
+            ((p[0] - s[0][0]) * d[1] - (p[1] - s[0][1]) * d[0]).abs() / distance(s[0], s[1])
+        };
+        let mut checked = 0;
+        for a in family(45.0) {
+            for b in family(165.0) {
+                if let Some(p) = crossing(a, b) {
+                    let off = family(105.0)
+                        .map(|m| near_line(p, m))
+                        .fold(f64::MAX, f64::min);
+                    assert!(off < 1e-6, "{p:?} is {off} mm off the middle lines");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 4, "{checked}");
+
+        settings.infill_pattern = InfillPattern::Gyroid;
+        let toolpaths = generate(&mesh, &settings).unwrap();
+        assert_ne!(sparse(&toolpaths.layers[10]), sparse(&toolpaths.layers[11]));
     }
 
     #[test]
