@@ -105,6 +105,11 @@ pub struct Settings {
     pub flavor: Flavor,
     /// Whether extrusion amounts in the G-code are relative or absolute.
     pub extrusion_mode: ExtrusionMode,
+    /// Number of extruders (tools or filament slots) of the printer. With
+    /// more than one, every object prints with the extruder it names (Bambu
+    /// Studio projects) and the G-code changes tools with `T<n>`; with one,
+    /// everything prints with the lowest extruder the objects name.
+    pub extruder_count: u32,
 
     // Material
     /// Filament diameter.
@@ -183,6 +188,14 @@ pub struct Settings {
     /// Bridges up to this length in millimetres get no supports; 0 supports
     /// every bridge.
     pub support_bridge_length: f64,
+    /// Side of the square tower that every tool change primes the new
+    /// extruder into, on every layer up to the last tool change; 0 disables
+    /// it. Only used with more than one extruder.
+    pub prime_tower_width: f64,
+    /// X of the centre of the prime tower on the bed.
+    pub prime_tower_x: f64,
+    /// Y of the centre of the prime tower on the bed.
+    pub prime_tower_y: f64,
 
     // Speeds
     /// Speed of the outermost wall.
@@ -221,6 +234,11 @@ pub struct Settings {
     pub start_gcode: String,
     /// G-code inserted after the print. `{setting_name}` placeholders are replaced.
     pub end_gcode: String,
+    /// G-code inserted at every tool change, after the old extruder has
+    /// retracted and before `T<n>` selects the new one. Besides
+    /// `{setting_name}`, `{previous_extruder}` and `{next_extruder}` are
+    /// replaced, counted from 0 as in `T<n>`.
+    pub toolchange_gcode: String,
 }
 
 impl Default for Settings {
@@ -233,6 +251,7 @@ impl Default for Settings {
             nozzle_diameter: 0.4,
             flavor: Flavor::Marlin,
             extrusion_mode: ExtrusionMode::Relative,
+            extruder_count: 1,
             filament_diameter: 1.75,
             filament_density: 1.24,
             flow_ratio: 1.0,
@@ -265,6 +284,9 @@ impl Default for Settings {
             support_spacing: 2.5,
             support_interface_layers: 2,
             support_bridge_length: 10.0,
+            prime_tower_width: 15.0,
+            prime_tower_x: 190.0,
+            prime_tower_y: 190.0,
             outer_wall_speed: 40.0,
             inner_wall_speed: 60.0,
             infill_speed: 80.0,
@@ -281,6 +303,7 @@ impl Default for Settings {
             start_gcode: "M140 S{bed_temp_first_layer}\nM104 S{nozzle_temp_first_layer}\nG28\nM190 S{bed_temp_first_layer}\nM109 S{nozzle_temp_first_layer}"
                 .to_owned(),
             end_gcode: "M104 S0\nM140 S0\nM107\nG91\nG1 Z10 F600\nG90\nM84".to_owned(),
+            toolchange_gcode: String::new(),
         }
     }
 }
@@ -435,7 +458,7 @@ impl Settings {
     pub fn placeholder_values(&self) -> BTreeMap<String, String> {
         self.table()
             .into_iter()
-            .filter(|(key, _)| key != "start_gcode" && key != "end_gcode")
+            .filter(|(key, _)| !key.ends_with("_gcode"))
             .map(|(key, value)| {
                 let text = match value {
                     toml::Value::String(s) => s,
@@ -468,11 +491,26 @@ impl Settings {
         } else {
             self.nozzle_diameter.max(self.max_layer_height)
         };
+        // The prime tower must stand on the bed only while it is printed, so
+        // that the defaults stay valid on small beds.
+        let tower = self.extruder_count > 1 && self.prime_tower_width > 0.0;
+        let tower_range = |bed: f64| {
+            if tower {
+                (
+                    self.prime_tower_width / 2.0,
+                    bed - self.prime_tower_width / 2.0,
+                )
+            } else {
+                (0.0, 2000.0)
+            }
+        };
+        let (tower_x, tower_y) = (tower_range(self.bed_size_x), tower_range(self.bed_size_y));
         vec![
             ("bed_size_x", self.bed_size_x, 10.0, 2000.0),
             ("bed_size_y", self.bed_size_y, 10.0, 2000.0),
             ("max_print_height", self.max_print_height, 1.0, 2000.0),
             ("nozzle_diameter", self.nozzle_diameter, 0.1, 2.0),
+            ("extruder_count", f64::from(self.extruder_count), 1.0, 16.0),
             ("filament_diameter", self.filament_diameter, 1.0, 3.5),
             ("filament_density", self.filament_density, 0.1, 20.0),
             ("flow_ratio", self.flow_ratio, 0.5, 2.0),
@@ -538,6 +576,9 @@ impl Settings {
                 0.0,
                 10.0,
             ),
+            ("prime_tower_width", self.prime_tower_width, 0.0, 100.0),
+            ("prime_tower_x", self.prime_tower_x, tower_x.0, tower_x.1),
+            ("prime_tower_y", self.prime_tower_y, tower_y.0, tower_y.1),
             ("outer_wall_speed", self.outer_wall_speed, 1.0, 1000.0),
             ("inner_wall_speed", self.inner_wall_speed, 1.0, 1000.0),
             ("infill_speed", self.infill_speed, 1.0, 1000.0),
@@ -656,6 +697,19 @@ mod tests {
         s.set("line_width", "0.3").unwrap();
         s.set("adaptive_layers", "true").unwrap();
         assert!(s.set("min_layer_height", "0.3").is_err());
+    }
+
+    #[test]
+    fn prime_tower_must_stand_on_the_bed_only_with_several_extruders() {
+        let mut s = Settings::from_toml("bed_size_x = 150.0").unwrap();
+        assert_eq!(s.extruder_count, 1);
+        assert!(s.set("extruder_count", "2").is_err(), "tower off the bed");
+        s.set("prime_tower_x", "140").unwrap();
+        s.set("extruder_count", "2").unwrap();
+        assert!(s.set("prime_tower_x", "145").is_err());
+        s.set("prime_tower_width", "0").unwrap();
+        s.set("prime_tower_x", "145").unwrap();
+        assert!(s.set("extruder_count", "17").is_err());
     }
 
     #[test]
