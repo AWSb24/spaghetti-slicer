@@ -20,6 +20,8 @@ use slicer_ui::plate::{
 use slicer_ui::settings::{CommonSettings, SettingsFile, build_settings, load_settings};
 use slicer_ui::view::{PlateView, kind_name, kinds_in, path_color};
 
+use crate::view3d::{Scene, View3d};
+
 /// How serious a message in the side panel is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Level {
@@ -90,6 +92,9 @@ pub struct App {
     view: PlateView,
     drag: Option<Drag>,
     notes: Vec<Note>,
+    /// 3D view instead of the 2D plate.
+    three_d: bool,
+    view3d: View3d,
 }
 
 impl App {
@@ -113,6 +118,8 @@ impl App {
             view: PlateView::default(),
             drag: None,
             notes: Vec::new(),
+            three_d: false,
+            view3d: View3d::default(),
         };
         app.open_paths(paths);
         app
@@ -274,6 +281,7 @@ impl App {
                     ),
                 );
                 self.notes.extend(result.warnings.iter().map(Note::from));
+                self.view3d.set_toolpaths(&result.toolpaths);
                 if let Ok(settings) = &self.current {
                     self.sliced = Some(Sliced {
                         result,
@@ -811,6 +819,26 @@ impl App {
     }
 }
 
+impl App {
+    /// The 3D view: the model on the plate, or the toolpaths up to the
+    /// chosen layer in the preview.
+    fn show_3d(&mut self, ui: &mut egui::Ui) {
+        let settings = self.current.as_ref().unwrap_or(&self.base);
+        let model = self.model.as_ref().map(|model| {
+            let fits = check_placement(model, &self.placement, settings).is_ok();
+            (model, self.model_serial, self.placement, fits)
+        });
+        let layer = (self.tab == Tab::Preview && self.sliced.is_some()).then_some(self.layer);
+        let scene = Scene {
+            bed: [settings.bed_size_x, settings.bed_size_y],
+            height: settings.max_print_height,
+            model,
+            layer,
+        };
+        self.view3d.show(ui, &scene);
+    }
+}
+
 /// A reset button next to a value that differs from the settings files.
 fn changed_marker<T: PartialEq + Copy>(
     ui: &mut egui::Ui,
@@ -862,11 +890,18 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Plate, "Plate");
                 ui.selectable_value(&mut self.tab, Tab::Preview, "Preview");
+                ui.separator();
+                ui.selectable_value(&mut self.three_d, false, "2D");
+                ui.selectable_value(&mut self.three_d, true, "3D");
             });
             if self.tab == Tab::Preview {
                 self.preview_controls(ui);
             }
-            self.plate(ui);
+            if self.three_d {
+                self.show_3d(ui);
+            } else {
+                self.plate(ui);
+            }
         });
     }
 }
