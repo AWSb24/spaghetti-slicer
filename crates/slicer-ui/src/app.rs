@@ -870,24 +870,23 @@ impl App {
     /// chosen layer in the preview.
     fn show_3d(&mut self, ui: &mut egui::Ui) {
         let settings = self.current.as_ref().unwrap_or(&self.base);
-        // ponytail: the 3D view shows one model, the selected one or else the
-        // first; drawing every model of the plate is the upgrade.
-        let shown = self.plate.selected.unwrap_or(0);
-        let model = self.plate.items.get(shown).map(|item| {
-            let fits = check_placement(&item.model, &item.placement, settings).is_ok();
-            // A new upload when the plate or the shown model changes.
-            let serial = self
-                .plate
-                .serial
-                .wrapping_mul(1024)
-                .wrapping_add(shown as u64);
-            (&item.model, serial, item.placement, fits)
-        });
+        let models = self
+            .plate
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let fits = check_placement(&item.model, &item.placement, settings).is_ok();
+                let selected = self.plate.selected == Some(index);
+                (&item.model, item.placement, selected, fits)
+            })
+            .collect();
         let layer = (self.tab == Tab::Preview && self.sliced.is_some()).then_some(self.layer);
         let scene = Scene {
             bed: [settings.bed_size_x, settings.bed_size_y],
             height: settings.max_print_height,
-            model,
+            serial: self.plate.serial,
+            models,
             layer,
         };
         self.view3d.show(ui, &scene);

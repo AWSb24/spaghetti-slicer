@@ -12,7 +12,7 @@ What works: STL and 3MF import (geometry only, one plate of a Bambu Studio proje
 - The G-code for Marlin and Klipper is the same. For Bambu Lab printers there is a project file (`-o name.gcode.3mf`) and an X1C profile, but neither has ever been tried on a printer: the start sequence uses common commands only, and it is not known whether the printer accepts the file.
 - Colours and settings stored in a 3MF file are ignored. The extruder that a Bambu Studio project names per object is read. With `extruder_count` above 1 every object prints with its extruder (tool change with `T<n>` and `toolchange_gcode`, optional prime tower); with one extruder everything prints with the lowest one (warning `slicing.multiple_extruders`). Tool changes and the prime tower have never run on a printer.
 - The time estimate has not been compared with a real print and ignores heating.
-- The desktop app is a first version; its 3D view shows one model at a time, and in the browser slicing blocks the page.
+- The desktop app is a first version; in the browser slicing blocks the page.
 - The resin output (`slice-sla`) is a first step: an open archive of layer images, not a file any printer reads, and without supports or hollowing.
 - Server jobs that are still queued or running are lost when the server stops; finished ones survive only with `SPAGHETTI_DATA_DIR`.
 

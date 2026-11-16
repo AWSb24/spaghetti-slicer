@@ -34,9 +34,11 @@ pub struct Scene<'a> {
     pub bed: [f64; 2],
     /// Build height in millimetres, for the first camera position.
     pub height: f64,
-    /// The model, a number that changes whenever another model is loaded,
-    /// where it sits, and whether it fits the printer.
-    pub model: Option<(&'a Model, u64, Placement, bool)>,
+    /// A number that changes whenever models are added or removed.
+    pub serial: u64,
+    /// Every model on the plate, where it sits, whether it is selected and
+    /// whether it fits the printer.
+    pub models: Vec<(&'a Model, Placement, bool, bool)>,
     /// Show the toolpaths up to and including this layer instead of the
     /// model.
     pub layer: Option<usize>,
@@ -49,8 +51,8 @@ pub struct View3d {
     camera: Option<OrbitCamera>,
     /// Bed and theme the bed buffers were made for.
     bed_sent: Option<([f64; 2], bool)>,
-    /// Model the model buffer was made for.
-    model_sent: Option<u64>,
+    /// Plate the model buffers were made for.
+    models_sent: Option<u64>,
     gpu: Arc<Mutex<Gpu>>,
 }
 
@@ -90,12 +92,22 @@ impl View3d {
         let frame = Frame {
             view_projection: camera.view_projection(rect.width() / rect.height().max(1.0)),
             light: camera.light_direction(),
-            model: scene.model.filter(|_| scene.layer.is_none()).map(
-                |(model, _, placement, fits)| {
-                    let color = if fits { [76, 141, 255] } else { [230, 60, 60] };
-                    (model_matrix(model, &placement), rgb(color))
-                },
-            ),
+            models: if scene.layer.is_none() {
+                scene
+                    .models
+                    .iter()
+                    .map(|(model, placement, selected, fits)| {
+                        let color = match (fits, selected) {
+                            (false, _) => [230, 60, 60],
+                            (true, true) => [120, 175, 255],
+                            (true, false) => [76, 141, 255],
+                        };
+                        (model_matrix(model, placement), rgb(color))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
             layer: scene.layer,
             plate: rgb(if dark { [48, 48, 52] } else { [222, 222, 226] }),
         };
@@ -146,11 +158,15 @@ impl View3d {
             };
             gpu.pending_bed = Some((bed_plate(scene.bed), bed_grid(scene.bed, grid, border)));
         }
-        if let Some((model, serial, _, _)) = scene.model
-            && self.model_sent != Some(serial)
-        {
-            self.model_sent = Some(serial);
-            gpu.pending_model = Some(mesh_triangles(&model.mesh));
+        if self.models_sent != Some(scene.serial) {
+            self.models_sent = Some(scene.serial);
+            gpu.pending_models = Some(
+                scene
+                    .models
+                    .iter()
+                    .map(|(model, ..)| mesh_triangles(&model.mesh))
+                    .collect(),
+            );
         }
     }
 }
@@ -160,12 +176,11 @@ fn rgb(c: [u8; 3]) -> [f32; 3] {
 }
 
 /// Everything a frame needs from the app, copied into the paint callback.
-#[derive(Clone, Copy)]
 struct Frame {
     view_projection: Mat4,
     light: [f32; 3],
-    /// Model matrix and colour, when the model is shown.
-    model: Option<(Mat4, [f32; 3])>,
+    /// Model matrix and colour of every model shown, in plate order.
+    models: Vec<(Mat4, [f32; 3])>,
     layer: Option<usize>,
     plate: [f32; 3],
 }
@@ -179,10 +194,10 @@ struct Gpu {
     error: Option<String>,
     plate: Option<Buffers>,
     grid: Option<Buffers>,
-    model: Option<Buffers>,
+    models: Vec<Buffers>,
     paths: Option<Buffers>,
     pending_bed: Option<(Triangles, Lines)>,
-    pending_model: Option<Triangles>,
+    pending_models: Option<Vec<Triangles>>,
     pending_paths: Option<Lines>,
 }
 
@@ -446,7 +461,7 @@ impl Gpu {
             let shaded = &programs.shaded;
             gl.use_program(Some(shaded.program));
             gl.uniform_3_f32_slice(shaded.light.as_ref(), &frame.light);
-            let solid = |buffers: &Option<Buffers>, model: &Mat4, color: &[f32; 3]| {
+            let solid = |buffers: Option<&Buffers>, model: &Mat4, color: &[f32; 3]| {
                 if let Some(buffers) = buffers {
                     let mvp = multiply(&frame.view_projection, model);
                     gl.uniform_matrix_4_f32_slice(shaded.mvp.as_ref(), false, &mvp);
@@ -456,9 +471,9 @@ impl Gpu {
                     buffers.draw(gl, glow::TRIANGLES, 0..count);
                 }
             };
-            solid(&self.plate, &identity, &frame.plate);
-            if let Some((model, color)) = &frame.model {
-                solid(&self.model, model, color);
+            solid(self.plate.as_ref(), &identity, &frame.plate);
+            for (buffers, (model, color)) in self.models.iter().zip(&frame.models) {
+                solid(Some(buffers), model, color);
             }
 
             let lines = &programs.lines;
@@ -494,8 +509,13 @@ impl Gpu {
             replace(gl, &mut self.plate, Buffers::triangles(gl, &plate))?;
             replace(gl, &mut self.grid, Buffers::lines(gl, grid))?;
         }
-        if let Some(model) = self.pending_model.take() {
-            replace(gl, &mut self.model, Buffers::triangles(gl, &model))?;
+        if let Some(models) = self.pending_models.take() {
+            for old in self.models.drain(..) {
+                old.delete(gl);
+            }
+            for model in &models {
+                self.models.push(Buffers::triangles(gl, model)?);
+            }
         }
         if let Some(paths) = self.pending_paths.take() {
             replace(gl, &mut self.paths, Buffers::lines(gl, paths))?;
