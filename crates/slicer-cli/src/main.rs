@@ -47,6 +47,23 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Slice an STL or 3MF model into layer images for a resin (MSLA) printer
+    ///
+    /// Writes a ZIP archive with one PNG per layer and a JSON manifest
+    /// (docs/sla-format.md). No supports and no hollowing yet.
+    SliceSla {
+        /// Model file (STL or 3MF)
+        input: PathBuf,
+        /// Archive to write [default: input with .sla.zip extension]
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Override a resin setting, e.g. --set exposure_time=2.5
+        #[arg(short, long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        /// Print the result (or the error) as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Print all settings with their default values as TOML
     DefaultConfig,
     /// Turn profiles saved by Orca Slicer (JSON) into a settings file
@@ -98,25 +115,56 @@ fn main() -> ExitCode {
             plate,
             svg,
             json,
-        } => match slice(input, output, &config, &set, plate, svg) {
-            Ok(result) => {
-                if json {
-                    println!("{result:#}");
-                } else {
-                    print_summary(&result);
-                }
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                if json {
-                    eprintln!("{}", json!({ "error": error }));
-                } else {
-                    eprintln!("error: {error}");
-                }
-                ExitCode::FAILURE
-            }
-        },
+        } => report(
+            slice(input, output, &config, &set, plate, svg),
+            json,
+            print_summary,
+        ),
+        Command::SliceSla {
+            input,
+            output,
+            set,
+            json,
+        } => report(slice_sla(input, output, &set), json, print_sla_summary),
     }
+}
+
+/// Prints the result of a slicing command as JSON or as a summary.
+fn report(
+    result: Result<serde_json::Value, Diagnostic>,
+    json: bool,
+    summary: fn(&serde_json::Value),
+) -> ExitCode {
+    match result {
+        Ok(result) => {
+            if json {
+                println!("{result:#}");
+            } else {
+                summary(&result);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            if json {
+                eprintln!("{}", json!({ "error": error }));
+            } else {
+                eprintln!("error: {error}");
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Splits a `--set` argument into key and value.
+fn split_override(item: &str) -> Result<(&str, &str), Diagnostic> {
+    let (key, value) = item.split_once('=').ok_or_else(|| {
+        Diagnostic::error(
+            "cli.invalid_override",
+            format!("--set expects KEY=VALUE, got '{item}'"),
+        )
+        .with("argument", item)
+    })?;
+    Ok((key.trim(), value.trim()))
 }
 
 fn slice(
@@ -135,16 +183,8 @@ fn slice(
             .map_err(|e| in_file(path)(e.diagnostic()))?;
     }
     for item in overrides {
-        let (key, value) = item.split_once('=').ok_or_else(|| {
-            Diagnostic::error(
-                "cli.invalid_override",
-                format!("--set expects KEY=VALUE, got '{item}'"),
-            )
-            .with("argument", item)
-        })?;
-        settings
-            .set(key.trim(), value.trim())
-            .map_err(|e| e.diagnostic())?;
+        let (key, value) = split_override(item)?;
+        settings.set(key, value).map_err(|e| e.diagnostic())?;
     }
 
     let bytes = fs::read(&input).map_err(|e| io_error("io.read", &input, &e))?;
@@ -191,6 +231,53 @@ fn slice(
         "stats": result.stats,
         "warnings": warnings.as_slice(),
     }))
+}
+
+fn slice_sla(
+    input: PathBuf,
+    output: Option<PathBuf>,
+    overrides: &[String],
+) -> Result<serde_json::Value, Diagnostic> {
+    let mut settings = slicer_sla::SlaSettings::default();
+    for item in overrides {
+        let (key, value) = split_override(item)?;
+        settings.set(key, value).map_err(|e| e.diagnostic())?;
+    }
+    let bytes = fs::read(&input).map_err(|e| io_error("io.read", &input, &e))?;
+    let mut warnings = Diagnostics::new();
+    let mesh = slicer_formats::parse_model(&bytes, None, &mut warnings).map_err(in_file(&input))?;
+    let print = slicer_sla::slice(&mesh, &settings, &mut warnings).map_err(|e| e.diagnostic())?;
+    let archive = slicer_sla::write_archive(&print).map_err(|e| e.diagnostic())?;
+    let output = output.unwrap_or_else(|| input.with_extension("sla.zip"));
+    fs::write(&output, archive).map_err(|e| io_error("io.write", &output, &e))?;
+    Ok(json!({
+        "output": output.display().to_string(),
+        "stats": print.stats,
+        "warnings": warnings.as_slice(),
+    }))
+}
+
+fn print_sla_summary(result: &serde_json::Value) {
+    for warning in result["warnings"].as_array().into_iter().flatten() {
+        eprintln!(
+            "warning: {}",
+            warning["message"].as_str().unwrap_or_default()
+        );
+    }
+    let stats = &result["stats"];
+    let seconds = stats["print_time_s"].as_f64().unwrap_or(0.0) as u64;
+    println!("Wrote {}", result["output"].as_str().unwrap_or_default());
+    println!("  layers:    {}", stats["layers"]);
+    println!(
+        "  resin:     {:.2} ml",
+        stats["resin_volume_ml"].as_f64().unwrap_or(0.0)
+    );
+    println!(
+        "  time:      {}h {:02}m {:02}s (exposure and plate moves)",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    );
 }
 
 fn import_orca(profiles: &[PathBuf], output: Option<PathBuf>) -> Result<(), Diagnostic> {
