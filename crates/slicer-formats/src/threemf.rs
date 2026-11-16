@@ -5,7 +5,8 @@
 //! parts of the same package. Everything else (materials, colours, slices,
 //! vendor data) is ignored, with one exception: project files of Bambu
 //! Studio list which objects lie on which build plate, and the reader can
-//! pick one plate.
+//! pick one plate; they also name the extruder of each object, which the
+//! mesh keeps for the object's triangles.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -543,15 +544,32 @@ impl Package<'_> {
 /// Name of the part in which Bambu Studio lists the objects of each plate.
 const PLATE_PART: &str = "Metadata/model_settings.config";
 
-/// Reads the build plates of a Bambu Studio project: the number of each
-/// plate and the identifiers of the objects on it. The layout was worked out
-/// from project files; text that does not fit it yields no plates.
-fn plates(text: &str) -> Vec<(u32, Vec<u32>)> {
-    let mut plates: Vec<(u32, Vec<u32>)> = Vec::new();
+/// A build plate: its number and the identifiers of the objects on it.
+type Plate = (u32, Vec<u32>);
+
+/// Reads the build plates of a Bambu Studio project, with the number of each
+/// plate and the identifiers of the objects on it, and the extruder of each
+/// object that names one, counted from 0 (the file counts from 1). The
+/// layout was worked out from project files; text that does not fit it
+/// yields no plates and no extruders.
+// ponytail: only the extruder of a whole object is read. Parts of an object
+// can name their own extruder (multi-colour models); they print with the
+// object's.
+fn project(text: &str) -> (Vec<Plate>, HashMap<u32, u32>) {
+    let mut plates: Vec<Plate> = Vec::new();
+    let mut extruders = HashMap::new();
     let (mut in_plate, mut in_instance) = (false, false);
+    let (mut object, mut in_part) = (None, false);
     let mut reader = quick_xml::Reader::from_str(text);
     loop {
         match reader.read_event() {
+            Ok(Event::Start(element)) if element.local_name().into_inner() == "object" => {
+                let [id] = attributes(&element, ["id"]);
+                object = id.and_then(|v| v.trim().parse::<u32>().ok());
+            }
+            Ok(Event::Start(element)) if element.local_name().into_inner() == "part" => {
+                in_part = true;
+            }
             Ok(Event::Start(element) | Event::Empty(element)) => {
                 match element.local_name().into_inner() {
                     "plate" => {
@@ -559,6 +577,15 @@ fn plates(text: &str) -> Vec<(u32, Vec<u32>)> {
                         plates.push((0, Vec::new()));
                     }
                     "model_instance" => in_instance = true,
+                    "metadata" if object.is_some() && !in_part => {
+                        let [key, value] = attributes(&element, ["key", "value"]);
+                        let value = value.and_then(|v| v.trim().parse::<u32>().ok());
+                        if let (Some(id), Some("extruder"), Some(number @ 1..)) =
+                            (object, key.as_deref(), value)
+                        {
+                            extruders.insert(id, number - 1);
+                        }
+                    }
                     "metadata" if in_plate => {
                         let [key, value] = attributes(&element, ["key", "value"]);
                         let value = value.and_then(|v| v.trim().parse::<u32>().ok());
@@ -576,13 +603,15 @@ fn plates(text: &str) -> Vec<(u32, Vec<u32>)> {
             Ok(Event::End(element)) => match element.local_name().into_inner() {
                 "plate" => in_plate = false,
                 "model_instance" => in_instance = false,
+                "object" => object = None,
+                "part" => in_part = false,
                 _ => {}
             },
             Ok(Event::Eof) | Err(_) => break,
             Ok(_) => {}
         }
     }
-    plates
+    (plates, extruders)
 }
 
 /// Parses a 3MF package into a single mesh in millimetres.
@@ -616,9 +645,9 @@ pub fn parse_3mf_plate(
     let root = root.trim_start_matches('/').to_string();
     package.load(&root)?;
 
-    let plates = package
+    let (plates, extruders) = package
         .read(PLATE_PART)?
-        .map(|text| plates(&text))
+        .map(|text| project(&text))
         .unwrap_or_default();
     // A file with a single plate is read as a whole, so nothing is lost if
     // its plate list is incomplete.
@@ -666,7 +695,9 @@ pub fn parse_3mf_plate(
             object: item.object,
             transform: item.transform,
         };
+        let first = mesh.triangles.len();
         package.emit(&root, &item, &IDENTITY, 0, &mut skipped, &mut mesh)?;
+        mesh.set_extruder(first, extruders.get(&item.object).copied().unwrap_or(0));
     }
     if mesh.triangles.is_empty() {
         return Err(ThreeMfError::NoTriangles);
@@ -964,6 +995,27 @@ mod tests {
         let whole = parse_3mf_plate(&plain, Some(1), &mut diagnostics).unwrap();
         assert_eq!(whole.triangles.len(), 8);
         assert!(parse_3mf_plate(&plain, Some(2), &mut diagnostics).is_err());
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn objects_keep_the_extruder_the_project_names() {
+        let text = model(
+            "",
+            &format!(
+                "<resources><object id=\"1\">{TETRAHEDRON}</object><object id=\"2\">{TETRAHEDRON}</object><object id=\"3\">{TETRAHEDRON}</object></resources><build><item objectid=\"1\"/><item objectid=\"2\" transform=\"1 0 0 0 1 0 0 0 1 5 0 0\"/><item objectid=\"3\" transform=\"1 0 0 0 1 0 0 0 1 10 0 0\"/></build>"
+            ),
+        );
+        // Object 1 says extruder 2, its part says 3 (ignored), object 2 says
+        // nothing, object 3 says 1.
+        let config = "<config><object id=\"1\"><metadata key=\"name\" value=\"a\"/><metadata key=\"extruder\" value=\"2\"/><part id=\"1\"><metadata key=\"extruder\" value=\"3\"/></part></object><object id=\"3\"><metadata key=\"extruder\" value=\"1\"/></object></config>";
+        let mut diagnostics = Diagnostics::new();
+        let bytes = package(&[("3D/3dmodel.model", &text), (PLATE_PART, config)]);
+        let mesh = parse_3mf(&bytes, &mut diagnostics).unwrap();
+        let per_object: Vec<u32> = (0..3).map(|object| mesh.extruder(4 * object)).collect();
+        assert_eq!(per_object, [1, 0, 0]);
+        assert_eq!(mesh.extruders.len(), 12);
+        assert_eq!(mesh.used_extruders(), [0, 1]);
         assert!(diagnostics.is_empty());
     }
 

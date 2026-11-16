@@ -86,6 +86,8 @@ pub struct Path {
     /// Whether the move from the end of the previous path to the start of
     /// this one stays over the part, so that it needs no retraction.
     pub travel_inside: bool,
+    /// Extruder that prints the path, counted from 0.
+    pub extruder: u32,
 }
 
 impl Path {
@@ -229,6 +231,26 @@ pub fn generate_cancellable(
         );
     }
     mesh.check(diagnostics);
+    // ponytail: one extruder prints everything, the lowest one the model
+    // asks for. Separate regions per extruder and tool changes are the
+    // upgrade.
+    let used = mesh.used_extruders();
+    let extruder = used.first().copied().unwrap_or(0);
+    if used.len() > 1 {
+        let list: Vec<String> = used.iter().map(|e| (e + 1).to_string()).collect();
+        diagnostics.push(
+            Diagnostic::warning(
+                "slicing.multiple_extruders",
+                format!(
+                    "the objects of the model ask for extruders {}; only one extruder is supported, everything is printed with extruder {}",
+                    list.join(", "),
+                    extruder + 1
+                ),
+            )
+            .with("extruders", list.join(" "))
+            .with("extruder", extruder + 1),
+        );
+    }
     let (min, max) = mesh.bounds().ok_or(FdmError::EmptyModel)?;
     let size = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
     let volume = [
@@ -369,6 +391,7 @@ pub fn generate_cancellable(
     for (layer, flags) in layers.iter_mut().zip(inside) {
         for (path, flag) in layer.paths.iter_mut().zip(flags) {
             path.travel_inside = flag;
+            path.extruder = extruder;
         }
     }
     // Without supports, say where they would be needed.
@@ -978,6 +1001,7 @@ fn push_loops(
             points,
             closed: true,
             travel_inside: false,
+            extruder: 0,
         };
         if path.length() >= width {
             *position = path.points[0];
@@ -1022,6 +1046,7 @@ fn push_lines(
                     points: line.to_vec(),
                     closed: false,
                     travel_inside: false,
+                    extruder: 0,
                 });
             }
         }
@@ -1473,6 +1498,44 @@ mod tests {
                 .filter(|w| distance(w[0].points[0], w[1].points[0]) > 20.0)
                 .all(|w| !w[1].travel_inside)
         );
+    }
+
+    #[test]
+    fn paths_carry_the_extruder_of_the_model() {
+        let extruders = |mesh: &Mesh| {
+            let mut diagnostics = Diagnostics::new();
+            let toolpaths = generate_reporting(mesh, &Settings::default(), &mut diagnostics);
+            let mut used: Vec<u32> = toolpaths
+                .unwrap()
+                .layers
+                .iter()
+                .flat_map(|layer| layer.paths.iter().map(|p| p.extruder))
+                .collect();
+            used.dedup();
+            (used, diagnostics)
+        };
+        let cube = Mesh::cuboid(10.0, 10.0, 2.0);
+        let (used, diagnostics) = extruders(&cube);
+        assert_eq!(used, [0]);
+        assert!(diagnostics.is_empty());
+
+        // A model on extruder 3 alone prints with it, without a warning.
+        let mut third = cube.clone();
+        third.set_extruder(0, 2);
+        let (used, diagnostics) = extruders(&third);
+        assert_eq!(used, [2]);
+        assert!(diagnostics.is_empty());
+
+        // Two objects on extruders 2 and 3: the first one prints both.
+        let mut other = cube.clone();
+        other.translate([20.0, 0.0, 0.0]);
+        other.set_extruder(0, 1);
+        third.merge(&other);
+        let (used, diagnostics) = extruders(&third);
+        assert_eq!(used, [1]);
+        assert_eq!(diagnostics.codes(), ["slicing.multiple_extruders"]);
+        assert_eq!(diagnostics.as_slice()[0].context["extruders"], "2 3");
+        assert_eq!(diagnostics.as_slice()[0].context["extruder"], "2");
     }
 
     #[test]
