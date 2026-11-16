@@ -131,6 +131,14 @@ fn corpus() -> Vec<Model> {
         ),
         model("pin_2x2x40", Mesh::cuboid(2.0, 2.0, 40.0), NONE, None),
         model("wall_0.9", Mesh::cuboid(20.0, 0.9, 5.0), NONE, None),
+        // Between one and two lines: one line of its own width, not a wall
+        // loop whose sides overlap.
+        model(
+            "wall_0.65_one_line",
+            Mesh::cuboid(20.0, 0.65, 3.0),
+            NONE,
+            Some(0.1),
+        ),
         // Narrower than a line: one line of its own width.
         model(
             "wall_0.3_thin",
