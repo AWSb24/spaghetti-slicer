@@ -1118,6 +1118,8 @@ async fn send_job(
         Err(response) => return *response,
     };
     let target = target.clone();
+    // Callers know the printer by name only; its address stays on the server.
+    let address = target.to_string();
     let file = format!("{id}.gcode");
     let started = Instant::now();
     let outcome = tokio::task::spawn_blocking(move || {
@@ -1154,6 +1156,10 @@ async fn send_job(
                 "job.send_failed",
                 json!({ "job": id, "printer": name, "error": error.code, "ms": ms }),
             );
+            let message = error
+                .message
+                .replace(&address, &format!("printer '{name}'"));
+            let error = Diagnostic::error(error.code, message).with("printer", name);
             error_response(StatusCode::BAD_GATEWAY, &error)
         }
     }

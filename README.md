@@ -4,15 +4,15 @@ A 3D printing slicer written entirely in Rust, for desktop and server use.
 
 **Status: early prototype. The G-code has never been run on a printer. Do not print it unattended.**
 
-What works: STL and 3MF import (geometry only, one plate of a Bambu Studio project), closing small holes in a mesh, slicing, walls, solid top/bottom layers, sparse infill (rectilinear, grid, triangles, gyroid), optional adaptive layer height, thin walls and gap fill with lines of their own width, skirt, brim, retraction, G-code for Marlin and Klipper, layered settings files with a set of [profiles](profiles/README.md), time and material estimates, per-layer SVG preview, an HTTP server with a job API, a container image.
+What works: STL and 3MF import (geometry only, one plate of a Bambu Studio project), closing small holes in a mesh, slicing, walls, solid top/bottom layers, sparse infill (rectilinear, grid, triangles, gyroid), optional adaptive layer height, thin walls and gap fill with lines of their own width, several objects on one plate, several extruders with tool changes and a prime tower, tree supports, skirt, brim, retraction, G-code for Marlin and Klipper, layered settings files with a set of [profiles](profiles/README.md), time and material estimates, per-layer SVG preview, sending to Klipper (Moonraker) and OctoPrint, an HTTP server with a job API, a container image, a desktop app that also runs in the browser, and a first resin (MSLA) pipeline.
 
 ## Known limitations
 
-- Supports are simple: straight columns of lines with a loop around them under everything that overhangs by more than half a line width per layer, except short bridges (`supports = true`, off by default), filled densely in the layers right under the surface they carry, with one empty layer between support and model above and below. No tree supports, and the gaps cannot be set. Bridges (solid areas with nothing below) are filled with lines that run from one side that carries them to the other, in the best of every 15° and along or across the bridge's longest edge; they have their own speed, flow and fan setting (`bridge_speed`, `bridge_flow`, `bridge_fan_speed`). With supports switched on, bridges up to `support_bridge_length` (10 mm by default) get none. The seam is lined up at the back of the model, put at the sharpest corner of every loop (`seam_position = corner`; corners are measured over two line widths of path, so rounded ones count too, and inward corners are preferred because the seam hides better there) or left where the nozzle happens to be; it cannot be placed by hand.
+- Supports are simple: straight columns of lines with a loop around them under everything that overhangs by more than half a line width per layer, except short bridges (`supports = true`, off by default), filled densely in the layers right under the surface they carry, with one empty layer between support and model above and below. Tree supports (`support_style = tree`) start at points `support_spacing` apart under the dense interface; their branches lean towards each other, keep the gap to the model, merge into trunks and stand on the bed or on the model. The gaps cannot be set. Bridges (solid areas with nothing below) are filled with lines that run from one side that carries them to the other, in the best of every 15° and along or across the bridge's longest edge; they have their own speed, flow and fan setting (`bridge_speed`, `bridge_flow`, `bridge_fan_speed`). With supports switched on, bridges up to `support_bridge_length` (10 mm by default) get none. The seam is lined up at the back of the model, put at the sharpest corner of every loop (`seam_position = corner`; corners are measured over two line widths of path, so rounded ones count too, and inward corners are preferred because the seam hides better there) or left where the nozzle happens to be; it cannot be placed by hand.
 - The G-code for Marlin and Klipper is the same. For Bambu Lab printers there is a project file (`-o name.gcode.3mf`) and an X1C profile, but neither has ever been tried on a printer: the start sequence uses common commands only, and it is not known whether the printer accepts the file.
-- Colours and settings stored in a 3MF file are ignored. The extruder that a Bambu Studio project names per object is read, but everything prints with one extruder (warning `slicing.multiple_extruders`).
+- Colours and settings stored in a 3MF file are ignored. The extruder that a Bambu Studio project names per object is read. With `extruder_count` above 1 every object prints with its extruder (tool change with `T<n>` and `toolchange_gcode`, optional prime tower); with one extruder everything prints with the lowest one (warning `slicing.multiple_extruders`). Tool changes and the prime tower have never run on a printer.
 - The time estimate has not been compared with a real print and ignores heating.
-- The desktop app is a first version (2D plate view, one model at a time).
+- The desktop app is a first version; its 3D view shows one model at a time, and in the browser slicing blocks the page.
 - The resin output (`slice-sla`) is a first step: an open archive of layer images, not a file any printer reads, and without supports or hollowing.
 - Server jobs that are still queued or running are lost when the server stops; finished ones survive only with `SPAGHETTI_DATA_DIR`.
 
@@ -74,6 +74,24 @@ cargo run --release -p slicer-cli -- slice model.stl -s adaptive_layers=true -s 
 cargo run --release -p slicer-cli -- slice-sla model.stl -o model.sla.zip --set exposure_time=2.5
 ```
 
+Add `--set supports=1 --set elevation=5 --set raft_thickness=1` for supports on a raft, and `--set hollow_wall=2` to hollow the model with a 2 mm wall and drain holes.
+
+### Several models on one plate
+
+```bash
+cargo run --release -p slicer-cli -- slice a.stl b.stl -o plate.gcode
+```
+
+arranges the models side by side (`--gap` sets the distance, default 5 mm plus the brim). `--keep-positions` keeps the coordinates of the files, for example the build item positions of a 3MF.
+
+### Sending to a printer
+
+```bash
+cargo run --release -p slicer-cli -- slice model.stl --send moonraker://printer.local:7125 --start
+```
+
+uploads the G-code to Klipper (Moonraker) and starts it; `octoprint://host` targets OctoPrint, `moonraker+https://` and `octoprint+https://` use TLS. `send file.gcode --to PRINTER` uploads an existing file. The API key comes from `--api-key` or `SPAGHETTI_PRINTER_API_KEY`. Only tested against a stand-in, never against a real printer. Bambu Lab printers are not supported yet.
+
 Errors go to stderr with exit code 1. With `--json`, errors and warnings are objects with a stable `code`, a `message` and a `context`:
 
 | Code | Meaning |
@@ -96,7 +114,13 @@ Errors go to stderr with exit code 1. With `--json`, errors and warnings are obj
 | `slicing.open_contours` (warning) | Some layers have contours that do not close and were dropped |
 | `slicing.unsupported_overhangs` (warning) | Some layers reach more than one line width beyond the layer below (overhangs or bridges) and supports are switched off |
 | `mesh.degenerate_removed` (warning) | Triangles without area were removed before slicing; their neighbours were joined so the surface stays closed |
-| `slicing.multiple_extruders` (warning) | Objects of the model ask for different extruders (Bambu Studio projects); everything is printed with the lowest one |
+| `slicing.multiple_extruders` (warning) | Objects of the model ask for different extruders while `extruder_count` is 1; everything is printed with the lowest one |
+| `slicing.missing_extruder` (warning) | Objects ask for an extruder beyond `extruder_count`; they are printed with extruder 1 |
+| `slicing.prime_tower_overlap` (warning) | The prime tower overlaps the model; move it with `prime_tower_x`/`prime_tower_y` |
+| `slicing.outside_bed` | An object placed as given (`--keep-positions`, the desktop app) reaches over the edge of the bed, or arranged objects do not fit |
+| `slicing.objects_overlap` (warning) | The outlines of two objects overlap seen from above; they are printed as one |
+| `send.invalid_target`, `send.connection`, `send.unauthorized`, `send.too_large`, `send.rejected` | A printer address is malformed, the printer cannot be reached, refused the API key, refused the file as too large, or refused the upload otherwise |
+| `send.not_started` (warning) | The file was uploaded but the printer did not start it |
 | `slicing.thin_regions` (warning) | Some layers have parts narrower than half a line width that are not printed (parts between half and one line width get a single line of their own width) |
 
 ## Desktop app (preview)
@@ -105,7 +129,9 @@ Errors go to stderr with exit code 1. With `--json`, errors and warnings are obj
 cargo run --release -p slicer-ui -- [model.stl] [settings.toml ...]
 ```
 
-Opens a window: load an STL or 3MF, move, rotate and scale it on the plate, load settings files and edit common values, slice with cancel, step through the layers and save G-code or `.gcode.3mf`. The plate is a 2D top view of the model's outline; there is no 3D view and no web version yet. Building it on Linux needs no extra system packages.
+Opens a window: add STL or 3MF models, move, rotate, scale and arrange them on the plate, pick printer, material and process from `profiles/` or import an Orca Slicer profile, edit common values or search all settings, slice with a progress bar and cancel, step through the layers in 2D or 3D (turn with the left mouse button, pan with the right one or Shift, zoom with the wheel) and save G-code or `.gcode.3mf`. Building it on Linux needs no extra system packages.
+
+The same app runs in a browser. Build it with `bash tools/build-web.sh` (needs `rustup target add wasm32-unknown-unknown` and `wasm-bindgen-cli` in the version from `Cargo.lock`), start the server with `SPAGHETTI_WEB_DIR=target/web` and open `http://localhost:8080/app/`. Models are sliced in the browser; nothing is uploaded. While a slice runs the page does not react. In the browser there is no profile folder to choose and no Orca import.
 
 ## Server
 
@@ -138,6 +164,8 @@ curl -F model=@examples/cube_20mm.stl -F settings=@settings.toml -F set=infill_d
 | `POST /v1/jobs` | Create a job (multipart fields `model`, `settings`, `set`, `plate`; several `settings` files are layered in order); answers `202` at once |
 | `GET /v1/jobs/{id}` | Status (`queued`, `running`, `done`, `failed`, `cancelled`), statistics, warnings or the error |
 | `GET /v1/jobs/{id}/gcode` | The G-code of a finished job |
+| `POST /v1/jobs/{id}/send` | Upload the G-code of a finished job to a printer configured on the server; JSON body `{"printer": NAME, "start": false}`; 502 if the printer fails |
+| `GET /app/` | The browser app, if `SPAGHETTI_WEB_DIR` is set |
 | `GET /v1/jobs/{id}/gcode.3mf` | The same G-code as a project file for Bambu Lab printers (untested on a printer, like the file the command line tool writes) |
 | `DELETE /v1/jobs/{id}` | Cancel an unfinished job or delete a finished one |
 
@@ -153,6 +181,9 @@ The server is configured through environment variables only:
 | `SPAGHETTI_MAX_UPLOAD_BYTES` | `268435456` | Largest request body |
 | `SPAGHETTI_RESULT_TTL_SECONDS` | `3600` | How long finished jobs are kept |
 | `SPAGHETTI_TOKEN` | unset | If set, `/v1/` requires `Authorization: Bearer <token>` |
+| `SPAGHETTI_PRINTERS` | unset | Printers jobs may be sent to, as `name=address,…` (e.g. `shop=moonraker://10.0.0.5:7125`). Callers can only name these; without `SPAGHETTI_TOKEN` anyone who can reach the port can start prints on them |
+| `SPAGHETTI_PRINTER_KEY_<NAME>` | unset | API key of printer NAME (upper case) |
+| `SPAGHETTI_WEB_DIR` | unset | Directory with the built browser app, served at `/app/` |
 | `SPAGHETTI_DATA_DIR` | unset | If set, finished jobs (status and G-code) are kept in this directory and survive a restart, until they expire. Jobs still queued or running when the server stops are lost. In the container, mount a volume writable by user 65532 |
 
 Without a token anyone who can reach the port can submit jobs. Logs are JSON lines on standard output.

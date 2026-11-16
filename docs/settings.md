@@ -13,6 +13,7 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `nozzle_diameter` | 0.4 | 0.1 to 2 | Nozzle diameter. |
 | `flavor` | marlin | `marlin`, `klipper` | G-code dialect. |
 | `extrusion_mode` | relative | `relative`, `absolute` | Whether extrusion amounts in the G-code are relative or absolute. |
+| `extruder_count` | 1 | 1 to 16 | Number of extruders (tools or filament slots) of the printer. With more than one, every object prints with the extruder it names (Bambu Studio projects) and the G-code changes tools with `T<n>`; with one, everything prints with the lowest extruder the objects name. |
 | `filament_diameter` | 1.75 | 1 to 3.5 | Filament diameter. |
 | `filament_density` | 1.24 | 0.1 to 20 | Filament density in g/cm³, used for the weight estimate. |
 | `flow_ratio` | 1 | 0.5 to 2 | Multiplier on the extruded amount. |
@@ -36,15 +37,19 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `bottom_layers` | 4 | 0 to 1000 | Number of solid layers at the bottom. |
 | `infill_density` | 15 | 0 to 100 | Sparse infill density in percent. |
 | `infill_pattern` | grid | `rectilinear`, `grid`, `triangles`, `gyroid` | Sparse infill pattern. |
-| `infill_angle` | 45 | 0 to 180 | Direction of the infill lines in degrees from the X axis; every other layer is turned by 90 degrees. Triangles keep it on every layer; the gyroid ignores it. |
+| `infill_angle` | 45 | 0 to 180 | Direction of the infill lines in degrees from the X axis; every other layer is turned by 90 degrees. Triangles and the gyroid keep it on every layer. |
 | `infill_overlap` | 15 | 0 to 50 | How far infill reaches into the innermost wall, in percent of the line width. |
 | `skirt_loops` | 2 | 0 to 20 | Number of skirt loops around the first layer. |
 | `skirt_distance` | 4 | 0 to 50 | Distance between skirt and model. |
 | `brim_width` | 0 | 0 to 50 | Width of the brim attached to the first layer; 0 disables it. |
 | `supports` | false | `true`, `false` | Whether to print supports under overhangs and bridges. |
-| `support_spacing` | 2.5 | 0.5 to 20 | Distance between the lines of a support. |
+| `support_style` | normal | `normal`, `tree` | Shape of the supports: straight columns (`normal`) or branches that merge into trunks (`tree`). |
+| `support_spacing` | 2.5 | 0.5 to 20 | Distance between the lines of a support. Tree supports also touch the surface they carry at points this far apart. |
 | `support_interface_layers` | 2 | 0 to 10 | Number of densely filled support layers right under the surface they carry. |
 | `support_bridge_length` | 10 | 0 to 1000 | Bridges up to this length in millimetres get no supports; 0 supports every bridge. |
+| `prime_tower_width` | 15 | 0 to 100 | Side of the square tower that every tool change primes the new extruder into, on every layer up to the last tool change; 0 disables it. Only used with more than one extruder. |
+| `prime_tower_x` | 190 | 0 to 2000 * | X of the centre of the prime tower on the bed. |
+| `prime_tower_y` | 190 | 0 to 2000 * | Y of the centre of the prime tower on the bed. |
 | `outer_wall_speed` | 40 | 1 to 1000 | Speed of the outermost wall. |
 | `inner_wall_speed` | 60 | 1 to 1000 | Speed of inner walls. |
 | `infill_speed` | 80 | 1 to 1000 | Speed of solid and sparse infill. |
@@ -60,3 +65,4 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `z_hop` | 0 | 0 to 10 | Nozzle lift during retracted travel moves; 0 disables it. |
 | `start_gcode` | see `default-config` | text with `{key}` placeholders | G-code inserted before the print. `{setting_name}` placeholders are replaced. |
 | `end_gcode` | see `default-config` | text with `{key}` placeholders | G-code inserted after the print. `{setting_name}` placeholders are replaced. |
+| `toolchange_gcode` | see `default-config` | text with `{key}` placeholders | G-code inserted at every tool change, after the old extruder has retracted and before `T<n>` selects the new one. Besides `{setting_name}`, `{previous_extruder}` and `{next_extruder}` are replaced, counted from 0 as in `T<n>`. |
