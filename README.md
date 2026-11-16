@@ -4,7 +4,7 @@ A 3D printing slicer written entirely in Rust, for desktop and server use.
 
 **Status: early prototype. The G-code has never been run on a printer. Do not print it unattended.**
 
-What works: STL and 3MF import (geometry only, one plate of a Bambu Studio project), closing small holes in a mesh, slicing, walls, solid top/bottom layers, sparse infill (rectilinear, grid, triangles, gyroid), optional adaptive layer height, skirt, brim, retraction, G-code for Marlin and Klipper, layered settings files with a set of [profiles](profiles/README.md), time and material estimates, per-layer SVG preview, an HTTP server with a job API, a container image.
+What works: STL and 3MF import (geometry only, one plate of a Bambu Studio project), closing small holes in a mesh, slicing, walls, solid top/bottom layers, sparse infill (rectilinear, grid, triangles, gyroid), optional adaptive layer height, thin walls and gap fill with lines of their own width, skirt, brim, retraction, G-code for Marlin and Klipper, layered settings files with a set of [profiles](profiles/README.md), time and material estimates, per-layer SVG preview, an HTTP server with a job API, a container image.
 
 ## Known limitations
 
@@ -12,6 +12,7 @@ What works: STL and 3MF import (geometry only, one plate of a Bambu Studio proje
 - The G-code for Marlin and Klipper is the same. For Bambu Lab printers there is a project file (`-o name.gcode.3mf`) and an X1C profile, but neither has ever been tried on a printer: the start sequence uses common commands only, and it is not known whether the printer accepts the file.
 - Colours and settings stored in a 3MF file are ignored. The extruder that a Bambu Studio project names per object is read, but everything prints with one extruder (warning `slicing.multiple_extruders`).
 - The time estimate has not been compared with a real print and ignores heating.
+- The desktop app is a first version (2D plate view, one model at a time).
 - The resin output (`slice-sla`) is a first step: an open archive of layer images, not a file any printer reads, and without supports or hollowing.
 - Server jobs that are still queued or running are lost when the server stops; finished ones survive only with `SPAGHETTI_DATA_DIR`.
 
@@ -96,7 +97,15 @@ Errors go to stderr with exit code 1. With `--json`, errors and warnings are obj
 | `slicing.unsupported_overhangs` (warning) | Some layers reach more than one line width beyond the layer below (overhangs or bridges) and supports are switched off |
 | `mesh.degenerate_removed` (warning) | Triangles without area were removed before slicing; their neighbours were joined so the surface stays closed |
 | `slicing.multiple_extruders` (warning) | Objects of the model ask for different extruders (Bambu Studio projects); everything is printed with the lowest one |
-| `slicing.thin_regions` (warning) | Some layers have parts narrower than the line width that are not printed |
+| `slicing.thin_regions` (warning) | Some layers have parts narrower than half a line width that are not printed (parts between half and one line width get a single line of their own width) |
+
+## Desktop app (preview)
+
+```bash
+cargo run --release -p slicer-ui -- [model.stl] [settings.toml ...]
+```
+
+Opens a window: load an STL or 3MF, move, rotate and scale it on the plate, load settings files and edit common values, slice with cancel, step through the layers and save G-code or `.gcode.3mf`. The plate is a 2D top view of the model's outline; there is no 3D view and no web version yet. Building it on Linux needs no extra system packages.
 
 ## Server
 

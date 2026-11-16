@@ -12,6 +12,7 @@ pub fn color(kind: PathKind) -> &'static str {
         PathKind::Support => "#c9a227",
         PathKind::OuterWall => "#e8590c",
         PathKind::InnerWall => "#f2b01e",
+        PathKind::GapFill => "#e63946",
         PathKind::SolidInfill => "#7b2cbf",
         PathKind::Bridge => "#4c8dff",
         PathKind::SparseInfill => "#2a9d8f",
@@ -64,7 +65,11 @@ pub fn layer_svg(layer: &Layer, line_width: f64) -> String {
     );
     for path in &layer.paths {
         let tag = if path.closed { "polygon" } else { "polyline" };
-        let _ = write!(svg, "<{tag} stroke=\"{}\" points=\"", color(path.kind));
+        let _ = write!(svg, "<{tag} stroke=\"{}\" ", color(path.kind));
+        if let Some(width) = path.width {
+            let _ = write!(svg, "stroke-width=\"{width:.3}\" ");
+        }
+        svg.push_str("points=\"");
         for p in &path.points {
             let _ = write!(svg, "{:.3},{:.3} ", p[0] - left, top - p[1]);
         }

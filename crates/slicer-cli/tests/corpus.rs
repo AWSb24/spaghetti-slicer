@@ -131,11 +131,25 @@ fn corpus() -> Vec<Model> {
         ),
         model("pin_2x2x40", Mesh::cuboid(2.0, 2.0, 40.0), NONE, None),
         model("wall_0.9", Mesh::cuboid(20.0, 0.9, 5.0), NONE, None),
+        // Narrower than a line: one line of its own width.
         model(
-            "wall_0.3_too_thin",
+            "wall_0.3_thin",
             Mesh::cuboid(20.0, 0.3, 5.0),
+            NONE,
+            Some(0.1),
+        ),
+        model(
+            "wall_0.15_too_thin",
+            Mesh::cuboid(20.0, 0.15, 5.0),
             THIN,
             None,
+        ),
+        // Two lines and a gap of 0.3 mm between them.
+        model(
+            "wall_1.2_gap",
+            Mesh::cuboid(20.0, 1.2, 5.0),
+            NONE,
+            Some(0.05),
         ),
         model("tiny_cube_0.5", Mesh::cuboid(0.5, 0.5, 0.5), THIN, None),
         model("cylinder", cylinder(10.0, 20.0, 64), NONE, Some(0.03)),
@@ -154,6 +168,12 @@ fn corpus() -> Vec<Model> {
         model("dome", dome(12.0, 64), NONE, Some(0.04)),
         model("tube", tube(12.0, 7.0, 10.0, 64), NONE, Some(0.03)),
         model("thin_tube_1mm_wall", tube(12.0, 11.0, 6.0, 96), NONE, None),
+        model(
+            "thin_tube_0.3_wall",
+            tube(12.0, 11.7, 6.0, 96),
+            NONE,
+            Some(0.1),
+        ),
         model("torus", torus(15.0, 4.0, 64, 32), HANGING, Some(0.05)),
         model(
             "star_5",
@@ -164,7 +184,7 @@ fn corpus() -> Vec<Model> {
         model(
             "star_needles",
             prism(&star_contour(40, 15.0, 5.0), 3.0),
-            THIN,
+            NONE,
             None,
         ),
         model(
@@ -192,7 +212,7 @@ fn corpus() -> Vec<Model> {
             Some(0.03),
         ),
         model("cube_rotated_45", rotated_z, NONE, Some(0.03)),
-        model("cube_tilted", tilted, THIN, Some(0.04)),
+        model("cube_tilted", tilted, NONE, Some(0.04)),
         model("ramp", ramp, THIN, Some(0.04)),
         model(
             "steps",
@@ -228,8 +248,8 @@ fn corpus() -> Vec<Model> {
                 Mesh::cuboid(20.0, 20.0, 3.0),
                 moved(Mesh::cuboid(20.0, 0.3, 10.0), [0.0, 10.0, 3.0]),
             ]),
-            THIN,
-            None,
+            NONE,
+            Some(0.05),
         ),
         model(
             "far_from_origin",
