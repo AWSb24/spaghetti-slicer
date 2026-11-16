@@ -66,6 +66,17 @@ pub enum SeamPosition {
     Nearest,
 }
 
+/// Shape of the supports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SupportStyle {
+    /// Straight columns under everything that hangs free.
+    Normal,
+    /// Branches that grow down from points under the overhangs, lean
+    /// towards each other and merge into trunks.
+    Tree,
+}
+
 /// The kind of printer settings are meant for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -176,7 +187,11 @@ pub struct Settings {
     pub brim_width: f64,
     /// Whether to print supports under overhangs and bridges.
     pub supports: bool,
-    /// Distance between the lines of a support.
+    /// Shape of the supports: straight columns (`normal`) or branches that
+    /// merge into trunks (`tree`).
+    pub support_style: SupportStyle,
+    /// Distance between the lines of a support. Tree supports also touch
+    /// the surface they carry at points this far apart.
     pub support_spacing: f64,
     /// Number of densely filled support layers right under the surface they carry.
     pub support_interface_layers: u32,
@@ -262,6 +277,7 @@ impl Default for Settings {
             skirt_distance: 4.0,
             brim_width: 0.0,
             supports: false,
+            support_style: SupportStyle::Normal,
             support_spacing: 2.5,
             support_interface_layers: 2,
             support_bridge_length: 10.0,
