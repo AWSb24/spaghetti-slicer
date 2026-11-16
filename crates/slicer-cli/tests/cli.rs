@@ -355,3 +355,106 @@ fn slices_a_cube_for_a_resin_printer() {
     assert!(!out.status.success());
     assert!(text(&out.stderr).contains("unknown resin setting 'nozzle_temp'"));
 }
+
+#[test]
+fn sliced_gcode_is_sent_to_a_printer() {
+    // A stand-in for Moonraker on 127.0.0.1; no real printer is contacted.
+    let printer = slicer_send::mock::Printer::start(201, r#"{"print_started": true}"#).unwrap();
+    let dir = workdir("send");
+    let stl = dir.join("cube.stl");
+    fs::write(
+        &stl,
+        slicer_formats::write_stl_binary(&Mesh::cuboid(10.0, 10.0, 2.0)),
+    )
+    .unwrap();
+    let output = dir.join("cube.gcode.3mf");
+    let target = format!("moonraker://{}", printer.address);
+    let out = bin()
+        .args([
+            "slice",
+            stl.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .args(["--send", &target, "--start", "--json"])
+        .env("SPAGHETTI_PRINTER_API_KEY", "key-from-env")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["sent"],
+        serde_json::json!({ "printer": target, "file": "cube.gcode", "started": true })
+    );
+
+    // The printer got plain G-code, the same as a .gcode output.
+    let request = printer.request().unwrap();
+    assert_eq!(request.path, "/server/files/upload");
+    assert_eq!(request.header("x-api-key"), Some("key-from-env"));
+    assert_eq!(request.field("print").unwrap(), b"true");
+    let gcode = request.field("file").unwrap();
+    assert!(text(&gcode).contains(";LAYER_CHANGE"));
+    assert!(slicer_formats::looks_like_3mf(&fs::read(&output).unwrap()));
+    let plain = dir.join("cube.gcode");
+    let out = run(&[
+        "slice",
+        stl.to_str().unwrap(),
+        "-o",
+        plain.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(gcode, fs::read(&plain).unwrap());
+
+    // The send command uploads an existing file; --api-key wins over the
+    // environment.
+    let printer = slicer_send::mock::Printer::start(201, r#"{"effectivePrint": false}"#).unwrap();
+    let file = dir.join("part.gcode");
+    fs::write(&file, "G28\n").unwrap();
+    let out = bin()
+        .args(["send", file.to_str().unwrap(), "--to"])
+        .arg(format!("octoprint://{}", printer.address))
+        .args(["--api-key", "key-from-option"])
+        .env("SPAGHETTI_PRINTER_API_KEY", "key-from-env")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("Sent part.gcode to octoprint://"));
+    let request = printer.request().unwrap();
+    assert_eq!(request.path, "/api/files/local");
+    assert_eq!(request.header("x-api-key"), Some("key-from-option"));
+    assert_eq!(request.field("print").unwrap(), b"false");
+    assert_eq!(request.field("file").unwrap(), b"G28\n");
+}
+
+#[test]
+fn send_errors_have_codes() {
+    let dir = workdir("send-errors");
+    let file = dir.join("part.gcode");
+    fs::write(&file, "G28\n").unwrap();
+    let send = |target: &str| {
+        let out = run(&["send", file.to_str().unwrap(), "--to", target, "--json"]);
+        assert!(!out.status.success());
+        let error: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+        error["error"]["code"].as_str().unwrap().to_string()
+    };
+    assert_eq!(send("http://printer"), "send.invalid_target");
+
+    let printer = slicer_send::mock::Printer::start(401, "{}").unwrap();
+    assert_eq!(
+        send(&format!("moonraker://{}", printer.address)),
+        "send.unauthorized"
+    );
+    let printer = slicer_send::mock::Printer::start(413, "{}").unwrap();
+    assert_eq!(
+        send(&format!("moonraker://{}", printer.address)),
+        "send.too_large"
+    );
+
+    // An unreachable printer: the address is checked before slicing, the
+    // connection after the G-code is written.
+    let address = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    assert_eq!(send(&format!("moonraker://{address}")), "send.connection");
+}

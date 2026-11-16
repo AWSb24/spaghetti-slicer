@@ -464,3 +464,126 @@ async fn server_stops_when_asked() {
     let result = tokio::time::timeout(Duration::from_secs(5), server).await;
     assert!(result.unwrap().unwrap().is_ok());
 }
+
+async fn send_to(router: &Router, id: &str, body: &str) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/jobs/{id}/send"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, body) = send(router, request).await;
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn finished_jobs_are_sent_to_configured_printers_only() {
+    // A stand-in for Moonraker on 127.0.0.1; no real printer is contacted.
+    let printer = slicer_send::mock::Printer::start(201, r#"{"print_started": true}"#).unwrap();
+    let down = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let config = Config::from_lookup(|name| match name {
+        "SPAGHETTI_PRINTERS" => Some(format!(
+            "shop=moonraker://{}, gone=octoprint://{down}",
+            printer.address
+        )),
+        "SPAGHETTI_PRINTER_KEY_SHOP" => Some("printer-key".to_string()),
+        _ => None,
+    })
+    .unwrap();
+    let router = App::new(config).router();
+    let (_, created) = create(&router, &[("model", &cube())]).await;
+    let id = created["id"].as_str().unwrap();
+    let job = finished(&router, id).await;
+
+    let (status, body) = send_to(&router, id, r#"{"printer": "shop", "start": true}"#).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["printer"], "shop");
+    assert_eq!(body["file"], format!("{id}.gcode"));
+    assert_eq!(body["started"], true);
+    let request = printer.request().unwrap();
+    assert_eq!(request.path, "/server/files/upload");
+    assert_eq!(request.header("x-api-key"), Some("printer-key"));
+    assert_eq!(request.field("print").unwrap(), b"true");
+    let gcode = Request::builder()
+        .uri(job["gcode_url"].as_str().unwrap())
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(request.field("file").unwrap(), send(&router, gcode).await.1);
+
+    // Callers can only name a configured printer, never an address.
+    for body in [
+        r#"{"printer": "moonraker://127.0.0.1:1"}"#,
+        r#"{"printer": "other"}"#,
+    ] {
+        let (status, answer) = send_to(&router, id, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(answer["error"]["code"], "send.unknown_printer");
+    }
+    for body in [
+        "",
+        "[]",
+        r#"{"start": true}"#,
+        r#"{"printer": "shop", "start": "yes"}"#,
+        r#"{"printer": "shop", "url": "x"}"#,
+    ] {
+        let (status, answer) = send_to(&router, id, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(answer["error"]["code"], "request.invalid");
+    }
+
+    // A printer that cannot be reached is the printer's fault: 502.
+    let (status, answer) = send_to(&router, id, r#"{"printer": "gone"}"#).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(answer["error"]["code"], "send.connection");
+
+    // Unknown and unfinished jobs have nothing to send.
+    let unknown = "00000000-0000-4000-8000-000000000000";
+    let (status, _) = send_to(&router, unknown, r#"{"printer": "shop"}"#).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, failed) = create(&router, &[("model", b"not a model")]).await;
+    let failed = failed["id"].as_str().unwrap();
+    finished(&router, failed).await;
+    let (status, answer) = send_to(&router, failed, r#"{"printer": "shop"}"#).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(answer["error"]["code"], "job.no_result");
+}
+
+#[test]
+fn printers_come_from_the_environment() {
+    let config = Config::from_lookup(|name| match name {
+        "SPAGHETTI_PRINTERS" => {
+            Some("a=moonraker://10.0.0.5:7125,b_2=octoprint+https://host/octo".into())
+        }
+        "SPAGHETTI_PRINTER_KEY_A" => Some("secret-key".into()),
+        _ => None,
+    })
+    .unwrap();
+    let names: Vec<&str> = config
+        .printers
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(names, ["a", "b_2"]);
+    assert_eq!(
+        config.printers[1].1.upload_url(),
+        "https://host/octo/api/files/local"
+    );
+    // The key is never shown.
+    assert!(!format!("{config:?}").contains("secret-key"));
+
+    for list in [
+        "moonraker://host",
+        "a b=moonraker://host",
+        "a=moonraker://host,A=octoprint://host",
+        "a=http://host",
+        "a=moonraker://user:password@host",
+    ] {
+        let error = Config::from_lookup(|name| (name == "SPAGHETTI_PRINTERS").then(|| list.into()))
+            .unwrap_err();
+        assert!(error.starts_with("SPAGHETTI_PRINTERS"), "{error}");
+        assert!(!error.contains("password"), "{error}");
+    }
+}

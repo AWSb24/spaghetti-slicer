@@ -20,6 +20,7 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 use slicer_core::{Diagnose, Diagnostic, Diagnostics};
 use slicer_profiles::Settings;
+use slicer_send::Target;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
@@ -42,6 +43,10 @@ pub struct Config {
     /// If set, finished jobs are kept in this directory and survive a
     /// restart (`SPAGHETTI_DATA_DIR`).
     pub data_dir: Option<PathBuf>,
+    /// Printers finished jobs may be sent to, by name (`SPAGHETTI_PRINTERS`,
+    /// API keys in `SPAGHETTI_PRINTER_KEY_<NAME>`). Callers can only name
+    /// one of these, so the server never contacts a host chosen by a caller.
+    pub printers: Vec<(String, Target)>,
 }
 
 impl Default for Config {
@@ -54,8 +59,51 @@ impl Default for Config {
             result_ttl: Duration::from_secs(3600),
             token: None,
             data_dir: None,
+            printers: Vec::new(),
         }
     }
+}
+
+/// Reads `SPAGHETTI_PRINTERS` (`NAME=ADDRESS,NAME=ADDRESS`) and the API key
+/// of each printer from `SPAGHETTI_PRINTER_KEY_<NAME>`.
+fn printers(lookup: &impl Fn(&str) -> Option<String>) -> Result<Vec<(String, Target)>, String> {
+    let mut printers: Vec<(String, Target)> = Vec::new();
+    let list = lookup("SPAGHETTI_PRINTERS").unwrap_or_default();
+    for entry in list
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        // The entry is not repeated: it might hold credentials.
+        let Some((name, address)) = entry.split_once('=') else {
+            return Err(
+                "SPAGHETTI_PRINTERS expects NAME=ADDRESS entries separated by commas".into(),
+            );
+        };
+        let name = name.trim();
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(format!(
+                "SPAGHETTI_PRINTERS: the printer name '{name}' may only contain letters, digits and _"
+            ));
+        }
+        if printers
+            .iter()
+            .any(|(known, _)| known.eq_ignore_ascii_case(name))
+        {
+            return Err(format!(
+                "SPAGHETTI_PRINTERS: the printer name '{name}' is used twice"
+            ));
+        }
+        let key = lookup(&format!(
+            "SPAGHETTI_PRINTER_KEY_{}",
+            name.to_ascii_uppercase()
+        ));
+        let target = Target::parse(address)
+            .map_err(|error| format!("SPAGHETTI_PRINTERS: {}", error.message))?
+            .with_api_key(key);
+        printers.push((name.to_string(), target));
+    }
+    Ok(printers)
 }
 
 impl Config {
@@ -99,6 +147,7 @@ impl Config {
             data_dir: lookup("SPAGHETTI_DATA_DIR")
                 .filter(|dir| !dir.is_empty())
                 .map(PathBuf::from),
+            printers: printers(&lookup)?,
         };
         if config.workers == 0 {
             return Err("SPAGHETTI_WORKERS must be at least 1".to_string());
@@ -384,7 +433,7 @@ type Handler = fn() -> MethodRouter<App>;
 // ponytail: the method is not checked against the handler here; the API test
 // calls each operation with its method and fails on "method not allowed". A
 // route added in `App::router` outside this list is not noticed by any test.
-const OPERATIONS: [(&str, &str, Handler); 7] = [
+const OPERATIONS: [(&str, &str, Handler); 8] = [
     ("get", "/health", || get(health)),
     ("get", "/openapi.json", || get(|| async { Json(openapi()) })),
     ("post", "/v1/jobs", || post(create_job)),
@@ -392,6 +441,7 @@ const OPERATIONS: [(&str, &str, Handler); 7] = [
     ("delete", "/v1/jobs/{id}", || delete(cancel_job)),
     ("get", "/v1/jobs/{id}/gcode", || get(job_gcode)),
     ("get", "/v1/jobs/{id}/gcode.3mf", || get(job_gcode_3mf)),
+    ("post", "/v1/jobs/{id}/send", || post(send_job)),
 ];
 
 /// Method (lower case, as in OpenAPI) and path of every operation the router
@@ -484,6 +534,33 @@ pub fn openapi() -> Value {
                 "responses": {
                     "200": { "description": "Project file (.gcode.3mf)", "content": { "model/3mf": { "schema": { "type": "string", "format": "binary" } } } },
                     "401": error, "404": error, "409": error
+                }
+            } },
+            "/v1/jobs/{id}/send": { "post": {
+                "summary": "Upload the G-code of a finished job to a printer configured on the server (Moonraker or OctoPrint)",
+                "parameters": id,
+                "requestBody": { "required": true, "content": { "application/json": { "schema": {
+                    "type": "object",
+                    "required": ["printer"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "printer": { "type": "string", "description": "Name of a printer in SPAGHETTI_PRINTERS" },
+                        "start": { "type": "boolean", "default": false, "description": "Start printing once uploaded" }
+                    }
+                } } } },
+                "responses": {
+                    "200": { "description": "Uploaded", "content": { "application/json": { "schema": {
+                        "type": "object",
+                        "required": ["printer", "file", "started", "warnings"],
+                        "properties": {
+                            "printer": { "type": "string" },
+                            "file": { "type": "string", "description": "File name on the printer" },
+                            "started": { "type": "boolean", "description": "Whether the printer reports that the print started" },
+                            "warnings": { "type": "array", "items": { "$ref": "#/components/schemas/Diagnostic" } }
+                        }
+                    } } } },
+                    "400": error, "401": error, "404": error, "409": error,
+                    "502": { "description": "The printer could not be reached or refused the file (send.connection, send.unauthorized, send.too_large, send.rejected)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
                 }
             } }
         },
@@ -899,6 +976,94 @@ async fn job_gcode_3mf(State(app): State<App>, Path(id): Path<String>) -> Respon
     }
 }
 
+/// Uploads the G-code of a finished job to a printer from the server's list.
+/// The body is `{"printer": NAME, "start": BOOL}`.
+async fn send_job(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let invalid = |message: String| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            &Diagnostic::error("request.invalid", message),
+        )
+    };
+    let Ok(Value::Object(request)) = serde_json::from_slice::<Value>(&body) else {
+        return invalid(
+            r#"expected a JSON object such as {"printer": "name", "start": false}"#.into(),
+        );
+    };
+    if let Some(key) = request
+        .keys()
+        .find(|key| *key != "printer" && *key != "start")
+    {
+        return invalid(format!("unknown field '{key}'"));
+    }
+    let Some(name) = request.get("printer").and_then(Value::as_str) else {
+        return invalid("field 'printer' is missing or not a string".into());
+    };
+    let start = match request.get("start") {
+        None => false,
+        Some(Value::Bool(start)) => *start,
+        Some(_) => return invalid("field 'start' must be true or false".into()),
+    };
+    let Some((_, target)) = app.config.printers.iter().find(|(known, _)| known == name) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &Diagnostic::error(
+                "send.unknown_printer",
+                format!("no printer named '{name}' is configured on the server"),
+            )
+            .with("printer", name),
+        );
+    };
+    let (gcode, _) = match result_of(&app, &id) {
+        Ok(result) => result,
+        Err(response) => return *response,
+    };
+    let target = target.clone();
+    let file = format!("{id}.gcode");
+    let started = Instant::now();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let mut warnings = Diagnostics::new();
+        slicer_send::upload(&target, &file, gcode.as_bytes(), start, &mut warnings)
+            .map(|sent| (sent, warnings))
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(Diagnostic::error(
+            "server.internal",
+            "sending stopped unexpectedly",
+        ))
+    });
+    let ms = started.elapsed().as_millis() as u64;
+    match outcome {
+        Ok((sent, warnings)) => {
+            log(
+                "info",
+                "job.sent",
+                json!({ "job": id, "printer": name, "started": sent.started, "ms": ms }),
+            );
+            Json(json!({
+                "printer": name,
+                "file": sent.file,
+                "started": sent.started,
+                "warnings": warnings.as_slice(),
+            }))
+            .into_response()
+        }
+        Err(error) => {
+            log(
+                "warn",
+                "job.send_failed",
+                json!({ "job": id, "printer": name, "error": error.code, "ms": ms }),
+            );
+            error_response(StatusCode::BAD_GATEWAY, &error)
+        }
+    }
+}
+
 /// Cancels an unfinished job, or deletes the result of a finished one.
 async fn cancel_job(State(app): State<App>, Path(id): Path<String>) -> Response {
     let mut jobs = app.jobs();
@@ -938,6 +1103,7 @@ pub async fn serve(
             "listen": listener.local_addr()?.to_string(),
             "workers": app.config.workers,
             "auth": app.config.token.is_some(),
+            "printers": app.config.printers.iter().map(|(name, _)| name).collect::<Vec<_>>(),
         }),
     );
     let cleaner = app.clone();

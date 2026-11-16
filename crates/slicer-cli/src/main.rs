@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use serde_json::json;
 use slicer_core::{Diagnose, Diagnostic, Diagnostics};
 use slicer_profiles::Settings;
+use slicer_send::Target;
 
 #[derive(Parser)]
 #[command(
@@ -43,6 +44,26 @@ enum Command {
         /// Write one SVG preview per layer into this directory
         #[arg(long, value_name = "DIR")]
         svg: Option<PathBuf>,
+        /// Also upload the G-code to a printer, e.g. moonraker://host:7125
+        /// or octoprint://host (moonraker+https:// and octoprint+https://
+        /// for TLS)
+        #[arg(long, value_name = "PRINTER")]
+        send: Option<String>,
+        #[command(flatten)]
+        printer: PrinterOptions,
+        /// Print the result (or the error) as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Upload an existing G-code file to a printer (Moonraker or OctoPrint)
+    Send {
+        /// G-code file
+        input: PathBuf,
+        /// Printer, e.g. moonraker://host:7125 or octoprint://host
+        #[arg(long, value_name = "PRINTER")]
+        to: String,
+        #[command(flatten)]
+        printer: PrinterOptions,
         /// Print the result (or the error) as JSON
         #[arg(long)]
         json: bool,
@@ -80,6 +101,40 @@ enum Command {
     },
 }
 
+/// How G-code is handed to a printer.
+#[derive(clap::Args)]
+struct PrinterOptions {
+    /// Start printing the file once it is uploaded
+    #[arg(long)]
+    start: bool,
+    /// API key of the printer [default: environment variable
+    /// SPAGHETTI_PRINTER_API_KEY, which keeps it out of the process list]
+    #[arg(long, value_name = "KEY")]
+    api_key: Option<String>,
+}
+
+impl PrinterOptions {
+    /// The printer at `address` with the API key from the options or the
+    /// environment.
+    fn target(self, address: &str) -> Result<(Target, bool), Diagnostic> {
+        let key = self
+            .api_key
+            .or_else(|| std::env::var("SPAGHETTI_PRINTER_API_KEY").ok());
+        Ok((Target::parse(address)?.with_api_key(key), self.start))
+    }
+}
+
+/// Uploads G-code; the `sent` part of the report.
+fn send(
+    (target, start): &(Target, bool),
+    file_name: &str,
+    gcode: &[u8],
+    warnings: &mut Diagnostics,
+) -> Result<serde_json::Value, Diagnostic> {
+    let sent = slicer_send::upload(target, file_name, gcode, *start, warnings)?;
+    Ok(json!({ "printer": target.to_string(), "file": sent.file, "started": sent.started }))
+}
+
 /// Names the file a diagnostic concerns.
 fn in_file(path: &Path) -> impl Fn(Diagnostic) -> Diagnostic + '_ {
     move |diagnostic| {
@@ -114,9 +169,25 @@ fn main() -> ExitCode {
             set,
             plate,
             svg,
+            send,
+            printer,
             json,
         } => report(
-            slice(input, output, &config, &set, plate, svg),
+            send.map(|address| printer.target(&address))
+                .transpose()
+                .and_then(|send| slice(input, output, &config, &set, plate, svg, send)),
+            json,
+            print_summary,
+        ),
+        Command::Send {
+            input,
+            to,
+            printer,
+            json,
+        } => report(
+            printer
+                .target(&to)
+                .and_then(|target| send_file(&input, &target)),
             json,
             print_summary,
         ),
@@ -174,6 +245,7 @@ fn slice(
     overrides: &[String],
     plate: Option<u32>,
     svg: Option<PathBuf>,
+    printer: Option<(Target, bool)>,
 ) -> Result<serde_json::Value, Diagnostic> {
     let mut settings = Settings::default();
     for path in config {
@@ -226,11 +298,49 @@ fn slice(
         }
     }
 
-    Ok(json!({
+    // A printer gets plain G-code, also when a project file was written.
+    let sent = match &printer {
+        Some(printer) => {
+            let name = output
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let name = if container {
+                name[..name.len() - ".3mf".len()].to_string()
+            } else {
+                name
+            };
+            Some(send(
+                printer,
+                &name,
+                result.gcode.as_bytes(),
+                &mut warnings,
+            )?)
+        }
+        None => None,
+    };
+
+    let mut report = json!({
         "output": output.display().to_string(),
         "stats": result.stats,
         "warnings": warnings.as_slice(),
-    }))
+    });
+    if let Some(sent) = sent {
+        report["sent"] = sent;
+    }
+    Ok(report)
+}
+
+/// Uploads an existing G-code file.
+fn send_file(input: &Path, printer: &(Target, bool)) -> Result<serde_json::Value, Diagnostic> {
+    let gcode = fs::read(input).map_err(|e| io_error("io.read", input, &e))?;
+    let name = input
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut warnings = Diagnostics::new();
+    let sent = send(printer, &name, &gcode, &mut warnings)?;
+    Ok(json!({ "warnings": warnings.as_slice(), "sent": sent }))
 }
 
 fn slice_sla(
@@ -332,17 +442,31 @@ fn print_summary(result: &serde_json::Value) {
     let stats = &result["stats"];
     let number = |key: &str| stats[key].as_f64().unwrap_or(0.0);
     let seconds = number("print_time_s") as u64;
-    println!("Wrote {}", result["output"].as_str().unwrap_or_default());
-    println!("  layers:    {}", stats["layers"]);
-    println!(
-        "  filament:  {:.2} m, {:.1} g",
-        number("filament_length_mm") / 1000.0,
-        number("filament_weight_g")
-    );
-    println!(
-        "  time:      {}h {:02}m {:02}s (estimate with acceleration, without heating)",
-        seconds / 3600,
-        seconds / 60 % 60,
-        seconds % 60
-    );
+    if let Some(output) = result["output"].as_str() {
+        println!("Wrote {output}");
+        println!("  layers:    {}", stats["layers"]);
+        println!(
+            "  filament:  {:.2} m, {:.1} g",
+            number("filament_length_mm") / 1000.0,
+            number("filament_weight_g")
+        );
+        println!(
+            "  time:      {}h {:02}m {:02}s (estimate with acceleration, without heating)",
+            seconds / 3600,
+            seconds / 60 % 60,
+            seconds % 60
+        );
+    }
+    let sent = &result["sent"];
+    if let Some(printer) = sent["printer"].as_str() {
+        println!(
+            "Sent {} to {printer}{}",
+            sent["file"].as_str().unwrap_or_default(),
+            if sent["started"] == true {
+                "; the print started"
+            } else {
+                ""
+            }
+        );
+    }
 }
