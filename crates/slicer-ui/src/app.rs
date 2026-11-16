@@ -14,8 +14,7 @@ use slicer_ui::job::{
     with_output_extension,
 };
 use slicer_ui::plate::{
-    Model, Placement, SCALE_RANGE, bed_center, check_placement, load_model, offset_from_center,
-    outline_contains, placed_outline, transformed_mesh,
+    Placement, Plate, SCALE_RANGE, bed_center, check_placement, load_model, placed_outline,
 };
 use slicer_ui::settings::{CommonSettings, SettingsFile, build_settings, load_settings};
 use slicer_ui::view::{PlateView, kind_name, kinds_in, path_color};
@@ -58,8 +57,8 @@ enum Tab {
 struct Sliced {
     result: SliceResult,
     settings: Settings,
-    placement: Placement,
-    model_serial: u64,
+    placements: Vec<Placement>,
+    serial: u64,
 }
 
 /// What a drag in the plate view does.
@@ -71,10 +70,7 @@ enum Drag {
 
 /// The application state.
 pub struct App {
-    model: Option<Model>,
-    /// Counts loaded models, to tell whether a slice belongs to this one.
-    model_serial: u64,
-    placement: Placement,
+    plate: Plate,
     files: Vec<(PathBuf, SettingsFile)>,
     /// Settings from the files, before edits.
     base: Settings,
@@ -98,9 +94,7 @@ impl App {
     pub fn new(paths: &[PathBuf]) -> Self {
         let base = Settings::default();
         let mut app = Self {
-            model: None,
-            model_serial: 0,
-            placement: Placement::centered(&base),
+            plate: Plate::default(),
             files: Vec::new(),
             common: CommonSettings::from_settings(&base),
             current: Ok(base.clone()),
@@ -140,8 +134,7 @@ impl App {
             let settings: Vec<PathBuf> = settings.into_iter().cloned().collect();
             self.add_settings_files(&settings);
         }
-        // One model at a time: the last one wins.
-        if let Some(path) = models.last() {
+        for path in models {
             self.open_model(path);
         }
     }
@@ -155,17 +148,14 @@ impl App {
             });
         match loaded {
             Ok((model, warnings)) => {
-                self.notes.clear();
                 self.note(
                     Level::Info,
                     format!("Opened {name} ({} triangles)", model.mesh.triangles.len()),
                 );
                 self.notes
                     .extend(warnings.as_slice().iter().map(Note::from));
-                self.model = Some(model);
-                self.model_serial += 1;
                 let settings = self.current.as_ref().unwrap_or(&self.base);
-                self.placement = Placement::centered(settings);
+                self.plate.add(model, settings);
                 self.sliced = None;
                 self.job = None;
                 self.tab = Tab::Plate;
@@ -215,8 +205,10 @@ impl App {
             Ok(settings) => {
                 // A model in the middle of the old bed goes to the middle of
                 // the new one.
-                if self.placement.center == bed_center(&self.base) {
-                    self.placement.center = bed_center(&settings);
+                for item in &mut self.plate.items {
+                    if item.placement.center == bed_center(&self.base) {
+                        item.placement.center = bed_center(&settings);
+                    }
                 }
                 self.common = CommonSettings::from_settings(&settings);
                 self.base = settings;
@@ -232,25 +224,20 @@ impl App {
 
     /// Why slicing is not possible now, if it is not.
     fn slice_blocker(&self) -> Option<String> {
-        let Some(model) = &self.model else {
-            return Some("Open a model first.".to_owned());
-        };
         let settings = match &self.current {
             Ok(settings) => settings,
-            Err(error) => return Some(error.message.clone()),
+            Err(error) if !self.plate.items.is_empty() => return Some(error.message.clone()),
+            Err(_) => &self.base,
         };
-        check_placement(model, &self.placement, settings)
-            .err()
-            .map(|error| error.message)
+        self.plate.check(settings).err().map(|error| error.message)
     }
 
     fn start_slice(&mut self, ctx: &egui::Context) {
-        let (Some(model), Ok(settings)) = (&self.model, &self.current) else {
+        let Ok(settings) = &self.current else {
             return;
         };
         let request = SliceRequest {
-            mesh: transformed_mesh(model, &self.placement),
-            offset: offset_from_center(&self.placement, settings),
+            objects: self.plate.meshes(),
             settings: settings.clone(),
         };
         let ctx = ctx.clone();
@@ -278,8 +265,8 @@ impl App {
                     self.sliced = Some(Sliced {
                         result,
                         settings: settings.clone(),
-                        placement: self.placement,
-                        model_serial: self.model_serial,
+                        placements: self.plate.placements(),
+                        serial: self.plate.serial,
                     });
                     self.layer = 0;
                     self.tab = Tab::Preview;
@@ -296,8 +283,8 @@ impl App {
     /// and settings.
     fn slice_is_current(&self) -> bool {
         self.sliced.as_ref().is_some_and(|sliced| {
-            sliced.model_serial == self.model_serial
-                && sliced.placement == self.placement
+            sliced.serial == self.plate.serial
+                && sliced.placements == self.plate.placements()
                 && self.current.as_ref() == Ok(&sliced.settings)
         })
     }
@@ -306,7 +293,7 @@ impl App {
         let Some(sliced) = &self.sliced else {
             return;
         };
-        let model_name = self.model.as_ref().map_or("model", |m| m.name.as_str());
+        let model_name = self.plate.items.first().map_or("model", |i| &i.model.name);
         let (label, extension) = if gcode_3mf {
             ("Bambu Lab project", "gcode.3mf")
         } else {
@@ -344,33 +331,57 @@ impl App {
     }
 
     fn model_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Model");
+        ui.heading("Models");
+        let bed = self.bed();
         ui.horizontal(|ui| {
-            if ui.button("Open…").clicked()
-                && let Some(path) = rfd::FileDialog::new()
+            if ui.button("Add…").clicked()
+                && let Some(paths) = rfd::FileDialog::new()
                     .add_filter("Models", &["stl", "3mf"])
-                    .pick_file()
+                    .pick_files()
             {
-                self.open_model(&path);
+                for path in paths {
+                    self.open_model(&path);
+                }
             }
-            ui.weak("or drop a file here");
+            let arrange = egui::Button::new("Arrange");
+            if ui
+                .add_enabled(!self.plate.items.is_empty(), arrange)
+                .on_hover_text("Place all models side by side")
+                .clicked()
+            {
+                self.plate
+                    .arrange(self.current.as_ref().unwrap_or(&self.base));
+            }
+            ui.weak("or drop files here");
         });
-        let Some(model) = &self.model else {
+        let mut clicked = None;
+        for (index, item) in self.plate.items.iter().enumerate() {
+            let (s, size) = (item.placement.scale, item.model.size);
+            let text = format!(
+                "{}: {:.1} × {:.1} × {:.1} mm",
+                item.model.name,
+                size[0] * s,
+                size[1] * s,
+                size[2] * s
+            );
+            if ui
+                .selectable_label(self.plate.selected == Some(index), text)
+                .clicked()
+            {
+                clicked = Some(index);
+            }
+        }
+        if clicked.is_some() {
+            self.plate.selected = clicked;
+        }
+        let Some(item) = self.plate.selected_mut() else {
             return;
         };
-        let s = self.placement.scale;
-        ui.label(format!(
-            "{}: {:.1} × {:.1} × {:.1} mm",
-            model.name,
-            model.size[0] * s,
-            model.size[1] * s,
-            model.size[2] * s
-        ));
-        let bed = self.bed();
+        let placement = &mut item.placement;
         egui::Grid::new("placement").num_columns(2).show(ui, |ui| {
             ui.label("X");
             ui.add(
-                egui::DragValue::new(&mut self.placement.center[0])
+                egui::DragValue::new(&mut placement.center[0])
                     .speed(0.5)
                     .range(0.0..=bed[0])
                     .suffix(" mm"),
@@ -378,7 +389,7 @@ impl App {
             ui.end_row();
             ui.label("Y");
             ui.add(
-                egui::DragValue::new(&mut self.placement.center[1])
+                egui::DragValue::new(&mut placement.center[1])
                     .speed(0.5)
                     .range(0.0..=bed[1])
                     .suffix(" mm"),
@@ -387,21 +398,21 @@ impl App {
             ui.label("Rotation");
             ui.horizontal(|ui| {
                 ui.add(
-                    egui::DragValue::new(&mut self.placement.rotation_deg)
+                    egui::DragValue::new(&mut placement.rotation_deg)
                         .speed(1.0)
                         .range(-360.0..=360.0)
                         .suffix("°"),
                 );
                 if ui.small_button("−90°").clicked() {
-                    self.placement.rotation_deg = (self.placement.rotation_deg - 90.0) % 360.0;
+                    placement.rotation_deg = (placement.rotation_deg - 90.0) % 360.0;
                 }
                 if ui.small_button("+90°").clicked() {
-                    self.placement.rotation_deg = (self.placement.rotation_deg + 90.0) % 360.0;
+                    placement.rotation_deg = (placement.rotation_deg + 90.0) % 360.0;
                 }
             });
             ui.end_row();
             ui.label("Scale");
-            let mut percent = self.placement.scale * 100.0;
+            let mut percent = placement.scale * 100.0;
             let (min, max) = SCALE_RANGE;
             if ui
                 .add(
@@ -412,22 +423,27 @@ impl App {
                 )
                 .changed()
             {
-                self.placement.scale = percent / 100.0;
+                placement.scale = percent / 100.0;
             }
             ui.end_row();
         });
+        let mut delete = false;
         ui.horizontal(|ui| {
             if ui.button("Center").clicked() {
-                self.placement.center = [bed[0] / 2.0, bed[1] / 2.0];
+                placement.center = [bed[0] / 2.0, bed[1] / 2.0];
             }
             if ui.button("Reset").clicked() {
-                self.placement = Placement {
+                *placement = Placement {
                     center: [bed[0] / 2.0, bed[1] / 2.0],
                     rotation_deg: 0.0,
                     scale: 1.0,
                 };
             }
+            delete = ui.button("Delete").clicked();
         });
+        if delete {
+            self.plate.remove_selected();
+        }
     }
 
     fn settings_section(&mut self, ui: &mut egui::Ui) {
@@ -627,30 +643,39 @@ impl App {
             self.view = PlateView::default();
         }
         let frame = self.view.frame(area_min, area_size, bed);
-        let outline = self
-            .model
-            .as_ref()
-            .map(|model| placed_outline(model, &self.placement))
-            .unwrap_or_default();
-
+        let outlines: Vec<Vec<[f64; 2]>> = self
+            .plate
+            .items
+            .iter()
+            .map(|item| placed_outline(&item.model, &item.placement))
+            .collect();
+        let under_pointer = response
+            .interact_pointer_pos()
+            .and_then(|pos| self.plate.at(frame.to_bed([pos.x, pos.y])));
+        if response.clicked() && self.tab == Tab::Plate {
+            self.plate.selected = under_pointer;
+        }
         if response.drag_started() {
-            let on_model = response
-                .interact_pointer_pos()
-                .is_some_and(|pos| outline_contains(&outline, frame.to_bed([pos.x, pos.y])));
             let primary = response.dragged_by(PointerButton::Primary);
-            self.drag = Some(if primary && on_model && self.tab == Tab::Plate {
-                Drag::Model
-            } else {
-                Drag::Pan
+            self.drag = Some(match under_pointer {
+                Some(index) if primary && self.tab == Tab::Plate => {
+                    self.plate.selected = Some(index);
+                    Drag::Model
+                }
+                _ => Drag::Pan,
             });
         }
         if response.dragged() {
             let delta = response.drag_delta();
             match self.drag {
                 Some(Drag::Model) => {
-                    let center = &mut self.placement.center;
-                    center[0] = (center[0] + f64::from(delta.x / frame.scale)).clamp(0.0, bed[0]);
-                    center[1] = (center[1] - f64::from(delta.y / frame.scale)).clamp(0.0, bed[1]);
+                    if let Some(item) = self.plate.selected_mut() {
+                        let center = &mut item.placement.center;
+                        center[0] =
+                            (center[0] + f64::from(delta.x / frame.scale)).clamp(0.0, bed[0]);
+                        center[1] =
+                            (center[1] - f64::from(delta.y / frame.scale)).clamp(0.0, bed[1]);
+                    }
                 }
                 Some(Drag::Pan) | None => {
                     self.view.pan[0] += delta.x;
@@ -688,13 +713,13 @@ impl App {
         );
 
         match self.tab {
-            Tab::Plate => self.paint_outline(&painter, &outline, &to_screen),
+            Tab::Plate => self.paint_outlines(&painter, &outlines, &to_screen),
             Tab::Preview => self.paint_layer(&painter, frame.scale, &to_screen),
         }
 
         let hint = match self.tab {
             Tab::Plate => {
-                "Drag the model to move it · scroll to zoom · drag elsewhere to pan · double-click to fit"
+                "Click a model to select it, drag to move it · scroll to zoom · drag elsewhere to pan · double-click to fit"
             }
             Tab::Preview => {
                 "Scroll to zoom · drag to pan · double-click to fit · arrow keys change the layer"
@@ -709,34 +734,35 @@ impl App {
         );
     }
 
-    fn paint_outline(
+    fn paint_outlines(
         &self,
         painter: &egui::Painter,
-        outline: &[[f64; 2]],
+        outlines: &[Vec<[f64; 2]>],
         to_screen: &dyn Fn([f64; 2]) -> Pos2,
     ) {
-        let (Some(model), Ok(settings)) = (&self.model, &self.current) else {
+        let Ok(settings) = &self.current else {
             return;
         };
-        if outline.len() < 3 {
-            return;
+        for (index, (item, outline)) in self.plate.items.iter().zip(outlines).enumerate() {
+            if outline.len() < 3 {
+                continue;
+            }
+            let fits = check_placement(&item.model, &item.placement, settings).is_ok();
+            let [r, g, b] = if fits { [76, 141, 255] } else { [230, 60, 60] };
+            let selected = self.plate.selected == Some(index);
+            let (alpha, width) = if selected { (110, 2.5) } else { (50, 1.0) };
+            let line = Color32::from_rgb(r, g, b);
+            let fill = Color32::from_rgba_unmultiplied(r, g, b, alpha);
+            let points: Vec<Pos2> = outline.iter().map(|&p| to_screen(p)).collect();
+            painter.add(Shape::convex_polygon(
+                points,
+                fill,
+                Stroke::new(width, line),
+            ));
+            if selected {
+                painter.circle_filled(to_screen(item.placement.center), 3.0, line);
+            }
         }
-        let fits = check_placement(model, &self.placement, settings).is_ok();
-        let (fill, line) = if fits {
-            (
-                Color32::from_rgba_unmultiplied(76, 141, 255, 90),
-                Color32::from_rgb(76, 141, 255),
-            )
-        } else {
-            (
-                Color32::from_rgba_unmultiplied(230, 60, 60, 90),
-                Color32::from_rgb(230, 60, 60),
-            )
-        };
-        let points: Vec<Pos2> = outline.iter().map(|&p| to_screen(p)).collect();
-        painter.add(Shape::convex_polygon(points, fill, Stroke::new(2.0, line)));
-        let center = to_screen(self.placement.center);
-        painter.circle_filled(center, 3.0, line);
     }
 
     fn paint_layer(

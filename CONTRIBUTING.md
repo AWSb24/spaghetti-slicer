@@ -80,6 +80,7 @@ All three must pass. New behaviour needs a test.
 | Resin print archive (`.sla.zip`) | Own design, described in `docs/sla-format.md` |
 | Anycubic Photon Mono X screen and build volume | Manufacturer's product page |
 | Import of Orca Slicer profiles | Key names and value formats read from profiles a user saved in Orca Slicer, as data files; no source code or shipped profile read |
+| Arranging objects on the plate (shelf packing of bounding boxes) | Next-fit decreasing height: Coffman, Garey, Johnson, Tarjan, "Performance bounds for level-oriented two-dimensional packing algorithms", SIAM J. Comput. 9(4), 1980 |
 
 The initial implementation was written with an AI coding assistant, without consulting the source code of other slicers.
 

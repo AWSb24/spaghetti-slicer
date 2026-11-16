@@ -1,10 +1,5 @@
-//! A model on the build plate: loading, placing, rotating and scaling.
-//!
-//! The slicer always centres the model on the bed. A different position is
-//! applied afterwards by moving the finished toolpaths, which gives the same
-//! result because path generation does not depend on where the model sits.
-// ponytail: once the core places objects itself (several objects on one
-// plate), the shift after slicing goes away and the placement is passed in.
+//! Models on the build plate: loading, placing, rotating, scaling and
+//! arranging them. The slicer gets every model where it is placed.
 
 use slicer_core::{Diagnostic, Diagnostics, Mesh};
 use slicer_fdm::Toolpaths;
@@ -144,9 +139,8 @@ pub fn outline_contains(outline: &[[f64; 2]], point: [f64; 2]) -> bool {
             .all(|(a, b)| cross(*a, *b, point) >= 0.0)
 }
 
-/// The mesh to slice: rotated and scaled. Its position does not matter
-/// because the slicer centres it; see [`offset_from_center`].
-pub fn transformed_mesh(model: &Model, placement: &Placement) -> Mesh {
+/// The mesh to slice: rotated, scaled and moved to its place on the bed.
+pub fn placed_mesh(model: &Model, placement: &Placement) -> Mesh {
     let mut mesh = model.mesh.clone();
     mesh.rotate_z(placement.rotation_deg.to_radians());
     for v in &mut mesh.vertices {
@@ -154,17 +148,14 @@ pub fn transformed_mesh(model: &Model, placement: &Placement) -> Mesh {
             *c *= placement.scale;
         }
     }
+    if let Some((lo, hi)) = mesh.bounds() {
+        mesh.translate([
+            placement.center[0] - (lo[0] + hi[0]) / 2.0,
+            placement.center[1] - (lo[1] + hi[1]) / 2.0,
+            0.0,
+        ]);
+    }
     mesh
-}
-
-/// How far the toolpaths must move from the bed centre, where the slicer
-/// puts the model, to the chosen placement.
-pub fn offset_from_center(placement: &Placement, settings: &Settings) -> [f64; 2] {
-    let center = bed_center(settings);
-    [
-        placement.center[0] - center[0],
-        placement.center[1] - center[1],
-    ]
 }
 
 /// Checks that the placed model can be sliced: a sensible scale, inside the
@@ -210,16 +201,103 @@ pub fn check_placement(
     Ok(())
 }
 
-/// Moves every path of every layer by `offset` in X and Y.
-pub fn shift_toolpaths(toolpaths: &mut Toolpaths, offset: [f64; 2]) {
-    for point in toolpaths
-        .layers
-        .iter_mut()
-        .flat_map(|layer| &mut layer.paths)
-        .flat_map(|path| &mut path.points)
-    {
-        point[0] += offset[0];
-        point[1] += offset[1];
+/// A model and where it sits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Item {
+    /// The model as loaded.
+    pub model: Model,
+    /// Its position, rotation and scale.
+    pub placement: Placement,
+}
+
+/// The models on the build plate and which one is selected.
+#[derive(Debug, Clone, Default)]
+pub struct Plate {
+    /// The models in the order they were added.
+    pub items: Vec<Item>,
+    /// Index of the selected model, which the side panel edits.
+    pub selected: Option<usize>,
+    /// Counts models added and removed, to tell whether a slice shows the
+    /// current plate.
+    pub serial: u64,
+}
+
+impl Plate {
+    /// Puts a model in the middle of the bed and selects it.
+    pub fn add(&mut self, model: Model, settings: &Settings) {
+        self.items.push(Item {
+            model,
+            placement: Placement::centered(settings),
+        });
+        self.selected = Some(self.items.len() - 1);
+        self.serial += 1;
+    }
+
+    /// Removes the selected model; nothing is selected afterwards.
+    pub fn remove_selected(&mut self) {
+        if let Some(index) = self.selected.take().filter(|&i| i < self.items.len()) {
+            self.items.remove(index);
+            self.serial += 1;
+        }
+    }
+
+    /// The selected model.
+    pub fn selected_mut(&mut self) -> Option<&mut Item> {
+        self.items.get_mut(self.selected?)
+    }
+
+    /// The topmost (last added) model whose outline contains `point`.
+    pub fn at(&self, point: [f64; 2]) -> Option<usize> {
+        self.items.iter().rposition(|item| {
+            outline_contains(&placed_outline(&item.model, &item.placement), point)
+        })
+    }
+
+    /// Where every model sits, in order.
+    pub fn placements(&self) -> Vec<Placement> {
+        self.items.iter().map(|item| item.placement).collect()
+    }
+
+    /// Places all models side by side without overlap (see
+    /// [`slicer_fdm::arrange`]); rotation and scale stay.
+    pub fn arrange(&mut self, settings: &Settings) {
+        let sizes: Vec<[f64; 2]> = self
+            .items
+            .iter()
+            .map(|item| {
+                bounds_2d(placed_outline(&item.model, &item.placement))
+                    .map_or([0.0, 0.0], |(lo, hi)| [hi[0] - lo[0], hi[1] - lo[1]])
+            })
+            .collect();
+        let corners = slicer_fdm::arrange(&sizes, settings, slicer_fdm::ARRANGE_GAP);
+        for ((item, size), corner) in self.items.iter_mut().zip(&sizes).zip(corners) {
+            item.placement.center = [corner[0] + size[0] / 2.0, corner[1] + size[1] / 2.0];
+        }
+    }
+
+    /// Checks every model with [`check_placement`]; the message names the
+    /// model when there are several.
+    pub fn check(&self, settings: &Settings) -> Result<(), Diagnostic> {
+        if self.items.is_empty() {
+            return Err(Diagnostic::error("ui.no_model", "Open a model first."));
+        }
+        for item in &self.items {
+            check_placement(&item.model, &item.placement, settings).map_err(|mut error| {
+                if self.items.len() > 1 {
+                    error.message = format!("{}: {}", item.model.name, error.message);
+                }
+                error
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The meshes to slice, each where it is placed.
+    pub fn meshes(&self) -> Vec<Mesh> {
+        self.items
+            .iter()
+            .map(|item| placed_mesh(&item.model, &item.placement))
+            .collect()
     }
 }
 
@@ -331,16 +409,16 @@ mod tests {
     }
 
     #[test]
-    fn transformed_mesh_matches_outline() {
+    fn placed_mesh_matches_outline() {
         let model = cube_model(20.0, 10.0, 5.0);
         let placement = Placement {
-            center: [0.0, 0.0],
+            center: [70.0, 30.0],
             rotation_deg: 30.0,
             scale: 1.5,
         };
-        let (lo, hi) = transformed_mesh(&model, &placement).bounds().unwrap();
+        let (lo, hi) = placed_mesh(&model, &placement).bounds().unwrap();
         let (outline_lo, outline_hi) = bounds_2d(placed_outline(&model, &placement)).unwrap();
-        // Same size seen from above, centred on the origin.
+        // Same place seen from above.
         assert!(near([lo[0], lo[1]], outline_lo));
         assert!(near([hi[0], hi[1]], outline_hi));
         assert!((hi[2] - 7.5).abs() < 1e-9);
@@ -381,25 +459,65 @@ mod tests {
     }
 
     #[test]
-    fn toolpaths_move_to_the_placement() {
-        let model = cube_model(20.0, 10.0, 2.0);
+    fn models_are_sliced_where_they_are_placed() {
         let settings = Settings {
             skirt_loops: 0,
             ..Settings::default()
         };
-        let placement = Placement {
-            center: [30.0, 40.0],
-            rotation_deg: 0.0,
-            scale: 1.0,
-        };
-        let mut toolpaths =
-            slicer_fdm::generate(&transformed_mesh(&model, &placement), &settings).unwrap();
-        shift_toolpaths(&mut toolpaths, offset_from_center(&placement, &settings));
+        let mut plate = Plate::default();
+        plate.add(cube_model(20.0, 10.0, 2.0), &settings);
+        plate.add(cube_model(10.0, 10.0, 2.0), &settings);
+        plate.items[0].placement.center = [30.0, 40.0];
+        plate.items[1].placement.center = [150.0, 60.0];
+        assert!(plate.check(&settings).is_ok());
+        let toolpaths = slicer_fdm::generate_plate(
+            &plate.meshes(),
+            slicer_fdm::Placement::AsGiven,
+            &settings,
+            &mut Diagnostics::new(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
         let (lo, hi) = toolpath_bounds(&toolpaths).unwrap();
-        // The outer wall lies half a line width inside the model's outline.
-        let center = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0];
-        assert!((center[0] - 30.0).abs() < 0.01 && (center[1] - 40.0).abs() < 0.01);
-        assert!(hi[0] - lo[0] < 20.0 && hi[0] - lo[0] > 19.0);
+        // The outer walls lie half a line width inside the outlines.
+        assert!(near(lo, [20.225, 35.225]) && near(hi, [154.775, 64.775]));
+    }
+
+    #[test]
+    fn plate_holds_several_models() {
+        let settings = Settings::default();
+        let mut plate = Plate::default();
+        assert_eq!(plate.check(&settings).unwrap_err().code, "ui.no_model");
+        plate.add(cube_model(20.0, 10.0, 5.0), &settings);
+        plate.add(cube_model(30.0, 30.0, 5.0), &settings);
+        assert_eq!(plate.selected, Some(1));
+        // Both in the middle: the one added last is on top.
+        assert_eq!(plate.at([110.0, 110.0]), Some(1));
+        assert_eq!(plate.at([10.0, 10.0]), None);
+
+        plate.arrange(&settings);
+        let placements = plate.placements();
+        // The deeper one comes first, 5 mm gap, centred: X 82.5 to 112.5
+        // and 117.5 to 137.5, both from Y 95 backwards.
+        assert!(near(placements[1].center, [97.5, 110.0]), "{placements:?}");
+        assert!(near(placements[0].center, [127.5, 100.0]), "{placements:?}");
+        assert_eq!(plate.at([127.5, 100.0]), Some(0));
+        plate.arrange(&settings);
+        assert_eq!(plate.placements(), placements, "arranging is repeatable");
+
+        plate.items[0].placement.center = [5.0, 110.0];
+        let error = plate.check(&settings).unwrap_err();
+        assert_eq!(error.code, "ui.off_bed");
+        assert!(error.message.starts_with("cube: "), "{}", error.message);
+
+        let serial = plate.serial;
+        plate.selected = Some(0);
+        plate.remove_selected();
+        assert_eq!(plate.items.len(), 1);
+        assert_eq!(plate.selected, None);
+        assert!(plate.serial > serial);
+        plate.remove_selected();
+        assert_eq!(plate.items.len(), 1);
     }
 
     #[test]

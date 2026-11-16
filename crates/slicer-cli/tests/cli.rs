@@ -355,3 +355,169 @@ fn slices_a_cube_for_a_resin_printer() {
     assert!(!out.status.success());
     assert!(text(&out.stderr).contains("unknown resin setting 'nozzle_temp'"));
 }
+
+/// X and Y of the outer wall moves of layer `index` (from 0).
+fn outer_wall_points(gcode: &str, index: usize) -> Vec<[f64; 2]> {
+    let layer = gcode.split(";LAYER_CHANGE").nth(index + 1).unwrap();
+    let mut points = Vec::new();
+    for section in layer.split(";TYPE:").skip(1) {
+        if !section.starts_with("Outer wall") {
+            continue;
+        }
+        for line in section
+            .lines()
+            .filter(|l| l.starts_with("G1 ") && l.contains(" E"))
+        {
+            let value = |axis: char| {
+                line.split(' ')
+                    .find_map(|word| word.strip_prefix(axis))
+                    .map(|v| v.parse::<f64>().unwrap())
+            };
+            if let (Some(x), Some(y)) = (value('X'), value('Y')) {
+                points.push([x, y]);
+            }
+        }
+    }
+    points
+}
+
+/// Smallest and largest X of the points left and right of `split`.
+fn x_ranges(points: &[[f64; 2]], split: f64) -> [[f64; 2]; 2] {
+    let range = |left: bool| {
+        points
+            .iter()
+            .map(|p| p[0])
+            .filter(|&x| (x < split) == left)
+            .fold([f64::MAX, f64::MIN], |r, x| [r[0].min(x), r[1].max(x)])
+    };
+    [range(true), range(false)]
+}
+
+#[test]
+fn several_models_are_arranged_side_by_side() {
+    let dir = workdir("arrange");
+    let cube = slicer_formats::write_stl_binary(&Mesh::cuboid(20.0, 20.0, 20.0));
+    let (a, b) = (dir.join("a.stl"), dir.join("b.stl"));
+    fs::write(&a, &cube).unwrap();
+    fs::write(&b, &cube).unwrap();
+    let plate = dir.join("plate.gcode");
+    let out = run(&[
+        "slice",
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+        "-o",
+        plate.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["warnings"].as_array().unwrap().len(), 0);
+    let gcode = fs::read_to_string(&plate).unwrap();
+    // Two 20 mm cubes 5 mm apart, centred on the 220 mm bed: X 87.5 to
+    // 107.5 and 112.5 to 132.5. Outer walls lie half a line width inside.
+    for layer in [0, 99] {
+        let points = outer_wall_points(&gcode, layer);
+        let [left, right] = x_ranges(&points, 110.0);
+        for (range, expected) in [(left, [87.725, 107.275]), (right, [112.725, 132.275])] {
+            assert!(
+                (range[0] - expected[0]).abs() < 1e-3 && (range[1] - expected[1]).abs() < 1e-3,
+                "layer {layer}: {range:?}"
+            );
+        }
+        assert!(points.iter().all(|p| (p[1] - 110.0).abs() < 10.0));
+    }
+
+    // Kept where the files put them, both cubes stand at the origin.
+    let out = run(&[
+        "slice",
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+        "--keep-positions",
+        "--json",
+    ]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["warnings"][0]["code"], "slicing.objects_overlap");
+
+    // A plate that does not fit names the file that ends up outside.
+    let out = run(&[
+        "slice",
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+        "-s",
+        "bed_size_x=40",
+        "-s",
+        "bed_size_y=40",
+        "--json",
+    ]);
+    assert!(!out.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "slicing.outside_bed");
+    assert!(
+        error["error"]["context"]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("b.stl")
+    );
+}
+
+#[test]
+fn build_items_of_a_3mf_can_keep_their_positions() {
+    let dir = workdir("keep");
+    let cube = Mesh::cuboid(10.0, 10.0, 10.0);
+    let vertices: String = cube
+        .vertices
+        .iter()
+        .map(|[x, y, z]| format!("<vertex x=\"{x}\" y=\"{y}\" z=\"{z}\"/>"))
+        .collect();
+    let triangles: String = cube
+        .triangles
+        .iter()
+        .map(|[a, b, c]| format!("<triangle v1=\"{a}\" v2=\"{b}\" v3=\"{c}\"/>"))
+        .collect();
+    let model = format!(
+        "<?xml version=\"1.0\"?><model unit=\"millimeter\" xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\"><resources><object id=\"1\" type=\"model\"><mesh><vertices>{vertices}</vertices><triangles>{triangles}</triangles></mesh></object></resources><build><item objectid=\"1\" transform=\"1 0 0 0 1 0 0 0 1 30 40 0\"/><item objectid=\"1\" transform=\"1 0 0 0 1 0 0 0 1 150 160 0\"/></build></model>"
+    );
+    let file = dir.join("two.3mf");
+    fs::write(
+        &file,
+        slicer_formats::write_package(&[("3D/3dmodel.model", &model)]).unwrap(),
+    )
+    .unwrap();
+
+    let kept = dir.join("kept.gcode");
+    let out = run(&[
+        "slice",
+        file.to_str().unwrap(),
+        "--keep-positions",
+        "-o",
+        kept.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let points = outer_wall_points(&fs::read_to_string(&kept).unwrap(), 0);
+    let [left, right] = x_ranges(&points, 100.0);
+    assert!((left[0] - 30.225).abs() < 1e-3 && (left[1] - 39.775).abs() < 1e-3);
+    assert!((right[0] - 150.225).abs() < 1e-3 && (right[1] - 159.775).abs() < 1e-3);
+
+    // Without the option the items move together to the middle of the bed:
+    // the pair spans 130 mm, so it starts at X 45.
+    let out = run(&["slice", file.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let points = outer_wall_points(&fs::read_to_string(dir.join("two.gcode")).unwrap(), 0);
+    let [left, right] = x_ranges(&points, 100.0);
+    assert!((left[0] - 45.225).abs() < 1e-3, "{left:?}");
+    assert!((right[1] - 174.775).abs() < 1e-3, "{right:?}");
+
+    // Kept positions must lie on the bed.
+    let out = run(&[
+        "slice",
+        file.to_str().unwrap(),
+        "--keep-positions",
+        "-s",
+        "bed_size_x=100",
+        "--json",
+    ]);
+    assert!(!out.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "slicing.outside_bed");
+}
