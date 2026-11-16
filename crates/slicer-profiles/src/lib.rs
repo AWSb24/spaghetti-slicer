@@ -31,6 +31,12 @@ pub enum InfillPattern {
     Rectilinear,
     /// Lines in both directions on every layer.
     Grid,
+    /// Lines in three directions 60° apart on every layer, forming
+    /// triangles.
+    Triangles,
+    /// Wavy lines from the cross-section of a gyroid surface; the waves turn
+    /// with the height.
+    Gyroid,
 }
 
 /// Order in which the walls of a layer are printed.
@@ -144,7 +150,8 @@ pub struct Settings {
     /// Sparse infill pattern.
     pub infill_pattern: InfillPattern,
     /// Direction of the infill lines in degrees from the X axis; every
-    /// other layer is turned by 90 degrees.
+    /// other layer is turned by 90 degrees. Triangles keep it on every
+    /// layer; the gyroid ignores it.
     pub infill_angle: f64,
     /// How far infill reaches into the innermost wall, in percent of the line width.
     pub infill_overlap: f64,

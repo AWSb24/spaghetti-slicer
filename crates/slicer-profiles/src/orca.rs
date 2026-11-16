@@ -83,7 +83,11 @@ const MAPPING: &[(&str, &str, Kind)] = &[
     (
         "sparse_infill_pattern",
         "infill_pattern",
-        Kind::Choice(&[("grid", "grid")]),
+        Kind::Choice(&[
+            ("grid", "grid"),
+            ("triangles", "triangles"),
+            ("gyroid", "gyroid"),
+        ]),
     ),
     ("infill_direction", "infill_angle", Kind::Angle),
     ("infill_wall_overlap", "infill_overlap", Kind::Percent),
@@ -317,7 +321,7 @@ mod tests {
         assert_eq!(settings.layer_height, 0.16);
         assert_eq!(settings.wall_loops, 3);
         assert_eq!(settings.infill_density, 10.0);
-        assert_eq!(settings.infill_pattern, InfillPattern::Grid);
+        assert_eq!(settings.infill_pattern, InfillPattern::Gyroid);
         assert_eq!(settings.infill_overlap, 25.0);
         assert_eq!(settings.infill_angle, 45.0);
         assert_eq!(settings.seam_position, SeamPosition::Rear);
@@ -328,15 +332,14 @@ mod tests {
         };
         assert_eq!(skipped(&machine), ["machine_start_gcode"]);
         assert_eq!(skipped(&filament), ["pressure_advance"]);
-        assert_eq!(
-            skipped(&process),
-            [
-                "bridge_acceleration",
-                "skirt_loops",
-                "sparse_infill_pattern"
-            ]
-        );
-        assert_eq!(process.taken.len(), 7);
+        assert_eq!(skipped(&process), ["bridge_acceleration", "skirt_loops"]);
+        assert_eq!(process.taken.len(), 8);
+
+        // Patterns without a counterpart leave the setting alone.
+        let other = r#"{ "sparse_infill_pattern": "honeycomb" }"#;
+        let other = import_orca(other, &mut settings).unwrap();
+        assert_eq!(skipped(&other), ["sparse_infill_pattern"]);
+        assert_eq!(settings.infill_pattern, InfillPattern::Gyroid);
     }
 
     #[test]

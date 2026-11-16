@@ -11,10 +11,12 @@ use std::f64::consts::{FRAC_1_SQRT_2, FRAC_PI_4};
 
 use i_overlay::core::fill_rule::FillRule;
 use i_overlay::core::overlay_rule::OverlayRule;
+use i_overlay::float::clip::FloatClip;
 use i_overlay::float::scale::FixedScaleFloatOverlay;
 use i_overlay::float::single::SingleFloatOverlay;
 use i_overlay::mesh::float::outline::offset::OutlineOffset;
 use i_overlay::mesh::float::style::{LineJoin, OutlineStyle};
+use i_overlay::string::clip::ClipRule;
 
 /// A point in the XY plane, in millimetres.
 pub type Point = [f64; 2];
@@ -111,6 +113,31 @@ pub fn difference(a: &Shapes, b: &Shapes) -> Shapes {
         return a.clone();
     }
     boolean(a, b, OverlayRule::Difference)
+}
+
+/// The parts of open polylines that lie inside `shapes`. Where pieces meet
+/// end to start, they come back as one polyline, so `lines` may as well be
+/// loose segments, as long as consecutive ones point the same way. The
+/// direction of a result is not guaranteed.
+pub fn clip_polylines(shapes: &Shapes, lines: &[Vec<Point>]) -> Vec<Vec<Point>> {
+    if shapes.is_empty() || lines.is_empty() {
+        return Vec::new();
+    }
+    let (fill, rule) = (
+        FillRule::NonZero,
+        ClipRule {
+            invert: false,
+            boundary_included: false,
+        },
+    );
+    let mut clipped = lines
+        .clip_by_fixed_scale(shapes, fill, rule, SCALE)
+        .unwrap_or_else(|_| lines.clip_by(shapes, fill, rule));
+    for point in clipped.iter_mut().flatten() {
+        point[0] = (point[0] * SCALE).round() / SCALE;
+        point[1] = (point[1] * SCALE).round() / SCALE;
+    }
+    clipped
 }
 
 /// Grows (`delta > 0`) or shrinks (`delta < 0`) shapes by `delta` millimetres
@@ -751,6 +778,35 @@ mod tests {
         assert_eq!(cleaned[0].len(), 2);
         assert_eq!(cleaned[0][0].len(), 4);
         assert_eq!(cleaned[0][1], real_hole);
+    }
+
+    #[test]
+    fn polylines_are_clipped_and_joined() {
+        let shapes = from_loops(&[square(0.0, 0.0, 20.0), square(5.0, 5.0, 10.0)]);
+        // A zigzag across the hole, given as loose segments.
+        let points = [
+            [-5.0, 10.0],
+            [2.0, 12.0],
+            [10.0, 10.0],
+            [18.0, 12.0],
+            [25.0, 10.0],
+        ];
+        let segments: Vec<Vec<Point>> = points.windows(2).map(<[Point]>::to_vec).collect();
+        let mut pieces = clip_polylines(&shapes, &segments);
+        assert_eq!(pieces.len(), 2, "{pieces:?}");
+        for piece in &mut pieces {
+            if piece[0][0] > piece[piece.len() - 1][0] {
+                piece.reverse();
+            }
+        }
+        pieces.sort_by(|a, b| a[0][0].total_cmp(&b[0][0]));
+        // Left: from the outline over the corner at x 2 to the hole.
+        assert_eq!(pieces[0].len(), 3);
+        assert!(distance(pieces[0][0], [0.0, 10.0 + 10.0 / 7.0]) < GRID);
+        assert_eq!(pieces[0][1], [2.0, 12.0]);
+        assert_eq!(pieces[0][2][0], 5.0);
+        assert_eq!(pieces[1][pieces[1].len() - 1][0], 20.0);
+        assert!(clip_polylines(&Vec::new(), &segments).is_empty());
     }
 
     #[test]
