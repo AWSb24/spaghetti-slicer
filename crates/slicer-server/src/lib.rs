@@ -42,6 +42,9 @@ pub struct Config {
     /// If set, finished jobs are kept in this directory and survive a
     /// restart (`SPAGHETTI_DATA_DIR`).
     pub data_dir: Option<PathBuf>,
+    /// If set, the browser app built by `tools/build-web.sh` is served from
+    /// this directory at `/app/` (`SPAGHETTI_WEB_DIR`).
+    pub web_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -54,6 +57,7 @@ impl Default for Config {
             result_ttl: Duration::from_secs(3600),
             token: None,
             data_dir: None,
+            web_dir: None,
         }
     }
 }
@@ -97,6 +101,9 @@ impl Config {
             )?),
             token: lookup("SPAGHETTI_TOKEN").filter(|token| !token.is_empty()),
             data_dir: lookup("SPAGHETTI_DATA_DIR")
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from),
+            web_dir: lookup("SPAGHETTI_WEB_DIR")
                 .filter(|dir| !dir.is_empty())
                 .map(PathBuf::from),
         };
@@ -362,7 +369,26 @@ impl App {
         let api = api
             .layer(DefaultBodyLimit::max(self.config.max_upload_bytes))
             .layer(middleware::from_fn_with_state(self.clone(), authorize));
+        // The browser app: static files, outside the API and its token.
+        let web = Router::new()
+            .route(
+                "/app",
+                get(|| async { axum::response::Redirect::permanent("/app/") }),
+            )
+            .route(
+                "/app/",
+                get(|State(app): State<App>| async move { web_file(&app, "").await }),
+            )
+            .route(
+                "/app/{*path}",
+                get(
+                    |State(app): State<App>, Path(path): Path<String>| async move {
+                        web_file(&app, &path).await
+                    },
+                ),
+            );
         public
+            .merge(web)
             .nest("/v1", api)
             .fallback(|| async {
                 failure(
@@ -595,6 +621,52 @@ async fn authorize(State(app): State<App>, request: Request, next: Next) -> Resp
         }
     }
     next.run(request).await
+}
+
+/// A file of the browser app below `/app/`; the directory itself is
+/// `index.html`.
+async fn web_file(app: &App, path: &str) -> Response {
+    let Some(dir) = &app.config.web_dir else {
+        return failure(
+            StatusCode::NOT_FOUND,
+            "web.not_installed",
+            "the browser app is not installed on this server; build it with tools/build-web.sh and set SPAGHETTI_WEB_DIR",
+        );
+    };
+    let path = std::path::Path::new(if path.is_empty() { "index.html" } else { path });
+    // Only plain names below the directory: no `..`, no absolute paths.
+    let plain = path
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)));
+    let file = dir.join(path);
+    let bytes = if plain {
+        tokio::task::spawn_blocking(move || std::fs::read(file))
+            .await
+            .ok()
+            .and_then(Result::ok)
+    } else {
+        None
+    };
+    let Some(bytes) = bytes else {
+        return failure(
+            StatusCode::NOT_FOUND,
+            "request.not_found",
+            "no such file in the browser app",
+        );
+    };
+    let content_type = match path.extension().and_then(|e| e.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript",
+        // Browsers compile WebAssembly while it streams only with this type.
+        Some("wasm") => "application/wasm",
+        Some("css") => "text/css",
+        Some("json") => "application/json",
+        Some("png") => "image/png",
+        Some("svg") => "image/svg+xml",
+        Some("ico") => "image/x-icon",
+        _ => "application/octet-stream",
+    };
+    ([(header::CONTENT_TYPE, content_type)], bytes).into_response()
 }
 
 async fn health() -> Json<Value> {

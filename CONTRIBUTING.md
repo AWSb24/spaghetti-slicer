@@ -74,6 +74,7 @@ All three must pass. New behaviour needs a test.
 | `;TYPE:` and `;LAYER_CHANGE` comments | Naming convention read by common G-code viewers, used for interoperability |
 | Thin walls and gap fill | Centre line by shrinking a region and averaging its two sides; skip test by Steiner's formula for parallel sets; own design |
 | Desktop app | `eframe`/`egui` (MIT OR Apache-2.0), `rfd` (MIT); layout own design |
+| Browser build of the desktop app | eframe's web runner; `wasm-bindgen`, `wasm-bindgen-futures`, `js-sys`, `web-sys`, `web-time` (MIT OR Apache-2.0); downloads through a Blob URL after the MDN Web API documentation |
 | Default start and end G-code | Generic Marlin commands, not taken from any profile |
 | Resin layer images (scanline fill with non-zero winding, supersampling) | Standard scanline fill, own design |
 | PNG writer for resin layers | PNG specification (ISO/IEC 15948); `flate2` and `crc32fast` crates (MIT OR Apache-2.0) |

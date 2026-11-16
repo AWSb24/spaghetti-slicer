@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Spaghetti Slicer</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #1b1b1b; color: #ccc; font-family: sans-serif; }
+    canvas { display: block; width: 100%; height: 100%; }
+    #loading { position: absolute; top: 50%; left: 0; right: 0; text-align: center; }
+  </style>
+</head>
+<body>
+  <canvas id="slicer"></canvas>
+  <p id="loading">Loading the slicer…</p>
+  <!-- Models are sliced in this page; nothing is uploaded. -->
+  <script type="module">
+    import init from "./slicer.js";
+    init().catch((error) => {
+      document.getElementById("loading").textContent = "The slicer could not start: " + error;
+    });
+  </script>
+</body>
+</html>
