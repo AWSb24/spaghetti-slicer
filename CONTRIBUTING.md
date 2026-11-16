@@ -80,6 +80,7 @@ All three must pass. New behaviour needs a test.
 | Thin walls and gap fill | Centre line by shrinking a region and averaging its two sides; skip test by Steiner's formula for parallel sets; own design |
 | Folded walls in regions one to two lines wide | Morphological opening (shrink, then grow back) of a wall's centre area finds where its loop's sides lie closer than a line; textbook mathematical morphology (Serra), own design |
 | Desktop app | `eframe`/`egui` (MIT OR Apache-2.0), `rfd` (MIT); layout own design |
+| 3D view (orbit camera, look-at and perspective matrices, flat shading) | Textbook OpenGL matrices as documented for `gluLookAt`/`gluPerspective`; drawn with `glow`/`egui_glow` (MIT OR Apache-2.0, already used by eframe); own design |
 | Default start and end G-code | Generic Marlin commands, not taken from any profile |
 | Resin layer images (scanline fill with non-zero winding, supersampling) | Standard scanline fill, own design |
 | PNG writer for resin layers | PNG specification (ISO/IEC 15948); `flate2` and `crc32fast` crates (MIT OR Apache-2.0) |

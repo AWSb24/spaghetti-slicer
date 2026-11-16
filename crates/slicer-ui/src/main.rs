@@ -7,6 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod view3d;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -21,6 +22,8 @@ fn main() -> ExitCode {
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([800.0, 500.0])
             .with_drag_and_drop(true),
+        // The 3D view needs a depth buffer.
+        depth_buffer: 24,
         ..Default::default()
     };
     let result = eframe::run_native(

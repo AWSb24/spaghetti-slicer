@@ -6,7 +6,9 @@
 //! (egui) lives in the binary and only calls into these modules, so they
 //! can be tested and reused by a later web build.
 
+pub mod camera;
 pub mod job;
 pub mod plate;
+pub mod scene;
 pub mod settings;
 pub mod view;
