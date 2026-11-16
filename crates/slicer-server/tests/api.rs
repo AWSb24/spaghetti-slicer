@@ -105,9 +105,10 @@ async fn the_api_description_matches_the_router() {
     // Every operation exists: with a token it is answered by its handler,
     // not by the fallback, and never with "method not allowed".
     let id = "00000000-0000-4000-8000-000000000000";
-    let mut operations = 0;
+    let mut described = Vec::new();
     for (path, methods) in served["paths"].as_object().unwrap() {
         for (method, operation) in methods.as_object().unwrap() {
+            described.push((method.as_str(), path.as_str()));
             let request = Request::builder()
                 .method(method.to_uppercase().as_str())
                 .uri(path.replace("{id}", id))
@@ -127,10 +128,14 @@ async fn the_api_description_matches_the_router() {
                 announced.contains_key(status.as_str()),
                 "{method} {path} answered {status}"
             );
-            operations += 1;
         }
     }
-    assert_eq!(operations, 7);
+    // The router is built from this list, so a route that is not
+    // described (or described but not routed) shows up here.
+    let mut routed = slicer_server::operations();
+    described.sort_unstable();
+    routed.sort_unstable();
+    assert_eq!(described, routed);
 }
 
 #[tokio::test]
