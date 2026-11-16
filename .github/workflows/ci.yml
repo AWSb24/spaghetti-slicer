@@ -37,6 +37,9 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
+      # The workspace includes the desktop UI (slicer-ui). Its window
+      # libraries (X11, Wayland, OpenGL) are loaded at run time, so Linux
+      # needs no extra packages to build and test it.
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 

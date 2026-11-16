@@ -4,7 +4,9 @@ use std::fmt::Write;
 
 use crate::{Layer, PathKind};
 
-fn color(kind: PathKind) -> &'static str {
+/// Colour of a path kind as `#rrggbb`, shared by the SVG preview and the
+/// layer view of the desktop UI.
+pub fn color(kind: PathKind) -> &'static str {
     match kind {
         PathKind::Skirt | PathKind::Brim => "#8a8a8a",
         PathKind::Support => "#c9a227",
