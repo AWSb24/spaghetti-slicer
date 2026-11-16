@@ -127,6 +127,19 @@ pub struct Settings {
     pub layer_height: f64,
     /// Height of the first layer.
     pub first_layer_height: f64,
+    /// Whether layers after the first one get thinner where the surface of
+    /// the model is shallow and thicker where it is steep, between
+    /// `min_layer_height` and `max_layer_height`. `layer_height` then only
+    /// sets the thickness of the top and bottom shells (`top_layers` or
+    /// `bottom_layers` times `layer_height`) and the steepest overhang that
+    /// needs no support.
+    pub adaptive_layers: bool,
+    /// Thinnest layer with adaptive layers, used where the surface is nearly
+    /// flat. On a sloped surface layers are only so thick that the steps
+    /// they leave are no higher than on a flat one printed at this height.
+    pub min_layer_height: f64,
+    /// Thickest layer with adaptive layers, used where the walls are steep.
+    pub max_layer_height: f64,
     /// Width of one extruded line.
     pub line_width: f64,
     /// Number of wall loops.
@@ -225,6 +238,9 @@ impl Default for Settings {
             bridge_fan_speed: 100.0,
             layer_height: 0.2,
             first_layer_height: 0.2,
+            adaptive_layers: false,
+            min_layer_height: 0.1,
+            max_layer_height: 0.3,
             line_width: 0.45,
             wall_loops: 2,
             wall_order: WallOrder::InnerOuter,
@@ -436,7 +452,15 @@ impl Settings {
     /// Every numeric setting with its value and the smallest and largest
     /// value allowed. Some limits depend on other settings.
     pub fn limits(&self) -> Vec<(&'static str, f64, f64, f64)> {
-        let thickest = self.layer_height.max(self.first_layer_height);
+        let mut thickest = self.layer_height.max(self.first_layer_height);
+        // The limits of adaptive layers only bind while they are on, so that
+        // the defaults stay valid for nozzles thinner than they are thick.
+        let tallest = if self.adaptive_layers {
+            thickest = thickest.max(self.max_layer_height);
+            self.nozzle_diameter
+        } else {
+            self.nozzle_diameter.max(self.max_layer_height)
+        };
         vec![
             ("bed_size_x", self.bed_size_x, 10.0, 2000.0),
             ("bed_size_y", self.bed_size_y, 10.0, 2000.0),
@@ -472,6 +496,13 @@ impl Settings {
                 0.02,
                 self.nozzle_diameter,
             ),
+            (
+                "min_layer_height",
+                self.min_layer_height,
+                0.02,
+                self.max_layer_height,
+            ),
+            ("max_layer_height", self.max_layer_height, 0.02, tallest),
             (
                 "line_width",
                 self.line_width,
@@ -606,6 +637,18 @@ mod tests {
         assert!(s.set("technology", "sla").is_err());
         assert!(s.set("infill_density", "150").is_err());
         assert_eq!(s.infill_density, 100.0);
+    }
+
+    #[test]
+    fn adaptive_layer_limits_bind_only_while_on() {
+        // A thin nozzle keeps the defaults valid while adaptive layers are off.
+        let mut s = Settings::from_toml("nozzle_diameter = 0.25\nline_width = 0.25\nlayer_height = 0.1\nfirst_layer_height = 0.15").unwrap();
+        assert!(s.set("adaptive_layers", "true").is_err());
+        s.set("max_layer_height", "0.25").unwrap();
+        assert!(s.set("adaptive_layers", "true").is_err(), "line too narrow");
+        s.set("line_width", "0.3").unwrap();
+        s.set("adaptive_layers", "true").unwrap();
+        assert!(s.set("min_layer_height", "0.3").is_err());
     }
 
     #[test]

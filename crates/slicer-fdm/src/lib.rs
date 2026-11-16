@@ -1,5 +1,6 @@
 //! FDM toolpath generation: perimeters, infill, supports and path planning.
 
+mod adaptive;
 pub mod preview;
 
 use std::fmt;
@@ -243,25 +244,30 @@ pub fn generate_cancellable(
         -min[2],
     ]);
 
-    // Layer i ends at first_layer_height + i * layer_height and is cut at
-    // its mid-height.
-    let mut tops = Vec::new();
-    loop {
-        let top = settings.first_layer_height + tops.len() as f64 * settings.layer_height;
-        if top > size[2] + 1e-6 {
-            break;
-        }
-        tops.push(top);
-    }
-    let heights: Vec<f64> = (0..tops.len())
-        .map(|i| {
-            if i == 0 {
-                settings.first_layer_height
-            } else {
-                settings.layer_height
+    // Without adaptive layers layer i ends at first_layer_height + i *
+    // layer_height. Every layer is cut at its mid-height.
+    let (tops, heights) = if settings.adaptive_layers {
+        adaptive::plan(&mesh, size[2], settings)
+    } else {
+        let mut tops = Vec::new();
+        loop {
+            let top = settings.first_layer_height + tops.len() as f64 * settings.layer_height;
+            if top > size[2] + 1e-6 {
+                break;
             }
-        })
-        .collect();
+            tops.push(top);
+        }
+        let heights: Vec<f64> = (0..tops.len())
+            .map(|i| {
+                if i == 0 {
+                    settings.first_layer_height
+                } else {
+                    settings.layer_height
+                }
+            })
+            .collect();
+        (tops, heights)
+    };
     let cut_heights: Vec<f64> = tops
         .iter()
         .zip(&heights)
@@ -290,6 +296,12 @@ pub fn generate_cancellable(
         if index == 0 {
             return Vec::new();
         }
+        // The same angle reaches less far between slices closer together.
+        let reach = if settings.adaptive_layers {
+            reach * (cut_heights[index] - cut_heights[index - 1]) / settings.layer_height
+        } else {
+            reach
+        };
         let below = polygon::offset(&slices[index - 1], reach);
         polygon::clean(polygon::difference(&slices[index], &below), least, 0.0)
     });
@@ -310,7 +322,7 @@ pub fn generate_cancellable(
         if stopped() {
             return (Vec::new(), false);
         }
-        layer_work(&slices, &supports, index, settings)
+        layer_work(&slices, &heights, &supports, index, settings)
     });
     if stopped() {
         return Err(FdmError::Cancelled);
@@ -439,7 +451,9 @@ fn travels_inside(layer: &Layer, slice: &Shapes) -> Vec<bool> {
 /// model, with one empty layer under the surface they carry and above the
 /// model they stand on, and one line width of distance to its sides. The
 /// dense part is what lies right under a carried surface.
-// ponytail: straight columns. No supports that lean or branch.
+// ponytail: straight columns. No supports that lean or branch. The gaps are
+// one layer whatever its thickness, so with adaptive layers they are as thin
+// as the layers there.
 fn support_areas(
     slices: &[Shapes],
     hanging: &[Shapes],
@@ -506,6 +520,7 @@ enum Work {
 /// by a wall.
 fn layer_work(
     slices: &[Shapes],
+    heights: &[f64],
     supports: &[(Shapes, Shapes)],
     index: usize,
     settings: &Settings,
@@ -585,7 +600,7 @@ fn layer_work(
     if fill_area.is_empty() {
         return (work, thin);
     }
-    let (solid, sparse) = split_solid_sparse(slices, index, &fill_area, settings);
+    let (solid, sparse) = split_solid_sparse(slices, heights, index, &fill_area, settings);
 
     let turn = if index.is_multiple_of(2) { 0.0 } else { 90.0 };
     let direction = HatchDirection::degrees(settings.infill_angle + turn);
@@ -634,16 +649,15 @@ fn layer_work(
 /// (top and bottom surfaces) and the part that gets sparse infill.
 fn split_solid_sparse(
     slices: &[Shapes],
+    heights: &[f64],
     index: usize,
     fill_area: &Shapes,
     settings: &Settings,
 ) -> (Shapes, Shapes) {
-    let bottom = settings.bottom_layers as usize;
-    let top = settings.top_layers as usize;
     // Without enough layers below or above, the whole layer is a surface.
-    if (bottom > 0 && index < bottom) || (top > 0 && index + top >= slices.len()) {
+    let Some((bottom, top)) = shell_layers(heights, index, settings) else {
         return (fill_area.clone(), Vec::new());
-    }
+    };
     // Interior is what is covered by every layer within reach above and below.
     let mut interior = fill_area.clone();
     for neighbour in (index - bottom..index).chain(index + 1..=index + top) {
@@ -670,6 +684,35 @@ fn split_solid_sparse(
     }
     let sparse = polygon::difference(fill_area, &solid);
     (solid, sparse)
+}
+
+/// How many layers below and above layer `index` form its bottom and top
+/// shell, or `None` when there are not enough of them and the layer is a
+/// surface itself. With adaptive layers the shells keep the thickness they
+/// have with constant layers, `bottom_layers` or `top_layers` times
+/// `layer_height`, however many layers that takes.
+fn shell_layers(heights: &[f64], index: usize, settings: &Settings) -> Option<(usize, usize)> {
+    let bottom = settings.bottom_layers as usize;
+    let top = settings.top_layers as usize;
+    if !settings.adaptive_layers {
+        let surface = (bottom > 0 && index < bottom) || (top > 0 && index + top >= heights.len());
+        return (!surface).then_some((bottom, top));
+    }
+    let count = |layers: &mut dyn Iterator<Item = &f64>, layer_count: usize| {
+        let wanted = layer_count as f64 * settings.layer_height - 1e-6;
+        let (mut total, mut count) = (0.0, 0);
+        for height in layers {
+            if total >= wanted {
+                break;
+            }
+            total += height;
+            count += 1;
+        }
+        (total >= wanted).then_some(count)
+    };
+    let below = count(&mut heights[..index].iter().rev(), bottom)?;
+    let above = count(&mut heights[index + 1..].iter(), top)?;
+    Some((below, above))
 }
 
 /// Whether `point` lies inside the shapes (even-odd).
@@ -1533,6 +1576,77 @@ mod tests {
         assert_eq!(
             generate(&mesh, &settings).unwrap(),
             generate(&mesh, &settings).unwrap()
+        );
+    }
+
+    fn adaptive() -> Settings {
+        let mut settings = Settings::default();
+        settings.adaptive_layers = true;
+        settings
+    }
+
+    #[test]
+    fn adaptive_layers_follow_the_slope() {
+        let mut settings = adaptive();
+        settings.infill_density = 100.0;
+        settings.infill_overlap = 0.0;
+        settings.skirt_loops = 0;
+        let mesh = slicer_core::primitives::sphere(15.0, 96);
+        let layers = generate(&mesh, &settings).unwrap().layers;
+        let (min, max) = (settings.min_layer_height, settings.max_layer_height);
+        assert!((layers[0].height - settings.first_layer_height).abs() < 1e-9);
+        for pair in layers.windows(2) {
+            let h = pair[1].height;
+            assert!(h > min - 1e-6 && h < max + 1e-6, "{h}");
+            assert!((pair[1].z - pair[0].z - h).abs() < 1e-9);
+        }
+        // Thin at the top, thick at the equator.
+        let at = |z: f64| {
+            layers
+                .iter()
+                .find(|layer| layer.z >= z)
+                .map(|layer| layer.height)
+                .unwrap()
+        };
+        assert!((at(15.0) - max).abs() < 1e-6, "{}", at(15.0));
+        assert!((at(29.8) - min).abs() < 0.005, "{}", at(29.8));
+        assert!((at(0.6) - min).abs() < 0.03, "{}", at(0.6));
+        // Far fewer layers than with the thinnest one throughout.
+        assert!(layers.len() < 210, "{}", layers.len());
+        // The model is no more than the thinnest layer taller than the print.
+        let top = layers.last().unwrap().z;
+        assert!(top <= 30.0 + 1e-6 && top > 30.0 - min, "{top}");
+        // Extrusion follows the thickness of every layer.
+        let volume: f64 = layers
+            .iter()
+            .map(|l| l.paths.iter().map(Path::length).sum::<f64>() * settings.line_width * l.height)
+            .sum();
+        let ratio = volume / mesh.volume();
+        assert!((ratio - 1.0).abs() < 0.05, "ratio {ratio}");
+    }
+
+    #[test]
+    fn adaptive_layers_end_on_flat_surfaces_and_keep_shell_thickness() {
+        let mut base = Mesh::cuboid(30.0, 30.0, 5.0);
+        let mut tower = Mesh::cuboid(10.0, 10.0, 10.0);
+        tower.translate([10.0, 10.0, 5.0]);
+        base.merge(&tower);
+        let settings = adaptive();
+        let layers = generate(&base, &settings).unwrap().layers;
+        // Walls are vertical: thick layers, ending on the step and the top.
+        assert!(layers[1..].iter().all(|l| l.height > 0.15), "{layers:?}");
+        assert!(layers.iter().any(|l| (l.z - 5.0).abs() < 1e-9));
+        assert!((layers.last().unwrap().z - 15.0).abs() < 1e-9);
+        // The top shell is as thick as five layers of 0.2 mm, not five layers.
+        let solid_on_top: f64 = layers
+            .iter()
+            .filter(|l| l.z > 10.0 && extruded_length(l, PathKind::SparseInfill) == 0.0)
+            .map(|l| l.height)
+            .sum();
+        let wanted = f64::from(settings.top_layers) * settings.layer_height;
+        assert!(
+            solid_on_top > wanted - 1e-6 && solid_on_top < wanted + settings.max_layer_height,
+            "{solid_on_top}"
         );
     }
 }
