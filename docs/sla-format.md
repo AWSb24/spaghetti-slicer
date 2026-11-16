@@ -74,9 +74,9 @@ the same program version gives a byte-identical archive.
 | `format`, `format_version` | Always `spaghetti-sla` and `1` for this description. Readers should reject other versions. |
 | `generator` | Program and version that wrote the archive. |
 | `image.pixel_size` | Width and height of one pixel in mm. |
-| `settings` | Every setting the print was sliced with (table below). |
-| `stats.layers` | Number of layers. |
-| `stats.resin_volume_ml` | Cured resin; partly lit pixels count in proportion. |
+| `settings` | Every setting the print was sliced with (table below). Settings of a feature that is switched off are left out: `elevation` and `raft_thickness` when 0, `supports` and all `support_*` keys without supports, `hollow_wall` and `drain_hole_diameter` without hollowing. A reader should take the defaults for missing keys. |
+| `stats.layers` | Number of layers, raft and elevation included. |
+| `stats.resin_volume_ml` | Cured resin of model, raft and supports together, after hollowing; partly lit pixels count in proportion. |
 | `stats.print_time_s` | Exposure of every layer plus lifting and lowering the plate after it. Acceleration, pauses and the light-off delay of the printer are not included. |
 | `layers[].file` | Image of the layer inside the archive. |
 | `layers[].z` | Top of the layer above the build plate in mm. |
@@ -106,6 +106,17 @@ Set with `--set key=value`. Lengths in mm, times in seconds, speeds in mm/s.
 | `lift_speed` | 2 | 0.01–100 | Speed of the plate going up |
 | `retract_speed` | 3 | 0.01–100 | Speed of the plate going down |
 | `antialiasing` | 4 | 1–16 | Samples per pixel along each axis; 1 turns anti-aliasing off |
+| `elevation` | 0 | 0–100 | Gap between the top of the raft (or the plate) and the lowest point of the model; needs supports |
+| `raft_thickness` | 0 | 0–10 | Raft under model and supports; 0 prints none |
+| `supports` | 0 | 0 or 1 | 1 prints supports from the raft up to overhangs |
+| `support_overhang_angle` | 45 | 0–89 | Downward-facing surfaces tilted further than this (degrees) from the vertical get supports |
+| `support_spacing` | 3 | 0.5–20 | Distance between support points on an overhang |
+| `support_tip_diameter` | 0.4 | 0.05–5 | Diameter where a support touches the model |
+| `support_tip_length` | 2 | 0.1–20 | Length of the cone from tip to pillar |
+| `support_pillar_diameter` | 1.2 | 0.2–10 | Diameter of a pillar |
+| `support_brace_height` | 10 | 0–1000 | Neighbouring pillars at least this tall get crossed braces; 0 none |
+| `hollow_wall` | 0 | 0–20 | Wall thickness of a hollowed model; 0 prints it solid |
+| `drain_hole_diameter` | 2 | 0–20 | Drain holes at the lowest points of each cavity; 0 none |
 
 Screen and height defaults are those of the reference printer, the Anycubic
 Photon Mono X: 8.9" monochrome LCD with 3840 × 2400 pixels, XY resolution
@@ -119,14 +130,52 @@ the resin; they have not been verified on the device.
 
 ## How the layers are made
 
-1. The mesh is centred on the screen and placed on the build plate.
+1. The mesh is centred on the screen. Its lowest point is placed
+   `raft_thickness + elevation` above the build plate.
 2. Layer `i` (from 0) covers `i · layer_height` to `(i + 1) · layer_height`
-   and is cut at its mid-height; the number of layers is the model height
-   divided by the layer height, rounded down.
-3. Each layer's contours are filled with the non-zero winding rule (outer
+   and is cut at its mid-height; the number of layers is the height of the
+   model's top above the plate divided by the layer height, rounded down.
+3. Hollowing (`hollow_wall` > 0): a point of a layer becomes cavity when a
+   ball of radius `hollow_wall` around it lies inside the model, so walls,
+   top and bottom keep that thickness. Per layer this is the layer shrunk
+   by the wall, intersected with the layers up to `hollow_wall` above and
+   below shrunk by `sqrt(hollow_wall² − dz²)` (at most 8 layers on each side
+   are compared, evenly spread). Wherever a cavity region does not overlap
+   the cavity of the layer below, it has a local lowest point: a vertical
+   drain hole of `drain_hole_diameter` is cut from there straight down
+   through the floor until it leaves the model. With `elevation` 0 such a
+   hole faces the plate and is closed by it (warning `sla.drain_on_plate`);
+   without holes the warning is `sla.sealed_cavity`.
+4. Supports (`supports` = 1): support points are the points of a grid of
+   `support_spacing` (anchored at the screen's corner) under every triangle
+   facing down more than `support_overhang_angle` from the vertical, plus
+   every vertex that no neighbour lies below (local minimum), at most one
+   per grid cell. A point is dropped when it is less than one layer above
+   the raft, when it is near a drain hole, or when the model lies below it
+   (checked at its centre and at four points on the pillar's edge). Each
+   remaining point gets a support drawn as discs in every layer: from the
+   raft up a pillar of `support_pillar_diameter`, then over
+   `support_tip_length` a cone narrowing to `support_tip_diameter`, which
+   reaches one tip radius into the model. Every pillar and its nearest
+   neighbour within twice the spacing get crossed braces rising at 45°
+   (half the pillar diameter thick) when both pillars' straight parts are
+   at least `support_brace_height` tall and the model is not in between.
+   Circles are 16-sided polygons (32 for drain holes).
+5. Raft (`raft_thickness` > 0): the convex hull of the pillar feet and the
+   model's lowest layer, grown by half a pillar diameter, in every layer
+   below `raft_thickness`.
+6. Each layer's contours are filled with the non-zero winding rule (outer
    contours counter-clockwise, holes clockwise), sampled at
    `antialiasing × antialiasing` evenly spaced points per pixel; the pixel
    value is the covered fraction times 255, rounded.
 
-Not done yet: supports, hollowing and drain holes, anti-aliasing by
-grey-level correction for a given resin, vendor formats.
+Raft, elevation and supports add layers, so they add exposure and plate
+moves to `stats.print_time_s`; raft, supports and hollowing change
+`stats.resin_volume_ml`. Both are computed from the images as before.
+
+Not done yet: auto-orientation; supports standing on the model (a point
+above another part of the model gets none, nor do the ceilings of
+cavities); small overhang islands between grid points that hold no local
+minimum; drain holes at positions given by the user; a chamfered raft
+edge; anti-aliasing by grey-level correction for a given resin; vendor
+formats. None of it has been printed.

@@ -79,6 +79,7 @@ All three must pass. New behaviour needs a test.
 | PNG writer for resin layers | PNG specification (ISO/IEC 15948); `flate2` and `crc32fast` crates (MIT OR Apache-2.0) |
 | Resin print archive (`.sla.zip`) | Own design, described in `docs/sla-format.md` |
 | Anycubic Photon Mono X screen and build volume | Manufacturer's product page |
+| Resin supports, raft and hollowing (grid support points, cone tips, 45° braces, hollowing as erosion by a ball, drain holes at cavity minima) | Own design; erosion from textbook mathematical morphology |
 | Import of Orca Slicer profiles | Key names and value formats read from profiles a user saved in Orca Slicer, as data files; no source code or shipped profile read |
 
 The initial implementation was written with an AI coding assistant, without consulting the source code of other slicers.
