@@ -24,6 +24,9 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `fan_speed` | 100 | 0 to 100 | Part cooling fan speed in percent. |
 | `fan_off_layers` | 1 | 0 or more | Number of initial layers printed with the fan off. |
 | `bridge_fan_speed` | 100 | 0 to 100 | Part cooling fan speed in percent while printing bridges. |
+| `min_layer_time` | 0 | 0 to 600 | Shortest time in seconds a layer may take, so that it can cool before the next one goes on top; smaller layers are printed slower. 0 turns it off. |
+| `min_print_speed` | 10 | 1 to 1000 | Slowest speed in mm/s that `min_layer_time` slows extrusion down to. |
+| `pressure_advance` | 0 | 0 to 2 | Pressure advance (linear advance) factor written at the start of the print: `M900 K` for Marlin, `SET_PRESSURE_ADVANCE` for Klipper. 0 leaves the printer's own value. |
 | `layer_height` | 0.2 | 0.02 to 0.4 * | Layer height. |
 | `first_layer_height` | 0.2 | 0.02 to 0.4 * | Height of the first layer. |
 | `adaptive_layers` | false | `true`, `false` | Whether layers after the first one get thinner where the surface of the model is shallow and thicker where it is steep, between `min_layer_height` and `max_layer_height`. `layer_height` then only sets the thickness of the top and bottom shells (`top_layers` or `bottom_layers` times `layer_height`) and the steepest overhang that needs no support. |
@@ -35,14 +38,19 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `seam_position` | rear | `rear`, `corner`, `nearest` | Where the walls of a layer start and end. |
 | `top_layers` | 5 | 0 to 1000 | Number of solid layers at the top. |
 | `bottom_layers` | 4 | 0 to 1000 | Number of solid layers at the bottom. |
+| `spiral_vase` | false | `true`, `false` | Vase mode: above the solid bottom layers, the outer wall alone is printed as one line rising continuously, without seams, infill or top layers. One wall loop, no supports. |
 | `infill_density` | 15 | 0 to 100 | Sparse infill density in percent. |
 | `infill_pattern` | grid | `rectilinear`, `grid`, `triangles`, `gyroid` | Sparse infill pattern. |
 | `infill_angle` | 45 | 0 to 180 | Direction of the infill lines in degrees from the X axis; every other layer is turned by 90 degrees. Triangles and the gyroid keep it on every layer. |
 | `infill_connect` | true | `true`, `false` | Whether the lines of rectilinear sparse infill are joined into zig-zags along the walls. Saves travel moves and retractions but uses more material (on small areas up to a third more infill). Along solid infill and bridges the lines stay apart. |
 | `infill_overlap` | 15 | 0 to 50 | How far infill reaches into the innermost wall, in percent of the line width. |
+| `ironing` | false | `true`, `false` | Whether top surfaces are ironed: the hot nozzle passes over them once more with very little material to smooth them. |
+| `ironing_flow` | 10 | 0 to 100 | Material extruded while ironing, in percent of a normal line. |
+| `ironing_spacing` | 0.1 | 0.01 to 2 | Distance between the lines of ironing. |
 | `skirt_loops` | 2 | 0 to 20 | Number of skirt loops around the first layer. |
 | `skirt_distance` | 4 | 0 to 50 | Distance between skirt and model. |
 | `brim_width` | 0 | 0 to 50 | Width of the brim attached to the first layer; 0 disables it. |
+| `elephant_foot_compensation` | 0 | 0 to 0.45 | How far the outline of the first layer is moved inwards, against the first layer squashing out wider than the model (elephant foot). 0 turns it off. |
 | `supports` | false | `true`, `false` | Whether to print supports under overhangs and bridges. |
 | `support_style` | normal | `normal`, `tree` | Shape of the supports: straight columns (`normal`) or branches that merge into trunks (`tree`). |
 | `support_spacing` | 2.5 | 0.5 to 20 | Distance between the lines of a support. Tree supports also touch the surface they carry at points this far apart. |
@@ -55,6 +63,7 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `inner_wall_speed` | 60 | 1 to 1000 | Speed of inner walls. |
 | `infill_speed` | 80 | 1 to 1000 | Speed of solid and sparse infill. |
 | `bridge_speed` | 30 | 1 to 1000 | Speed of bridges: solid infill with nothing below it. |
+| `ironing_speed` | 20 | 1 to 1000 | Speed of ironing. |
 | `bridge_flow` | 1 | 0.5 to 2 | Multiplier on the extruded amount of bridges, on top of `flow_ratio`. |
 | `first_layer_speed` | 25 | 1 to 1000 | Speed of all extrusion on the first layer. |
 | `travel_speed` | 150 | 1 to 2000 | Speed of moves without extrusion. |

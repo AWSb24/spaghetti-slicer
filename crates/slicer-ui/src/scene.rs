@@ -459,16 +459,19 @@ mod tests {
                 Layer {
                     z: 0.2,
                     height: 0.2,
+                    spiral: false,
                     paths: vec![path(PathKind::OuterWall, square.clone(), true)],
                 },
                 Layer {
                     z: 0.4,
                     height: 0.2,
+                    spiral: false,
                     paths: vec![],
                 },
                 Layer {
                     z: 0.6,
                     height: 0.2,
+                    spiral: false,
                     paths: vec![
                         path(PathKind::SparseInfill, square, false),
                         path(PathKind::Bridge, vec![[5.0, 5.0]], false),

@@ -164,7 +164,7 @@ pub fn step_from_code(code: u8) -> Option<Step> {
 }
 
 /// Every path kind, for reading them back.
-const KINDS: [PathKind; 10] = [
+const KINDS: [PathKind; 11] = [
     PathKind::Skirt,
     PathKind::Brim,
     PathKind::Support,
@@ -175,6 +175,7 @@ const KINDS: [PathKind; 10] = [
     PathKind::Bridge,
     PathKind::SparseInfill,
     PathKind::PrimeTower,
+    PathKind::Ironing,
 ];
 
 fn kind_code(kind: PathKind) -> u8 {
@@ -190,6 +191,7 @@ fn kind_code(kind: PathKind) -> u8 {
         PathKind::Bridge => 7,
         PathKind::SparseInfill => 8,
         PathKind::PrimeTower => 9,
+        PathKind::Ironing => 10,
     }
 }
 
@@ -233,9 +235,15 @@ fn write_toolpaths(out: &mut Writer, toolpaths: &Toolpaths) {
     let Toolpaths { layers } = toolpaths;
     out.len(layers.len());
     for layer in layers {
-        let Layer { z, height, paths } = layer;
+        let Layer {
+            z,
+            height,
+            paths,
+            spiral,
+        } = layer;
         out.f64(*z);
         out.f64(*height);
+        out.u8(u8::from(*spiral));
         out.len(paths.len());
         for path in paths {
             write_path(out, path);
@@ -248,6 +256,7 @@ fn read_toolpaths(input: &mut Reader) -> Result<Toolpaths, Malformed> {
         Ok(Layer {
             z: input.f64()?,
             height: input.f64()?,
+            spiral: input.u8()? != 0,
             paths: input.list(read_path)?,
         })
     })?;

@@ -146,6 +146,16 @@ pub struct Settings {
     pub fan_off_layers: u32,
     /// Part cooling fan speed in percent while printing bridges.
     pub bridge_fan_speed: f64,
+    /// Shortest time in seconds a layer may take, so that it can cool
+    /// before the next one goes on top; smaller layers are printed slower.
+    /// 0 turns it off.
+    pub min_layer_time: f64,
+    /// Slowest speed in mm/s that `min_layer_time` slows extrusion down to.
+    pub min_print_speed: f64,
+    /// Pressure advance (linear advance) factor written at the start of the
+    /// print: `M900 K` for Marlin, `SET_PRESSURE_ADVANCE` for Klipper. 0
+    /// leaves the printer's own value.
+    pub pressure_advance: f64,
 
     // Process
     /// Layer height.
@@ -177,6 +187,10 @@ pub struct Settings {
     pub top_layers: u32,
     /// Number of solid layers at the bottom.
     pub bottom_layers: u32,
+    /// Vase mode: above the solid bottom layers, the outer wall alone is
+    /// printed as one line rising continuously, without seams, infill or
+    /// top layers. One wall loop, no supports.
+    pub spiral_vase: bool,
     /// Sparse infill density in percent.
     pub infill_density: f64,
     /// Sparse infill pattern.
@@ -192,12 +206,23 @@ pub struct Settings {
     pub infill_connect: bool,
     /// How far infill reaches into the innermost wall, in percent of the line width.
     pub infill_overlap: f64,
+    /// Whether top surfaces are ironed: the hot nozzle passes over them
+    /// once more with very little material to smooth them.
+    pub ironing: bool,
+    /// Material extruded while ironing, in percent of a normal line.
+    pub ironing_flow: f64,
+    /// Distance between the lines of ironing.
+    pub ironing_spacing: f64,
     /// Number of skirt loops around the first layer.
     pub skirt_loops: u32,
     /// Distance between skirt and model.
     pub skirt_distance: f64,
     /// Width of the brim attached to the first layer; 0 disables it.
     pub brim_width: f64,
+    /// How far the outline of the first layer is moved inwards, against
+    /// the first layer squashing out wider than the model (elephant foot).
+    /// 0 turns it off.
+    pub elephant_foot_compensation: f64,
     /// Whether to print supports under overhangs and bridges.
     pub supports: bool,
     /// Shape of the supports: straight columns (`normal`) or branches that
@@ -229,6 +254,8 @@ pub struct Settings {
     pub infill_speed: f64,
     /// Speed of bridges: solid infill with nothing below it.
     pub bridge_speed: f64,
+    /// Speed of ironing.
+    pub ironing_speed: f64,
     /// Multiplier on the extruded amount of bridges, on top of `flow_ratio`.
     pub bridge_flow: f64,
     /// Speed of all extrusion on the first layer.
@@ -285,6 +312,9 @@ impl Default for Settings {
             fan_speed: 100.0,
             fan_off_layers: 1,
             bridge_fan_speed: 100.0,
+            min_layer_time: 0.0,
+            min_print_speed: 10.0,
+            pressure_advance: 0.0,
             layer_height: 0.2,
             first_layer_height: 0.2,
             adaptive_layers: false,
@@ -296,14 +326,19 @@ impl Default for Settings {
             seam_position: SeamPosition::Rear,
             top_layers: 5,
             bottom_layers: 4,
+            spiral_vase: false,
             infill_density: 15.0,
             infill_pattern: InfillPattern::Grid,
             infill_angle: 45.0,
             infill_connect: true,
             infill_overlap: 15.0,
+            ironing: false,
+            ironing_flow: 10.0,
+            ironing_spacing: 0.1,
             skirt_loops: 2,
             skirt_distance: 4.0,
             brim_width: 0.0,
+            elephant_foot_compensation: 0.0,
             supports: false,
             support_style: SupportStyle::Normal,
             support_spacing: 2.5,
@@ -316,6 +351,7 @@ impl Default for Settings {
             inner_wall_speed: 60.0,
             infill_speed: 80.0,
             bridge_speed: 30.0,
+            ironing_speed: 20.0,
             bridge_flow: 1.0,
             first_layer_speed: 25.0,
             travel_speed: 150.0,
@@ -649,6 +685,18 @@ impl Settings {
                 100.0,
             ),
             ("z_hop", self.z_hop, 0.0, 10.0),
+            ("min_layer_time", self.min_layer_time, 0.0, 600.0),
+            ("min_print_speed", self.min_print_speed, 1.0, 1000.0),
+            ("pressure_advance", self.pressure_advance, 0.0, 2.0),
+            (
+                "elephant_foot_compensation",
+                self.elephant_foot_compensation,
+                0.0,
+                self.line_width,
+            ),
+            ("ironing_flow", self.ironing_flow, 0.0, 100.0),
+            ("ironing_spacing", self.ironing_spacing, 0.01, 2.0),
+            ("ironing_speed", self.ironing_speed, 1.0, 1000.0),
         ]
     }
 }

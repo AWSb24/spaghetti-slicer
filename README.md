@@ -66,6 +66,16 @@ Thinner layers where the surface is shallow, thicker ones on steep walls (top an
 cargo run --release -p slicer-cli -- slice model.stl -s adaptive_layers=true -s min_layer_height=0.1 -s max_layer_height=0.3
 ```
 
+More print options, all off by default (see `docs/settings.md`):
+
+- `min_layer_time = 8` slows extrusion on small layers so that each takes at least 8 seconds to cool, but not below `min_print_speed`.
+- `pressure_advance = 0.04` writes `M900 K0.04` (Marlin) or `SET_PRESSURE_ADVANCE ADVANCE=0.04` (Klipper) at the start.
+- `elephant_foot_compensation = 0.15` prints the first layer that much smaller all round.
+- `spiral_vase = true` prints the outer wall alone above the solid bottom, as one line rising continuously, without seams.
+- `ironing = true` passes over every top surface once more with 10 % of the material (`ironing_flow`), lines `ironing_spacing` apart at `ironing_speed`.
+
+None of them has been tried on a printer yet.
+
 ### Calibration prints
 
 ```bash

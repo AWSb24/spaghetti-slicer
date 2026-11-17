@@ -64,7 +64,9 @@ fn settings_reference_is_current() {
                 "support_style" => "`normal`, `tree`".to_string(),
                 "extrusion_mode" => "`relative`, `absolute`".to_string(),
                 "fan_off_layers" => "0 or more".to_string(),
-                "supports" | "adaptive_layers" | "infill_connect" => "`true`, `false`".to_string(),
+                "supports" | "adaptive_layers" | "infill_connect" | "spiral_vase" | "ironing" => {
+                    "`true`, `false`".to_string()
+                }
                 "start_gcode" | "end_gcode" | "toolchange_gcode" => {
                     "text with `{key}` placeholders".to_string()
                 }

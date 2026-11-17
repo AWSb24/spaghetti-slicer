@@ -123,6 +123,8 @@ pub enum PathKind {
     /// Tower beside the model that an extruder primes into after a tool
     /// change.
     PrimeTower,
+    /// A pass with very little material over a top surface to smooth it.
+    Ironing,
 }
 
 /// A continuous extrusion.
@@ -170,6 +172,9 @@ pub struct Layer {
     pub height: f64,
     /// Paths in printing order.
     pub paths: Vec<Path>,
+    /// Vase mode: the layer's one outer wall rises from the height of the
+    /// layer below to `z` as it goes round (see `Settings::spiral_vase`).
+    pub spiral: bool,
 }
 
 /// The complete print, layer by layer from the bed up.
@@ -383,6 +388,21 @@ pub fn generate_plate_with_object_settings(
     progress: &Progress,
 ) -> Result<Toolpaths, FdmError> {
     let stopped = || stop.load(Ordering::Relaxed);
+    // Vase mode prints one wall and nothing inside or on top, the same for
+    // every object.
+    let vase;
+    let (settings, own) = if settings.spiral_vase {
+        vase = Settings {
+            wall_loops: 1,
+            top_layers: 0,
+            infill_density: 0.0,
+            supports: false,
+            ..settings.clone()
+        };
+        (&vase, &[][..])
+    } else {
+        (settings, own)
+    };
     // Objects with equal settings form a group. With a single group its
     // settings are those of the whole plate.
     let (groups, membership) = objects::groups(objects.len(), own, settings);
@@ -748,6 +768,7 @@ pub fn generate_plate_with_object_settings(
             Layer {
                 z: tops[index],
                 height: heights[index],
+                spiral: settings.spiral_vase && index >= settings.bottom_layers as usize,
                 paths,
             }
         })
@@ -1133,7 +1154,15 @@ fn region_work(
     index: usize,
     settings: &Settings,
 ) -> (Vec<Work>, bool) {
-    let slice = &slices[index];
+    // The first layer squashes out wider than the model; it is printed
+    // that much smaller.
+    let shrunk;
+    let slice = if index == 0 && settings.elephant_foot_compensation > 0.0 {
+        shrunk = polygon::offset(&slices[0], -settings.elephant_foot_compensation);
+        &shrunk
+    } else {
+        &slices[index]
+    };
     let width = settings.line_width;
     let walls = settings.wall_loops as usize;
     let mut work = Vec::new();
@@ -1330,6 +1359,19 @@ fn region_work(
                     work.push(Work::Polylines(lines, PathKind::SparseInfill, 0.0));
                 }
             }
+        }
+    }
+    if settings.ironing {
+        // The part of the fill area that nothing covers: the top surface.
+        // The lines cross those of the solid infill below them.
+        let top = match model.get(index + 1) {
+            Some(above) => polygon::difference(&fill_area, above),
+            None => fill_area.clone(),
+        };
+        let top = polygon::clean(top, width * width, 0.0);
+        if !top.is_empty() {
+            let lines = polygon::hatch(&top, settings.ironing_spacing, other, min_length);
+            work.push(Work::Lines(lines, PathKind::Ironing, 2.0 * width));
         }
     }
     (work, thin)
@@ -3186,6 +3228,34 @@ mod tests {
             let ratio = deposited_area(layer, &settings) / expected;
             assert!((ratio - 1.0).abs() < 0.1, "z {}: {ratio}", layer.z);
         }
+    }
+
+    #[test]
+    fn elephant_foot_compensation_shrinks_the_first_layer() {
+        let mesh = Mesh::cuboid(20.0, 20.0, 1.0);
+        let outer_min_x = |toolpaths: &Toolpaths, layer: usize| {
+            toolpaths.layers[layer]
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::OuterWall)
+                .flat_map(|p| p.points.iter().map(|q| q[0]))
+                .fold(f64::INFINITY, f64::min)
+        };
+        let plain = Settings {
+            skirt_loops: 0,
+            ..Settings::default()
+        };
+        let shrunk = Settings {
+            elephant_foot_compensation: 0.3,
+            ..plain.clone()
+        };
+        let (a, b) = (
+            generate(&mesh, &plain).unwrap(),
+            generate(&mesh, &shrunk).unwrap(),
+        );
+        assert!((outer_min_x(&b, 0) - outer_min_x(&a, 0) - 0.3).abs() < 1e-6);
+        assert_eq!(outer_min_x(&b, 1), outer_min_x(&a, 1));
+        assert_eq!(a.layers[1..], b.layers[1..]);
     }
 
     #[test]

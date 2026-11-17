@@ -12,7 +12,7 @@ use std::fmt::{self, Write};
 use serde::Serialize;
 use slicer_core::Point;
 use slicer_core::polygon::distance;
-use slicer_fdm::{PathKind, Progress, Step, Toolpaths};
+use slicer_fdm::{Layer, PathKind, Progress, Step, Toolpaths};
 use slicer_profiles::{ExtrusionMode, Flavor, Settings};
 
 /// Summary of a generated print.
@@ -149,6 +149,7 @@ fn label(kind: PathKind) -> &'static str {
         PathKind::Bridge => "Bridge",
         PathKind::SparseInfill => "Sparse infill",
         PathKind::PrimeTower => "Prime tower",
+        PathKind::Ironing => "Ironing",
     }
 }
 
@@ -198,6 +199,7 @@ fn expand(
 }
 
 /// One movement of the printer, as far as its duration is concerned.
+#[derive(Clone)]
 struct Move {
     /// Unit vector in the XY plane; zero for moves along Z or of the
     /// filament only.
@@ -284,7 +286,44 @@ struct Writer<'a> {
     nozzle_z: Option<f64>,
 }
 
-impl Writer<'_> {
+/// What the layers hand on to the next one besides the printer's state.
+#[derive(Debug, Clone, Copy, Default)]
+struct Carry {
+    /// What the fan was last told, in percent.
+    fan: f64,
+    /// The extruder selected with `T<n>`, none before the first one.
+    selected: Option<u32>,
+    /// A tool change may have moved the nozzle away from the layer.
+    restore_z: bool,
+}
+
+/// What every layer needs from the whole print.
+struct Context<'a> {
+    values: &'a BTreeMap<String, String>,
+    filament_area: f64,
+    several: bool,
+    absolute: bool,
+}
+
+impl<'a> Writer<'a> {
+    /// A writer in the same state, with nothing written or recorded yet,
+    /// to try a layer out.
+    fn fork(&self) -> Writer<'a> {
+        Writer {
+            settings: self.settings,
+            out: String::new(),
+            position: self.position,
+            z: self.z,
+            feed: self.feed,
+            tool: self.tool,
+            retracted: self.retracted.clone(),
+            filament: self.filament.clone(),
+            e: self.e,
+            moves: Vec::new(),
+            nozzle_z: self.nozzle_z,
+        }
+    }
+
     /// Returns the ` F...` word if the feed rate (mm/s) differs from the
     /// active one.
     fn feed_word(&mut self, speed: f64) -> String {
@@ -400,6 +439,32 @@ impl Writer<'_> {
         self.position = Some(to);
     }
 
+    /// Like [`Writer::extrude`], and the nozzle rises to `z` on the way.
+    fn extrude_rising(
+        &mut self,
+        to: Point,
+        z: f64,
+        filament_per_mm: f64,
+        speed: f64,
+        kind: PathKind,
+    ) {
+        let Some(from) = self.position else { return };
+        let length = distance(from, to);
+        if length < 1e-4 {
+            return;
+        }
+        self.unretract();
+        let e = length * filament_per_mm;
+        let f = self.feed_word(speed);
+        let word = self.e_word(e);
+        let _ = writeln!(self.out, "G1 X{:.3} Y{:.3} Z{z:.3}{word}{f}", to[0], to[1]);
+        self.filament[self.tool] += e;
+        let direction = [(to[0] - from[0]) / length, (to[1] - from[1]) / length];
+        self.record(direction, length, speed, Some(kind));
+        self.position = Some(to);
+        self.nozzle_z = Some(z);
+    }
+
     fn extrude(&mut self, to: Point, filament_per_mm: f64, speed: f64, kind: PathKind) {
         let Some(from) = self.position else { return };
         let length = distance(from, to);
@@ -415,6 +480,196 @@ impl Writer<'_> {
         let direction = [(to[0] - from[0]) / length, (to[1] - from[1]) / length];
         self.record(direction, length, speed, Some(kind));
         self.position = Some(to);
+    }
+}
+
+/// Writes one layer. Extrusion runs at `slow` times its speed (1 for full
+/// speed), see [`slowdown`].
+fn write_layer(
+    w: &mut Writer,
+    carry: &mut Carry,
+    layer: &Layer,
+    index: usize,
+    context: &Context,
+    slow: f64,
+) -> Result<(), GcodeError> {
+    let settings = w.settings;
+    let _ = writeln!(
+        w.out,
+        ";LAYER_CHANGE\n;Z:{:.3}\n;HEIGHT:{:.3}",
+        layer.z, layer.height
+    );
+    if index == 1 {
+        if settings.nozzle_temp != settings.nozzle_temp_first_layer {
+            let _ = writeln!(w.out, "M104 S{}", settings.nozzle_temp);
+        }
+        if settings.bed_temp != settings.bed_temp_first_layer {
+            let _ = writeln!(w.out, "M140 S{}", settings.bed_temp);
+        }
+    }
+    let layer_fan = if index >= settings.fan_off_layers as usize {
+        settings.fan_speed
+    } else {
+        0.0
+    };
+    if layer_fan != carry.fan {
+        carry.fan = layer_fan;
+        let _ = writeln!(w.out, "M106 S{:.0}", carry.fan * 2.55);
+    }
+    if context.absolute {
+        // Start every layer at zero so the numbers stay short and exact.
+        w.out.push_str("G92 E0\n");
+        w.e = 0.0;
+    }
+    // In vase mode the one wall rises from where the layer below ended;
+    // a layer that has more to print is printed flat.
+    let spiral = layer.spiral
+        && matches!(layer.paths.as_slice(), [only] if only.closed && only.kind == PathKind::OuterWall);
+    let rise_from = w.nozzle_z.filter(|_| spiral);
+    match rise_from {
+        Some(from) => w.z = from,
+        None => {
+            w.z = layer.z;
+            w.move_z(layer.z);
+        }
+    }
+
+    let filament_per_mm =
+        settings.line_width * layer.height * settings.flow_ratio / context.filament_area;
+    let mut current_kind = None;
+    for path in &layer.paths {
+        let Some(&first) = path.points.first() else {
+            continue;
+        };
+        if context.several && carry.selected != Some(path.extruder) {
+            let next = path.extruder;
+            if let Some(previous) = carry.selected {
+                w.retract();
+                let values = toolchange_values(context.values, previous, next);
+                let block = expand(&settings.toolchange_gcode, "toolchange_gcode", &values)?;
+                w.out.push_str(&block);
+                let _ = writeln!(w.out, "T{next}");
+                if context.absolute {
+                    w.out.push_str("G92 E0\n");
+                    w.e = 0.0;
+                }
+                // Where the custom G-code left the nozzle is unknown.
+                w.position = None;
+                carry.restore_z = true;
+            } else {
+                let _ = writeln!(w.out, "T{next}");
+            }
+            carry.selected = Some(next);
+            w.select(next as usize);
+        }
+        w.travel(first, path.travel_inside);
+        if carry.restore_z {
+            w.move_z(layer.z);
+            carry.restore_z = false;
+        }
+        let bridge = path.kind == PathKind::Bridge;
+        let wanted = if bridge {
+            settings.bridge_fan_speed
+        } else {
+            layer_fan
+        };
+        if wanted != carry.fan {
+            carry.fan = wanted;
+            let _ = writeln!(w.out, "M106 S{:.0}", carry.fan * 2.55);
+        }
+        let filament_per_mm = if bridge {
+            filament_per_mm * settings.bridge_flow
+        } else {
+            filament_per_mm
+        };
+        let filament_per_mm = if path.kind == PathKind::Ironing {
+            filament_per_mm * settings.ironing_flow / 100.0
+        } else {
+            filament_per_mm
+        };
+        // Lines of their own width get material in proportion to it.
+        let filament_per_mm = match path.width {
+            Some(width) => filament_per_mm * width / settings.line_width,
+            None => filament_per_mm,
+        };
+        if current_kind != Some(path.kind) {
+            current_kind = Some(path.kind);
+            let _ = writeln!(w.out, ";TYPE:{}", label(path.kind));
+        }
+        let speed = slowed(path_speed(settings, path.kind, index), slow, settings);
+        if let Some(from) = rise_from {
+            // Z climbs in proportion to the length gone round.
+            let mut corners: Vec<Point> = path.points.clone();
+            corners.push(first);
+            let total: f64 = corners.windows(2).map(|p| distance(p[0], p[1])).sum();
+            let mut done = 0.0;
+            for pair in corners.windows(2) {
+                done += distance(pair[0], pair[1]);
+                let z = from + (layer.z - from) * done / total.max(1e-9);
+                w.extrude_rising(pair[1], z, filament_per_mm, speed, path.kind);
+            }
+            w.z = layer.z;
+            continue;
+        }
+        for &point in &path.points[1..] {
+            w.extrude(point, filament_per_mm, speed, path.kind);
+        }
+        if path.closed {
+            w.extrude(first, filament_per_mm, speed, path.kind);
+        }
+    }
+    Ok(())
+}
+
+/// The factor by which extrusion on `layer` slows down so that the layer
+/// takes at least `min_layer_time`; 1 if it takes that long anyway or the
+/// setting is off. The layer is tried out on copies of the writer: the
+/// time spent extruding is stretched to fill the gap, and as acceleration
+/// makes slower moves gain less than their speed says, the stretch is
+/// repeated a few times.
+// ponytail: up to four trial runs of the layer; `min_print_speed` can keep
+// a layer shorter than asked.
+fn slowdown(
+    w: &Writer,
+    carry: Carry,
+    layer: &Layer,
+    index: usize,
+    context: &Context,
+) -> Result<f64, GcodeError> {
+    let settings = w.settings;
+    let goal = settings.min_layer_time;
+    if goal <= 0.0 {
+        return Ok(1.0);
+    }
+    let mut slow = 1.0;
+    for _ in 0..4 {
+        let mut trial = w.fork();
+        let mut carry = carry;
+        write_layer(&mut trial, &mut carry, layer, index, context, slow)?;
+        let times = move_times(&trial.moves, settings.acceleration, settings.jerk);
+        let total: f64 = times.iter().sum();
+        let extruding: f64 = trial
+            .moves
+            .iter()
+            .zip(&times)
+            .filter(|(m, _)| m.kind.is_some())
+            .map(|(_, t)| t)
+            .sum();
+        if total >= goal * 0.99 || extruding <= 0.0 {
+            break;
+        }
+        slow *= extruding / (goal - (total - extruding));
+    }
+    Ok(slow)
+}
+
+/// `speed` slowed by `slow`, but not below `min_print_speed` unless it was
+/// slower already.
+fn slowed(speed: f64, slow: f64, settings: &Settings) -> f64 {
+    if slow >= 1.0 {
+        speed
+    } else {
+        (speed * slow).max(settings.min_print_speed.min(speed))
     }
 }
 
@@ -448,6 +703,7 @@ pub fn path_speed(settings: &Settings, kind: PathKind, layer: usize) -> f64 {
         | PathKind::Support
         | PathKind::PrimeTower => settings.infill_speed,
         PathKind::Bridge => settings.bridge_speed,
+        PathKind::Ironing => settings.ironing_speed,
         PathKind::Skirt | PathKind::Brim => settings.first_layer_speed,
     }
 }
@@ -493,108 +749,27 @@ pub fn write_gcode_with_progress(
         "G21\nG90\nM83\n"
     });
 
-    // What the fan was last told, in percent.
-    let mut fan = 0.0;
-    // The extruder selected with `T<n>`, none before the first one.
-    let mut selected: Option<u32> = None;
-    // A tool change may have moved the nozzle away from the layer.
-    let mut restore_z = false;
-    for (index, layer) in toolpaths.layers.iter().enumerate() {
-        let _ = writeln!(
-            w.out,
-            ";LAYER_CHANGE\n;Z:{:.3}\n;HEIGHT:{:.3}",
-            layer.z, layer.height
-        );
-        if index == 1 {
-            if settings.nozzle_temp != settings.nozzle_temp_first_layer {
-                let _ = writeln!(w.out, "M104 S{}", settings.nozzle_temp);
-            }
-            if settings.bed_temp != settings.bed_temp_first_layer {
-                let _ = writeln!(w.out, "M140 S{}", settings.bed_temp);
-            }
-        }
-        let layer_fan = if index >= settings.fan_off_layers as usize {
-            settings.fan_speed
-        } else {
-            0.0
+    if settings.pressure_advance > 0.0 {
+        let _ = match settings.flavor {
+            Flavor::Marlin => writeln!(w.out, "M900 K{}", settings.pressure_advance),
+            Flavor::Klipper => writeln!(
+                w.out,
+                "SET_PRESSURE_ADVANCE ADVANCE={}",
+                settings.pressure_advance
+            ),
         };
-        if layer_fan != fan {
-            fan = layer_fan;
-            let _ = writeln!(w.out, "M106 S{:.0}", fan * 2.55);
-        }
-        if absolute {
-            // Start every layer at zero so the numbers stay short and exact.
-            w.out.push_str("G92 E0\n");
-            w.e = 0.0;
-        }
-        w.z = layer.z;
-        w.move_z(layer.z);
+    }
 
-        let filament_per_mm =
-            settings.line_width * layer.height * settings.flow_ratio / filament_area;
-        let mut current_kind = None;
-        for path in &layer.paths {
-            let Some(&first) = path.points.first() else {
-                continue;
-            };
-            if several && selected != Some(path.extruder) {
-                let next = path.extruder;
-                if let Some(previous) = selected {
-                    w.retract();
-                    let values = toolchange_values(&values, previous, next);
-                    let block = expand(&settings.toolchange_gcode, "toolchange_gcode", &values)?;
-                    w.out.push_str(&block);
-                    let _ = writeln!(w.out, "T{next}");
-                    if absolute {
-                        w.out.push_str("G92 E0\n");
-                        w.e = 0.0;
-                    }
-                    // Where the custom G-code left the nozzle is unknown.
-                    w.position = None;
-                    restore_z = true;
-                } else {
-                    let _ = writeln!(w.out, "T{next}");
-                }
-                selected = Some(next);
-                w.select(next as usize);
-            }
-            w.travel(first, path.travel_inside);
-            if restore_z {
-                w.move_z(layer.z);
-                restore_z = false;
-            }
-            let bridge = path.kind == PathKind::Bridge;
-            let wanted = if bridge {
-                settings.bridge_fan_speed
-            } else {
-                layer_fan
-            };
-            if wanted != fan {
-                fan = wanted;
-                let _ = writeln!(w.out, "M106 S{:.0}", fan * 2.55);
-            }
-            let filament_per_mm = if bridge {
-                filament_per_mm * settings.bridge_flow
-            } else {
-                filament_per_mm
-            };
-            // Lines of their own width get material in proportion to it.
-            let filament_per_mm = match path.width {
-                Some(width) => filament_per_mm * width / settings.line_width,
-                None => filament_per_mm,
-            };
-            if current_kind != Some(path.kind) {
-                current_kind = Some(path.kind);
-                let _ = writeln!(w.out, ";TYPE:{}", label(path.kind));
-            }
-            let speed = path_speed(settings, path.kind, index);
-            for &point in &path.points[1..] {
-                w.extrude(point, filament_per_mm, speed, path.kind);
-            }
-            if path.closed {
-                w.extrude(first, filament_per_mm, speed, path.kind);
-            }
-        }
+    let context = Context {
+        values: &values,
+        filament_area,
+        several,
+        absolute,
+    };
+    let mut carry = Carry::default();
+    for (index, layer) in toolpaths.layers.iter().enumerate() {
+        let slow = slowdown(&w, carry, layer, index, &context)?;
+        write_layer(&mut w, &mut carry, layer, index, &context, slow)?;
         progress.advance();
     }
     w.retract();
@@ -771,6 +946,176 @@ mod tests {
         assert!(samples.iter().any(|&s| s > 0.0 && s < 1.0));
         assert_eq!(progress.step(), Step::Done);
         assert_eq!(output, slice(&mesh, &settings));
+    }
+
+    #[test]
+    fn pressure_advance_is_set_for_the_firmware() {
+        let mesh = Mesh::cuboid(10.0, 10.0, 2.0);
+        let set = Settings {
+            pressure_advance: 0.04,
+            ..Settings::default()
+        };
+        assert!(slice(&mesh, &set).gcode.contains(
+            "
+M83
+M900 K0.04
+"
+        ));
+        let klipper = Settings {
+            flavor: Flavor::Klipper,
+            ..set
+        };
+        let gcode = slice(&mesh, &klipper).gcode;
+        assert!(gcode.contains(
+            "
+SET_PRESSURE_ADVANCE ADVANCE=0.04
+"
+        ));
+        let off = slice(&mesh, &Settings::default()).gcode;
+        assert!(!off.contains("M900") && !off.contains("PRESSURE_ADVANCE"));
+    }
+
+    #[test]
+    fn small_layers_slow_down_to_the_minimum_layer_time() {
+        let mesh = Mesh::cuboid(15.0, 15.0, 3.0);
+        let fast = slice(&mesh, &Settings::default());
+        let set = Settings {
+            min_layer_time: 25.0,
+            ..Settings::default()
+        };
+        let slow = slice(&mesh, &set);
+        let layers = slow.stats.layers as f64;
+        let per_layer = fast.stats.print_time_s / layers;
+        assert!(per_layer < 25.0 * 0.6, "{per_layer}");
+        // Close to 25 seconds a layer; acceleration makes it inexact.
+        let time = slow.stats.print_time_s;
+        assert!(
+            time > layers * 25.0 * 0.85 && time < layers * 25.0 * 1.2,
+            "{time}"
+        );
+        // The same material, and extrusion never slower than the minimum.
+        assert!((slow.stats.filament_length_mm - fast.stats.filament_length_mm).abs() < 1e-6);
+        let mut feed = 0.0;
+        for line in slow.gcode.lines() {
+            if let Some(f) = word(line, 'F') {
+                feed = f;
+            }
+            if line.starts_with("G1 X") && word(line, 'E').is_some_and(|e| e > 0.0) {
+                assert!(feed >= set.min_print_speed * 60.0 - 1e-9, "{line}");
+            }
+        }
+        // A floor of 30 mm/s keeps the layers shorter.
+        let floor = Settings {
+            min_print_speed: 35.0,
+            ..set
+        };
+        assert!(slice(&mesh, &floor).stats.print_time_s < time);
+    }
+
+    #[test]
+    fn vase_mode_rises_in_one_line() {
+        let mesh = Mesh::cuboid(20.0, 20.0, 5.0);
+        let settings = Settings {
+            spiral_vase: true,
+            ..Settings::default()
+        };
+        let toolpaths = slicer_fdm::generate(&mesh, &settings).unwrap();
+        let bottom = settings.bottom_layers as usize;
+        for layer in &toolpaths.layers[bottom..] {
+            assert!(layer.spiral);
+            assert_eq!(layer.paths.len(), 1, "one wall, nothing inside");
+        }
+        assert!(!toolpaths.layers[bottom - 1].spiral);
+        let gcode = write_gcode(&toolpaths, &settings).unwrap().gcode;
+        // From the first spiral layer on, no move of Z alone, and Z never
+        // goes down while extruding up to the top.
+        let start = gcode
+            .split(";LAYER_CHANGE")
+            .take(bottom + 1)
+            .map(|part| part.len() + ";LAYER_CHANGE".len())
+            .sum::<usize>()
+            - ";LAYER_CHANGE".len();
+        let spiral = &gcode[start..gcode.rfind(settings.end_gcode.as_str()).unwrap()];
+        let mut z = 0.0;
+        let mut rising = 0;
+        for line in spiral.lines() {
+            if line.starts_with("G1 Z") {
+                panic!("separate Z move in vase mode: {line}");
+            }
+            if let (true, Some(next)) = (line.starts_with("G1 X"), word(line, 'Z')) {
+                assert!(next >= z - 1e-9, "{line}");
+                z = next;
+                rising += 1;
+            }
+        }
+        // Four sides a layer, each climbing on its way.
+        assert_eq!(rising, 4 * (toolpaths.layers.len() - bottom));
+        assert!((z - 5.0).abs() < 1e-6, "{z}");
+    }
+
+    #[test]
+    fn top_surfaces_are_ironed_with_little_material() {
+        // A step: the lower block's top shows beside the upper one.
+        let mut mesh = Mesh::cuboid(30.0, 20.0, 2.0);
+        let mut upper = Mesh::cuboid(10.0, 20.0, 2.0);
+        upper.translate([0.0, 0.0, 2.0]);
+        mesh.merge(&upper);
+        let settings = Settings {
+            ironing: true,
+            ..Settings::default()
+        };
+        let toolpaths = slicer_fdm::generate(&mesh, &settings).unwrap();
+        let ironed: Vec<usize> = (0..toolpaths.layers.len())
+            .filter(|&i| {
+                toolpaths.layers[i]
+                    .paths
+                    .iter()
+                    .any(|p| p.kind == PathKind::Ironing)
+            })
+            .collect();
+        // The top of the step and the top of the tower, nothing else.
+        assert_eq!(ironed.len(), 2, "{ironed:?}");
+        assert_eq!(*ironed.last().unwrap(), toolpaths.layers.len() - 1);
+        let gcode = write_gcode(&toolpaths, &settings).unwrap().gcode;
+        let filament_area = PI * (settings.filament_diameter / 2.0).powi(2);
+        let full = settings.line_width * settings.layer_height / filament_area;
+        let mut ironing = false;
+        let (mut checked, mut feed) = (0, 0.0);
+        for line in gcode.lines() {
+            if let Some(kind) = line.strip_prefix(";TYPE:") {
+                ironing = kind == "Ironing";
+            }
+            if let Some(f) = word(line, 'F') {
+                feed = f;
+            }
+            let (Some(_), Some(e)) = (word(line, 'X'), word(line, 'E')) else {
+                continue;
+            };
+            if ironing && line.starts_with("G1") && e > 0.0 {
+                assert_eq!(feed, settings.ironing_speed * 60.0, "{line}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 10);
+        let without = slicer_fdm::generate(
+            &mesh,
+            &Settings {
+                ironing: false,
+                ..settings.clone()
+            },
+        )
+        .unwrap();
+        let with_gcode = write_gcode(&toolpaths, &settings).unwrap();
+        let without_gcode = write_gcode(&without, &settings).unwrap();
+        // A tenth of the material of a normal line, per millimetre.
+        let extra = with_gcode.stats.filament_length_mm - without_gcode.stats.filament_length_mm;
+        let ironed_length: f64 = ironed
+            .iter()
+            .flat_map(|&i| &toolpaths.layers[i].paths)
+            .filter(|p| p.kind == PathKind::Ironing)
+            .map(slicer_fdm::Path::length)
+            .sum();
+        assert!((extra - ironed_length * full * 0.1).abs() < 1e-3, "{extra}");
     }
 
     #[test]
