@@ -32,14 +32,16 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
 
       - name: Build
-        run: cargo build --release --locked -p slicer-cli -p slicer-server
+        run: cargo build --release --locked -p slicer-cli -p slicer-server -p slicer-ui
 
       - name: Package
         shell: bash
         run: |
           dir="spaghetti-slicer-${{ matrix.name }}"
           mkdir "$dir"
-          cp target/release/spaghetti-slicer{,-server}${{ runner.os == 'Windows' && '.exe' || '' }} "$dir/"
+          # Command line, server and desktop app; the app finds `profiles`
+          # next to itself.
+          cp target/release/spaghetti-slicer{,-server,-ui}${{ runner.os == 'Windows' && '.exe' || '' }} "$dir/"
           cp -r README.md LICENSE-MIT LICENSE-APACHE profiles "$dir/"
           "$dir/spaghetti-slicer${{ runner.os == 'Windows' && '.exe' || '' }}" --version
           if [ "${{ runner.os }}" = Windows ]; then
@@ -78,8 +80,11 @@ jobs:
           image="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+            tags=(-t "$image:${GITHUB_REF_NAME#v}")
+            # A pre-release (v0.1.0-test) does not move `latest`.
+            case "$GITHUB_REF_NAME" in *-*) ;; *) tags+=(-t "$image:latest") ;; esac
             docker buildx build --platform linux/amd64,linux/arm64 \
-              -t "$image:${GITHUB_REF_NAME#v}" -t "$image:latest" --push .
+              "${tags[@]}" --push .
           else
             docker buildx build --platform linux/amd64,linux/arm64 .
           fi
@@ -104,5 +109,8 @@ jobs:
           cd dist
           sha256sum spaghetti-slicer-* > SHA256SUMS
           cat SHA256SUMS
+          # A tag with a suffix (v0.1.0-test) is published as a pre-release.
+          pre=()
+          case "$GITHUB_REF_NAME" in *-*) pre=(--prerelease) ;; esac
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME" --generate-notes spaghetti-slicer-* SHA256SUMS
+            --title "$GITHUB_REF_NAME" --generate-notes "${pre[@]}" spaghetti-slicer-* SHA256SUMS

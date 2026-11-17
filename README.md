@@ -220,7 +220,9 @@ cargo +nightly fuzz run stl
 
 ## Releases
 
-A tag `v*` runs `.github/workflows/release.yml`: it builds archives with both programs and the profiles for Linux, Windows and macOS, a container image for amd64 and arm64 (pushed to `ghcr.io`), and publishes a GitHub release with checksums and generated notes. Started by hand, the workflow only builds, as a rehearsal.
+A tag `v*` runs `.github/workflows/release.yml`: it builds archives with the command line tool, the server, the desktop app (`spaghetti-slicer-ui`) and the profiles for Linux, Windows and macOS, a container image for amd64 and arm64 (pushed to `ghcr.io`), and publishes a GitHub release with checksums and generated notes. A tag with a suffix such as `v0.1.0-test` becomes a pre-release and does not move the image tag `latest`. Started by hand, the workflow only builds, as a rehearsal.
+
+The programs are not signed. Windows SmartScreen asks before the first start ("More info", "Run anyway"); on macOS remove the quarantine flag after unpacking with `xattr -dr com.apple.quarantine spaghetti-slicer-macos-arm64`.
 
 ## Project documents
 
