@@ -868,7 +868,7 @@ impl App {
         }
     }
 
-    /// The G-code of the shown layer at the top left of the preview, with
+    /// The G-code of the shown layer at the bottom left of the preview, with
     /// the line near the last shown move marked.
     fn gcode_view(&mut self, ctx: &egui::Context, canvas: Rect) {
         let Some(sliced) = &self.sliced else {
@@ -884,8 +884,10 @@ impl App {
         let current = index.line_at(self.layer, fraction);
         let mut open = self.gcode_open;
         egui::Area::new(egui::Id::unique("gcode_view"))
-            .pivot(Align2::LEFT_TOP)
-            .fixed_pos(canvas.left_top() + Vec2::new(12.0, 12.0))
+            // Right of the view buttons, above the moves slider; the legend
+            // takes the top right.
+            .pivot(Align2::LEFT_BOTTOM)
+            .fixed_pos(canvas.left_bottom() + Vec2::new(72.0, -48.0))
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(theme::POPUP)
@@ -907,8 +909,8 @@ impl App {
                             return;
                         }
                         ui.set_width(320.0);
-                        let first = current.saturating_sub(8);
-                        let last = (first + 18).min(index.len());
+                        let first = current.saturating_sub(5);
+                        let last = (first + 12).min(index.len());
                         for n in first..last {
                             let line = index.line(gcode, n);
                             let text: String = line.chars().take(44).collect();
