@@ -1,9 +1,10 @@
 //! Models on the build plate: loading, placing, rotating, scaling and
 //! arranging them. The slicer gets every model where it is placed.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use slicer_core::{Diagnostic, Diagnostics, Mesh};
+use slicer_core::{Diagnose, Diagnostic, Diagnostics, Mesh};
 use slicer_fdm::Toolpaths;
 use slicer_profiles::Settings;
 
@@ -432,6 +433,10 @@ pub struct Item {
     pub model: Arc<Model>,
     /// Its position, rotation and scale.
     pub placement: Placement,
+    /// Settings this model prints with instead of the plate's, by key, as
+    /// text; only keys of [`slicer_fdm::OBJECT_SETTINGS`]. Empty: the
+    /// plate's settings.
+    pub overrides: BTreeMap<String, String>,
 }
 
 /// The models on the build plate and which one is selected.
@@ -452,6 +457,7 @@ impl Plate {
         self.items.push(Item {
             model: Arc::new(model),
             placement: Placement::centered(settings),
+            overrides: BTreeMap::new(),
         });
         self.selected = Some(self.items.len() - 1);
         self.serial += 1;
@@ -472,6 +478,7 @@ impl Plate {
         self.items.push(Item {
             model: Arc::clone(&item.model),
             placement,
+            overrides: item.overrides.clone(),
         });
         self.selected = Some(self.items.len() - 1);
         self.serial += 1;
@@ -481,11 +488,50 @@ impl Plate {
     /// selection does not count.
     pub fn same_as(&self, other: &Plate) -> bool {
         self.items.len() == other.items.len()
-            && self
-                .items
-                .iter()
-                .zip(&other.items)
-                .all(|(a, b)| Arc::ptr_eq(&a.model, &b.model) && a.placement == b.placement)
+            && self.items.iter().zip(&other.items).all(|(a, b)| {
+                Arc::ptr_eq(&a.model, &b.model)
+                    && a.placement == b.placement
+                    && a.overrides == b.overrides
+            })
+    }
+
+    /// Gives model `index` the settings `overrides` of its own (see
+    /// [`Item::overrides`]); counts as a change of the plate if they differ.
+    pub fn set_overrides(&mut self, index: usize, overrides: BTreeMap<String, String>) {
+        if let Some(item) = self.items.get_mut(index)
+            && item.overrides != overrides
+        {
+            item.overrides = overrides;
+            self.serial += 1;
+        }
+    }
+
+    /// The settings of every model of its own, in order: `settings` with
+    /// its overrides, or `None` for a model without. Fails, naming the
+    /// model, if an override is not valid with `settings`.
+    pub fn object_settings(
+        &self,
+        settings: &Settings,
+    ) -> Result<Vec<Option<Settings>>, Diagnostic> {
+        self.items
+            .iter()
+            .map(|item| {
+                if item.overrides.is_empty() {
+                    return Ok(None);
+                }
+                let mut own = settings.clone();
+                let values = item.overrides.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+                own.set_all(values).map_err(|e| {
+                    let mut error = e.diagnostic().with("object", &item.model.name);
+                    error.message = format!(
+                        "{} (settings of the object): {}",
+                        item.model.name, error.message
+                    );
+                    error
+                })?;
+                Ok(Some(own))
+            })
+            .collect()
     }
 
     /// Removes the selected model; nothing is selected afterwards.
@@ -547,6 +593,7 @@ impl Plate {
             Some(Item {
                 model: Arc::new(model),
                 placement: at,
+                overrides: item.overrides.clone(),
             })
         });
         let width = |item: &Item| {
@@ -610,8 +657,8 @@ impl Plate {
         }
     }
 
-    /// Checks every model with [`check_placement`]; the message names the
-    /// model when there are several.
+    /// Checks every model with [`check_placement`], and its own settings;
+    /// the message names the model when there are several.
     pub fn check(&self, settings: &Settings) -> Result<(), Diagnostic> {
         if self.items.is_empty() {
             return Err(Diagnostic::error("ui.no_model", "Open a model first."));
@@ -624,7 +671,7 @@ impl Plate {
                 error
             })?;
         }
-        Ok(())
+        self.object_settings(settings).map(|_| ())
     }
 
     /// The meshes to slice, each where it is placed.
@@ -758,6 +805,51 @@ mod tests {
         // Somewhere off the origin, as models in files often are.
         mesh.translate([37.0, -12.0, 5.0]);
         Model::from_mesh("cube", mesh).unwrap()
+    }
+
+    #[test]
+    fn models_keep_settings_of_their_own() {
+        let settings = Settings::default();
+        let mut plate = Plate::default();
+        let mut history = History::default();
+        plate.add(cube_model(10.0, 10.0, 10.0), &settings);
+        plate.add(cube_model(10.0, 10.0, 10.0), &settings);
+        history.settle(&plate);
+        assert_eq!(plate.object_settings(&settings).unwrap(), [None, None]);
+
+        let own = BTreeMap::from([("infill_density".to_owned(), "100".to_owned())]);
+        let serial = plate.serial;
+        plate.set_overrides(1, own.clone());
+        assert!(plate.serial > serial);
+        // The same values again change nothing.
+        let serial = plate.serial;
+        plate.set_overrides(1, own.clone());
+        assert_eq!(plate.serial, serial);
+        let resolved = plate.object_settings(&settings).unwrap();
+        assert_eq!(resolved[0], None);
+        assert_eq!(resolved[1].as_ref().unwrap().infill_density, 100.0);
+        // Changing them is a step that can be undone.
+        history.settle(&plate);
+        assert!(history.can_undo());
+        history.undo(&mut plate);
+        assert!(plate.items[1].overrides.is_empty());
+        history.redo(&mut plate);
+        assert_eq!(plate.items[1].overrides, own);
+
+        // Copies and cut parts keep them.
+        let item = plate.items[1].clone();
+        plate.add_copy(&item, &settings);
+        assert_eq!(plate.items[2].overrides, own);
+        assert!(plate.cut(2, 5.0, [true, true], false, &settings));
+        assert_eq!(plate.items[2].overrides, own);
+        assert_eq!(plate.items[3].overrides, own);
+
+        // Values that are not valid name the model.
+        let bad = BTreeMap::from([("infill_density".to_owned(), "300".to_owned())]);
+        plate.set_overrides(0, bad);
+        let error = plate.check(&settings).unwrap_err();
+        assert!(error.message.starts_with("cube"), "{}", error.message);
+        assert_eq!(error.code, "settings.out_of_range");
     }
 
     #[test]

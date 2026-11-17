@@ -2,6 +2,7 @@
 //! and the progress bar. The logic lives in `slicer_ui::profiles` and
 //! `slicer_ui::settings_list`.
 
+use std::collections::BTreeMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs;
 #[cfg(not(target_arch = "wasm32"))]
@@ -16,7 +17,7 @@ use slicer_ui::profiles::import_orca_files;
 use slicer_ui::profiles::{ProfileSet, find_profiles_dir, profile_name};
 use slicer_ui::settings::CommonSettings;
 use slicer_ui::settings_list::{
-    PROCESS_TABS, Row, SettingsEditor, rows_of, setting_label, setting_unit,
+    PROCESS_TABS, Row, SettingsEditor, changed_overrides, rows_of, setting_label, setting_unit,
 };
 
 use crate::theme;
@@ -387,6 +388,37 @@ pub fn process_tabs(
             setting_row(ui, row, editor, base, common, overrides, true);
         }
     }
+}
+
+/// The settings one object on the plate may set for itself
+/// ([`slicer_fdm::OBJECT_SETTINGS`]), as rows like those of the process
+/// tabs: values that differ from the plate's (`plate`) are bold and can be
+/// reset. `overrides` are the object's values now, `editor` keeps what is
+/// typed. Returns the object's new values after a change.
+pub fn object_settings(
+    ui: &mut egui::Ui,
+    editor: &mut SettingsEditor,
+    plate: &Settings,
+    overrides: &BTreeMap<String, String>,
+) -> Option<BTreeMap<String, String>> {
+    // The editor lists the object's values on top of the plate's.
+    editor.set_edits(overrides.clone());
+    let mut common = CommonSettings::from_settings(plate);
+    let before = match editor.build(plate, &common, "") {
+        Ok(settings) => settings,
+        Err(error) => {
+            ui.colored_label(ui.visuals().error_fg_color, error.message);
+            let clear = ui.button("Use the plate's settings").clicked();
+            return clear.then(BTreeMap::new);
+        }
+    };
+    ui.push_id("object_settings", |ui| {
+        for row in &rows_of(&before, plate, slicer_fdm::OBJECT_SETTINGS) {
+            setting_row(ui, row, editor, plate, &mut common, "", true);
+        }
+    });
+    let after = editor.build(plate, &common, "").ok()?;
+    (after != before).then(|| changed_overrides(overrides, plate, &before, &after))
 }
 
 /// The title of a group of settings: a small mark, the name in bold and a

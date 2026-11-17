@@ -158,6 +158,9 @@ pub struct App {
     cut: Option<CutDialog>,
     /// Whether the G-code view of the preview is unfolded.
     gcode_open: bool,
+    /// What is typed into the settings of the selected object, and which
+    /// object that is.
+    object_editor: (Option<usize>, SettingsEditor),
 }
 
 impl App {
@@ -201,6 +204,7 @@ impl App {
             face_mode: false,
             cut: None,
             gcode_open: true,
+            object_editor: (None, SettingsEditor::default()),
             setup,
         };
         app.refresh_builtin();
@@ -399,9 +403,13 @@ impl App {
         let Ok(settings) = &self.current else {
             return;
         };
+        let Ok(object_settings) = self.plate.object_settings(settings) else {
+            return;
+        };
         let request = SliceRequest {
             objects: self.plate.meshes(),
             settings: settings.clone(),
+            object_settings,
         };
         let ctx = ctx.clone();
         self.job = Some(SliceJob::start(request, move || ctx.request_repaint()));
@@ -900,7 +908,15 @@ impl App {
                 size[1] * s,
                 size[2] * s
             );
+            // Models with settings of their own are marked.
+            let own = !item.overrides.is_empty();
+            let text = if own { format!("{text}   ✱") } else { text };
             let row = ui.selectable_label(self.plate.selected == Some(index), text);
+            let row = if own {
+                row.on_hover_text("Has settings of its own")
+            } else {
+                row
+            };
             if row.clicked() || row.secondary_clicked() {
                 clicked = Some(index);
             }
@@ -1001,6 +1017,45 @@ impl App {
         }
         if orient {
             self.orient_selected();
+        }
+        self.object_settings(ui);
+    }
+
+    /// The settings the selected model sets for itself, folded away until
+    /// opened.
+    fn object_settings(&mut self, ui: &mut egui::Ui) {
+        let (Some(index), Ok(plate)) = (self.plate.selected, &self.current) else {
+            return;
+        };
+        let Some(item) = self.plate.items.get(index) else {
+            return;
+        };
+        // Typing for another model is dropped.
+        if self.object_editor.0 != Some(index) {
+            self.object_editor = (Some(index), SettingsEditor::default());
+        }
+        let title = match item.overrides.len() {
+            0 => "Object settings".to_owned(),
+            n => format!("Object settings ({n} own)"),
+        };
+        let mut changed = None;
+        egui::CollapsingHeader::new(title)
+            .id_salt("object_settings")
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("Values for this model only; the rest come from the plate.")
+                        .small()
+                        .color(theme::TEXT_WEAK),
+                );
+                changed = crate::settings_ui::object_settings(
+                    ui,
+                    &mut self.object_editor.1,
+                    plate,
+                    &item.overrides,
+                );
+            });
+        if let Some(overrides) = changed {
+            self.plate.set_overrides(index, overrides);
         }
     }
 

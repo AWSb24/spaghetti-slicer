@@ -2,10 +2,12 @@
 
 mod adaptive;
 mod infill;
+mod objects;
 mod plate;
 pub mod preview;
 mod tree;
 
+pub use objects::{OBJECT_SETTINGS, object_settings};
 pub use plate::{ARRANGE_GAP, Placement, arrange};
 pub mod progress;
 
@@ -328,7 +330,7 @@ pub fn generate_with_progress(
 /// as one.
 // ponytail: the objects are printed together, layer by layer, with the
 // layer heights of the whole plate. Printing one object after the other
-// and per-object settings are the upgrade. Cutting the mesh counts as one
+// is the upgrade. Cutting the mesh counts as one
 // part of the progress; reporting from inside `slice_mesh_reporting` is
 // the upgrade there.
 pub fn generate_plate(
@@ -351,7 +353,44 @@ pub fn generate_plate_with_progress(
     stop: &AtomicBool,
     progress: &Progress,
 ) -> Result<Toolpaths, FdmError> {
+    let own = [];
+    generate_plate_with_object_settings(
+        objects,
+        &own,
+        placement,
+        settings,
+        diagnostics,
+        stop,
+        progress,
+    )
+}
+
+/// Like [`generate_plate_with_progress`], and object `i` prints with its
+/// own settings `own[i]` where given: its walls, top and bottom shells,
+/// infill and whether it gets supports follow the keys in
+/// [`OBJECT_SETTINGS`] (see [`object_settings`]). All other settings of
+/// `own[i]` are ignored; layer heights, skirt, brim, the shape of supports,
+/// speeds and travel are those of `settings` for the whole plate. Objects
+/// without own settings, or with values equal to the plate's, print
+/// exactly as with [`generate_plate_with_progress`].
+pub fn generate_plate_with_object_settings(
+    objects: &[Mesh],
+    own: &[Option<Settings>],
+    placement: Placement,
+    settings: &Settings,
+    diagnostics: &mut Diagnostics,
+    stop: &AtomicBool,
+    progress: &Progress,
+) -> Result<Toolpaths, FdmError> {
     let stopped = || stop.load(Ordering::Relaxed);
+    // Objects with equal settings form a group. With a single group its
+    // settings are those of the whole plate.
+    let (groups, membership) = objects::groups(objects.len(), own, settings);
+    let settings = match groups.as_slice() {
+        [only] => only,
+        _ => settings,
+    };
+    let any_supports = groups.iter().any(|g| g.supports);
     // Turning, removing degenerate triangles, closing holes, checking.
     progress.start(Step::Preparing, 4);
     plate::check(objects, placement, settings, diagnostics)?;
@@ -452,14 +491,17 @@ pub fn generate_plate_with_progress(
             volume,
         });
     }
-    match placement {
-        Placement::Centre => mesh.translate([
+    let shift = match placement {
+        Placement::Centre => Some([
             volume[0] / 2.0 - (min[0] + max[0]) / 2.0,
             volume[1] / 2.0 - (min[1] + max[1]) / 2.0,
             -min[2],
         ]),
         // Every object is on the bed already.
-        Placement::AsGiven => {}
+        Placement::AsGiven => None,
+    };
+    if let Some(shift) = shift {
+        mesh.translate(shift);
     }
 
     // Without adaptive layers layer i ends at first_layer_height + i *
@@ -500,6 +542,31 @@ pub fn generate_plate_with_progress(
     if slices.iter().all(Vec::is_empty) {
         return Err(FdmError::NothingToPrint);
     }
+    // With several groups of objects every group gets its own region of
+    // every layer, which it prints with its settings.
+    let object_regions = if groups.len() > 1 {
+        objects::regions(
+            objects,
+            placement,
+            &membership,
+            groups.len(),
+            shift,
+            &cut_heights,
+        )
+    } else {
+        Vec::new()
+    };
+    // Where only some groups have supports, those only go under them, and
+    // only the others are warned about.
+    let mixed = !object_regions.is_empty() && groups.iter().any(|g| !g.supports) && any_supports;
+    let (supported, unsupported) = if mixed {
+        (
+            Some(objects::with_supports(&object_regions, &groups, true)),
+            Some(objects::with_supports(&object_regions, &groups, false)),
+        )
+    } else {
+        (None, None)
+    };
 
     // The geometry of a layer depends only on the slices, so all cores work
     // on it. Putting the pieces in printing order depends on where the
@@ -508,7 +575,7 @@ pub fn generate_plate_with_progress(
     // is half a line width (about 50 degrees from vertical at the default
     // layer height); without, only a full line width is worth a warning.
     progress.start(Step::Geometry, slices.len());
-    let (reach, least) = if settings.supports {
+    let (reach, least) = if any_supports {
         (0.5 * settings.line_width, 0.01)
     } else {
         (settings.line_width, MIN_OVERHANG_AREA)
@@ -526,14 +593,18 @@ pub fn generate_plate_with_progress(
         let below = polygon::offset(&slices[index - 1], reach);
         polygon::clean(polygon::difference(&slices[index], &below), least, 0.0)
     });
-    let supports = if settings.supports {
+    let supports = if any_supports {
         // Short bridges carry themselves.
         let carried: Vec<Shapes> = parallel_map(slices.len(), |index| {
-            hanging[index]
+            let carried: Shapes = hanging[index]
                 .iter()
                 .filter(|shape| !spans_freely(shape, &slices[index - 1], settings))
                 .cloned()
-                .collect()
+                .collect();
+            match &supported {
+                Some(supported) => polygon::intersection(&carried, &supported[index]),
+                None => carried,
+            }
         });
         support_areas(&slices, &carried, &cut_heights, settings)
     } else {
@@ -543,7 +614,7 @@ pub fn generate_plate_with_progress(
     // part of the layer that its objects cover. Where objects of different
     // extruders overlap, the higher extruder takes the overlap, so that a
     // part placed into another one (an inlay, a label) keeps its colour.
-    let regions: Vec<(u32, Vec<Shapes>)> = if count > 1 && used.len() > 1 {
+    let extruder_regions: Vec<(u32, Vec<Shapes>)> = if count > 1 && used.len() > 1 {
         let own: Vec<Vec<Shapes>> = used
             .iter()
             .map(|&e| slice_mesh(&with_extruder(&mesh, e), &cut_heights))
@@ -563,6 +634,15 @@ pub fn generate_plate_with_progress(
     } else {
         Vec::new()
     };
+    // Every region with its extruder and settings; empty if one extruder
+    // prints the whole model with the plate's settings.
+    let regions = objects::split(
+        extruder_regions,
+        object_regions,
+        &groups,
+        extruder,
+        settings,
+    );
     if stopped() {
         return Err(FdmError::Cancelled);
     }
@@ -580,11 +660,12 @@ pub fn generate_plate_with_progress(
             return (groups, thin);
         }
         let mut thin = false;
-        for (e, region) in &regions {
+        for (e, region_settings, region) in &regions {
             if region[index].is_empty() {
                 continue;
             }
-            let (work, region_thin) = region_work(region, &slices, &heights, index, settings);
+            let (work, region_thin) =
+                region_work(region, &slices, &heights, index, region_settings);
             thin |= region_thin;
             match groups.iter_mut().find(|(g, _)| g == e) {
                 Some(group) => group.1.extend(work),
@@ -687,8 +768,20 @@ pub fn generate_plate_with_progress(
         }
     }
     // Without supports, say where they would be needed.
+    // ponytail: where only some objects have supports, what hangs free is
+    // measured with the reach used for supports, half a line width, so
+    // the others are warned about slightly shallower overhangs than
+    // without any supports.
+    let hanging = match &unsupported {
+        Some(unsupported) => parallel_map(hanging.len(), |index| {
+            let free = polygon::intersection(&hanging[index], &unsupported[index]);
+            polygon::clean(free, MIN_OVERHANG_AREA, 0.0)
+        }),
+        None if any_supports => Vec::new(),
+        None => hanging,
+    };
     let hanging_layers: Vec<usize> = (0..hanging.len())
-        .filter(|&index| !settings.supports && !hanging[index].is_empty())
+        .filter(|&index| !hanging[index].is_empty())
         .collect();
     if let Some(first) = hanging_layers.first() {
         let largest = hanging

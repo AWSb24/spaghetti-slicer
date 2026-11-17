@@ -21,6 +21,10 @@ pub struct SliceRequest {
     pub objects: Vec<Mesh>,
     /// Settings to slice with.
     pub settings: Settings,
+    /// The settings of every object of its own, in the order of `objects`
+    /// (see [`crate::plate::Plate::object_settings`]); `None` or missing:
+    /// the object prints with `settings`.
+    pub object_settings: Vec<Option<Settings>>,
 }
 
 /// A finished slice.
@@ -44,8 +48,9 @@ pub fn slice(
 ) -> Result<SliceResult, Diagnostic> {
     let settings = &request.settings;
     let mut warnings = Diagnostics::new();
-    let toolpaths = slicer_fdm::generate_plate_with_progress(
+    let toolpaths = slicer_fdm::generate_plate_with_object_settings(
         &request.objects,
+        &request.object_settings,
         slicer_fdm::Placement::AsGiven,
         settings,
         &mut warnings,
@@ -278,6 +283,7 @@ mod tests {
         SliceRequest {
             objects: vec![cube_at([60.0, 130.0])],
             settings: Settings::default(),
+            object_settings: Vec::new(),
         }
     }
 
@@ -312,6 +318,28 @@ mod tests {
         let toolpaths = slicer_fdm::generate(&cube, &centred.settings).unwrap();
         let direct = slicer_gcode::write_gcode(&toolpaths, &centred.settings).unwrap();
         assert_eq!(result.output.gcode, direct.gcode);
+    }
+
+    #[test]
+    fn objects_slice_with_their_own_settings() {
+        let mut two = request();
+        two.objects.push(cube_at([160.0, 130.0]));
+        let plain = SliceJob::start(two.clone(), || {}).wait().unwrap();
+        let solid = Settings {
+            infill_density: 100.0,
+            ..Settings::default()
+        };
+        two.object_settings = vec![None, Some(solid)];
+        let own = SliceJob::start(two, || {}).wait().unwrap();
+        let sparse = |result: &SliceResult, x: std::ops::Range<f64>| {
+            result.toolpaths.layers.iter().any(|layer| {
+                layer.paths.iter().any(|p| {
+                    p.kind == slicer_fdm::PathKind::SparseInfill && x.contains(&p.points[0][0])
+                })
+            })
+        };
+        assert!(sparse(&plain, 100.0..200.0) && sparse(&own, 0.0..100.0));
+        assert!(!sparse(&own, 100.0..200.0));
     }
 
     #[test]
