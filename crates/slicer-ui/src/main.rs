@@ -10,7 +10,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod icons;
 mod settings_ui;
+mod theme;
 mod view3d;
 // Files and dialogs: the file system on the desktop, the browser on the web.
 #[cfg_attr(target_arch = "wasm32", path = "web.rs")]

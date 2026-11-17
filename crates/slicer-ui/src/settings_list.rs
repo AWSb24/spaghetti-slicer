@@ -14,71 +14,122 @@ use slicer_profiles::{SETTINGS_INFO, SettingInfo, Settings, SettingsError};
 
 use crate::settings::{CommonSettings, parse_overrides};
 
+/// A tab of process settings: its name and its groups, each a name and
+/// the keys in it.
+pub type ProcessTab = (
+    &'static str,
+    &'static [(&'static str, &'static [&'static str])],
+);
+
 /// The process settings of the side panel in tabs, as slicers usually
-/// group them: name of the tab and its keys in the order shown. Everything
-/// else is in the list of all settings.
-pub const PROCESS_TABS: [(&str, &[&str]); 5] = [
+/// group them: each tab has named groups with their keys in the order
+/// shown. Everything else is in the list of all settings.
+pub const PROCESS_TABS: [ProcessTab; 5] = [
     (
         "Quality",
         &[
-            "layer_height",
-            "first_layer_height",
-            "adaptive_layers",
-            "min_layer_height",
-            "max_layer_height",
-            "line_width",
-            "seam_position",
-            "wall_order",
+            (
+                "Layer height",
+                &[
+                    "layer_height",
+                    "first_layer_height",
+                    "adaptive_layers",
+                    "min_layer_height",
+                    "max_layer_height",
+                ],
+            ),
+            ("Line width", &["line_width"]),
+            ("Seam", &["seam_position"]),
+            ("Walls", &["wall_order"]),
         ],
     ),
     (
         "Strength",
         &[
-            "wall_loops",
-            "top_layers",
-            "bottom_layers",
-            "infill_density",
-            "infill_pattern",
-            "infill_angle",
-            "infill_connect",
-            "infill_overlap",
+            ("Walls", &["wall_loops"]),
+            ("Top/bottom shells", &["top_layers", "bottom_layers"]),
+            (
+                "Sparse infill",
+                &[
+                    "infill_density",
+                    "infill_pattern",
+                    "infill_angle",
+                    "infill_connect",
+                    "infill_overlap",
+                ],
+            ),
         ],
     ),
     (
         "Speed",
         &[
-            "outer_wall_speed",
-            "inner_wall_speed",
-            "infill_speed",
-            "bridge_speed",
-            "first_layer_speed",
-            "travel_speed",
-            "acceleration",
-            "jerk",
+            ("First layer speed", &["first_layer_speed"]),
+            (
+                "Other layers speed",
+                &[
+                    "outer_wall_speed",
+                    "inner_wall_speed",
+                    "infill_speed",
+                    "bridge_speed",
+                ],
+            ),
+            ("Travel speed", &["travel_speed"]),
+            ("Acceleration", &["acceleration", "jerk"]),
         ],
     ),
     (
         "Support",
         &[
-            "supports",
-            "support_style",
-            "support_spacing",
-            "support_interface_layers",
-            "support_bridge_length",
+            ("Support", &["supports", "support_style", "support_spacing"]),
+            (
+                "Advanced",
+                &["support_interface_layers", "support_bridge_length"],
+            ),
         ],
     ),
     (
         "Others",
         &[
-            "skirt_loops",
-            "skirt_distance",
-            "brim_width",
-            "prime_tower_width",
-            "prime_tower_x",
-            "prime_tower_y",
+            ("Skirt", &["skirt_loops", "skirt_distance"]),
+            ("Brim", &["brim_width"]),
+            (
+                "Prime tower",
+                &["prime_tower_width", "prime_tower_x", "prime_tower_y"],
+            ),
         ],
     ),
 ];
+
+/// The unit of a setting's value for the field, e.g. "mm/s"; empty for
+/// counts, switches and choices.
+pub fn setting_unit(key: &str) -> &'static str {
+    match key {
+        "acceleration" => "mm/s²",
+        "jerk" => "mm/s",
+        "filament_density" => "g/cm³",
+        "infill_density" | "infill_overlap" | "fan_speed" | "bridge_fan_speed" => "%",
+        _ if key.ends_with("_speed") => "mm/s",
+        _ if key.ends_with("_angle") => "°",
+        _ if key.ends_with("_temp") || key.contains("_temp_") => "°C",
+        _ if [
+            "_height",
+            "_width",
+            "_distance",
+            "_length",
+            "_spacing",
+            "_diameter",
+        ]
+        .iter()
+        .any(|end| key.ends_with(end))
+            || key == "z_hop"
+            || key.starts_with("bed_size_")
+            || key.starts_with("prime_tower_") =>
+        {
+            "mm"
+        }
+        _ => "",
+    }
+}
 
 /// A setting's name for people: `infill_density` becomes "Infill density".
 pub fn setting_label(key: &str) -> String {
@@ -355,19 +406,35 @@ mod tests {
     fn process_tabs_name_known_settings_once() {
         let base = Settings::default();
         let mut seen = Vec::new();
-        for (_, keys) in PROCESS_TABS {
-            let rows = rows_of(&base, &base, keys);
-            let shown: Vec<&str> = rows.iter().map(|r| r.info.key).collect();
-            assert_eq!(shown, keys, "every key is a setting");
-            for key in keys {
-                assert!(!seen.contains(key), "{key} is in two tabs");
-                seen.push(key);
+        for (_, groups) in PROCESS_TABS {
+            for (_, keys) in groups.iter() {
+                let rows = rows_of(&base, &base, keys);
+                let shown: Vec<&str> = rows.iter().map(|r| r.info.key).collect();
+                assert_eq!(shown, *keys, "every key is a setting");
+                for key in keys.iter() {
+                    assert!(!seen.contains(key), "{key} is in two places");
+                    seen.push(key);
+                }
             }
         }
         assert!(rows_of(&base, &base, &["nope"]).is_empty());
         assert_eq!(setting_label("infill_density"), "Infill density");
         assert_eq!(setting_label("jerk"), "Jerk");
         assert_eq!(setting_label(""), "");
+        for (key, unit) in [
+            ("layer_height", "mm"),
+            ("outer_wall_speed", "mm/s"),
+            ("acceleration", "mm/s²"),
+            ("infill_density", "%"),
+            ("infill_angle", "°"),
+            ("nozzle_temp", "°C"),
+            ("nozzle_temp_first_layer", "°C"),
+            ("prime_tower_x", "mm"),
+            ("wall_loops", ""),
+            ("supports", ""),
+        ] {
+            assert_eq!(setting_unit(key), unit, "{key}");
+        }
     }
 
     #[test]

@@ -95,6 +95,16 @@ impl OrbitCamera {
         self.target = add(self.target, shift);
     }
 
+    /// Moves closer by `factor` (above 1) or away, keeping `point` where
+    /// it is on the screen: the target moves towards it as the camera
+    /// does.
+    pub fn zoom_at(&mut self, factor: f32, point: [f32; 3]) {
+        let before = self.distance;
+        self.zoom(factor);
+        let k = 1.0 - self.distance / before;
+        self.target = add(self.target, scale(sub(point, self.target), k));
+    }
+
     /// Moves closer to the target by `factor` (above 1) or away from it.
     pub fn zoom(&mut self, factor: f32) {
         let (min, max) = DISTANCE_RANGE;
@@ -147,6 +157,39 @@ impl OrbitCamera {
     pub fn view_projection(&self, aspect: f32) -> Mat4 {
         multiply(&self.projection(aspect), &self.view())
     }
+
+    /// The ray through a point of the view given in normalized device
+    /// coordinates (-1 to 1, Y up) for a view `aspect` times as wide as it
+    /// is high: the camera position and a unit direction.
+    pub fn ray(&self, ndc: [f32; 2], aspect: f32) -> ([f32; 3], [f32; 3]) {
+        let t = (FOV_Y_DEG / 2.0).to_radians().tan();
+        let forward = scale(self.backward(), -1.0);
+        let (right, up) = self.right_up();
+        let sideways = add(scale(right, ndc[0] * t * aspect), scale(up, ndc[1] * t));
+        (self.eye(), normalize(add(forward, sideways)))
+    }
+
+    /// Turns the camera to look straight down (`top`) or from the front,
+    /// keeping target and distance.
+    pub fn look(&mut self, top: bool) {
+        if top {
+            self.yaw_deg = -90.0;
+            self.pitch_deg = PITCH_LIMIT_DEG;
+        } else {
+            self.yaw_deg = -90.0;
+            self.pitch_deg = 0.0;
+        }
+    }
+}
+
+/// Where a ray from `origin` in direction `dir` meets the horizontal plane
+/// at height `z`; `None` if it runs parallel or away from it.
+pub fn ray_plane_z(origin: [f32; 3], dir: [f32; 3], z: f32) -> Option<[f32; 3]> {
+    if dir[2].abs() < 1e-9 {
+        return None;
+    }
+    let t = (z - origin[2]) / dir[2];
+    (t > 0.0).then(|| add(origin, scale(dir, t)))
 }
 
 /// `a * b`.
@@ -171,6 +214,10 @@ pub fn transform_point(m: &Mat4, p: [f32; 3]) -> Option<[f32; 3]> {
 
 fn add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
 fn scale(a: [f32; 3], s: f32) -> [f32; 3] {
@@ -305,6 +352,52 @@ mod tests {
         assert!(near(dot(light, light), 1.0));
         assert!(dot(light, camera.backward()) > 0.5);
         assert!(light[2] > camera.backward()[2]);
+    }
+
+    #[test]
+    fn rays_go_through_the_point_under_the_cursor() {
+        let camera = OrbitCamera::fit(BED, 250.0);
+        let (eye, dir) = camera.ray([0.0, 0.0], ASPECT);
+        let at = add(eye, scale(dir, camera.distance));
+        assert!(
+            (0..3).all(|i| (at[i] - camera.target[i]).abs() < 1e-2),
+            "{at:?}"
+        );
+        for point in [[0.3, -0.2], [-0.9, 0.7]] {
+            let (eye, dir) = camera.ray(point, ASPECT);
+            let p = ndc(&camera, add(eye, scale(dir, 100.0)));
+            assert!(
+                near(p[0], point[0]) && near(p[1], point[1]),
+                "{point:?} -> {p:?}"
+            );
+        }
+        // The ray down to the bed lands on it; a ray upwards never does.
+        let (eye, dir) = camera.ray([0.0, -0.3], ASPECT);
+        let hit = ray_plane_z(eye, dir, 0.0).unwrap();
+        assert!(hit[2].abs() < 1e-3);
+        assert!(ray_plane_z([0.0, 0.0, 10.0], [0.0, 0.0, 1.0], 0.0).is_none());
+        assert!(ray_plane_z([0.0, 0.0, 10.0], [1.0, 0.0, 0.0], 0.0).is_none());
+    }
+
+    #[test]
+    fn zoom_keeps_the_point_under_the_cursor() {
+        let mut camera = OrbitCamera::fit(BED, 250.0);
+        let point = [60.0, 200.0, 0.0];
+        let before = ndc(&camera, point);
+        camera.zoom_at(1.7, point);
+        let after = ndc(&camera, point);
+        assert!(
+            near(before[0], after[0]) && near(before[1], after[1]),
+            "{before:?} {after:?}"
+        );
+        // Out again, and against the limit: still in place.
+        camera.zoom_at(0.5, point);
+        camera.zoom_at(1e9, point);
+        let after = ndc(&camera, point);
+        assert!(
+            near(before[0], after[0]) && near(before[1], after[1]),
+            "{after:?}"
+        );
     }
 
     #[test]

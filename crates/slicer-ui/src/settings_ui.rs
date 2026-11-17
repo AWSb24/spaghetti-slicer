@@ -15,7 +15,11 @@ use slicer_profiles::{Settings, ValueKind};
 use slicer_ui::profiles::import_orca_files;
 use slicer_ui::profiles::{ProfileSet, find_profiles_dir, profile_name};
 use slicer_ui::settings::CommonSettings;
-use slicer_ui::settings_list::{PROCESS_TABS, Row, SettingsEditor, rows_of, setting_label};
+use slicer_ui::settings_list::{
+    PROCESS_TABS, Row, SettingsEditor, rows_of, setting_label, setting_unit,
+};
+
+use crate::theme;
 
 /// What the profile picker asks the window to do.
 // The browser build has no Orca import, so two variants go unused there.
@@ -229,18 +233,63 @@ pub fn process_tabs(
     overrides: &str,
     current: &Settings,
 ) {
+    // Text tabs; the open one is underlined in the accent colour.
     ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 2.0;
-        ui.spacing_mut().button_padding.x = 6.0;
+        ui.spacing_mut().item_spacing.x = 12.0;
         for (index, (name, _)) in PROCESS_TABS.iter().enumerate() {
-            ui.selectable_value(tab, index, *name);
+            let open = *tab == index;
+            let color = if open { theme::TEXT } else { theme::TEXT_WEAK };
+            let response = ui.add(
+                egui::Label::new(RichText::new(*name).color(color)).sense(egui::Sense::click()),
+            );
+            if open {
+                let r = response.rect;
+                ui.painter().line_segment(
+                    [
+                        r.left_bottom() + egui::vec2(0.0, 2.0),
+                        r.right_bottom() + egui::vec2(0.0, 2.0),
+                    ],
+                    egui::Stroke::new(2.0, theme::ACCENT),
+                );
+            }
+            if response.clicked() {
+                *tab = index;
+            }
         }
     });
-    ui.separator();
-    let (_, keys) = PROCESS_TABS[(*tab).min(PROCESS_TABS.len() - 1)];
-    for row in &rows_of(current, base, keys) {
-        setting_row(ui, row, editor, base, common, overrides, true);
+    ui.add_space(2.0);
+    let (_, groups) = PROCESS_TABS[(*tab).min(PROCESS_TABS.len() - 1)];
+    for (group, keys) in groups.iter() {
+        ui.add_space(6.0);
+        group_header(ui, group);
+        for row in &rows_of(current, base, keys) {
+            setting_row(ui, row, editor, base, common, overrides, true);
+        }
     }
+}
+
+/// The title of a group of settings: a small mark, the name in bold and a
+/// line to the right edge.
+fn group_header(ui: &mut egui::Ui, name: &str) {
+    ui.horizontal(|ui| {
+        let (mark, _) = ui.allocate_exact_size(egui::Vec2::splat(12.0), egui::Sense::hover());
+        ui.painter().rect_stroke(
+            mark.shrink(1.0),
+            2.0,
+            egui::Stroke::new(1.2, theme::ACCENT),
+            egui::StrokeKind::Inside,
+        );
+        let label = ui.label(RichText::new(name).strong().color(theme::TEXT));
+        let y = label.rect.center().y;
+        let right = ui.max_rect().right();
+        ui.painter().line_segment(
+            [
+                egui::pos2(label.rect.right() + 6.0, y),
+                egui::pos2(right, y),
+            ],
+            egui::Stroke::new(1.0, theme::LINE),
+        );
+    });
 }
 
 /// One setting with its field. `friendly` shows the name as words and
@@ -262,6 +311,7 @@ fn setting_row(
     };
     ui.horizontal(|ui| {
         let (name, width) = if friendly {
+            ui.add_space(14.0);
             (RichText::new(setting_label(key)), 150.0)
         } else {
             (RichText::new(key).monospace(), 210.0)
@@ -315,12 +365,35 @@ fn setting_row(
                 } else {
                     egui::TextEdit::singleline(&mut text)
                 };
-                let width = match (multiline, friendly) {
-                    (true, _) => 220.0,
-                    (false, true) => 70.0,
-                    (false, false) => 90.0,
+                let unit = setting_unit(key);
+                let response = if friendly && !multiline {
+                    // Value and unit in one box.
+                    egui::Frame::new()
+                        .fill(theme::PANEL)
+                        .stroke(egui::Stroke::new(1.0, theme::LINE))
+                        .corner_radius(3)
+                        .inner_margin(egui::Margin::symmetric(4, 1))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            let response = ui.add(
+                                field
+                                    .frame(egui::Frame::NONE)
+                                    .desired_width(if unit.is_empty() { 82.0 } else { 52.0 }),
+                            );
+                            if !unit.is_empty() {
+                                ui.add_sized(
+                                    [28.0, 16.0],
+                                    egui::Label::new(
+                                        RichText::new(unit).small().color(theme::TEXT_WEAK),
+                                    ),
+                                );
+                            }
+                            response
+                        })
+                        .inner
+                } else {
+                    ui.add(field.desired_width(if multiline { 220.0 } else { 90.0 }))
                 };
-                let response = ui.add(field.desired_width(width));
                 if response.changed() {
                     editor.drafts.insert(key.to_owned(), text.clone());
                 }
