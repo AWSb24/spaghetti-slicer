@@ -9,6 +9,7 @@
 pub mod camera;
 pub mod job;
 pub mod plate;
+pub mod plates;
 pub mod profiles;
 pub mod scene;
 pub mod settings;

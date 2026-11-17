@@ -161,6 +161,12 @@ impl View3d {
         segments
     }
 
+    /// Builds the models again on the next frame, for example after
+    /// another plate is shown whose serial may equal the last one's.
+    pub fn forget_models(&mut self) {
+        self.models_sent = None;
+    }
+
     /// Draws the scene into the rest of `ui` and handles the mouse: a
     /// click selects, dragging a model moves it over the bed, dragging
     /// elsewhere turns the view, the right button or Shift pans, the wheel

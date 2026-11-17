@@ -14,13 +14,12 @@ use slicer_core::{Diagnostic, Severity};
 use slicer_fdm::PathKind;
 use slicer_profiles::Settings;
 use slicer_ui::job::{
-    SliceJob, SliceRequest, SliceResult, encode_output, format_duration, output_name,
-    with_output_extension,
+    SliceJob, SliceRequest, SliceResult, encode_output, format_duration, with_output_extension,
 };
 use slicer_ui::plate::{
-    History, Item, Placement, Plate, SCALE_RANGE, bed_center, check_placement, face_normal,
-    load_model,
+    Item, Placement, Plate, SCALE_RANGE, bed_center, check_placement, face_normal, load_model,
 };
+use slicer_ui::plates::{self, Plates};
 use slicer_ui::profiles::{
     ROLES, Setup, builtin_path, builtin_text, fit_processes, profile_name, replace_profiles,
     standard_process,
@@ -108,7 +107,11 @@ struct CutDialog {
 
 /// The application state.
 pub struct App {
+    /// The plate shown; [`App::plates`] holds the others.
     plate: Plate,
+    /// The other plates with their slices, and the steps of all plates
+    /// that can be undone.
+    plates: Plates<Sliced>,
     files: Vec<(PathBuf, SettingsFile)>,
     /// Settings from the files, before edits.
     base: Settings,
@@ -144,8 +147,6 @@ pub struct App {
     color_by: ColorBy,
     /// The model copied with Ctrl+C.
     clipboard: Option<Item>,
-    /// Steps of the plate that can be undone.
-    history: History,
     /// The printer or filament dialog, if open.
     profile_dialog: Option<ProfileKind>,
     /// The built-in printers and materials chosen in the setup assistant.
@@ -174,6 +175,7 @@ impl App {
         let base = Settings::default();
         let mut app = Self {
             plate: Plate::default(),
+            plates: Plates::new(),
             files: Vec::new(),
             common: CommonSettings::from_settings(&base),
             current: Ok(base.clone()),
@@ -195,7 +197,6 @@ impl App {
             moves: None,
             color_by: ColorBy::LineType,
             clipboard: None,
-            history: History::default(),
             profile_dialog: None,
             wizard: (!setup.done).then(|| Wizard::new(&setup)),
             face_mode: false,
@@ -365,7 +366,8 @@ impl App {
             Ok(settings) => {
                 // A model in the middle of the old bed goes to the middle of
                 // the new one.
-                for item in &mut self.plate.items {
+                let others = self.plates.others_mut().flat_map(|p| p.items.iter_mut());
+                for item in self.plate.items.iter_mut().chain(others) {
                     if item.placement.center == bed_center(&self.base) {
                         item.placement.center = bed_center(&settings);
                     }
@@ -466,8 +468,13 @@ impl App {
         } else {
             ("G-code", "gcode")
         };
-        let Some(path) = platform::save_path(&output_name(model_name, gcode_3mf), label, extension)
-        else {
+        let suggested = plates::output_name(
+            model_name,
+            self.plates.current() + 1,
+            self.plates.count(),
+            gcode_3mf,
+        );
+        let Some(path) = platform::save_path(&suggested, label, extension) else {
             return;
         };
         let path = PathBuf::from(with_output_extension(&path.to_string_lossy(), gcode_3mf));
@@ -1092,7 +1099,12 @@ impl App {
             }
         });
         let blocker = self.slice_blocker();
-        let slice = pill(ui, "Slice plate", !current, blocker.is_none());
+        let label = if self.plates.count() > 1 {
+            format!("Slice plate {}", self.plates.current() + 1)
+        } else {
+            "Slice plate".to_owned()
+        };
+        let slice = pill(ui, &label, !current, blocker.is_none());
         if slice.main.clicked() || slice.chevron.clicked() {
             self.start_slice(ui.ctx());
         }
@@ -1132,20 +1144,20 @@ impl App {
                             }
                             ui.separator();
                             let undo = ui
-                                .add_enabled_ui(self.history.can_undo(), |ui| {
+                                .add_enabled_ui(self.plates.can_undo(), |ui| {
                                     icons::button(ui, Icon::Undo, 34.0, "Undo (Ctrl+Z)", false)
                                 })
                                 .inner;
                             if undo.clicked() {
-                                self.history.undo(&mut self.plate);
+                                self.undo();
                             }
                             let redo = ui
-                                .add_enabled_ui(self.history.can_redo(), |ui| {
+                                .add_enabled_ui(self.plates.can_redo(), |ui| {
                                     icons::button(ui, Icon::Redo, 34.0, "Redo (Ctrl+Y)", false)
                                 })
                                 .inner;
                             if redo.clicked() {
-                                self.history.redo(&mut self.plate);
+                                self.redo();
                             }
                             ui.separator();
                             let duplicate = ui
@@ -1588,6 +1600,115 @@ impl App {
         }
     }
 
+    /// Runs `change` on the plates and, if it shows another plate, stops a
+    /// running slice (it belongs to the plate left) and shows the new
+    /// plate's slice.
+    fn change_plates(
+        &mut self,
+        change: impl FnOnce(&mut Plates<Sliced>, &mut Plate, &mut Option<Sliced>),
+    ) {
+        let before = self.plates.current_id();
+        change(&mut self.plates, &mut self.plate, &mut self.sliced);
+        if self.plates.current_id() == before {
+            return;
+        }
+        if self.job.take().is_some() {
+            self.note(Level::Info, "Slicing cancelled");
+        }
+        self.cut = None;
+        self.face_mode = false;
+        self.layer = 0;
+        self.moves = None;
+        self.view3d.forget_models();
+        self.upload_paths();
+    }
+
+    /// Shows plate `index`.
+    fn show_plate(&mut self, index: usize) {
+        self.change_plates(|plates, plate, sliced| plates.switch(index, plate, sliced));
+    }
+
+    /// Takes all plates back one step.
+    fn undo(&mut self) {
+        self.change_plates(Plates::undo);
+    }
+
+    /// Takes all plates forward one undone step.
+    fn redo(&mut self) {
+        self.change_plates(Plates::redo);
+    }
+
+    /// Moves the selected model to plate `to`, or to a new plate.
+    fn move_selected_to(&mut self, to: Option<usize>) {
+        let Some(index) = self.plate.selected else {
+            return;
+        };
+        let to = to.unwrap_or_else(|| self.plates.push());
+        if self.plates.move_item(index, to, &mut self.plate) {
+            self.cut = None;
+            self.note(Level::Info, format!("Moved to plate {}", to + 1));
+        }
+    }
+
+    /// The row of plates above the 3D view: a button for every plate, which
+    /// shows it, with a menu to remove it on a right click, and a button
+    /// to add a plate.
+    fn plate_bar(&mut self, ui: &mut egui::Ui) {
+        let counts = self.plates.model_counts(&self.plate);
+        let current = self.plates.current();
+        let many = counts.len() > 1;
+        ui.horizontal_centered(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (index, count) in counts.iter().enumerate() {
+                let color = if index == current {
+                    Color32::WHITE
+                } else {
+                    theme::TEXT
+                };
+                let text = RichText::new(format!(" {} ", index + 1)).color(color);
+                let models = if *count == 1 { "model" } else { "models" };
+                let button = ui
+                    .add(egui::Button::selectable(index == current, text))
+                    .on_hover_text(format!("Plate {}: {count} {models}", index + 1));
+                if button.clicked() {
+                    self.show_plate(index);
+                }
+                button.context_menu(|ui| {
+                    if ui.button("Show").clicked() {
+                        self.show_plate(index);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(many, egui::Button::new("Remove plate"))
+                        .on_hover_text("Removes the plate with its models")
+                        .clicked()
+                    {
+                        self.change_plates(|plates, plate, sliced| {
+                            plates.remove(index, plate, sliced);
+                        });
+                        ui.close();
+                    }
+                });
+            }
+            if ui
+                .button(RichText::new(" + ").color(theme::TEXT))
+                .on_hover_text("Add a plate")
+                .clicked()
+            {
+                let index = self.plates.push();
+                self.show_plate(index);
+            }
+            if many {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!("Plate {} of {}", current + 1, counts.len()))
+                        .small()
+                        .color(theme::TEXT_WEAK),
+                );
+            }
+        });
+    }
+
     /// The selected model's name, size, volume and triangle count at the
     /// bottom left of the plate, right of the view buttons.
     fn object_info(&self, ctx: &egui::Context, canvas: Rect) {
@@ -1660,6 +1781,19 @@ impl App {
             self.plate.remove_selected();
             ui.close();
         }
+        ui.menu_button("Move to plate", |ui| {
+            let shown = self.plates.current();
+            for index in (0..self.plates.count()).filter(|&i| i != shown) {
+                if ui.button(format!("Plate {}", index + 1)).clicked() {
+                    self.move_selected_to(Some(index));
+                    ui.close();
+                }
+            }
+            if ui.button("New plate").clicked() {
+                self.move_selected_to(None);
+                ui.close();
+            }
+        });
         ui.separator();
         let mut placement_action =
             |ui: &mut egui::Ui, label: &str, change: &dyn Fn(&mut Placement)| {
@@ -1718,14 +1852,14 @@ impl App {
         let pressed = |key: egui::Key| ctx.input(|i| i.key_pressed(key));
         if command && pressed(egui::Key::Z) {
             if shift {
-                self.history.redo(&mut self.plate);
+                self.redo();
             } else {
-                self.history.undo(&mut self.plate);
+                self.undo();
             }
             return;
         }
         if command && pressed(egui::Key::Y) {
-            self.history.redo(&mut self.plate);
+            self.redo();
             return;
         }
         // Copy and paste arrive as events; Ctrl+C and Ctrl+V are not keys.
@@ -2036,6 +2170,11 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::CANVAS))
             .show(ui, |ui| {
+                egui::Panel::top("plates")
+                    .resizable(false)
+                    .exact_size(30.0)
+                    .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(3))
+                    .show(ui, |ui| self.plate_bar(ui));
                 let preview = self.tab == Tab::Preview;
                 if preview && self.sliced.is_some() {
                     egui::Panel::right("layers")
@@ -2083,7 +2222,7 @@ impl eframe::App for App {
         }
         // A change is one step once the mouse is let go.
         if !ctx.input(|i| i.pointer.any_down()) {
-            self.history.settle(&self.plate);
+            self.plates.settle(&self.plate);
         }
     }
 }
