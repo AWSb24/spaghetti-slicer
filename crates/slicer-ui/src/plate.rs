@@ -1,9 +1,17 @@
 //! Models on the build plate: loading, placing, rotating, scaling and
 //! arranging them. The slicer gets every model where it is placed.
 
+use std::sync::Arc;
+
 use slicer_core::{Diagnostic, Diagnostics, Mesh};
 use slicer_fdm::Toolpaths;
 use slicer_profiles::Settings;
+
+/// Steps that can be undone.
+const UNDO_STEPS: usize = 100;
+
+/// Gap in millimetres between a model and its copy.
+const COPY_GAP: f64 = 5.0;
 
 /// Distance in millimetres by which a model may reach over the edge of the
 /// bed before it counts as off the bed, to absorb rounding.
@@ -204,8 +212,8 @@ pub fn check_placement(
 /// A model and where it sits.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Item {
-    /// The model as loaded.
-    pub model: Model,
+    /// The model as loaded; copies share it.
+    pub model: Arc<Model>,
     /// Its position, rotation and scale.
     pub placement: Placement,
 }
@@ -226,11 +234,42 @@ impl Plate {
     /// Puts a model in the middle of the bed and selects it.
     pub fn add(&mut self, model: Model, settings: &Settings) {
         self.items.push(Item {
-            model,
+            model: Arc::new(model),
             placement: Placement::centered(settings),
         });
         self.selected = Some(self.items.len() - 1);
         self.serial += 1;
+    }
+
+    /// Adds a copy of `item` beside it, to the right if that stays on the
+    /// bed and to the left otherwise, and selects the copy.
+    pub fn add_copy(&mut self, item: &Item, settings: &Settings) {
+        let width = bounds_2d(placed_outline(&item.model, &item.placement))
+            .map_or(0.0, |(lo, hi)| hi[0] - lo[0]);
+        let mut placement = item.placement;
+        let step = width + COPY_GAP;
+        placement.center[0] = if placement.center[0] + step + width / 2.0 <= settings.bed_size_x {
+            placement.center[0] + step
+        } else {
+            (placement.center[0] - step).max(width / 2.0)
+        };
+        self.items.push(Item {
+            model: Arc::clone(&item.model),
+            placement,
+        });
+        self.selected = Some(self.items.len() - 1);
+        self.serial += 1;
+    }
+
+    /// Whether `other` has the same models in the same places; the
+    /// selection does not count.
+    pub fn same_as(&self, other: &Plate) -> bool {
+        self.items.len() == other.items.len()
+            && self
+                .items
+                .iter()
+                .zip(&other.items)
+                .all(|(a, b)| Arc::ptr_eq(&a.model, &b.model) && a.placement == b.placement)
     }
 
     /// Removes the selected model; nothing is selected afterwards.
@@ -301,6 +340,70 @@ impl Plate {
     }
 }
 
+/// The states of the plate that can be undone and redone. Changes are
+/// recorded when they are finished, so dragging a model is one step.
+#[derive(Debug, Default)]
+pub struct History {
+    /// The last recorded state.
+    current: Plate,
+    undo: Vec<Plate>,
+    redo: Vec<Plate>,
+}
+
+impl History {
+    /// Records `plate` as a new step if it differs from the last one;
+    /// call it when no change is in progress.
+    pub fn settle(&mut self, plate: &Plate) {
+        if !plate.same_as(&self.current) {
+            let before = std::mem::replace(&mut self.current, plate.clone());
+            self.undo.push(before);
+            if self.undo.len() > UNDO_STEPS {
+                self.undo.remove(0);
+            }
+            self.redo.clear();
+        }
+    }
+
+    /// Whether there is a step to undo.
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    /// Whether there is a step to redo.
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    /// Takes `plate` back one step.
+    pub fn undo(&mut self, plate: &mut Plate) {
+        if let Some(previous) = self.undo.pop() {
+            let now = std::mem::replace(&mut self.current, previous);
+            self.redo.push(now);
+            self.restore(plate);
+        }
+    }
+
+    /// Takes `plate` forward one undone step.
+    pub fn redo(&mut self, plate: &mut Plate) {
+        if let Some(next) = self.redo.pop() {
+            let now = std::mem::replace(&mut self.current, next);
+            self.undo.push(now);
+            self.restore(plate);
+        }
+    }
+
+    /// Puts the current state on the plate. Its serial goes up, so that
+    /// views and slices count it as changed.
+    fn restore(&self, plate: &mut Plate) {
+        let serial = plate.serial + 1;
+        *plate = self.current.clone();
+        plate.serial = serial;
+        if plate.selected.is_some_and(|i| i >= plate.items.len()) {
+            plate.selected = None;
+        }
+    }
+}
+
 /// Smallest and largest corner of all paths, or `None` without paths.
 pub fn toolpath_bounds(toolpaths: &Toolpaths) -> Option<([f64; 2], [f64; 2])> {
     bounds_2d(
@@ -359,6 +462,53 @@ mod tests {
         // Somewhere off the origin, as models in files often are.
         mesh.translate([37.0, -12.0, 5.0]);
         Model::from_mesh("cube", mesh).unwrap()
+    }
+
+    #[test]
+    fn copies_undo_and_redo() {
+        let settings = Settings::default();
+        let model = Model::from_mesh("cube", Mesh::cuboid(20.0, 10.0, 5.0)).unwrap();
+        let mut plate = Plate::default();
+        let mut history = History::default();
+        history.settle(&plate);
+        assert!(!history.can_undo());
+
+        plate.add(model, &settings);
+        history.settle(&plate);
+        let first = plate.items[0].clone();
+        plate.add_copy(&first, &settings);
+        // Beside the original, sharing its model.
+        assert_eq!(plate.items[1].placement.center, [135.0, 110.0]);
+        assert!(Arc::ptr_eq(&plate.items[0].model, &plate.items[1].model));
+        assert_eq!(plate.selected, Some(1));
+        history.settle(&plate);
+        // Only the selection changes: no new step.
+        plate.selected = Some(0);
+        history.settle(&plate);
+        plate.items[0].placement.center = [50.0, 50.0];
+        history.settle(&plate);
+
+        let serial = plate.serial;
+        history.undo(&mut plate);
+        assert_eq!(plate.items[0].placement.center, [110.0, 110.0]);
+        assert!(plate.serial > serial);
+        history.undo(&mut plate);
+        assert_eq!(plate.items.len(), 1);
+        history.redo(&mut plate);
+        assert_eq!(plate.items.len(), 2);
+        assert!(history.can_redo());
+        // A new change drops what could be redone.
+        plate.remove_selected();
+        history.settle(&plate);
+        assert!(!history.can_redo());
+        history.undo(&mut plate);
+        assert_eq!(plate.items.len(), 2);
+
+        // At the right edge the copy goes to the left.
+        let mut edge = plate.items[0].clone();
+        edge.placement.center = [210.0, 110.0];
+        plate.add_copy(&edge, &settings);
+        assert_eq!(plate.items.last().unwrap().placement.center, [185.0, 110.0]);
     }
 
     #[test]

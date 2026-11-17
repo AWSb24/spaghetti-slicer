@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use eframe::egui::{self, RichText};
 use slicer_fdm::Step;
-use slicer_profiles::{Settings, ValueKind};
+use slicer_profiles::{SETTINGS_INFO, Settings, ValueKind};
 #[cfg(not(target_arch = "wasm32"))]
 use slicer_ui::profiles::import_orca_files;
 use slicer_ui::profiles::{ProfileSet, find_profiles_dir, profile_name};
@@ -59,14 +59,22 @@ impl Profiles {
         }
     }
 
+    /// Reads the profile folder again, after a profile was saved into it.
+    pub fn rescan(&mut self) {
+        if let Some(set) = &mut self.set {
+            *set = ProfileSet::scan(&set.dir.clone());
+        }
+    }
+
     /// The drop-down for one role of `slicer_ui::profiles::ROLES` (printer, material,
-    /// process), across the width of the panel. `files` are the settings
-    /// files in use.
+    /// process), across the width of the panel less `reserve` pixels for
+    /// what follows in the row. `files` are the settings files in use.
     pub fn combo(
         &mut self,
         ui: &mut egui::Ui,
         files: &[PathBuf],
         role: usize,
+        reserve: f32,
     ) -> Option<ProfileAction> {
         let Some(set) = &self.set else {
             if role == 0 {
@@ -80,7 +88,7 @@ impl Profiles {
             .and_then(|index| set.files[role].get(index))
             .map_or_else(|| "(none)".to_owned(), |path| profile_name(path));
         egui::ComboBox::from_id_salt(("profile", role))
-            .width(ui.available_width())
+            .width(ui.available_width() - reserve)
             .selected_text(shown)
             .show_ui(ui, |ui| {
                 let mut wanted = choice;
@@ -169,6 +177,101 @@ impl Profiles {
             notes: imported.notes,
         })
     }
+}
+
+/// Which profile a settings dialog edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileKind {
+    /// The printer: bed, nozzle, firmware, retraction, custom G-code.
+    Printer,
+    /// The filament: temperatures, cooling, flow, density.
+    Filament,
+}
+
+impl ProfileKind {
+    /// Title of the dialog.
+    fn title(self) -> &'static str {
+        match self {
+            ProfileKind::Printer => "Printer settings",
+            ProfileKind::Filament => "Filament settings",
+        }
+    }
+
+    /// The groups of settings (see `SettingInfo::group`) the dialog shows.
+    fn groups(self) -> &'static [&'static str] {
+        match self {
+            ProfileKind::Printer => &["Printer", "Retraction", "Custom G-code"],
+            ProfileKind::Filament => &["Material"],
+        }
+    }
+
+    /// The keys of every setting the dialog shows, as a profile of this
+    /// kind holds them.
+    pub fn keys(self) -> Vec<&'static str> {
+        SETTINGS_INFO
+            .iter()
+            .filter(|info| self.groups().contains(&info.group))
+            .map(|info| info.key)
+            .collect()
+    }
+}
+
+/// A dialog with the printer or filament settings, grouped as in the
+/// settings files, and a button to save them as a profile. `current` are
+/// the settings sliced with. Returns true when the user asks to save.
+#[allow(clippy::too_many_arguments)]
+pub fn profile_window(
+    ctx: &egui::Context,
+    open: &mut Option<ProfileKind>,
+    editor: &mut SettingsEditor,
+    base: &Settings,
+    common: &mut CommonSettings,
+    overrides: &str,
+    current: Option<&Settings>,
+) -> bool {
+    let Some(kind) = *open else {
+        return false;
+    };
+    let mut still_open = true;
+    let mut save = false;
+    egui::Window::new(kind.title())
+        .id(egui::Id::unique("profile_window"))
+        .open(&mut still_open)
+        .default_size([460.0, 560.0])
+        .vscroll(true)
+        .show(ctx, |ui| {
+            let Some(current) = current else {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    "The settings are invalid; fix the message in the side panel.",
+                );
+                return;
+            };
+            for group in kind.groups() {
+                let keys: Vec<&str> = SETTINGS_INFO
+                    .iter()
+                    .filter(|info| info.group == *group)
+                    .map(|info| info.key)
+                    .collect();
+                ui.add_space(6.0);
+                group_header(ui, group);
+                for row in &rows_of(current, base, &keys) {
+                    setting_row(ui, row, editor, base, common, overrides, true);
+                }
+            }
+            ui.add_space(8.0);
+            ui.separator();
+            save = ui
+                .button("Save as profile…")
+                .on_hover_text(
+                    "Write these settings to a profile file, for example in the profile folder",
+                )
+                .clicked();
+        });
+    if !still_open {
+        *open = None;
+    }
+    save
 }
 
 /// The window with every setting. `current` are the settings sliced with,

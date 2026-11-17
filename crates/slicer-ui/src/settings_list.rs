@@ -118,6 +118,7 @@ pub fn setting_unit(key: &str) -> &'static str {
             "_length",
             "_spacing",
             "_diameter",
+            "_travel",
         ]
         .iter()
         .any(|end| key.ends_with(end))
@@ -430,6 +431,7 @@ mod tests {
             ("nozzle_temp", "°C"),
             ("nozzle_temp_first_layer", "°C"),
             ("prime_tower_x", "mm"),
+            ("retraction_min_travel", "mm"),
             ("wall_loops", ""),
             ("supports", ""),
         ] {

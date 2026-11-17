@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use eframe::egui::{self, Align2, FontId, PointerButton, Pos2, Rect, Sense, Vec2};
 use eframe::egui_glow::{self, ShaderVersion};
 use eframe::glow::{self, HasContext};
-use slicer_fdm::{PathKind, Toolpaths};
+use slicer_fdm::{Layer, Path, PathKind, Toolpaths};
 use slicer_ui::camera::{Mat4, OrbitCamera, multiply, ray_plane_z};
 use slicer_ui::plate::{Model, Placement};
 use slicer_ui::scene::{
@@ -78,15 +78,17 @@ pub struct View3d {
 
 impl View3d {
     /// Hands the toolpaths of a slice to the GPU on the next frame as
-    /// strands `line_width` wide, without the kinds in `hidden`, and
-    /// returns the number of segments in every layer.
+    /// strands `line_width` wide in the colours `color` gives, without the
+    /// kinds in `hidden`, and returns the number of segments in every
+    /// layer.
     pub fn set_toolpaths(
         &mut self,
         toolpaths: &Toolpaths,
         line_width: f64,
         hidden: &[PathKind],
+        color: impl Fn(&Path, usize, &Layer) -> [u8; 3],
     ) -> Vec<usize> {
-        let strands = toolpath_strands(toolpaths, line_width, hidden);
+        let strands = toolpath_strands(toolpaths, line_width, hidden, color);
         let segments = strands.segments_per_layer();
         if let Ok(mut gpu) = self.gpu.lock() {
             gpu.pending_paths = Some(strands);
@@ -97,8 +99,10 @@ impl View3d {
     /// Draws the scene into the rest of `ui` and handles the mouse: a
     /// click selects, dragging a model moves it over the bed, dragging
     /// elsewhere turns the view, the right button or Shift pans, the wheel
-    /// zooms. Models can only be picked while no toolpaths are shown.
-    pub fn show(&mut self, ui: &mut egui::Ui, scene: &Scene) -> Event {
+    /// zooms, a right click selects the model under the pointer. Models can
+    /// only be picked while no toolpaths are shown. Returns the event and
+    /// the response of the view, for a context menu.
+    pub fn show(&mut self, ui: &mut egui::Ui, scene: &Scene) -> (Event, egui::Response) {
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = response.rect;
         if self.bed_sent.is_some_and(|bed| bed != scene.bed) || response.double_clicked() {
@@ -167,7 +171,7 @@ impl View3d {
         if response.drag_stopped() {
             self.dragging = None;
         }
-        if response.clicked() && pickable {
+        if (response.clicked() || response.secondary_clicked()) && pickable {
             let picked = response
                 .interact_pointer_pos()
                 .and_then(|pos| hit(camera, pos))
@@ -236,7 +240,7 @@ impl View3d {
             );
         }
         self.view_buttons(ui, rect);
-        event
+        (event, response)
     }
 
     /// Round buttons at the bottom left: whole bed, from above, from the

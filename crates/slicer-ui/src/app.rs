@@ -17,15 +17,20 @@ use slicer_ui::job::{
     SliceJob, SliceRequest, SliceResult, encode_output, format_duration, output_name,
     with_output_extension,
 };
-use slicer_ui::plate::{Placement, Plate, SCALE_RANGE, bed_center, check_placement, load_model};
+use slicer_ui::plate::{
+    History, Item, Placement, Plate, SCALE_RANGE, bed_center, check_placement, load_model,
+};
 use slicer_ui::profiles::replace_profiles;
 use slicer_ui::settings::{CommonSettings, SettingsFile, load_settings};
 use slicer_ui::settings_list::{PROCESS_TABS, SettingsEditor};
-use slicer_ui::view::{kind_name, kinds_in, length_by_kind, path_color};
+use slicer_ui::view::{ColorBy, gradient, kind_name, kinds_in, length_by_kind, path_color};
 
 use crate::icons::{self, Icon};
 use crate::platform;
-use crate::settings_ui::{ProfileAction, Profiles, process_tabs, progress_bar, settings_window};
+use crate::settings_ui::{
+    ProfileAction, ProfileKind, Profiles, process_tabs, profile_window, progress_bar,
+    settings_window,
+};
 use crate::theme;
 use crate::view3d::{Event, Scene, View3d};
 
@@ -113,6 +118,14 @@ pub struct App {
     /// How many segments of the shown layer the preview draws; all if
     /// `None`.
     moves: Option<usize>,
+    /// What the colours of the preview show.
+    color_by: ColorBy,
+    /// The model copied with Ctrl+C.
+    clipboard: Option<Item>,
+    /// Steps of the plate that can be undone.
+    history: History,
+    /// The printer or filament dialog, if open.
+    profile_dialog: Option<ProfileKind>,
 }
 
 impl App {
@@ -141,6 +154,10 @@ impl App {
             hidden: Vec::new(),
             segments: Vec::new(),
             moves: None,
+            color_by: ColorBy::LineType,
+            clipboard: None,
+            history: History::default(),
+            profile_dialog: None,
         };
         app.open_paths(paths);
         app
@@ -300,11 +317,6 @@ impl App {
                 );
                 self.notes.extend(result.warnings.iter().map(Note::from));
                 if let Ok(settings) = &self.current {
-                    self.segments = self.view3d.set_toolpaths(
-                        &result.toolpaths,
-                        settings.line_width,
-                        &self.hidden,
-                    );
                     self.moves = None;
                     self.sliced = Some(Sliced {
                         lengths: length_by_kind(&result.toolpaths.layers),
@@ -315,6 +327,7 @@ impl App {
                     });
                     self.layer = 0;
                     self.tab = Tab::Preview;
+                    self.upload_paths();
                 }
             }
             Err(error) if error.code == "slicing.cancelled" => {
@@ -396,9 +409,14 @@ impl App {
         let mut action = None;
 
         Self::section_head(ui, Icon::Printer, "Printer");
-        if let Some(chosen) = self.profiles.combo(ui, &paths, 0) {
-            action = Some(chosen);
-        }
+        ui.horizontal(|ui| {
+            if let Some(chosen) = self.profiles.combo(ui, &paths, 0, 32.0) {
+                action = Some(chosen);
+            }
+            if icons::button(ui, Icon::Process, 24.0, "Edit printer settings", false).clicked() {
+                self.profile_dialog = Some(ProfileKind::Printer);
+            }
+        });
         let base = &self.base;
         ui.label(
             RichText::new(format!(
@@ -421,8 +439,11 @@ impl App {
                 FontId::proportional(12.0),
                 Color32::WHITE,
             );
-            if let Some(chosen) = self.profiles.combo(ui, &paths, 1) {
+            if let Some(chosen) = self.profiles.combo(ui, &paths, 1, 32.0) {
                 action = Some(chosen);
+            }
+            if icons::button(ui, Icon::Process, 24.0, "Edit filament settings", false).clicked() {
+                self.profile_dialog = Some(ProfileKind::Filament);
             }
         });
         ui.add_space(6.0);
@@ -432,7 +453,7 @@ impl App {
         ui.add_space(6.0);
 
         Self::section_head(ui, Icon::Process, "Process");
-        if let Some(chosen) = self.profiles.combo(ui, &paths, 2) {
+        if let Some(chosen) = self.profiles.combo(ui, &paths, 2, 0.0) {
             action = Some(chosen);
         }
         ui.add_space(2.0);
@@ -530,6 +551,29 @@ impl App {
         }
     }
 
+    /// Saves the settings of the open printer or filament dialog as a
+    /// profile file and lists it with the profiles.
+    fn save_profile(&mut self) {
+        let (Some(kind), Ok(settings)) = (self.profile_dialog, &self.current) else {
+            return;
+        };
+        let name = match kind {
+            ProfileKind::Printer => "my-printer.toml",
+            ProfileKind::Filament => "my-filament.toml",
+        };
+        let Some(path) = platform::save_path(name, "Settings", "toml") else {
+            return;
+        };
+        let text = settings.to_toml_keys(&kind.keys());
+        match platform::write(&path, text.as_bytes()) {
+            Ok(()) => {
+                self.note(Level::Info, format!("Saved {}", path.display()));
+                self.profiles.rescan();
+            }
+            Err(e) => self.note(Level::Error, format!("{}: {e}", path.display())),
+        }
+    }
+
     fn pick_models(&mut self, ctx: &egui::Context) {
         for path in platform::pick_files(ctx, "Models", &["stl", "3mf"], true) {
             self.open_model(&path);
@@ -555,6 +599,7 @@ impl App {
         }
         let bed = self.bed();
         let mut clicked = None;
+        let mut rows = Vec::new();
         for (index, item) in self.plate.items.iter().enumerate() {
             let (s, size) = (item.placement.scale, item.model.size);
             let text = format!(
@@ -564,15 +609,19 @@ impl App {
                 size[1] * s,
                 size[2] * s
             );
-            if ui
-                .selectable_label(self.plate.selected == Some(index), text)
-                .clicked()
-            {
+            let row = ui.selectable_label(self.plate.selected == Some(index), text);
+            if row.clicked() || row.secondary_clicked() {
                 clicked = Some(index);
             }
+            rows.push(row);
         }
         if clicked.is_some() {
             self.plate.selected = clicked;
+        }
+        for (index, row) in rows.into_iter().enumerate() {
+            if self.plate.selected == Some(index) {
+                row.context_menu(|ui| self.object_menu(ui));
+            }
         }
         let Some(item) = self.plate.selected_mut() else {
             return;
@@ -738,6 +787,44 @@ impl App {
                                     .arrange(self.current.as_ref().unwrap_or(&self.base));
                             }
                             ui.separator();
+                            let undo = ui
+                                .add_enabled_ui(self.history.can_undo(), |ui| {
+                                    icons::button(ui, Icon::Undo, 34.0, "Undo (Ctrl+Z)", false)
+                                })
+                                .inner;
+                            if undo.clicked() {
+                                self.history.undo(&mut self.plate);
+                            }
+                            let redo = ui
+                                .add_enabled_ui(self.history.can_redo(), |ui| {
+                                    icons::button(ui, Icon::Redo, 34.0, "Redo (Ctrl+Y)", false)
+                                })
+                                .inner;
+                            if redo.clicked() {
+                                self.history.redo(&mut self.plate);
+                            }
+                            ui.separator();
+                            let duplicate = ui
+                                .add_enabled_ui(selected, |ui| {
+                                    icons::button(
+                                        ui,
+                                        Icon::Duplicate,
+                                        34.0,
+                                        "Duplicate (Ctrl+D)",
+                                        false,
+                                    )
+                                })
+                                .inner;
+                            if duplicate.clicked()
+                                && let Some(item) = self
+                                    .plate
+                                    .selected
+                                    .and_then(|i| self.plate.items.get(i))
+                                    .cloned()
+                            {
+                                let settings = self.current.as_ref().unwrap_or(&self.base).clone();
+                                self.plate.add_copy(&item, &settings);
+                            }
                             let bed = self.bed();
                             let tools = [
                                 (Icon::Center, "Move to the middle of the bed"),
@@ -934,15 +1021,41 @@ impl App {
         self.moves = (shown < count).then_some(shown);
     }
 
-    /// The legend at the top right of the preview: every line type with
-    /// its colour, its share of the extruded length and the length, and
-    /// the totals. Types not in the shown layer are dimmed.
+    /// Sends the toolpaths of the slice to the 3D view in the colours of
+    /// the chosen view, without the hidden line types.
+    fn upload_paths(&mut self) {
+        let Some(sliced) = &self.sliced else {
+            return;
+        };
+        let (by, settings) = (self.color_by, &sliced.settings);
+        let toolpaths = &sliced.result.toolpaths;
+        let range = by.range(toolpaths, settings);
+        self.segments = self.view3d.set_toolpaths(
+            toolpaths,
+            settings.line_width,
+            &self.hidden,
+            |path, index, layer| by.color(path, index, layer, settings, range),
+        );
+    }
+
+    /// The legend at the top right of the preview. For line types: colour,
+    /// estimated time, share of the time and length of every type, with a
+    /// switch to hide it, and the travel time; for the other views a colour
+    /// scale. Below are the totals. Types not in the shown layer are
+    /// dimmed.
     fn legend(&mut self, ctx: &egui::Context, canvas: Rect) {
         let Some(sliced) = &self.sliced else {
             return;
         };
         let stats = &sliced.result.output.stats;
-        let total: f64 = sliced.lengths.iter().map(|(_, length)| length).sum();
+        let total_time = stats.print_time_s.max(1e-9);
+        let time_of = |kind: Option<PathKind>| {
+            stats
+                .times
+                .iter()
+                .find(|(k, _)| *k == kind)
+                .map_or(0.0, |(_, t)| *t)
+        };
         let in_layer = sliced
             .result
             .toolpaths
@@ -950,8 +1063,12 @@ impl App {
             .get(self.layer)
             .map(kinds_in)
             .unwrap_or_default();
+        let range = self
+            .color_by
+            .range(&sliced.result.toolpaths, &sliced.settings);
         let current = self.slice_is_current();
         let mut toggled = None;
+        let mut color_by = self.color_by;
         egui::Area::new(egui::Id::unique("legend"))
             .pivot(Align2::RIGHT_TOP)
             .fixed_pos(canvas.right_top() + Vec2::new(-12.0, 12.0))
@@ -961,46 +1078,72 @@ impl App {
                     .corner_radius(4)
                     .inner_margin(10)
                     .show(ui, |ui| {
-                        egui::Grid::new("legend_rows")
-                            .num_columns(5)
-                            .spacing([12.0, 3.0])
-                            .show(ui, |ui| {
-                                ui.label("");
-                                ui.label(RichText::new("Line type").strong());
-                                ui.label(RichText::new("%").strong());
-                                ui.label(RichText::new("Length").strong());
-                                ui.label("");
-                                ui.end_row();
-                                for &(kind, length) in &sliced.lengths {
-                                    let [r, g, b] = path_color(kind);
-                                    let (swatch, _) =
-                                        ui.allocate_exact_size(Vec2::splat(11.0), Sense::hover());
-                                    ui.painter().rect_filled(
-                                        swatch,
-                                        1.0,
-                                        Color32::from_rgb(r, g, b),
-                                    );
-                                    let name = RichText::new(kind_name(kind));
-                                    ui.label(if in_layer.contains(&kind) {
-                                        name
-                                    } else {
-                                        name.color(theme::TEXT_WEAK)
-                                    });
-                                    let share = if total > 0.0 { length / total } else { 0.0 };
-                                    ui.label(format!("{:.1}", share * 100.0));
-                                    ui.label(format!("{:.2} m", length / 1000.0));
-                                    let hidden = self.hidden.contains(&kind);
-                                    let (icon, tip) = if hidden {
-                                        (Icon::EyeClosed, "Show")
-                                    } else {
-                                        (Icon::Eye, "Hide")
-                                    };
-                                    if icons::button(ui, icon, 20.0, tip, false).clicked() {
-                                        toggled = Some(kind);
-                                    }
-                                    ui.end_row();
+                        let name = ColorBy::ALL
+                            .iter()
+                            .find(|(by, _)| *by == color_by)
+                            .map_or("", |(_, name)| name);
+                        egui::ComboBox::from_id_salt("color_by")
+                            .selected_text(name)
+                            .show_ui(ui, |ui| {
+                                for (by, name) in ColorBy::ALL {
+                                    ui.selectable_value(&mut color_by, by, name);
                                 }
                             });
+                        ui.add_space(4.0);
+                        if self.color_by == ColorBy::LineType {
+                            egui::Grid::new("legend_rows")
+                                .num_columns(6)
+                                .spacing([10.0, 3.0])
+                                .show(ui, |ui| {
+                                    ui.label("");
+                                    for title in ["Line type", "Time", "%", "Length"] {
+                                        ui.label(RichText::new(title).strong());
+                                    }
+                                    ui.label("");
+                                    ui.end_row();
+                                    for &(kind, length) in &sliced.lengths {
+                                        let [r, g, b] = path_color(kind);
+                                        let (swatch, _) = ui
+                                            .allocate_exact_size(Vec2::splat(11.0), Sense::hover());
+                                        ui.painter().rect_filled(
+                                            swatch,
+                                            1.0,
+                                            Color32::from_rgb(r, g, b),
+                                        );
+                                        let name = RichText::new(kind_name(kind));
+                                        ui.label(if in_layer.contains(&kind) {
+                                            name
+                                        } else {
+                                            name.color(theme::TEXT_WEAK)
+                                        });
+                                        let time = time_of(Some(kind));
+                                        ui.label(format_duration(time));
+                                        ui.label(format!("{:.1}", time / total_time * 100.0));
+                                        ui.label(format!("{:.2} m", length / 1000.0));
+                                        let hidden = self.hidden.contains(&kind);
+                                        let (icon, tip) = if hidden {
+                                            (Icon::EyeClosed, "Show")
+                                        } else {
+                                            (Icon::Eye, "Hide")
+                                        };
+                                        if icons::button(ui, icon, 20.0, tip, false).clicked() {
+                                            toggled = Some(kind);
+                                        }
+                                        ui.end_row();
+                                    }
+                                    let travel = time_of(None);
+                                    ui.label("");
+                                    ui.label(
+                                        RichText::new("Travel and retraction")
+                                            .color(theme::TEXT_WEAK),
+                                    );
+                                    ui.label(format_duration(travel));
+                                    ui.label(format!("{:.1}", travel / total_time * 100.0));
+                                    ui.end_row();
+                                });
+                        } else if let Some((lo, hi)) = range {
+                            color_scale(ui, lo, hi, self.color_by.unit());
+                        }
                         ui.add_space(6.0);
                         ui.label(RichText::new("Total estimation").strong());
                         ui.separator();
@@ -1030,17 +1173,191 @@ impl App {
                         }
                     });
             });
+        let mut changed = color_by != self.color_by;
+        self.color_by = color_by;
         if let Some(kind) = toggled {
             if let Some(at) = self.hidden.iter().position(|&k| k == kind) {
                 self.hidden.remove(at);
             } else {
                 self.hidden.push(kind);
             }
-            self.segments = self.view3d.set_toolpaths(
-                &sliced.result.toolpaths,
-                sliced.settings.line_width,
-                &self.hidden,
-            );
+            changed = true;
+        }
+        if changed {
+            self.upload_paths();
+        }
+    }
+
+    /// The selected model's name, size, volume and triangle count at the
+    /// bottom left of the plate, right of the view buttons.
+    fn object_info(&self, ctx: &egui::Context, canvas: Rect) {
+        let Some(item) = self.plate.selected.and_then(|i| self.plate.items.get(i)) else {
+            return;
+        };
+        let (s, size) = (item.placement.scale, item.model.size);
+        egui::Area::new(egui::Id::unique("object_info"))
+            .pivot(Align2::LEFT_BOTTOM)
+            .fixed_pos(canvas.left_bottom() + Vec2::new(72.0, -12.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(theme::POPUP)
+                    .corner_radius(3)
+                    .inner_margin(egui::Margin {
+                        left: 12,
+                        right: 10,
+                        top: 6,
+                        bottom: 6,
+                    })
+                    .show(ui, |ui| {
+                        let text = format!(
+                            "Object name: {}\nSize: {:.2} × {:.2} × {:.2} mm\nVolume: {:.2} mm³\nTriangles: {}",
+                            item.model.name,
+                            size[0] * s,
+                            size[1] * s,
+                            size[2] * s,
+                            item.model.mesh.volume() * s * s * s,
+                            item.model.mesh.triangles.len()
+                        );
+                        ui.label(RichText::new(text).small().color(theme::TEXT));
+                    });
+            });
+    }
+
+    /// The actions on the selected model, for its context menu.
+    fn object_menu(&mut self, ui: &mut egui::Ui) {
+        let bed = self.bed();
+        let settings = self.current.as_ref().unwrap_or(&self.base).clone();
+        if ui
+            .add(egui::Button::new("Duplicate").shortcut_text("Ctrl+D"))
+            .clicked()
+        {
+            if let Some(item) = self
+                .plate
+                .selected
+                .and_then(|i| self.plate.items.get(i))
+                .cloned()
+            {
+                self.plate.add_copy(&item, &settings);
+            }
+            ui.close();
+        }
+        if ui
+            .add(egui::Button::new("Copy").shortcut_text("Ctrl+C"))
+            .clicked()
+        {
+            self.clipboard = self
+                .plate
+                .selected
+                .and_then(|i| self.plate.items.get(i))
+                .cloned();
+            ui.close();
+        }
+        if ui
+            .add(egui::Button::new("Delete").shortcut_text("Del"))
+            .clicked()
+        {
+            self.plate.remove_selected();
+            ui.close();
+        }
+        ui.separator();
+        let mut placement_action =
+            |ui: &mut egui::Ui, label: &str, change: &dyn Fn(&mut Placement)| {
+                if ui.button(label).clicked() {
+                    if let Some(item) = self.plate.selected_mut() {
+                        change(&mut item.placement);
+                    }
+                    ui.close();
+                }
+            };
+        placement_action(ui, "Move to the middle", &|p| {
+            p.center = [bed[0] / 2.0, bed[1] / 2.0]
+        });
+        placement_action(ui, "Turn left by 90°", &|p| {
+            p.rotation_deg = (p.rotation_deg + 90.0) % 360.0;
+        });
+        placement_action(ui, "Turn right by 90°", &|p| {
+            p.rotation_deg = (p.rotation_deg - 90.0) % 360.0;
+        });
+        placement_action(ui, "Reset rotation and scale", &|p| {
+            p.rotation_deg = 0.0;
+            p.scale = 1.0;
+        });
+    }
+
+    /// Keyboard shortcuts, when no text field has the keyboard: undo and
+    /// redo, copy and paste, duplicate, delete, arrange, move the selected
+    /// model with the arrow keys (Shift for 10 mm), Escape to deselect.
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let settings = self.current.as_ref().unwrap_or(&self.base).clone();
+        let (command, shift) = ctx.input(|i| (i.modifiers.command, i.modifiers.shift));
+        let pressed = |key: egui::Key| ctx.input(|i| i.key_pressed(key));
+        if command && pressed(egui::Key::Z) {
+            if shift {
+                self.history.redo(&mut self.plate);
+            } else {
+                self.history.undo(&mut self.plate);
+            }
+            return;
+        }
+        if command && pressed(egui::Key::Y) {
+            self.history.redo(&mut self.plate);
+            return;
+        }
+        // Copy and paste arrive as events; Ctrl+C and Ctrl+V are not keys.
+        let (copy, paste) = ctx.input(|i| {
+            (
+                i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+                i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))),
+            )
+        });
+        let selected = self
+            .plate
+            .selected
+            .and_then(|i| self.plate.items.get(i))
+            .cloned();
+        if copy {
+            self.clipboard = selected.clone();
+        }
+        if paste && let Some(item) = self.clipboard.clone() {
+            self.plate.add_copy(&item, &settings);
+        }
+        if command
+            && pressed(egui::Key::D)
+            && let Some(item) = &selected
+        {
+            self.plate.add_copy(item, &settings);
+        }
+        if self.tab != Tab::Plate {
+            return;
+        }
+        if pressed(egui::Key::Delete) || pressed(egui::Key::Backspace) {
+            self.plate.remove_selected();
+        }
+        if pressed(egui::Key::Escape) {
+            self.plate.selected = None;
+        }
+        if !command && pressed(egui::Key::A) && !self.plate.items.is_empty() {
+            self.plate.arrange(&settings);
+        }
+        let step = if shift { 10.0 } else { 1.0 };
+        let bed = self.bed();
+        for (key, d) in [
+            (egui::Key::ArrowLeft, [-step, 0.0]),
+            (egui::Key::ArrowRight, [step, 0.0]),
+            (egui::Key::ArrowUp, [0.0, step]),
+            (egui::Key::ArrowDown, [0.0, -step]),
+        ] {
+            if pressed(key)
+                && let Some(item) = self.plate.selected_mut()
+            {
+                let center = &mut item.placement.center;
+                center[0] = (center[0] + d[0]).clamp(0.0, bed[0]);
+                center[1] = (center[1] + d[1]).clamp(0.0, bed[1]);
+            }
         }
     }
 
@@ -1057,7 +1374,7 @@ impl App {
             .map(|(index, item)| {
                 let fits = check_placement(&item.model, &item.placement, settings).is_ok();
                 let selected = self.plate.selected == Some(index);
-                (&item.model, item.placement, selected, fits)
+                (&*item.model, item.placement, selected, fits)
             })
             .collect();
         let layer = (self.tab == Tab::Preview && self.sliced.is_some()).then_some(self.layer);
@@ -1069,7 +1386,11 @@ impl App {
             layer,
             moves: self.moves,
         };
-        match self.view3d.show(ui, &scene) {
+        let (event, response) = self.view3d.show(ui, &scene);
+        if self.tab == Tab::Plate && self.plate.selected.is_some() {
+            response.context_menu(|ui| self.object_menu(ui));
+        }
+        match event {
             Event::None => {}
             Event::Select(index) => self.plate.selected = index,
             Event::Move(index, [dx, dy]) => {
@@ -1082,6 +1403,40 @@ impl App {
             }
         }
     }
+}
+
+/// A colour bar from `lo` to `hi` with its ends and middle labelled.
+fn color_scale(ui: &mut egui::Ui, lo: f64, hi: f64, unit: &str) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(240.0, 14.0), Sense::hover());
+    let steps = 48;
+    for i in 0..steps {
+        let t = i as f32 / steps as f32;
+        let [r, g, b] = gradient(f64::from(t));
+        let x0 = rect.left() + rect.width() * t;
+        let x1 = rect.left() + rect.width() * (i + 1) as f32 / steps as f32;
+        ui.painter().rect_filled(
+            Rect::from_min_max(
+                Pos2::new(x0, rect.top()),
+                Pos2::new(x1 + 0.5, rect.bottom()),
+            ),
+            0.0,
+            Color32::from_rgb(r, g, b),
+        );
+    }
+    ui.horizontal(|ui| {
+        ui.set_width(240.0);
+        let label = |v: f64| format!("{} {unit}", (v * 100.0).round() / 100.0);
+        ui.label(RichText::new(label(lo)).small());
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(RichText::new(label(hi)).small());
+            ui.with_layout(
+                Layout::centered_and_justified(egui::Direction::LeftToRight),
+                |ui| {
+                    ui.label(RichText::new(label((lo + hi) / 2.0)).small());
+                },
+            );
+        });
+    });
 }
 
 /// The parts of a pill-shaped button: the label and the round chevron on
@@ -1180,6 +1535,7 @@ impl eframe::App for App {
         self.poll_job();
         self.handle_dropped_files(&ctx);
         self.current = self.editor.build(&self.base, &self.common, &self.overrides);
+        self.shortcuts(&ctx);
 
         egui::Panel::top("top")
             .frame(egui::Frame::new().fill(theme::PANEL))
@@ -1192,6 +1548,18 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| self.side_panel(ui));
             });
+        let save = profile_window(
+            &ctx,
+            &mut self.profile_dialog,
+            &mut self.editor,
+            &self.base,
+            &mut self.common,
+            &self.overrides,
+            self.current.as_ref().ok(),
+        );
+        if save {
+            self.save_profile();
+        }
         settings_window(
             &ctx,
             &mut self.all_settings,
@@ -1231,6 +1599,7 @@ impl eframe::App for App {
                     }
                 } else {
                     self.toolbar(&ctx, canvas);
+                    self.object_info(&ctx, canvas);
                 }
                 // Above the slider along the bottom of the preview.
                 let lift = if preview && self.sliced.is_some() {
@@ -1240,5 +1609,9 @@ impl eframe::App for App {
                 };
                 self.notifications(&ctx, canvas, lift);
             });
+        // A change is one step once the mouse is let go.
+        if !ctx.input(|i| i.pointer.any_down()) {
+            self.history.settle(&self.plate);
+        }
     }
 }

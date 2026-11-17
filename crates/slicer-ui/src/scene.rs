@@ -5,11 +5,10 @@
 use std::ops::Range;
 
 use slicer_core::Mesh;
-use slicer_fdm::{PathKind, Toolpaths};
+use slicer_fdm::{Layer, Path, PathKind, Toolpaths};
 
 use crate::camera::Mat4;
 use crate::plate::{Model, Placement, bounds_2d};
-use crate::view::path_color;
 
 /// Grid spacing on the bed in millimetres.
 const GRID_STEP: f64 = 10.0;
@@ -302,15 +301,21 @@ pub fn bed_grid(bed: [f64; 2], grid: [u8; 4], border: [u8; 4]) -> Lines {
     lines
 }
 
-/// Every extrusion of every layer as a strand in the colour of its kind,
-/// leaving out the kinds in `hidden`. Lines are `line_width` wide unless
-/// the path has its own width, and as high as their layer.
-pub fn toolpath_strands(toolpaths: &Toolpaths, line_width: f64, hidden: &[PathKind]) -> Strands {
+/// Every extrusion of every layer as a strand, leaving out the kinds in
+/// `hidden`; `color` gives each path's colour from the path, the number of
+/// its layer and the layer. Lines are `line_width` wide unless the path has
+/// its own width, and as high as their layer.
+pub fn toolpath_strands(
+    toolpaths: &Toolpaths,
+    line_width: f64,
+    hidden: &[PathKind],
+    color: impl Fn(&Path, usize, &Layer) -> [u8; 3],
+) -> Strands {
     let mut strands = Strands::default();
-    for layer in &toolpaths.layers {
+    for (index, layer) in toolpaths.layers.iter().enumerate() {
         let z = layer.z - layer.height / 2.0;
         for path in layer.paths.iter().filter(|p| !hidden.contains(&p.kind)) {
-            let [r, g, b] = path_color(path.kind);
+            let [r, g, b] = color(path, index, layer);
             let size = [path.width.unwrap_or(line_width), layer.height];
             for pair in path.points.windows(2) {
                 strands.push(pair[0], pair[1], z, size, [r, g, b, 255]);
@@ -338,6 +343,7 @@ mod tests {
     use super::*;
     use crate::camera::transform_point;
     use crate::plate::placed_outline;
+    use crate::view::path_color;
 
     fn path(kind: PathKind, points: Vec<[f64; 2]>, closed: bool) -> Path {
         Path {
@@ -461,7 +467,8 @@ mod tests {
                 },
             ],
         };
-        let strands = toolpath_strands(&toolpaths, 0.4, &[]);
+        let by_kind = |path: &Path, _: usize, _: &Layer| path_color(path.kind);
+        let strands = toolpath_strands(&toolpaths, 0.4, &[], by_kind);
         let n = INDICES_PER_SEGMENT;
         // Closed square: 4 segments; open: 3; a single point: none; thin: 1.
         assert_eq!(strands.layer_ends, [4 * n, 4 * n, 8 * n]);
@@ -499,6 +506,7 @@ mod tests {
             &toolpaths,
             0.4,
             &[PathKind::SparseInfill, PathKind::GapFill],
+            by_kind,
         );
         assert_eq!(walls_only.segments_per_layer(), [4, 0, 0]);
     }
@@ -507,7 +515,7 @@ mod tests {
     fn sliced_cube_draws_every_layer() {
         let mesh = Mesh::cuboid(10.0, 10.0, 2.0);
         let toolpaths = slicer_fdm::generate(&mesh, &Settings::default()).unwrap();
-        let strands = toolpath_strands(&toolpaths, 0.45, &[]);
+        let strands = toolpath_strands(&toolpaths, 0.45, &[], |path, _, _| path_color(path.kind));
         assert_eq!(strands.layer_ends.len(), toolpaths.layers.len());
         assert!(strands.layer_ends.windows(2).all(|w| w[0] < w[1]));
         // The top of the strands is the top of the last layer.

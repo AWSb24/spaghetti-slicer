@@ -37,6 +37,12 @@ pub enum Icon {
     TurnRight,
     /// Look at the whole bed again.
     Fit,
+    /// Undo the last change: a hooked arrow to the left.
+    Undo,
+    /// Redo an undone change.
+    Redo,
+    /// Copy the selected model: two boxes and a plus.
+    Duplicate,
     /// A shown line type.
     Eye,
     /// A hidden line type.
@@ -168,6 +174,41 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                 painter.add(Shape::line(vec![tip + a, tip, tip + b], stroke));
             }
             painter.add(Shape::line(points, stroke));
+        }
+        Icon::Undo | Icon::Redo => {
+            // A U-turn: from the arrow head along the top, round the right
+            // end and back along the bottom; mirrored for redo.
+            let flip = |x: f32| if icon == Icon::Redo { 1.0 - x } else { x };
+            let mut points: Vec<Pos2> = vec![at(flip(0.15), 0.35), at(flip(0.6), 0.35)];
+            points.extend(
+                arc(0.6, 0.575, 0.225, -PI / 2.0, PI / 2.0)
+                    .into_iter()
+                    .map(|p| {
+                        Pos2::new(
+                            if icon == Icon::Redo {
+                                2.0 * rect.center().x - p.x
+                            } else {
+                                p.x
+                            },
+                            p.y,
+                        )
+                    }),
+            );
+            points.push(at(flip(0.3), 0.8));
+            painter.add(Shape::line(points, stroke));
+            line(&[(flip(0.32), 0.18), (flip(0.15), 0.35), (flip(0.32), 0.52)]);
+        }
+        Icon::Duplicate => {
+            closed(&[(0.1, 0.32), (0.58, 0.32), (0.58, 0.9), (0.1, 0.9)]);
+            line(&[
+                (0.32, 0.32),
+                (0.32, 0.1),
+                (0.9, 0.1),
+                (0.9, 0.68),
+                (0.58, 0.68),
+            ]);
+            line(&[(0.34, 0.48), (0.34, 0.74)]);
+            line(&[(0.21, 0.61), (0.47, 0.61)]);
         }
         Icon::Eye | Icon::EyeClosed => {
             let upper = arc(0.5, 0.95, 0.6, -PI * 0.78, -PI * 0.22);

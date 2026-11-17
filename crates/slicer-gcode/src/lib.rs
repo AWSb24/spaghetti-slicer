@@ -32,6 +32,11 @@ pub struct Stats {
     /// one extruder (`extruder_count`); empty otherwise.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub extruders: Vec<ExtruderStats>,
+    /// Estimated seconds per line type, in the order the types first
+    /// appear; travel, retraction and Z moves are under `None`. They add up
+    /// to `print_time_s`. Not written to the file or to JSON.
+    #[serde(skip)]
+    pub times: Vec<(Option<PathKind>, f64)>,
 }
 
 /// Summary of what one extruder prints.
@@ -201,6 +206,8 @@ struct Move {
     speed: f64,
     /// Extruder selected during the move (its slot in the writer).
     tool: usize,
+    /// What is extruded; `None` for travel, retraction and Z moves.
+    kind: Option<PathKind>,
 }
 
 /// Time in seconds the moves take when the printer starts and ends at rest,
@@ -306,7 +313,7 @@ impl Writer<'_> {
             let _ = writeln!(self.out, "G1{e}{f}");
             self.retracted[self.tool] = true;
             self.filament[self.tool] -= length;
-            self.record([0.0, 0.0], length, self.settings.retraction_speed);
+            self.record([0.0, 0.0], length, self.settings.retraction_speed, None);
         }
     }
 
@@ -318,7 +325,7 @@ impl Writer<'_> {
             let _ = writeln!(self.out, "G1{e}{f}");
             self.retracted[self.tool] = false;
             self.filament[self.tool] += length;
-            self.record([0.0, 0.0], length, self.settings.retraction_speed);
+            self.record([0.0, 0.0], length, self.settings.retraction_speed, None);
         }
     }
 
@@ -333,13 +340,14 @@ impl Writer<'_> {
         self.tool = tool;
     }
 
-    fn record(&mut self, direction: Point, length: f64, speed: f64) {
+    fn record(&mut self, direction: Point, length: f64, speed: f64, kind: Option<PathKind>) {
         if length > 0.0 {
             self.moves.push(Move {
                 direction,
                 length,
                 speed,
                 tool: self.tool,
+                kind,
             });
         }
     }
@@ -348,7 +356,12 @@ impl Writer<'_> {
         let f = self.feed_word(self.settings.travel_speed);
         let _ = writeln!(self.out, "G1 Z{z:.3}{f}");
         if let Some(from) = self.nozzle_z.replace(z) {
-            self.record([0.0, 0.0], (z - from).abs(), self.settings.travel_speed);
+            self.record(
+                [0.0, 0.0],
+                (z - from).abs(),
+                self.settings.travel_speed,
+                None,
+            );
         }
     }
 
@@ -377,7 +390,7 @@ impl Writer<'_> {
         let f = self.feed_word(self.settings.travel_speed);
         let _ = writeln!(self.out, "G0 X{:.3} Y{:.3}{f}", to[0], to[1]);
         if let Some(direction) = direction {
-            self.record(direction, length, self.settings.travel_speed);
+            self.record(direction, length, self.settings.travel_speed, None);
         }
         if hop {
             self.move_z(self.z);
@@ -385,7 +398,7 @@ impl Writer<'_> {
         self.position = Some(to);
     }
 
-    fn extrude(&mut self, to: Point, filament_per_mm: f64, speed: f64) {
+    fn extrude(&mut self, to: Point, filament_per_mm: f64, speed: f64, kind: PathKind) {
         let Some(from) = self.position else { return };
         let length = distance(from, to);
         if length < 1e-4 {
@@ -398,7 +411,7 @@ impl Writer<'_> {
         let _ = writeln!(self.out, "G1 X{:.3} Y{:.3}{word}{f}", to[0], to[1]);
         self.filament[self.tool] += e;
         let direction = [(to[0] - from[0]) / length, (to[1] - from[1]) / length];
-        self.record(direction, length, speed);
+        self.record(direction, length, speed, Some(kind));
         self.position = Some(to);
     }
 }
@@ -417,6 +430,24 @@ impl Writer<'_> {
 /// the height of the layer (the custom G-code may have moved the nozzle).
 pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output, GcodeError> {
     write_gcode_with_progress(toolpaths, settings, &Progress::new())
+}
+
+/// Speed in mm/s at which a path of `kind` is printed on layer `layer`
+/// (counted from 0).
+pub fn path_speed(settings: &Settings, kind: PathKind, layer: usize) -> f64 {
+    if layer == 0 {
+        return settings.first_layer_speed;
+    }
+    match kind {
+        PathKind::OuterWall => settings.outer_wall_speed,
+        PathKind::InnerWall | PathKind::GapFill => settings.inner_wall_speed,
+        PathKind::SolidInfill
+        | PathKind::SparseInfill
+        | PathKind::Support
+        | PathKind::PrimeTower => settings.infill_speed,
+        PathKind::Bridge => settings.bridge_speed,
+        PathKind::Skirt | PathKind::Brim => settings.first_layer_speed,
+    }
 }
 
 /// Like [`write_gcode`], and reports how far it has got in `progress`,
@@ -554,25 +585,12 @@ pub fn write_gcode_with_progress(
                 current_kind = Some(path.kind);
                 let _ = writeln!(w.out, ";TYPE:{}", label(path.kind));
             }
-            let speed = if index == 0 {
-                settings.first_layer_speed
-            } else {
-                match path.kind {
-                    PathKind::OuterWall => settings.outer_wall_speed,
-                    PathKind::InnerWall | PathKind::GapFill => settings.inner_wall_speed,
-                    PathKind::SolidInfill
-                    | PathKind::SparseInfill
-                    | PathKind::Support
-                    | PathKind::PrimeTower => settings.infill_speed,
-                    PathKind::Bridge => settings.bridge_speed,
-                    PathKind::Skirt | PathKind::Brim => settings.first_layer_speed,
-                }
-            };
+            let speed = path_speed(settings, path.kind, index);
             for &point in &path.points[1..] {
-                w.extrude(point, filament_per_mm, speed);
+                w.extrude(point, filament_per_mm, speed, path.kind);
             }
             if path.closed {
-                w.extrude(first, filament_per_mm, speed);
+                w.extrude(first, filament_per_mm, speed, path.kind);
             }
         }
         progress.advance();
@@ -613,6 +631,13 @@ pub fn write_gcode_with_progress(
     } else {
         Vec::new()
     };
+    let mut by_kind: Vec<(Option<PathKind>, f64)> = Vec::new();
+    for (m, &time) in w.moves.iter().zip(&times) {
+        match by_kind.iter_mut().find(|(kind, _)| *kind == m.kind) {
+            Some((_, sum)) => *sum += time,
+            None => by_kind.push((m.kind, time)),
+        }
+    }
     let total: f64 = used.iter().sum();
     let stats = Stats {
         layers: toolpaths.layers.len(),
@@ -621,6 +646,7 @@ pub fn write_gcode_with_progress(
         filament_weight_g: volume(total) * settings.filament_density,
         print_time_s: times.iter().sum(),
         extruders,
+        times: by_kind,
     };
 
     let flavor = match settings.flavor {
@@ -675,6 +701,24 @@ mod tests {
 
     fn slice(mesh: &Mesh, settings: &Settings) -> Output {
         write_gcode(&slicer_fdm::generate(mesh, settings).unwrap(), settings).unwrap()
+    }
+
+    #[test]
+    fn times_per_line_type_add_up() {
+        let output = slice(&Mesh::cuboid(20.0, 20.0, 4.0), &Settings::default());
+        let stats = &output.stats;
+        let sum: f64 = stats.times.iter().map(|(_, t)| t).sum();
+        assert!((sum - stats.print_time_s).abs() < 1e-6, "{sum}");
+        let kinds: Vec<Option<PathKind>> = stats.times.iter().map(|(k, _)| *k).collect();
+        for kind in [
+            None,
+            Some(PathKind::Skirt),
+            Some(PathKind::OuterWall),
+            Some(PathKind::SparseInfill),
+        ] {
+            assert!(kinds.contains(&kind), "{kind:?} in {kinds:?}");
+        }
+        assert!(stats.times.iter().all(|(_, t)| *t > 0.0));
     }
 
     /// Value of the word starting with `letter` in a G-code line.
@@ -810,6 +854,7 @@ mod tests {
             length,
             speed,
             tool: 0,
+            kind: None,
         };
         let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
         // 100 mm at 50 mm/s with 1000 mm/s²: 0.05 s and 1.25 mm for each
