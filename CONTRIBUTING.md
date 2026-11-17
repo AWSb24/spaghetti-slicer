@@ -82,7 +82,7 @@ All three must pass. New behaviour needs a test.
 | Folded walls in regions one to two lines wide | Morphological opening (shrink, then grow back) of a wall's centre area finds where its loop's sides lie closer than a line; textbook mathematical morphology (Serra), own design |
 | Desktop app | `eframe`/`egui` (MIT OR Apache-2.0), `rfd` (MIT); layout own design |
 | 3D view (orbit camera, look-at and perspective matrices, flat shading) | Textbook OpenGL matrices as documented for `gluLookAt`/`gluPerspective`; drawn with `glow`/`egui_glow` (MIT OR Apache-2.0, already used by eframe); own design |
-| Browser build of the desktop app | eframe's web runner; `wasm-bindgen`, `wasm-bindgen-futures`, `js-sys`, `web-sys`, `web-time` (MIT OR Apache-2.0); downloads through a Blob URL after the MDN Web API documentation |
+| Browser build of the desktop app | eframe's web runner; `wasm-bindgen`, `wasm-bindgen-futures`, `js-sys`, `web-sys`, `web-time` (MIT OR Apache-2.0); downloads through a Blob URL and slicing in a module Web Worker after the MDN Web API documentation; own byte format between page and worker |
 | Default start and end G-code | Generic Marlin commands, not taken from any profile |
 | Calibration prints (temperature tower with `M104` per block, retraction length per band of height, flow per block; test models and the changes made to the written G-code) | Own design; `M104` from the Marlin G-code documentation |
 | Resin layer images (scanline fill with non-zero winding, supersampling) | Standard scanline fill, own design |

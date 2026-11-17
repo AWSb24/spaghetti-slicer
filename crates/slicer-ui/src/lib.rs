@@ -17,3 +17,6 @@ pub mod scene;
 pub mod settings;
 pub mod settings_list;
 pub mod view;
+pub mod wire;
+#[cfg(target_arch = "wasm32")]
+pub mod worker;

@@ -3,8 +3,11 @@
 //! The slicing thread writes into a [`Progress`] and any other thread reads
 //! it. Every step owns a fixed share of the whole; within a step the share
 //! grows with the parts (usually layers) that are done. Writing costs one
-//! atomic operation per layer and step.
+//! atomic operation per layer and step. A reader that cannot look while
+//! the slice runs (the page, while a Web Worker slices) is told about every
+//! change through [`Progress::with_report`] instead.
 
+use std::fmt;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 /// The steps of a slice, in order.
@@ -59,15 +62,30 @@ impl Step {
     }
 }
 
+/// Receives the step and the share done after every change.
+type Report = Box<dyn Fn(Step, f64) + Send + Sync>;
+
 /// Progress of one slice. Shared between the slicing thread and readers,
 /// usually in an `Arc`.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Progress {
     step: AtomicU8,
     done: AtomicU32,
     total: AtomicU32,
     /// Share of the whole in millionths; never decreases.
     overall: AtomicU32,
+    /// Told about every change, if set.
+    report: Option<Report>,
+}
+
+impl fmt::Debug for Progress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Progress")
+            .field("step", &self.step())
+            .field("fraction", &self.fraction())
+            .field("report", &self.report.is_some())
+            .finish()
+    }
 }
 
 impl Progress {
@@ -78,6 +96,17 @@ impl Progress {
             done: AtomicU32::new(0),
             total: AtomicU32::new(1),
             overall: AtomicU32::new(0),
+            report: None,
+        }
+    }
+
+    /// Nothing done yet; `report` is called with the step and the share
+    /// done after every change, in the slicing thread. It is called once
+    /// per part, so it should be quick.
+    pub fn with_report(report: impl Fn(Step, f64) + Send + Sync + 'static) -> Self {
+        Self {
+            report: Some(Box::new(report)),
+            ..Self::new()
         }
     }
 
@@ -108,8 +137,20 @@ impl Progress {
         self.raise(STARTS[STARTS.len() - 1]);
     }
 
+    /// Sets the step and the share done, from 0 to 1, directly. For a copy
+    /// of a progress that is written elsewhere, for example in a Web
+    /// Worker. The share still never decreases.
+    pub fn set(&self, step: Step, fraction: f64) {
+        self.step.store(step as u8, Ordering::Relaxed);
+        // Saturating cast: NaN becomes 0.
+        self.raise((fraction.clamp(0.0, 1.0) * 1e6).round() as u32);
+    }
+
     fn raise(&self, share: u32) {
         self.overall.fetch_max(share, Ordering::Relaxed);
+        if let Some(report) = &self.report {
+            report(self.step(), self.fraction());
+        }
     }
 
     /// The step being worked on.
@@ -158,5 +199,39 @@ mod tests {
         progress.finish();
         assert_eq!((progress.step(), progress.fraction()), (Step::Done, 1.0));
         assert_eq!(Step::Gcode.label(), "Writing G-code");
+    }
+
+    #[test]
+    fn reports_every_change_and_copies_follow() {
+        use std::sync::{Arc, Mutex};
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let progress = Progress::with_report(move |step, fraction| {
+            if let Ok(mut seen) = sink.lock() {
+                seen.push((step, fraction));
+            }
+        });
+        progress.start(Step::Cutting, 2);
+        progress.advance();
+        progress.finish();
+        let seen = seen.lock().map(|seen| seen.clone()).unwrap_or_default();
+        assert_eq!(
+            seen,
+            [
+                (Step::Cutting, 0.45),
+                (Step::Cutting, 0.51),
+                (Step::Done, 1.0)
+            ]
+        );
+        assert!(format!("{progress:?}").contains("Done"));
+
+        let copy = Progress::new();
+        copy.set(Step::Geometry, 0.6);
+        assert_eq!((copy.step(), copy.fraction()), (Step::Geometry, 0.6));
+        copy.set(Step::Geometry, 0.5);
+        assert_eq!(copy.fraction(), 0.6);
+        copy.set(Step::Done, f64::NAN);
+        assert_eq!((copy.step(), copy.fraction()), (Step::Done, 0.6));
     }
 }

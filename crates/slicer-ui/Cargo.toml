@@ -52,7 +52,8 @@ web-time = "1.1.0"
 wasm-bindgen = "0.2.130"
 wasm-bindgen-futures = "0.4.80"
 js-sys = "0.3.107"
-web-sys = { version = "0.3.107", features = ["Blob", "BlobPropertyBag", "console", "Document", "Element", "HtmlAnchorElement", "HtmlCanvasElement", "Url", "Window"] }
+# Slices run in a Web Worker (src/worker.rs, web/worker.js).
+web-sys = { version = "0.3.107", features = ["Blob", "BlobPropertyBag", "console", "DedicatedWorkerGlobalScope", "Document", "Element", "ErrorEvent", "Event", "HtmlAnchorElement", "HtmlCanvasElement", "MessageEvent", "Url", "Window", "Worker", "WorkerOptions", "WorkerType"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Load libwayland at run time instead of linking it (eframe leaves winit's

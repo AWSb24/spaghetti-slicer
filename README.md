@@ -12,7 +12,7 @@ What works: STL and 3MF import (geometry only, one plate of a Bambu Studio proje
 - The G-code for Marlin and Klipper is the same. For Bambu Lab printers there is a project file (`-o name.gcode.3mf`) and an X1C profile, but neither has ever been tried on a printer: the start sequence uses common commands only, and it is not known whether the printer accepts the file.
 - Colours and settings stored in a 3MF file are ignored. The extruder that a Bambu Studio project names per object is read. With `extruder_count` above 1 every object prints with its extruder (tool change with `T<n>` and `toolchange_gcode`, optional prime tower); with one extruder everything prints with the lowest one (warning `slicing.multiple_extruders`). Tool changes and the prime tower have never run on a printer.
 - The time estimate has not been compared with a real print and ignores heating.
-- The desktop app is a first version; in the browser slicing blocks the page.
+- The desktop app is a first version.
 - The resin output (`slice-sla`) is a first step: an open archive of layer images, not a file any printer reads, and without supports or hollowing.
 - Server jobs that are still queued or running are lost when the server stops; finished ones survive only with `SPAGHETTI_DATA_DIR`.
 
@@ -144,7 +144,7 @@ Opens a window laid out like the desktop slicers users know (Orca Slicer, Bambu 
 
 File → Save project… (Ctrl+S) writes the session as a 3MF file: every model as it is on the plate (also after cutting, mirroring or laying it on a face), placed by its build item, so other programs that read 3MF open the models where they lie. The settings files in use (with their text), the values of the side panel, the list of all settings and the extra lines are kept in the part `Metadata/spaghetti-project.toml`; its layout is described in `crates/slicer-ui/src/project.rs`. File → Open project… (Ctrl+O) replaces the plate and the settings with those of the file. A dropped or opened `.3mf` with that part opens as a project, any other 3MF as a model. In the browser saving downloads the file.
 
-The same app runs in a browser. Build it with `bash tools/build-web.sh` (needs `rustup target add wasm32-unknown-unknown` and `wasm-bindgen-cli` in the version from `Cargo.lock`), start the server with `SPAGHETTI_WEB_DIR=target/web` and open `http://localhost:8080/app/`. Models are sliced in the browser; nothing is uploaded. While a slice runs the page does not react. In the browser there is no profile folder to choose and no Orca import; the built-in profiles of the setup assistant are there.
+The same app runs in a browser. Build it with `bash tools/build-web.sh` (needs `rustup target add wasm32-unknown-unknown` and `wasm-bindgen-cli` in the version from `Cargo.lock`), start the server with `SPAGHETTI_WEB_DIR=target/web` and open `http://localhost:8080/app/`. Models are sliced in the browser, in a Web Worker, so the page keeps reacting, shows the progress and can cancel; nothing is uploaded. In the browser there is no profile folder to choose and no Orca import; the built-in profiles of the setup assistant are there.
 
 ## Server
 
