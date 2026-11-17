@@ -213,8 +213,12 @@ pub fn model_matrix(model: &Model, placement: &Placement) -> Mat4 {
 /// The first model that a ray from `origin` in direction `dir` hits, and
 /// how far along the ray: `models` are each model's matrix (see
 /// [`model_matrix`]) and mesh.
-pub fn pick(models: &[(Mat4, &Mesh)], origin: [f32; 3], dir: [f32; 3]) -> Option<(usize, f32)> {
-    let mut best: Option<(usize, f32)> = None;
+pub fn pick(
+    models: &[(Mat4, &Mesh)],
+    origin: [f32; 3],
+    dir: [f32; 3],
+) -> Option<(usize, f32, usize)> {
+    let mut best: Option<(usize, f32, usize)> = None;
     for (index, (matrix, mesh)) in models.iter().enumerate() {
         let corners: Vec<[f32; 3]> = mesh
             .vertices
@@ -227,14 +231,14 @@ pub fn pick(models: &[(Mat4, &Mesh)], origin: [f32; 3], dir: [f32; 3]) -> Option
                 [row(0), row(1), row(2)]
             })
             .collect();
-        for t in &mesh.triangles {
+        for (triangle, t) in mesh.triangles.iter().enumerate() {
             let [Some(&a), Some(&b), Some(&c)] = t.map(|i| corners.get(i as usize)) else {
                 continue;
             };
             if let Some(distance) = ray_triangle(origin, dir, [a, b, c])
-                && best.is_none_or(|(_, d)| distance < d)
+                && best.is_none_or(|(_, d, _)| distance < d)
             {
-                best = Some((index, distance));
+                best = Some((index, distance, triangle));
             }
         }
     }
@@ -417,11 +421,17 @@ mod tests {
         );
         let models = [(left, &model.mesh), (right, &model.mesh)];
         // Straight down onto the right cube: hits its top at Z = 10.
-        let (index, distance) = pick(&models, [70.0, 50.0, 100.0], [0.0, 0.0, -1.0]).unwrap();
+        let (index, distance, triangle) =
+            pick(&models, [70.0, 50.0, 100.0], [0.0, 0.0, -1.0]).unwrap();
         assert_eq!(index, 1);
         assert!((distance - 90.0).abs() < 1e-3);
+        // The top face, pointing up.
+        assert_eq!(
+            crate::plate::face_normal(&model.mesh, triangle),
+            Some([0.0, 0.0, 1.0])
+        );
         // Along X through both: the left one is first.
-        let (index, _) = pick(&models, [0.0, 50.0, 5.0], [1.0, 0.0, 0.0]).unwrap();
+        let (index, ..) = pick(&models, [0.0, 50.0, 5.0], [1.0, 0.0, 0.0]).unwrap();
         assert_eq!(index, 0);
         // Between them nothing is hit.
         assert!(pick(&models, [50.0, 50.0, 100.0], [0.0, 0.0, -1.0]).is_none());

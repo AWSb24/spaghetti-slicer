@@ -49,6 +49,12 @@ pub enum Icon {
     EyeClosed,
     /// Opens a list.
     Chevron,
+    /// Lay the model on a face: a box resting on the bed, arrow down.
+    LayOnFace,
+    /// Turn the model for printing: a box in a circling arrow.
+    AutoOrient,
+    /// Mirror the model: two triangles either side of an axis.
+    Mirror,
 }
 
 /// Draws `icon` into `rect` in `color`.
@@ -223,6 +229,34 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
         }
         Icon::Chevron => {
             line(&[(0.25, 0.4), (0.5, 0.65), (0.75, 0.4)]);
+        }
+        Icon::LayOnFace => {
+            line(&[(0.05, 0.92), (0.95, 0.92)]);
+            closed(&[(0.25, 0.42), (0.75, 0.42), (0.75, 0.84), (0.25, 0.84)]);
+            painter.rect_filled(
+                Rect::from_min_max(at(0.25, 0.78), at(0.75, 0.86)),
+                0.0,
+                theme::ACCENT,
+            );
+            line(&[(0.5, 0.04), (0.5, 0.3)]);
+            line(&[(0.38, 0.19), (0.5, 0.31), (0.62, 0.19)]);
+        }
+        Icon::AutoOrient => {
+            closed(&[(0.35, 0.35), (0.65, 0.35), (0.65, 0.65), (0.35, 0.65)]);
+            let points = arc(0.5, 0.5, 0.4, -PI * 0.35, PI * 1.35);
+            if let Some(&tip) = points.last() {
+                let a = Vec2::new(0.16 * size, -0.02 * size);
+                let b = Vec2::new(0.02 * size, 0.16 * size);
+                painter.add(Shape::line(vec![tip + a, tip, tip - b], stroke));
+            }
+            painter.add(Shape::line(points, stroke));
+        }
+        Icon::Mirror => {
+            closed(&[(0.08, 0.82), (0.4, 0.82), (0.4, 0.22)]);
+            closed(&[(0.92, 0.82), (0.6, 0.82), (0.6, 0.22)]);
+            for (y0, y1) in [(0.08, 0.22), (0.34, 0.48), (0.6, 0.74), (0.86, 0.95)] {
+                line(&[(0.5, y0), (0.5, y1)]);
+            }
         }
     }
 }

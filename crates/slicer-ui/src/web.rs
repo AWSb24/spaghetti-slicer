@@ -47,7 +47,7 @@ pub fn start() {
             .start(
                 canvas,
                 eframe::WebOptions::default(),
-                Box::new(|_| Ok(Box::new(WebApp(App::new(&[]))))),
+                Box::new(|cc| Ok(Box::new(WebApp(App::new(&[], cc.storage))))),
             )
             .await;
         // The page shows a message until the app runs.
@@ -67,6 +67,10 @@ pub fn start() {
 struct WebApp(App);
 
 impl eframe::App for WebApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::App::save(&mut self.0, storage);
+    }
+
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.0.logic(ctx, frame);
     }

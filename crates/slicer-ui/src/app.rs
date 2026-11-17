@@ -18,9 +18,13 @@ use slicer_ui::job::{
     with_output_extension,
 };
 use slicer_ui::plate::{
-    History, Item, Placement, Plate, SCALE_RANGE, bed_center, check_placement, load_model,
+    History, Item, Placement, Plate, SCALE_RANGE, bed_center, check_placement, face_normal,
+    load_model,
 };
-use slicer_ui::profiles::replace_profiles;
+use slicer_ui::profiles::{
+    ROLES, Setup, builtin_path, builtin_text, fit_processes, profile_name, replace_profiles,
+    standard_process,
+};
 use slicer_ui::settings::{CommonSettings, SettingsFile, load_settings};
 use slicer_ui::settings_list::{PROCESS_TABS, SettingsEditor};
 use slicer_ui::view::{ColorBy, gradient, kind_name, kinds_in, length_by_kind, path_color};
@@ -33,6 +37,7 @@ use crate::settings_ui::{
 };
 use crate::theme;
 use crate::view3d::{Event, Scene, View3d};
+use crate::wizard::{Wizard, WizardEnd};
 
 /// How serious a message in the side panel is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,12 +131,25 @@ pub struct App {
     history: History,
     /// The printer or filament dialog, if open.
     profile_dialog: Option<ProfileKind>,
+    /// The built-in printers and materials chosen in the setup assistant.
+    setup: Setup,
+    /// The setup assistant, if open.
+    wizard: Option<Wizard>,
+    /// Whether the next click on a model picks the face to lay it on.
+    face_mode: bool,
 }
 
 impl App {
     /// A window with nothing loaded; `paths` are opened as if dropped onto
-    /// it (models and `.toml` settings files).
-    pub fn new(paths: &[PathBuf]) -> Self {
+    /// it (models and `.toml` settings files). `storage` holds what the
+    /// setup assistant chose and the settings files of the last run, which
+    /// are used again unless `paths` contains settings files.
+    pub fn new(paths: &[PathBuf], storage: Option<&dyn eframe::Storage>) -> Self {
+        let stored = |key: &str| storage.and_then(|storage| storage.get_string(key));
+        let setup = stored("setup").map_or_else(Setup::default, |text| Setup::from_text(&text));
+        let last: Vec<PathBuf> = stored("files")
+            .map(|text| text.lines().map(PathBuf::from).collect())
+            .unwrap_or_default();
         let base = Settings::default();
         let mut app = Self {
             plate: Plate::default(),
@@ -158,9 +176,75 @@ impl App {
             clipboard: None,
             history: History::default(),
             profile_dialog: None,
+            wizard: (!setup.done).then(|| Wizard::new(&setup)),
+            face_mode: false,
+            setup,
         };
+        app.refresh_builtin();
+        let given = paths.iter().any(|path| {
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+        });
+        if !given {
+            // Files of the last run that are gone are left out.
+            let readable: Vec<PathBuf> = last
+                .into_iter()
+                .filter(|path| read_text(path).is_ok())
+                .collect();
+            if !readable.is_empty() {
+                app.read_settings_files(&readable);
+            }
+        }
         app.open_paths(paths);
         app
+    }
+
+    /// Lists the built-in profiles chosen in the setup assistant, with the
+    /// processes for the nozzle of the current printer.
+    fn refresh_builtin(&mut self) {
+        self.profiles
+            .set_builtin(self.setup.builtin(self.base.nozzle_diameter));
+    }
+
+    /// Takes over what the setup assistant chose. Without a printer in use
+    /// yet, the first chosen printer is used, with the first material and
+    /// the standard process.
+    fn finish_setup(&mut self, end: WizardEnd) {
+        let WizardEnd::Finish(setup) = end else {
+            self.setup.done = true;
+            return;
+        };
+        self.setup = setup;
+        self.refresh_builtin();
+        let paths: Vec<PathBuf> = self.files.iter().map(|(path, _)| path.clone()).collect();
+        let listing = self.profiles.listing();
+        let choice = listing.choice_of(&paths);
+        let Some(first) = self.setup.printers.first() else {
+            return;
+        };
+        if choice[0].is_some() {
+            return;
+        }
+        let nozzle = slicer_profiles::catalog::printer_by_id(first).map_or(0.4, |(_, n)| n);
+        let mut new = vec![builtin_path(ROLES[0].1, first)];
+        if let Some(material) = self.setup.materials.first() {
+            new.push(builtin_path(ROLES[1].1, material));
+        }
+        new.push(standard_process(nozzle));
+        let old = listing.chosen(&choice);
+        self.read_settings_files(&replace_profiles(&paths, &old, &new));
+        self.refresh_builtin();
+    }
+
+    /// Stores what the setup assistant chose and the settings files in use.
+    fn store(&self, storage: &mut dyn eframe::Storage) {
+        storage.set_string("setup", self.setup.to_text());
+        let files: Vec<String> = self
+            .files
+            .iter()
+            .map(|(path, _)| path.to_string_lossy().into_owned())
+            .collect();
+        storage.set_string("files", files.join("\n"));
     }
 
     fn note(&mut self, level: Level, text: impl Into<String>) {
@@ -233,22 +317,23 @@ impl App {
 
     fn read_settings_files(&mut self, paths: &[PathBuf]) {
         let mut files = Vec::new();
-        for path in paths {
-            match platform::read_to_string(path) {
+        for path in fit_processes(paths) {
+            match read_text(&path) {
                 Ok(text) => files.push((
                     path.clone(),
                     SettingsFile {
-                        name: file_name(path),
+                        name: file_name(&path),
                         text,
                     },
                 )),
-                Err(e) => {
-                    self.note(Level::Error, format!("{}: {e}", path.display()));
+                Err(text) => {
+                    self.note(Level::Error, text);
                     return;
                 }
             }
         }
         self.use_settings_files(files);
+        self.refresh_builtin();
     }
 
     fn use_settings_files(&mut self, files: Vec<(PathBuf, SettingsFile)>) {
@@ -551,6 +636,41 @@ impl App {
         }
     }
 
+    /// Mirrors the selected model along axis 0 (X), 1 (Y) or 2 (Z) of the
+    /// bed.
+    fn mirror_selected(&mut self, axis: usize) {
+        if let Some(index) = self.plate.selected
+            && let Some(item) = self.plate.items.get(index)
+        {
+            let model = item.model.mirrored(axis, item.placement.rotation_deg);
+            self.plate.set_model(index, model);
+        }
+    }
+
+    /// Turns the selected model so that it prints with the least overhang
+    /// and the most contact with the bed.
+    fn orient_selected(&mut self) {
+        if let Some(index) = self.plate.selected
+            && let Some(item) = self.plate.items.get(index)
+        {
+            let model = item.model.laid_on(item.model.best_down());
+            self.plate.set_model(index, model);
+            self.note(Level::Info, "Turned the model for the least overhang");
+        }
+    }
+
+    /// Lays model `index` on its triangle `triangle`.
+    fn lay_on_face(&mut self, index: usize, triangle: usize) {
+        self.face_mode = false;
+        self.plate.selected = Some(index);
+        if let Some(item) = self.plate.items.get(index)
+            && let Some(normal) = face_normal(&item.model.mesh, triangle)
+        {
+            let model = item.model.laid_on(normal);
+            self.plate.set_model(index, model);
+        }
+    }
+
     /// Saves the settings of the open printer or filament dialog as a
     /// profile file and lists it with the profiles.
     fn save_profile(&mut self) {
@@ -623,9 +743,11 @@ impl App {
                 row.context_menu(|ui| self.object_menu(ui));
             }
         }
+        let (mut mirror, mut orient) = (None, false);
         let Some(item) = self.plate.selected_mut() else {
             return;
         };
+        let size = item.model.size;
         let placement = &mut item.placement;
         egui::Grid::new("placement")
             .num_columns(2)
@@ -664,7 +786,51 @@ impl App {
                     placement.scale = percent / 100.0;
                 }
                 ui.end_row();
+                // Sizes scale all axes together.
+                ui.label("Size");
+                ui.horizontal(|ui| {
+                    for axis in 0..3 {
+                        let original = size[axis].max(1e-6);
+                        let mut mm = original * placement.scale;
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut mm)
+                                    .speed(0.5)
+                                    .max_decimals(2)
+                                    .range(original * min..=original * max),
+                            )
+                            .on_hover_text(["X in mm", "Y in mm", "Z in mm"][axis])
+                            .changed()
+                        {
+                            placement.scale = mm / original;
+                        }
+                    }
+                });
+                ui.end_row();
             });
+        ui.horizontal(|ui| {
+            ui.label("Mirror");
+            for (axis, name) in ["X", "Y", "Z"].into_iter().enumerate() {
+                if ui
+                    .small_button(name)
+                    .on_hover_text(format!("Mirror along {name}"))
+                    .clicked()
+                {
+                    mirror = Some(axis);
+                }
+            }
+            ui.add_space(8.0);
+            orient = ui
+                .small_button("Auto orient")
+                .on_hover_text("Turn the model for the least overhang")
+                .clicked();
+        });
+        if let Some(axis) = mirror {
+            self.mirror_selected(axis);
+        }
+        if orient {
+            self.orient_selected();
+        }
     }
 
     /// The bar at the top: file menu, Prepare and Preview, and on the
@@ -678,6 +844,13 @@ impl App {
                 }
                 if ui.button("Add settings file…").clicked() {
                     self.pick_settings_files(ui.ctx());
+                }
+                if ui
+                    .button("Setup assistant…")
+                    .on_hover_text("Choose your printers and filaments")
+                    .clicked()
+                {
+                    self.wizard = Some(Wizard::new(&self.setup));
                 }
                 ui.separator();
                 let sliced = self.sliced.is_some();
@@ -825,6 +998,44 @@ impl App {
                                 let settings = self.current.as_ref().unwrap_or(&self.base).clone();
                                 self.plate.add_copy(&item, &settings);
                             }
+                            ui.separator();
+                            let lay = ui
+                                .add_enabled_ui(any, |ui| {
+                                    icons::button(
+                                        ui,
+                                        Icon::LayOnFace,
+                                        34.0,
+                                        "Lay on face: click the face that goes onto the bed (Esc to stop)",
+                                        self.face_mode,
+                                    )
+                                })
+                                .inner;
+                            if lay.clicked() {
+                                self.face_mode = !self.face_mode;
+                            }
+                            let orient = ui
+                                .add_enabled_ui(selected, |ui| {
+                                    icons::button(
+                                        ui,
+                                        Icon::AutoOrient,
+                                        34.0,
+                                        "Auto orient: least overhang, most contact",
+                                        false,
+                                    )
+                                })
+                                .inner;
+                            if orient.clicked() {
+                                self.orient_selected();
+                            }
+                            let mirror = ui
+                                .add_enabled_ui(selected, |ui| {
+                                    icons::button(ui, Icon::Mirror, 34.0, "Mirror along X", false)
+                                })
+                                .inner;
+                            if mirror.clicked() {
+                                self.mirror_selected(0);
+                            }
+                            ui.separator();
                             let bed = self.bed();
                             let tools = [
                                 (Icon::Center, "Move to the middle of the bed"),
@@ -1283,6 +1494,23 @@ impl App {
             p.rotation_deg = 0.0;
             p.scale = 1.0;
         });
+        ui.separator();
+        ui.menu_button("Mirror", |ui| {
+            for (axis, name) in ["Along X", "Along Y", "Along Z"].into_iter().enumerate() {
+                if ui.button(name).clicked() {
+                    self.mirror_selected(axis);
+                    ui.close();
+                }
+            }
+        });
+        if ui.button("Lay on face").clicked() {
+            self.face_mode = true;
+            ui.close();
+        }
+        if ui.button("Auto orient").clicked() {
+            self.orient_selected();
+            ui.close();
+        }
     }
 
     /// Keyboard shortcuts, when no text field has the keyboard: undo and
@@ -1338,7 +1566,11 @@ impl App {
             self.plate.remove_selected();
         }
         if pressed(egui::Key::Escape) {
-            self.plate.selected = None;
+            if self.face_mode {
+                self.face_mode = false;
+            } else {
+                self.plate.selected = None;
+            }
         }
         if !command && pressed(egui::Key::A) && !self.plate.items.is_empty() {
             self.plate.arrange(&settings);
@@ -1385,14 +1617,19 @@ impl App {
             models,
             layer,
             moves: self.moves,
+            face_mode: self.face_mode && self.tab == Tab::Plate,
         };
         let (event, response) = self.view3d.show(ui, &scene);
+        if self.face_mode {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
         if self.tab == Tab::Plate && self.plate.selected.is_some() {
             response.context_menu(|ui| self.object_menu(ui));
         }
         match event {
             Event::None => {}
             Event::Select(index) => self.plate.selected = index,
+            Event::Face(index, triangle) => self.lay_on_face(index, triangle),
             Event::Move(index, [dx, dy]) => {
                 self.plate.selected = Some(index);
                 if let Some(item) = self.plate.items.get_mut(index) {
@@ -1518,7 +1755,17 @@ fn main_tab(ui: &mut egui::Ui, icon: Icon, name: &str, open: bool) -> egui::Resp
     response
 }
 
+/// The text of a settings file or built-in profile, or what went wrong.
+fn read_text(path: &Path) -> Result<String, String> {
+    builtin_text(path).unwrap_or_else(|| {
+        platform::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
+    })
+}
+
 fn file_name(path: &Path) -> String {
+    if builtin_text(path).is_some() {
+        return profile_name(path);
+    }
     path.file_name().map_or_else(
         || path.display().to_string(),
         |name| name.to_string_lossy().into_owned(),
@@ -1526,6 +1773,10 @@ fn file_name(path: &Path) -> String {
 }
 
 impl eframe::App for App {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.store(storage);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if !self.themed {
@@ -1609,6 +1860,12 @@ impl eframe::App for App {
                 };
                 self.notifications(&ctx, canvas, lift);
             });
+        if let Some(wizard) = &mut self.wizard
+            && let Some(end) = wizard.show(&ctx)
+        {
+            self.wizard = None;
+            self.finish_setup(end);
+        }
         // A change is one step once the mouse is let go.
         if !ctx.input(|i| i.pointer.any_down()) {
             self.history.settle(&self.plate);

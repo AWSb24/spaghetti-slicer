@@ -15,4 +15,6 @@ Each file only sets the keys that belong to its role; everything else keeps its 
 | `materials/pla.toml`, `materials/petg.toml` | Typical temperatures from filament makers' data sheets; adjust to your filament. |
 | `processes/*.toml` | Layer heights 0.12, 0.20 and 0.28 mm for a 0.4 mm nozzle. |
 
+Besides these files, the program has a catalog of printers, materials and processes built in (`crates/slicer-profiles/src/catalog.rs`), from which the setup assistant of the desktop and browser app picks. Build volumes, nozzle sizes and firmware are the makers' published data; speeds, retraction and temperatures are general starting values per kind of machine and material. None of these printers has run a print from this program yet.
+
 All values were chosen for this project from manufacturers' public specifications and general practice. Nothing was copied from the profiles of other slicers.

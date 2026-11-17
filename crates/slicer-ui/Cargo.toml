@@ -31,9 +31,10 @@ slicer-gcode.workspace = true
 slicer-formats.workspace = true
 slicer-profiles.workspace = true
 # OpenGL renderer: much less to compile than wgpu and enough for drawing
-# lines. X11 and Wayland libraries are loaded at run time, so building on
+# lines. `persistence` keeps the setup assistant's choice and the settings
+# files in use between runs (in the browser: local storage). X11 and Wayland libraries are loaded at run time, so building on
 # Linux needs no system packages.
-eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "persistence", "x11", "wayland"] }
 # File dialogs: native on Windows and macOS, the desktop portal over D-Bus on
 # Linux (no GTK needed).
 rfd = { version = "0.18.0", default-features = false, features = ["xdg-portal"] }

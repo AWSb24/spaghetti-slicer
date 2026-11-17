@@ -48,6 +48,8 @@ pub struct Scene<'a> {
     pub layer: Option<usize>,
     /// How many segments of that layer to show; all if `None`.
     pub moves: Option<usize>,
+    /// A click picks a face to lay a model on instead of selecting.
+    pub face_mode: bool,
 }
 
 /// What the user did to the models in the 3D view in this frame.
@@ -59,6 +61,8 @@ pub enum Event {
     Select(Option<usize>),
     /// Dragged a model across the bed by this many millimetres.
     Move(usize, [f64; 2]),
+    /// Clicked triangle `.1` of model `.0` to lay the model on.
+    Face(usize, usize),
 }
 
 /// State of the 3D view: camera and GPU buffers.
@@ -132,21 +136,25 @@ impl View3d {
                 .zip(&scene.models)
                 .map(|(m, (model, ..))| (*m, &model.mesh))
                 .collect();
-            pick(&models, origin, dir).map(|(index, t)| {
+            pick(&models, origin, dir).map(|(index, t, triangle)| {
                 let point = [
                     origin[0] + dir[0] * t,
                     origin[1] + dir[1] * t,
                     origin[2] + dir[2] * t,
                 ];
-                (index, point)
+                (index, point, triangle)
             })
         };
 
         let mut event = Event::None;
         let shift = ui.input(|i| i.modifiers.shift);
-        if response.drag_started_by(PointerButton::Primary) && !shift && pickable {
+        if response.drag_started_by(PointerButton::Primary)
+            && !shift
+            && pickable
+            && !scene.face_mode
+        {
             let origin = ui.input(|i| i.pointer.press_origin());
-            if let Some((index, point)) = origin.and_then(|pos| hit(camera, pos)) {
+            if let Some((index, point, _)) = origin.and_then(|pos| hit(camera, pos)) {
                 self.dragging = Some((index, point[2], point));
                 event = Event::Select(Some(index));
             }
@@ -174,9 +182,13 @@ impl View3d {
         if (response.clicked() || response.secondary_clicked()) && pickable {
             let picked = response
                 .interact_pointer_pos()
-                .and_then(|pos| hit(camera, pos))
-                .map(|(index, _)| index);
-            event = Event::Select(picked);
+                .and_then(|pos| hit(camera, pos));
+            event = match picked {
+                Some((index, _, triangle)) if scene.face_mode && response.clicked() => {
+                    Event::Face(index, triangle)
+                }
+                _ => Event::Select(picked.map(|(index, ..)| index)),
+            };
         }
         if response.hovered() {
             let (scroll, zoom) = ui.input(|i| (i.smooth_scroll_delta().y, i.zoom_delta()));

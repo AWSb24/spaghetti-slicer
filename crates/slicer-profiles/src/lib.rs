@@ -10,6 +10,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+pub mod catalog;
 pub mod info;
 pub mod orca;
 pub use info::{SETTINGS_INFO, SettingInfo, ValueKind, setting_info};

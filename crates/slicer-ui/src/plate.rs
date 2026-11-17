@@ -20,6 +20,16 @@ const EDGE_TOLERANCE: f64 = 1e-6;
 /// Smallest and largest scale factor the plate accepts.
 pub const SCALE_RANGE: (f64, f64) = (0.01, 100.0);
 
+/// A linear map of 3D points, by rows.
+pub type Mat3 = [[f64; 3]; 3];
+
+/// How far below the lowest point a vertex may lie and still touch the bed,
+/// in millimetres, when choosing an orientation.
+const CONTACT: f64 = 0.05;
+
+/// Most face directions tried when choosing an orientation.
+const ORIENT_CANDIDATES: usize = 40;
+
 /// A model loaded from a file, with what the plate view needs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Model {
@@ -56,6 +66,212 @@ impl Model {
             mesh,
         })
     }
+}
+
+impl Model {
+    /// The model with `m` applied to every point, standing on the bed
+    /// again with its centre on the Z axis. Mirroring maps keep the
+    /// outside out.
+    pub fn transformed(&self, m: Mat3) -> Model {
+        // Turns by multiples of 90° give exact 0 and 1, not 6e-17.
+        let m = m.map(|row| {
+            row.map(|x| {
+                if (x - x.round()).abs() < 1e-12 {
+                    x.round()
+                } else {
+                    x
+                }
+            })
+        });
+        let mut mesh = self.mesh.clone();
+        for v in &mut mesh.vertices {
+            *v = apply(m, *v);
+        }
+        if det(m) < 0.0 {
+            mesh.flip();
+        }
+        Model::from_mesh(self.name.clone(), mesh).unwrap_or_else(|_| self.clone())
+    }
+
+    /// The model mirrored along axis 0 (X), 1 (Y) or 2 (Z) of the bed,
+    /// while it stands turned by `rotation_deg` around Z.
+    pub fn mirrored(&self, axis: usize, rotation_deg: f64) -> Model {
+        let mut flip = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        flip[axis.min(2)][axis.min(2)] = -1.0;
+        let turn = rotation_z(rotation_deg.to_radians());
+        let back = rotation_z(-rotation_deg.to_radians());
+        // Into bed directions, mirror there, and back.
+        self.transformed(mul(back, mul(flip, turn)))
+    }
+
+    /// The model turned so that the direction `down` (in its own
+    /// coordinates) points straight down, onto the bed.
+    pub fn laid_on(&self, down: [f64; 3]) -> Model {
+        self.transformed(rotation_onto(down, [0.0, 0.0, -1.0]))
+    }
+
+    /// The direction to lay the model on (see [`Model::laid_on`]) for the
+    /// least overhang and the most contact with the bed. The candidates are
+    /// the directions of its largest flat faces and of the axes; `[0, 0,
+    /// -1]`, as it stands, wins ties.
+    pub fn best_down(&self) -> [f64; 3] {
+        let faces = faces(&self.mesh);
+        // Sum the area of faces pointing the same way.
+        let mut groups: Vec<([i64; 3], f64, [f64; 3])> = Vec::new();
+        for &(normal, area) in faces.iter().flatten() {
+            let key = normal.map(|c| (c * 50.0).round() as i64);
+            match groups.iter_mut().find(|(k, ..)| *k == key) {
+                Some((_, sum, n)) => {
+                    *sum += area;
+                    for (a, b) in n.iter_mut().zip(normal) {
+                        *a += b * area;
+                    }
+                }
+                None => groups.push((key, area, normal.map(|c| c * area))),
+            }
+        }
+        groups.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let mut candidates: Vec<[f64; 3]> = vec![
+            [0.0, 0.0, -1.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+        ];
+        candidates.extend(
+            groups
+                .iter()
+                .take(ORIENT_CANDIDATES)
+                .filter_map(|(_, _, n)| unit(*n)),
+        );
+        let mut best = ([0.0, 0.0, -1.0], f64::INFINITY);
+        for down in candidates {
+            let cost = orientation_cost(&self.mesh, &faces, down);
+            if cost < best.1 - 1e-6 {
+                best = (down, cost);
+            }
+        }
+        best.0
+    }
+}
+
+/// Outward unit normal and area of every triangle; `None` for degenerate
+/// ones.
+fn faces(mesh: &Mesh) -> Vec<Option<([f64; 3], f64)>> {
+    mesh.triangles
+        .iter()
+        .map(|t| {
+            let [a, b, c] = t.map(|i| mesh.vertices.get(i as usize).copied());
+            let (a, b, c) = (a?, b?, c?);
+            let n = cross3(sub3(b, a), sub3(c, a));
+            let len = dot3(n, n).sqrt();
+            (len > 1e-12).then(|| (n.map(|x| x / len), len / 2.0))
+        })
+        .collect()
+}
+
+/// Area of the faces that hang over (facing down more steeply than 45°)
+/// minus the area resting on the bed, with the model laid on `down`;
+/// lower is better. `faces` are the normals and areas of the triangles.
+fn orientation_cost(mesh: &Mesh, faces: &[Option<([f64; 3], f64)>], down: [f64; 3]) -> f64 {
+    let lowest = mesh
+        .vertices
+        .iter()
+        .map(|&v| dot3(v, down))
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mut cost = 0.0;
+    for (t, face) in mesh.triangles.iter().zip(faces) {
+        let corners = t.map(|i| mesh.vertices.get(i as usize).copied());
+        let ([Some(a), Some(b), Some(c)], Some((normal, area))) = (corners, *face) else {
+            continue;
+        };
+        let facing = dot3(normal, down);
+        if facing <= std::f64::consts::FRAC_1_SQRT_2 {
+            continue;
+        }
+        let on_bed = [a, b, c].iter().all(|&p| lowest - dot3(p, down) < CONTACT);
+        if on_bed {
+            cost -= area;
+        } else {
+            cost += area * facing;
+        }
+    }
+    cost
+}
+
+fn apply(m: Mat3, v: [f64; 3]) -> [f64; 3] {
+    m.map(|row| dot3(row, v))
+}
+
+fn mul(a: Mat3, b: Mat3) -> Mat3 {
+    a.map(|row| [0, 1, 2].map(|c| row[0] * b[0][c] + row[1] * b[1][c] + row[2] * b[2][c]))
+}
+
+fn det(m: Mat3) -> f64 {
+    dot3(m[0], cross3(m[1], m[2]))
+}
+
+fn rotation_z(angle: f64) -> Mat3 {
+    let (sin, cos) = angle.sin_cos();
+    [[cos, -sin, 0.0], [sin, cos, 0.0], [0.0, 0.0, 1.0]]
+}
+
+/// The rotation that turns the direction `from` into `to`.
+fn rotation_onto(from: [f64; 3], to: [f64; 3]) -> Mat3 {
+    let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let (Some(f), Some(t)) = (unit(from), unit(to)) else {
+        return identity;
+    };
+    let axis = cross3(f, t);
+    let (sin, cos) = (dot3(axis, axis).sqrt(), dot3(f, t));
+    if sin < 1e-9 {
+        if cos > 0.0 {
+            return identity;
+        }
+        // Opposite: half a turn around any axis across `from`.
+        let across = if f[0].abs() < 0.9 {
+            [1.0, 0.0, 0.0]
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+        let k = unit(cross3(f, across)).unwrap_or([0.0, 0.0, 1.0]);
+        return [0, 1, 2].map(|r| [0, 1, 2].map(|c| 2.0 * k[r] * k[c] - identity[r][c]));
+    }
+    // Rodrigues' formula.
+    let k = axis.map(|x| x / sin);
+    let kx = [[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]];
+    let kk = mul(kx, kx);
+    [0, 1, 2].map(|r| [0, 1, 2].map(|c| identity[r][c] + sin * kx[r][c] + (1.0 - cos) * kk[r][c]))
+}
+
+fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn unit(v: [f64; 3]) -> Option<[f64; 3]> {
+    let len = dot3(v, v).sqrt();
+    (len > 1e-12).then(|| v.map(|x| x / len))
+}
+
+/// Outward unit normal of triangle `index` of `mesh`.
+pub fn face_normal(mesh: &Mesh, index: usize) -> Option<[f64; 3]> {
+    let t = mesh.triangles.get(index)?;
+    let [a, b, c] = t.map(|i| mesh.vertices.get(i as usize).copied());
+    let (a, b, c) = (a?, b?, c?);
+    unit(cross3(sub3(b, a), sub3(c, a)))
 }
 
 /// Reads an STL or 3MF file. Returns the model and the warnings the reader
@@ -276,6 +492,15 @@ impl Plate {
     pub fn remove_selected(&mut self) {
         if let Some(index) = self.selected.take().filter(|&i| i < self.items.len()) {
             self.items.remove(index);
+            self.serial += 1;
+        }
+    }
+
+    /// Puts `model` in place of the model at `index` (for example turned
+    /// or mirrored); copies that shared the old model keep it.
+    pub fn set_model(&mut self, index: usize, model: Model) {
+        if let Some(item) = self.items.get_mut(index) {
+            item.model = Arc::new(model);
             self.serial += 1;
         }
     }
@@ -509,6 +734,87 @@ mod tests {
         edge.placement.center = [210.0, 110.0];
         plate.add_copy(&edge, &settings);
         assert_eq!(plate.items.last().unwrap().placement.center, [185.0, 110.0]);
+    }
+
+    fn close(a: [f64; 3], b: [f64; 3]) -> bool {
+        (0..3).all(|i| (a[i] - b[i]).abs() < 1e-9)
+    }
+
+    /// A wedge: a 20 x 10 mm right triangle in XZ, 5 mm deep in Y. Its
+    /// sloped face points to +X and up.
+    fn wedge() -> Model {
+        let v = vec![
+            [0.0, 0.0, 0.0],
+            [20.0, 0.0, 0.0],
+            [0.0, 0.0, 10.0],
+            [0.0, 5.0, 0.0],
+            [20.0, 5.0, 0.0],
+            [0.0, 5.0, 10.0],
+        ];
+        let triangles = vec![
+            [0, 1, 2],
+            [3, 5, 4],
+            [0, 4, 1],
+            [0, 3, 4],
+            [0, 2, 5],
+            [0, 5, 3],
+            [1, 5, 2],
+            [1, 4, 5],
+        ];
+        let mesh = Mesh {
+            vertices: v,
+            triangles,
+            ..Mesh::default()
+        };
+        Model::from_mesh("wedge", mesh).unwrap()
+    }
+
+    #[test]
+    fn models_mirror_turn_and_lie_down() {
+        let model = wedge();
+        assert!(model.mesh.signed_volume() > 0.0);
+        // Mirrored in X the slope faces -X; the outside stays out.
+        let mirrored = model.mirrored(0, 0.0);
+        assert!((mirrored.mesh.signed_volume() - model.mesh.signed_volume()).abs() < 1e-9);
+        assert_eq!(mirrored.size, model.size);
+        let tall = mirrored.mesh.vertices.iter().find(|v| v[2] > 9.0).unwrap();
+        assert!(tall[0] > 0.0, "{tall:?}");
+        // Turned by 90°, mirroring along the bed's X flips the model's Y.
+        let turned = model.mirrored(0, 90.0);
+        assert!((turned.mesh.signed_volume() - model.mesh.signed_volume()).abs() < 1e-9);
+        assert_eq!(turned.size, model.size);
+
+        // Lying on the side that faced -Y makes it 5 mm tall.
+        let side = model.laid_on([0.0, -1.0, 0.0]);
+        assert!((side.size[2] - 5.0).abs() < 1e-9, "{:?}", side.size);
+        // Upside down keeps the height.
+        let flipped = model.laid_on([0.0, 0.0, 1.0]);
+        assert!((flipped.size[2] - 10.0).abs() < 1e-9);
+        assert!(flipped.mesh.signed_volume() > 0.0);
+        // The normal of a face comes out of the model.
+        let normal = face_normal(&model.mesh, 0).unwrap();
+        assert!(close(normal, [0.0, -1.0, 0.0]), "{normal:?}");
+        let r = rotation_onto([1.0, 0.0, 0.0], [0.0, 0.0, -1.0]);
+        assert!(close(apply(r, [1.0, 0.0, 0.0]), [0.0, 0.0, -1.0]));
+        assert!((det(r) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn best_orientation_rests_on_the_largest_face() {
+        // A wedge rests best on its slope, the largest face, which leaves
+        // nothing hanging over.
+        let model = wedge();
+        let slope = unit([1.0, 0.0, 2.0]).unwrap();
+        assert!(close(model.best_down(), slope), "{:?}", model.best_down());
+        let tipped = model.laid_on([1.0, 0.0, 1.0]);
+        let best = tipped.laid_on(tipped.best_down());
+        assert!(best.size[2] <= 10.0 + 1e-6, "{:?}", best.size);
+        // A flat plate stood on its edge goes back to lying flat.
+        let plate = Model::from_mesh("plate", Mesh::cuboid(40.0, 30.0, 2.0)).unwrap();
+        let standing = plate.laid_on([1.0, 0.0, 0.0]);
+        assert!((standing.size[2] - 40.0).abs() < 1e-9);
+        let down = standing.laid_on(standing.best_down());
+        assert!((down.size[2] - 2.0).abs() < 1e-9, "{:?}", down.size);
     }
 
     #[test]

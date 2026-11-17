@@ -43,9 +43,11 @@ pub enum ProfileAction {
     Error(String),
 }
 
-/// The profile folder and its profiles.
+/// The profile folder and its profiles, and the built-in profiles chosen
+/// in the setup assistant.
 pub struct Profiles {
     set: Option<ProfileSet>,
+    builtin: [Vec<PathBuf>; 3],
 }
 
 impl Profiles {
@@ -56,6 +58,23 @@ impl Profiles {
         Self {
             set: find_profiles_dir(exe.as_deref(), cwd.as_deref())
                 .map(|dir| ProfileSet::scan(&dir)),
+            builtin: Default::default(),
+        }
+    }
+
+    /// Sets the built-in profiles listed before the files, by role.
+    pub fn set_builtin(&mut self, builtin: [Vec<PathBuf>; 3]) {
+        self.builtin = builtin;
+    }
+
+    /// Every profile to pick from: the built-in ones, then the files.
+    pub fn listing(&self) -> ProfileSet {
+        match &self.set {
+            Some(set) => set.with_builtin(&self.builtin),
+            None => ProfileSet {
+                dir: PathBuf::new(),
+                files: self.builtin.clone(),
+            },
         }
     }
 
@@ -76,12 +95,11 @@ impl Profiles {
         role: usize,
         reserve: f32,
     ) -> Option<ProfileAction> {
-        let Some(set) = &self.set else {
-            if role == 0 {
-                ui.weak("No profile folder found.");
-            }
+        let set = self.listing();
+        if set.files[role].is_empty() && role < 2 {
+            ui.weak("None yet: File > Setup assistant…");
             return None;
-        };
+        }
         let mut action = None;
         let choice = set.choice_of(files);
         let shown = choice[role]

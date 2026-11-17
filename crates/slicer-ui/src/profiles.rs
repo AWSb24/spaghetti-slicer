@@ -1,10 +1,14 @@
 //! The profile folder: finding it, listing the printer, material and
-//! process profiles in it, and importing Orca Slicer profiles.
+//! process profiles in it, and importing Orca Slicer profiles. Besides the
+//! files, the profiles built into the program (`slicer_profiles::catalog`)
+//! stand in the lists under paths starting with [`BUILTIN`]; the setup
+//! assistant chooses which of them are shown.
 
 use std::path::{Path, PathBuf};
 
 use slicer_core::{Diagnose, Diagnostic};
 use slicer_profiles::Settings;
+use slicer_profiles::catalog;
 
 /// The roles of profiles, in the order they are applied, with the
 /// subfolder of the profile folder that holds them.
@@ -13,6 +17,133 @@ pub const ROLES: [(&str, &str); 3] = [
     ("Material", "materials"),
     ("Process", "processes"),
 ];
+
+/// Start of the paths that stand for profiles built into the program.
+pub const BUILTIN: &str = "builtin:";
+
+/// The path that stands for the built-in profile `id` of a role, given by
+/// its subfolder in [`ROLES`].
+pub fn builtin_path(sub: &str, id: &str) -> PathBuf {
+    PathBuf::from(format!("{BUILTIN}{sub}/{id}"))
+}
+
+/// Role subfolder and identifier of a built-in profile's path.
+fn builtin_parts(path: &Path) -> Option<(&str, &str)> {
+    path.to_str()?.strip_prefix(BUILTIN)?.split_once('/')
+}
+
+/// The settings file of a built-in profile, or `None` if `path` is a file.
+pub fn builtin_text(path: &Path) -> Option<Result<String, String>> {
+    let (sub, id) = builtin_parts(path)?;
+    let text = match sub {
+        "printers" => catalog::printer_by_id(id).map(|(printer, nozzle)| printer.toml(nozzle)),
+        "materials" => catalog::material_by_id(id).map(catalog::Material::toml),
+        "processes" => catalog::process_by_id(id).map(|(process, nozzle)| process.toml(nozzle)),
+        _ => None,
+    };
+    Some(text.ok_or_else(|| format!("{}: no such built-in profile", path.display())))
+}
+
+/// What the setup assistant chose: the built-in printers (one entry per
+/// nozzle, see `catalog::Printer::id`) and materials to list.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Setup {
+    /// Whether the assistant has run, so it does not open by itself again.
+    pub done: bool,
+    /// Identifiers of the chosen printer profiles.
+    pub printers: Vec<String>,
+    /// Identifiers of the chosen materials.
+    pub materials: Vec<String>,
+}
+
+impl Setup {
+    /// One line per entry, to be stored between runs.
+    pub fn to_text(&self) -> String {
+        let mut text = format!("done={}\n", self.done);
+        for id in &self.printers {
+            text.push_str(&format!("printer={id}\n"));
+        }
+        for id in &self.materials {
+            text.push_str(&format!("material={id}\n"));
+        }
+        text
+    }
+
+    /// Reads what [`Setup::to_text`] wrote; unknown lines and profiles
+    /// that no longer exist are left out.
+    pub fn from_text(text: &str) -> Self {
+        let mut setup = Setup::default();
+        for line in text.lines() {
+            match line.split_once('=') {
+                Some(("done", value)) => setup.done = value == "true",
+                Some(("printer", id)) if catalog::printer_by_id(id).is_some() => {
+                    setup.printers.push(id.to_owned());
+                }
+                Some(("material", id)) if catalog::material_by_id(id).is_some() => {
+                    setup.materials.push(id.to_owned());
+                }
+                _ => {}
+            }
+        }
+        setup
+    }
+
+    /// The built-in profiles to list for each role: the chosen printers
+    /// and materials, and the processes for a `nozzle` this wide.
+    pub fn builtin(&self, nozzle: f64) -> [Vec<PathBuf>; 3] {
+        let [printers, materials, processes] = ROLES.map(|(_, sub)| sub);
+        [
+            self.printers
+                .iter()
+                .map(|id| builtin_path(printers, id))
+                .collect(),
+            self.materials
+                .iter()
+                .map(|id| builtin_path(materials, id))
+                .collect(),
+            catalog::processes(nozzle)
+                .iter()
+                .map(|process| builtin_path(processes, &process.id()))
+                .collect(),
+        ]
+    }
+}
+
+/// The path of the standard process for a nozzle, the one chosen with a
+/// new printer.
+pub fn standard_process(nozzle: f64) -> PathBuf {
+    let id = catalog::processes(nozzle)
+        .iter()
+        .find(|process| process.label == "Standard")
+        .map(catalog::Process::id)
+        .unwrap_or_default();
+    builtin_path(ROLES[2].1, &id)
+}
+
+/// `paths` with every built-in process made for another nozzle than the
+/// built-in printer among them swapped for the process of the same step
+/// (for example Standard) for that nozzle, so that changing the printer
+/// keeps the process valid.
+pub fn fit_processes(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let nozzle = paths.iter().find_map(|path| match builtin_parts(path) {
+        Some(("printers", id)) => catalog::printer_by_id(id).map(|(_, nozzle)| nozzle),
+        _ => None,
+    });
+    let Some(nozzle) = nozzle else {
+        return paths.to_vec();
+    };
+    let fitting = catalog::processes(nozzle);
+    paths
+        .iter()
+        .map(|path| match builtin_parts(path) {
+            Some(("processes", id)) => catalog::process_by_id(id)
+                .filter(|(process, _)| !fitting.contains(process))
+                .and_then(|(process, _)| fitting.iter().find(|p| p.label == process.label))
+                .map_or_else(|| path.clone(), |p| builtin_path(ROLES[2].1, &p.id())),
+            _ => path.clone(),
+        })
+        .collect()
+}
 
 /// Whether `dir` looks like a profile folder.
 fn is_profile_dir(dir: &Path) -> bool {
@@ -67,6 +198,19 @@ impl ProfileSet {
         }
     }
 
+    /// The built-in profiles `builtin` (by role) followed by the files of
+    /// this folder.
+    pub fn with_builtin(&self, builtin: &[Vec<PathBuf>; 3]) -> Self {
+        let mut files = builtin.clone();
+        for (all, own) in files.iter_mut().zip(&self.files) {
+            all.extend(own.iter().cloned());
+        }
+        Self {
+            dir: self.dir.clone(),
+            files,
+        }
+    }
+
     /// The chosen file of every role in order; `None` means no file of
     /// that role.
     pub fn chosen(&self, choice: &[Option<usize>; 3]) -> Vec<PathBuf> {
@@ -87,10 +231,19 @@ impl ProfileSet {
     }
 }
 
-/// The name a profile is shown with: its file name without `.toml`.
+/// The name a profile is shown with: its file name without `.toml`, or
+/// the name of a built-in profile.
 pub fn profile_name(path: &Path) -> String {
-    path.file_stem()
-        .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned())
+    let builtin = builtin_parts(path).and_then(|(sub, id)| match sub {
+        "printers" => catalog::printer_by_id(id).map(|(printer, nozzle)| printer.name(nozzle)),
+        "materials" => catalog::material_by_id(id).map(catalog::Material::display_name),
+        "processes" => catalog::process_by_id(id).map(|(process, _)| process.name()),
+        _ => None,
+    });
+    builtin.unwrap_or_else(|| {
+        path.file_stem()
+            .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned())
+    })
 }
 
 /// The settings files after the profile choice changed from `old` to
@@ -225,6 +378,66 @@ mod tests {
         }
         assert_eq!(set.chosen(&[None, Some(0), None]).len(), 1);
         assert_eq!(ProfileSet::scan(Path::new("no/such/dir")).files[0].len(), 0);
+    }
+
+    #[test]
+    fn built_in_profiles_are_listed_named_and_read() {
+        let setup = Setup {
+            done: true,
+            printers: vec!["bambu-lab-x1-carbon-0.4".to_owned()],
+            materials: vec!["generic-petg".to_owned(), "generic-pla".to_owned()],
+        };
+        let text = setup.to_text();
+        assert_eq!(Setup::from_text(&text), setup);
+        // Profiles that are gone are dropped.
+        let old = Setup::from_text("done=true\nprinter=no-such-printer\nmaterial=generic-pla\n");
+        assert!(old.done && old.printers.is_empty() && old.materials.len() == 1);
+
+        let builtin = setup.builtin(0.4);
+        assert_eq!(
+            builtin[0],
+            [PathBuf::from("builtin:printers/bambu-lab-x1-carbon-0.4")]
+        );
+        assert_eq!(builtin[2].len(), 6);
+        assert!(builtin[2].contains(&standard_process(0.4)));
+        assert_eq!(
+            profile_name(&builtin[0][0]),
+            "Bambu Lab X1 Carbon 0.4 nozzle"
+        );
+        assert_eq!(profile_name(&builtin[1][0]), "Generic PETG");
+        assert_eq!(profile_name(&standard_process(0.4)), "0.20mm Standard");
+        assert_eq!(profile_name(Path::new("a/pla.toml")), "pla");
+
+        // Built-in profiles stack like files.
+        let mut settings = Settings::default();
+        for path in [&builtin[0][0], &builtin[1][0], &standard_process(0.4)] {
+            settings
+                .apply_toml(&builtin_text(path).unwrap().unwrap())
+                .unwrap();
+        }
+        assert_eq!(settings.bed_size_x, 256.0);
+        assert_eq!(settings.nozzle_temp, 240.0);
+        assert_eq!(settings.layer_height, 0.2);
+        assert!(builtin_text(Path::new("a/pla.toml")).is_none());
+        assert!(
+            builtin_text(Path::new("builtin:printers/nothing"))
+                .unwrap()
+                .is_err()
+        );
+
+        // A printer with another nozzle takes the same step of process.
+        let fine = builtin_path("printers", "bambu-lab-x1-carbon-0.6");
+        let fitted = fit_processes(&[fine.clone(), standard_process(0.4), "own.toml".into()]);
+        assert_eq!(fitted, [fine, standard_process(0.6), "own.toml".into()]);
+        assert_eq!(profile_name(&fitted[1]), "0.30mm Standard");
+        assert_eq!(
+            fit_processes(&[standard_process(0.4)]),
+            [standard_process(0.4)]
+        );
+
+        let set = ProfileSet::scan(&shipped()).with_builtin(&builtin);
+        assert_eq!(set.files[0][0], builtin[0][0]);
+        assert!(set.files[0].len() > 1);
     }
 
     #[test]

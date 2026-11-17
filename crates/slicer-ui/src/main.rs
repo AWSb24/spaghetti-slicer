@@ -14,6 +14,7 @@ mod icons;
 mod settings_ui;
 mod theme;
 mod view3d;
+mod wizard;
 // Files and dialogs: the file system on the desktop, the browser on the web.
 #[cfg_attr(target_arch = "wasm32", path = "web.rs")]
 #[cfg_attr(not(target_arch = "wasm32"), path = "native.rs")]
@@ -38,7 +39,7 @@ fn main() -> std::process::ExitCode {
     let result = eframe::run_native(
         "Spaghetti Slicer",
         options,
-        Box::new(move |_| Ok(Box::new(app::App::new(&paths)))),
+        Box::new(move |cc| Ok(Box::new(app::App::new(&paths, cc.storage)))),
     );
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
