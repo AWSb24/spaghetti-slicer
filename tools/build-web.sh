@@ -19,5 +19,5 @@ cargo build --release --locked --manifest-path "$root/Cargo.toml" \
 mkdir -p "$out"
 wasm-bindgen --target web --no-typescript --out-dir "$out" --out-name slicer \
   "$target_dir/wasm32-unknown-unknown/release/spaghetti-slicer-ui.wasm"
-cp "$root/crates/slicer-ui/web/index.html" "$out/"
+cp "$root/crates/slicer-ui/web/index.html" "$root/crates/slicer-ui/web/worker.js" "$out/"
 echo "web app in $out"

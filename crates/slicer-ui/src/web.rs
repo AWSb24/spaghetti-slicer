@@ -1,6 +1,8 @@
 //! The browser build: starts the app on the page's canvas and replaces the
 //! file system with the browser's file picker, dropped files and
 //! downloads. The desktop build has the same functions in `native.rs`.
+//! The same module also runs in the slicing worker, which only calls
+//! [`slice_in_worker`].
 //!
 //! Browsers read files asynchronously, so picking or dropping a file does
 //! not open it at once: its bytes are kept here under its name, and
@@ -13,6 +15,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
+use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen::{JsCast, JsValue};
 
 use crate::app::App;
@@ -31,9 +34,13 @@ thread_local! {
     static LAST_DOWNLOAD: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-/// Starts the app on the canvas with the id `slicer`.
+/// Starts the app on the canvas with the id `slicer`. Does nothing in the
+/// slicing worker, which has no window.
 pub fn start() {
-    let document = web_sys::window().and_then(|window| window.document());
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let document = window.document();
     let Some(canvas) = document
         .as_ref()
         .and_then(|document| document.get_element_by_id("slicer"))
@@ -47,7 +54,7 @@ pub fn start() {
             .start(
                 canvas,
                 eframe::WebOptions::default(),
-                Box::new(|cc| Ok(Box::new(WebApp(App::new(&[], cc.storage))))),
+                Box::new(|cc| Ok(Box::new(App::new(&[], cc.storage)))),
             )
             .await;
         // The page shows a message until the app runs.
@@ -63,28 +70,11 @@ pub fn start() {
     });
 }
 
-/// The app, plus the slices that wait for the main thread.
-struct WebApp(App);
-
-impl eframe::App for WebApp {
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::App::save(&mut self.0, storage);
-    }
-
-    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        self.0.logic(ctx, frame);
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        // A slice started in the last frame runs now, after that frame
-        // (with "Generating toolpaths") is on screen. The page does not
-        // react until it is done.
-        slicer_ui::job::run_waiting();
-        self.0.ui(ui, frame);
-        if slicer_ui::job::has_waiting() {
-            ui.ctx().request_repaint();
-        }
-    }
+/// Entry point of the slicing worker: `worker.js` calls it with the
+/// request the page posted (see `slicer_ui::worker`).
+#[wasm_bindgen]
+pub fn slice_in_worker(request: JsValue) {
+    slicer_ui::worker::serve(&request);
 }
 
 fn js_error(error: &JsValue) -> String {

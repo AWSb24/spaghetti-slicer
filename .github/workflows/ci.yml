@@ -141,6 +141,8 @@ jobs:
           for _ in $(seq 30); do curl -fs localhost:8080/health && break; sleep 1; done
           curl -fs localhost:8080/app/ | grep -q 'id="slicer"'
           curl -fsI localhost:8080/app/slicer_bg.wasm | grep -qi 'content-type: application/wasm'
+          # Module workers are only started with a JavaScript type.
+          curl -fsI localhost:8080/app/worker.js | grep -qi 'content-type: text/javascript'
           ls -l web
 
       - uses: actions/upload-artifact@v7

@@ -1,4 +1,7 @@
-//! Slicing in a background thread, and saving the result.
+//! Slicing in the background, and saving the result.
+//!
+//! On the desktop a slice runs in a thread of its own; in the browser, which
+//! has no threads, in a Web Worker (see `worker.rs`).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,43 +78,60 @@ pub fn slice(
     })
 }
 
-/// A slice running in a background thread.
+/// A slice running in the background: in a thread on the desktop, in a
+/// Web Worker in the browser.
 ///
-/// Dropping the job asks the thread to stop; its result is then discarded.
+/// Dropping the job asks the slice to stop; its result is then discarded.
 #[derive(Debug)]
 pub struct SliceJob {
     stop: Arc<AtomicBool>,
     progress: Arc<Progress>,
     started: Instant,
     result: Receiver<Result<SliceResult, Diagnostic>>,
+    /// The worker that slices; it posts progress and the result back.
+    #[cfg(target_arch = "wasm32")]
+    worker: crate::worker::WorkerJob,
 }
 
 impl SliceJob {
-    /// Starts slicing. `notify` is called from the background thread when
-    /// the result is ready, for example to wake up the window.
+    /// Starts slicing. `notify` is called when the result is ready, for
+    /// example to wake up the window: on the desktop from the background
+    /// thread.
     pub fn start(request: SliceRequest, notify: impl FnOnce() + Send + 'static) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(Progress::new());
         let (sender, result) = mpsc::channel();
-        let (thread_stop, thread_progress) = (Arc::clone(&stop), Arc::clone(&progress));
-        spawn(move || {
-            let outcome = slice(&request, &thread_stop, &thread_progress);
-            // The receiver is gone if the job was dropped; nobody waits then.
-            let _ = sender.send(outcome);
-            notify();
-        });
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (thread_stop, thread_progress) = (Arc::clone(&stop), Arc::clone(&progress));
+            std::thread::spawn(move || {
+                let outcome = slice(&request, &thread_stop, &thread_progress);
+                // The receiver is gone if the job was dropped; nobody waits
+                // then.
+                let _ = sender.send(outcome);
+                notify();
+            });
+        }
+        #[cfg(target_arch = "wasm32")]
+        let worker =
+            crate::worker::WorkerJob::start(&request, sender, Arc::clone(&progress), notify);
         Self {
             stop,
             progress,
             started: Instant::now(),
             result,
+            #[cfg(target_arch = "wasm32")]
+            worker,
         }
     }
 
     /// Asks the slice to stop. The result then is the `slicing.cancelled`
-    /// error, or the finished slice if it was already done.
+    /// error, or the finished slice if it was already done. In the browser
+    /// the worker is stopped at once.
     pub fn cancel(&self) {
         self.stop.store(true, Ordering::Relaxed);
+        #[cfg(target_arch = "wasm32")]
+        self.worker.cancel();
     }
 
     /// Whether [`SliceJob::cancel`] was called.
@@ -157,44 +177,6 @@ impl Drop for SliceJob {
     fn drop(&mut self) {
         self.cancel();
     }
-}
-
-/// Runs `task` in a background thread.
-#[cfg(not(target_arch = "wasm32"))]
-fn spawn(task: impl FnOnce() + Send + 'static) {
-    std::thread::spawn(task);
-}
-
-#[cfg(target_arch = "wasm32")]
-thread_local! {
-    /// Slices waiting for [`run_waiting`].
-    static WAITING: std::cell::RefCell<Vec<Box<dyn FnOnce()>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// The browser has no threads: `task` waits until [`run_waiting`] runs it
-/// on the main thread.
-// ponytail: the page freezes while a slice runs and Cancel cannot be
-// clicked; a Web Worker running a second instance of the module would keep
-// it responsive.
-#[cfg(target_arch = "wasm32")]
-fn spawn(task: impl FnOnce() + Send + 'static) {
-    WAITING.with_borrow_mut(|waiting| waiting.push(Box::new(task)));
-}
-
-/// Runs the slices started since the last call, in the calling thread.
-/// Browser build only; the window calls it at the start of a frame.
-#[cfg(target_arch = "wasm32")]
-pub fn run_waiting() {
-    for task in WAITING.take() {
-        task();
-    }
-}
-
-/// Whether a slice waits for [`run_waiting`].
-#[cfg(target_arch = "wasm32")]
-pub fn has_waiting() -> bool {
-    WAITING.with_borrow(|waiting| !waiting.is_empty())
 }
 
 /// Whether a file name asks for the `.gcode.3mf` container of Bambu Lab
