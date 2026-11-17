@@ -12,6 +12,7 @@ pub mod job;
 pub mod plate;
 pub mod plates;
 pub mod profiles;
+pub mod project;
 pub mod scene;
 pub mod settings;
 pub mod settings_list;

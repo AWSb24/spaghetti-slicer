@@ -73,6 +73,27 @@ impl<S> Plates<S> {
         }
     }
 
+    /// The plates `plates` (at least one), the first shown, with no steps
+    /// to undo. Returns the list and the first plate, which the app holds.
+    pub fn from_plates(plates: Vec<Plate>) -> (Self, Plate) {
+        let mut list = Self::new();
+        let mut plates = plates.into_iter();
+        let first = plates.next().unwrap_or_default();
+        for plate in plates {
+            let index = list.push();
+            list.slots[index].plate = plate;
+        }
+        list.recorded = list.snapshot(&first);
+        (list, first)
+    }
+
+    /// Every plate in order; `plate` is the current one.
+    pub fn all<'a>(&'a self, plate: &'a Plate) -> Vec<&'a Plate> {
+        (0..self.slots.len())
+            .map(|i| self.plate_at(i, plate))
+            .collect()
+    }
+
     /// Number of plates.
     pub fn count(&self) -> usize {
         self.slots.len()
