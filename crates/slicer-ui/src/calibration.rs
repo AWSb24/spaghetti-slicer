@@ -137,6 +137,7 @@ mod tests {
         let request = SliceRequest {
             objects: plate.meshes(),
             settings: sliced_with,
+            object_settings: Vec::new(),
         };
         let mut result = slice(&request, &AtomicBool::new(false), &Progress::new()).unwrap();
         assert!(!result.output.gcode.contains("M104 S210\n"));

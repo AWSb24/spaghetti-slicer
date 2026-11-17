@@ -92,6 +92,8 @@ cargo run --release -p slicer-cli -- slice a.stl b.stl -o plate.gcode
 
 arranges the models side by side (`--gap` sets the distance, default 5 mm plus the brim). `--keep-positions` keeps the coordinates of the files, for example the build item positions of a 3MF.
 
+A model can have settings of its own that override the plate's process: wall loops and wall order, top and bottom layers, sparse infill (density, pattern, angle, connection, overlap) and supports on or off. In the desktop app they are under "Object settings" below the selected model; models with own values are marked with ✱ in the object list. In Rust, `slicer_fdm::generate_plate_with_object_settings` takes them per object. Layer heights, line width, skirt, brim, the kind of supports, seam, speeds and travel stay the same for the whole plate, and models without own values print exactly as before. The command line and the server have no settings per object yet.
+
 ### Sending to a printer
 
 ```bash

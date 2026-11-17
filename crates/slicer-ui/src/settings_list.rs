@@ -249,6 +249,13 @@ impl SettingsEditor {
         self.edits.len()
     }
 
+    /// Puts `edits` in place of the values set in the list so far, for
+    /// example the values one object on the plate sets for itself. Drafts
+    /// and errors stay.
+    pub fn set_edits(&mut self, edits: BTreeMap<String, String>) {
+        self.edits = edits;
+    }
+
     /// Every setting that matches the search, in the order of
     /// [`SETTINGS_INFO`]. `current` are the settings sliced with, `base`
     /// those from the settings files.
@@ -334,6 +341,35 @@ impl SettingsEditor {
         self.drafts.remove(key);
         self.errors.remove(key);
     }
+}
+
+/// The values an object on the plate sets for itself after its settings
+/// went from `before` to `after` in the editor: `overrides` with every key
+/// of [`slicer_fdm::OBJECT_SETTINGS`] that changed set to its new value, or
+/// dropped where that is the value of the plate (`plate`). Keys that did
+/// not change stay as they are, also if the plate has the same value now.
+pub fn changed_overrides(
+    overrides: &BTreeMap<String, String>,
+    plate: &Settings,
+    before: &Settings,
+    after: &Settings,
+) -> BTreeMap<String, String> {
+    let (plate, before, after) = (plate.values(), before.values(), after.values());
+    let mut changed = overrides.clone();
+    for key in slicer_fdm::OBJECT_SETTINGS {
+        let (Some(old), Some(new)) = (before.get(*key), after.get(*key)) else {
+            continue;
+        };
+        if old == new {
+            continue;
+        }
+        if plate.get(*key) == Some(new) {
+            changed.remove(*key);
+        } else {
+            changed.insert((*key).to_owned(), new.clone());
+        }
+    }
+    changed
 }
 
 fn build(
@@ -569,5 +605,39 @@ mod tests {
             .edit(&base, &mut common, "", "brim_width", "0")
             .unwrap();
         assert_eq!(editor.edit_count(), 2);
+    }
+
+    #[test]
+    fn objects_keep_the_values_they_set_for_themselves() {
+        let plate = Settings::default();
+        let mut editor = SettingsEditor::default();
+        // What the object section does in a frame: the object's values on
+        // top of the plate's, one edit, and the values that result.
+        let mut step = |overrides: &BTreeMap<String, String>, key: &str, value: Option<&str>| {
+            editor.set_edits(overrides.clone());
+            let mut common = CommonSettings::from_settings(&plate);
+            let before = editor.build(&plate, &common, "").unwrap();
+            match value {
+                Some(value) => editor.edit(&plate, &mut common, "", key, value).unwrap(),
+                None => editor.reset(&plate, &mut common, key),
+            }
+            let after = editor.build(&plate, &common, "").unwrap();
+            changed_overrides(overrides, &plate, &before, &after)
+        };
+        // One of the side panel's values and one of the list's.
+        let own = step(&BTreeMap::new(), "wall_loops", Some("4"));
+        let own = step(&own, "infill_pattern", Some("gyroid"));
+        let expected = BTreeMap::from([
+            ("infill_pattern".to_owned(), "gyroid".to_owned()),
+            ("wall_loops".to_owned(), "4".to_owned()),
+        ]);
+        assert_eq!(own, expected);
+        // Reset, or set to the plate's value, the key is dropped.
+        let own = step(&own, "wall_loops", None);
+        let own = step(&own, "infill_pattern", Some("grid"));
+        assert!(own.is_empty(), "{own:?}");
+        // A value that equals the plate's now stays while not edited.
+        let kept = BTreeMap::from([("infill_density".to_owned(), "15".to_owned())]);
+        assert_eq!(step(&kept, "top_layers", Some("6")).len(), 2);
     }
 }
