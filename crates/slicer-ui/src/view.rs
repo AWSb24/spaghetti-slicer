@@ -126,6 +126,19 @@ pub fn kind_name(kind: PathKind) -> String {
     name
 }
 
+/// Extruded length in millimetres of every kind of path over all `layers`,
+/// in the order the kinds first appear.
+pub fn length_by_kind(layers: &[Layer]) -> Vec<(PathKind, f64)> {
+    let mut lengths: Vec<(PathKind, f64)> = Vec::new();
+    for path in layers.iter().flat_map(|layer| &layer.paths) {
+        match lengths.iter_mut().find(|(kind, _)| *kind == path.kind) {
+            Some((_, length)) => *length += path.length(),
+            None => lengths.push((path.kind, path.length())),
+        }
+    }
+    lengths
+}
+
 /// The kinds of path in a layer, in the order they are first printed.
 pub fn kinds_in(layer: &Layer) -> Vec<PathKind> {
     let mut kinds = Vec::new();
@@ -197,5 +210,16 @@ mod tests {
         let mut unique = kinds.clone();
         unique.dedup();
         assert_eq!(unique, kinds);
+
+        let lengths = length_by_kind(&toolpaths.layers);
+        assert_eq!(lengths[0].0, PathKind::Skirt);
+        let total: f64 = lengths.iter().map(|(_, l)| l).sum();
+        let expected: f64 = toolpaths
+            .layers
+            .iter()
+            .flat_map(|layer| &layer.paths)
+            .map(slicer_fdm::Path::length)
+            .sum();
+        assert!(total > 0.0 && (total - expected).abs() < 1e-9);
     }
 }

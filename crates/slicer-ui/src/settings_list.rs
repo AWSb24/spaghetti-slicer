@@ -14,6 +14,109 @@ use slicer_profiles::{SETTINGS_INFO, SettingInfo, Settings, SettingsError};
 
 use crate::settings::{CommonSettings, parse_overrides};
 
+/// The process settings of the side panel in tabs, as slicers usually
+/// group them: name of the tab and its keys in the order shown. Everything
+/// else is in the list of all settings.
+pub const PROCESS_TABS: [(&str, &[&str]); 5] = [
+    (
+        "Quality",
+        &[
+            "layer_height",
+            "first_layer_height",
+            "adaptive_layers",
+            "min_layer_height",
+            "max_layer_height",
+            "line_width",
+            "seam_position",
+            "wall_order",
+        ],
+    ),
+    (
+        "Strength",
+        &[
+            "wall_loops",
+            "top_layers",
+            "bottom_layers",
+            "infill_density",
+            "infill_pattern",
+            "infill_angle",
+            "infill_connect",
+            "infill_overlap",
+        ],
+    ),
+    (
+        "Speed",
+        &[
+            "outer_wall_speed",
+            "inner_wall_speed",
+            "infill_speed",
+            "bridge_speed",
+            "first_layer_speed",
+            "travel_speed",
+            "acceleration",
+            "jerk",
+        ],
+    ),
+    (
+        "Support",
+        &[
+            "supports",
+            "support_style",
+            "support_spacing",
+            "support_interface_layers",
+            "support_bridge_length",
+        ],
+    ),
+    (
+        "Others",
+        &[
+            "skirt_loops",
+            "skirt_distance",
+            "brim_width",
+            "prime_tower_width",
+            "prime_tower_x",
+            "prime_tower_y",
+        ],
+    ),
+];
+
+/// A setting's name for people: `infill_density` becomes "Infill density".
+pub fn setting_label(key: &str) -> String {
+    let text = key.replace('_', " ");
+    let mut chars = text.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
+/// The rows of `keys`, in that order; unknown keys are left out.
+pub fn rows_of(current: &Settings, base: &Settings, keys: &[&str]) -> Vec<Row> {
+    let all = all_rows(current, base);
+    keys.iter()
+        .filter_map(|key| all.iter().find(|row| row.info.key == *key).cloned())
+        .collect()
+}
+
+/// Every setting, in the order of [`SETTINGS_INFO`].
+fn all_rows(current: &Settings, base: &Settings) -> Vec<Row> {
+    let values = current.values();
+    let profile = base.values();
+    let limits = current.limits();
+    SETTINGS_INFO
+        .iter()
+        .map(|info| Row {
+            info,
+            value: values.get(info.key).cloned().unwrap_or_default(),
+            profile_value: profile.get(info.key).cloned().unwrap_or_default(),
+            range: limits
+                .iter()
+                .find(|(key, ..)| *key == info.key)
+                .map(|&(_, _, min, max)| (min, max)),
+        })
+        .collect()
+}
+
 /// One line of the list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
@@ -98,21 +201,9 @@ impl SettingsEditor {
     /// [`SETTINGS_INFO`]. `current` are the settings sliced with, `base`
     /// those from the settings files.
     pub fn rows(&self, current: &Settings, base: &Settings) -> Vec<Row> {
-        let values = current.values();
-        let profile = base.values();
-        let limits = current.limits();
         let search = self.search.trim().to_lowercase();
-        SETTINGS_INFO
-            .iter()
-            .map(|info| Row {
-                info,
-                value: values.get(info.key).cloned().unwrap_or_default(),
-                profile_value: profile.get(info.key).cloned().unwrap_or_default(),
-                range: limits
-                    .iter()
-                    .find(|(key, ..)| *key == info.key)
-                    .map(|&(_, _, min, max)| (min, max)),
-            })
+        all_rows(current, base)
+            .into_iter()
             .filter(|row| !self.only_changed || row.changed())
             .filter(|row| {
                 search.is_empty()
@@ -258,6 +349,25 @@ mod tests {
         // Descriptions are searched too.
         search.search = "g/cm".to_owned();
         assert_eq!(search.rows(&base, &base)[0].info.key, "filament_density");
+    }
+
+    #[test]
+    fn process_tabs_name_known_settings_once() {
+        let base = Settings::default();
+        let mut seen = Vec::new();
+        for (_, keys) in PROCESS_TABS {
+            let rows = rows_of(&base, &base, keys);
+            let shown: Vec<&str> = rows.iter().map(|r| r.info.key).collect();
+            assert_eq!(shown, keys, "every key is a setting");
+            for key in keys {
+                assert!(!seen.contains(key), "{key} is in two tabs");
+                seen.push(key);
+            }
+        }
+        assert!(rows_of(&base, &base, &["nope"]).is_empty());
+        assert_eq!(setting_label("infill_density"), "Infill density");
+        assert_eq!(setting_label("jerk"), "Jerk");
+        assert_eq!(setting_label(""), "");
     }
 
     #[test]

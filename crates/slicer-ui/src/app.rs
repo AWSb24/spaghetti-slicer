@@ -1,12 +1,17 @@
-//! The window: side panel with model, settings and slicing, and a plate
-//! view that shows either the model's outline or one sliced layer.
+//! The window, laid out the way slicers usually are: a top bar with the
+//! Prepare and Preview tabs and the slice and export buttons, a side panel
+//! with printer, filament, process (in tabs), objects and messages, and the
+//! plate in 2D or 3D; the preview adds a layer slider on the right and a
+//! legend of the line types.
 
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{
-    self, Align2, Color32, FontId, PointerButton, Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2,
+    self, Align, Align2, Color32, FontId, Layout, PointerButton, Pos2, Rect, RichText, Sense,
+    Shape, Stroke, Vec2,
 };
 use slicer_core::{Diagnostic, Severity};
+use slicer_fdm::PathKind;
 use slicer_profiles::Settings;
 use slicer_ui::job::{
     SliceJob, SliceRequest, SliceResult, encode_output, format_duration, output_name,
@@ -17,11 +22,11 @@ use slicer_ui::plate::{
 };
 use slicer_ui::profiles::replace_profiles;
 use slicer_ui::settings::{CommonSettings, SettingsFile, load_settings};
-use slicer_ui::settings_list::SettingsEditor;
-use slicer_ui::view::{PlateView, kind_name, kinds_in, path_color};
+use slicer_ui::settings_list::{PROCESS_TABS, SettingsEditor};
+use slicer_ui::view::{PlateView, kind_name, kinds_in, length_by_kind, path_color};
 
 use crate::platform;
-use crate::settings_ui::{ProfileAction, Profiles, progress_bar, settings_window};
+use crate::settings_ui::{ProfileAction, Profiles, process_tabs, progress_bar, settings_window};
 use crate::view3d::{Scene, View3d};
 
 /// How serious a message in the side panel is.
@@ -61,6 +66,8 @@ enum Tab {
 /// A finished slice and what it was made from.
 struct Sliced {
     result: SliceResult,
+    /// Extruded length per line type, for the legend.
+    lengths: Vec<(PathKind, f64)>,
     settings: Settings,
     placements: Vec<Placement>,
     serial: u64,
@@ -100,6 +107,8 @@ pub struct App {
     editor: SettingsEditor,
     /// Whether the list of all settings is open.
     all_settings: bool,
+    /// The open tab of the process settings.
+    process_tab: usize,
 }
 
 impl App {
@@ -126,6 +135,7 @@ impl App {
             profiles: Profiles::find(),
             editor: SettingsEditor::default(),
             all_settings: false,
+            process_tab: 0,
         };
         app.open_paths(paths);
         app
@@ -283,6 +293,7 @@ impl App {
                 self.view3d.set_toolpaths(&result.toolpaths);
                 if let Ok(settings) = &self.current {
                     self.sliced = Some(Sliced {
+                        lengths: length_by_kind(&result.toolpaths.layers),
                         result,
                         settings: settings.clone(),
                         placements: self.plate.placements(),
@@ -342,7 +353,7 @@ impl App {
     }
 
     fn model_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Models");
+        ui.heading("Objects");
         let bed = self.bed();
         ui.horizontal(|ui| {
             if ui.button("Add…").clicked() {
@@ -454,10 +465,106 @@ impl App {
         }
     }
 
+    /// Printer, filament and process profiles, the process settings in
+    /// tabs, and the settings files behind them.
     fn settings_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Settings");
         let paths: Vec<PathBuf> = self.files.iter().map(|(path, _)| path.clone()).collect();
-        match self.profiles.ui(ui, &paths) {
+        let mut action = None;
+        for (role, heading) in ["Printer", "Filament", "Process"].into_iter().enumerate() {
+            ui.heading(heading);
+            if let Some(chosen) = self.profiles.combo(ui, &paths, role) {
+                action = Some(chosen);
+            }
+            if role == 0 {
+                let base = &self.base;
+                ui.weak(format!(
+                    "Bed {:.0} × {:.0} × {:.0} mm, nozzle {} mm",
+                    base.bed_size_x, base.bed_size_y, base.max_print_height, base.nozzle_diameter
+                ));
+            }
+            ui.add_space(6.0);
+        }
+
+        let current = match &self.current {
+            Ok(settings) => settings,
+            Err(_) => &self.base,
+        };
+        process_tabs(
+            ui,
+            &mut self.process_tab,
+            &mut self.editor,
+            &self.base,
+            &mut self.common,
+            &self.overrides,
+            current,
+        );
+        if self.process_tab == PROCESS_TABS.len() - 1 {
+            ui.add_space(4.0);
+            ui.label("More settings, one key = value per line:");
+            ui.add(
+                egui::TextEdit::multiline(&mut self.overrides)
+                    .hint_text("brim_width = 5\nnozzle_temp = 220")
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Monospace),
+            );
+        }
+        ui.add_space(4.0);
+        let edits = self.editor.edit_count();
+        let label = if edits == 0 {
+            "All settings…".to_owned()
+        } else {
+            format!("All settings… ({edits} edited)")
+        };
+        if ui
+            .button(label)
+            .on_hover_text("Every setting, with search; also printer and material values")
+            .clicked()
+        {
+            self.all_settings = !self.all_settings;
+        }
+        if let Err(error) = &self.current {
+            ui.colored_label(ui.visuals().error_fg_color, &error.message);
+        }
+
+        let mut remove = None;
+        egui::CollapsingHeader::new(format!("Settings files ({})", self.files.len()))
+            .id_salt("settings_files")
+            .show(ui, |ui| {
+                for (index, (path, file)) in self.files.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Remove").clicked() {
+                            remove = Some(index);
+                        }
+                        ui.label(&file.name)
+                            .on_hover_text(path.display().to_string());
+                    });
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button("Add file…")
+                        .on_hover_text("Settings in TOML; later files override earlier ones")
+                        .clicked()
+                    {
+                        let paths = platform::pick_files(ui.ctx(), "Settings", &["toml"], true);
+                        if !paths.is_empty() {
+                            self.add_settings_files(&paths);
+                        }
+                    }
+                    if !self.files.is_empty() && ui.small_button("Reload").clicked() {
+                        self.reload_settings_files();
+                    }
+                });
+                if let Some(chosen) = self.profiles.tools(ui) {
+                    action = Some(chosen);
+                }
+            });
+        if let Some(index) = remove {
+            let mut files = self.files.clone();
+            files.remove(index);
+            self.use_settings_files(files);
+        }
+        match action {
             Some(ProfileAction::Use { old, new }) => {
                 self.read_settings_files(&replace_profiles(&paths, &old, &new));
             }
@@ -471,183 +578,92 @@ impl App {
             Some(ProfileAction::Error(text)) => self.note(Level::Error, text),
             None => {}
         }
-        let mut remove = None;
-        for (index, (path, file)) in self.files.iter().enumerate() {
-            ui.horizontal(|ui| {
-                if ui.small_button("Remove").clicked() {
-                    remove = Some(index);
-                }
-                ui.label(&file.name)
-                    .on_hover_text(path.display().to_string());
-            });
-        }
-        if let Some(index) = remove {
-            let mut files = self.files.clone();
-            files.remove(index);
-            self.use_settings_files(files);
-        }
-        ui.horizontal(|ui| {
-            if ui
-                .button("Add file…")
-                .on_hover_text("Settings in TOML; later files override earlier ones")
-                .clicked()
-            {
-                let paths = platform::pick_files(ui.ctx(), "Settings", &["toml"], true);
-                if !paths.is_empty() {
-                    self.add_settings_files(&paths);
-                }
-            }
-            if !self.files.is_empty() && ui.button("Reload").clicked() {
-                self.reload_settings_files();
-            }
-        });
-        let base = &self.base;
-        ui.weak(format!(
-            "Bed {:.0} × {:.0} × {:.0} mm, nozzle {} mm",
-            base.bed_size_x, base.bed_size_y, base.max_print_height, base.nozzle_diameter
-        ));
-
-        let from_files = CommonSettings::from_settings(base);
-        let common = &mut self.common;
-        egui::Grid::new("common").num_columns(3).show(ui, |ui| {
-            ui.label("Layer height");
-            ui.add(
-                egui::DragValue::new(&mut common.layer_height)
-                    .speed(0.01)
-                    .range(0.02..=base.nozzle_diameter)
-                    .max_decimals(3)
-                    .suffix(" mm"),
-            );
-            changed_marker(ui, &mut common.layer_height, from_files.layer_height, |v| {
-                format!("{v} mm")
-            });
-            ui.end_row();
-            ui.label("Infill");
-            ui.add(egui::Slider::new(&mut common.infill_density, 0.0..=100.0).suffix(" %"));
-            changed_marker(
-                ui,
-                &mut common.infill_density,
-                from_files.infill_density,
-                |v| format!("{v} %"),
-            );
-            ui.end_row();
-            ui.label("Walls");
-            ui.add(egui::DragValue::new(&mut common.wall_loops).range(0..=20));
-            changed_marker(ui, &mut common.wall_loops, from_files.wall_loops, |v| {
-                v.to_string()
-            });
-            ui.end_row();
-            ui.label("Supports");
-            ui.checkbox(&mut common.supports, "");
-            changed_marker(ui, &mut common.supports, from_files.supports, |v| {
-                if v { "on" } else { "off" }.to_owned()
-            });
-            ui.end_row();
-        });
-        ui.label("More settings, one key = value per line:");
-        ui.add(
-            egui::TextEdit::multiline(&mut self.overrides)
-                .hint_text("brim_width = 5\nnozzle_temp = 220")
-                .desired_rows(3)
-                .desired_width(f32::INFINITY)
-                .font(egui::TextStyle::Monospace),
-        );
-        let edits = self.editor.edit_count();
-        let label = if edits == 0 {
-            "All settings…".to_owned()
-        } else {
-            format!("All settings… ({edits} edited)")
-        };
-        if ui.button(label).clicked() {
-            self.all_settings = !self.all_settings;
-        }
-        if let Err(error) = &self.current {
-            ui.colored_label(ui.visuals().error_fg_color, &error.message);
-        }
     }
 
-    fn slice_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Slice");
-        if let Some(job) = &self.job {
-            if job.is_cancelling() {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Cancelling");
-                });
-            } else {
-                let (step, fraction) = job.progress();
-                progress_bar(ui, step, fraction, job.elapsed().as_secs_f64());
+    /// The bar at the top: Prepare and Preview, and on the right slicing
+    /// and exporting.
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().button_padding = Vec2::new(14.0, 6.0);
+            for (tab, name) in [(Tab::Plate, "Prepare"), (Tab::Preview, "Preview")] {
+                ui.selectable_value(&mut self.tab, tab, RichText::new(name).size(15.0));
             }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                self.slice_controls(ui);
+            });
+        });
+    }
+
+    /// Slice and export buttons, or the progress of a running slice. Laid
+    /// out from right to left.
+    fn slice_controls(&mut self, ui: &mut egui::Ui) {
+        if let Some(job) = &self.job {
             if ui
                 .add_enabled(!job.is_cancelling(), egui::Button::new("Cancel"))
                 .clicked()
             {
                 job.cancel();
             }
-        } else {
-            let blocker = self.slice_blocker();
-            let button = ui.add_enabled(
-                blocker.is_none(),
-                egui::Button::new(RichText::new("Slice").strong()).min_size(Vec2::new(120.0, 28.0)),
-            );
-            if button.clicked() {
-                self.start_slice(ui.ctx());
+            if job.is_cancelling() {
+                ui.label("Cancelling");
+                ui.spinner();
+            } else {
+                let (step, fraction) = job.progress();
+                progress_bar(ui, step, fraction, job.elapsed().as_secs_f64());
             }
-            if let Some(text) = blocker {
-                ui.colored_label(ui.visuals().warn_fg_color, text);
-            }
-        }
-        let current = self.slice_is_current();
-        let Some(sliced) = &self.sliced else {
             return;
-        };
-        let stats = &sliced.result.output.stats;
-        ui.label(format!(
-            "{} layers, {}, {:.2} m / {:.1} g filament",
-            stats.layers,
-            format_duration(stats.print_time_s),
-            stats.filament_length_mm / 1000.0,
-            stats.filament_weight_g
-        ));
-        if !current {
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
-                "Model, placement or settings changed since this slice.",
-            );
         }
-        ui.horizontal(|ui| {
-            if ui.button("Save G-code…").clicked() {
-                self.save(false);
-            }
+        let blocker = self.slice_blocker();
+        let slice = ui.add_enabled(
+            blocker.is_none(),
+            egui::Button::new(RichText::new("Slice plate").strong())
+                .min_size(Vec2::new(120.0, 0.0)),
+        );
+        if slice.clicked() {
+            self.start_slice(ui.ctx());
+        }
+        if self.sliced.is_some() {
             if ui
-                .button("Save .gcode.3mf…")
+                .button("Export .gcode.3mf…")
                 .on_hover_text("Project file for Bambu Lab printers (not yet tested on a printer)")
                 .clicked()
             {
                 self.save(true);
             }
-        });
+            if ui.button("Export G-code…").clicked() {
+                self.save(false);
+            }
+        }
+        if let Some(text) = blocker {
+            ui.add(
+                egui::Label::new(RichText::new(text).color(ui.visuals().warn_fg_color)).truncate(),
+            );
+        }
     }
 
     fn messages_section(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("Messages");
-            if !self.notes.is_empty() && ui.small_button("Clear").clicked() {
-                self.notes.clear();
-            }
-        });
-        let visuals = ui.visuals().clone();
-        for note in self.notes.iter().rev() {
-            let (color, prefix) = match note.level {
-                Level::Info => (visuals.text_color(), ""),
-                Level::Warning => (visuals.warn_fg_color, "Warning: "),
-                Level::Error => (visuals.error_fg_color, "Error: "),
-            };
-            ui.add(
-                egui::Label::new(RichText::new(format!("{prefix}{}", note.text)).color(color))
-                    .wrap(),
-            );
-        }
+        egui::CollapsingHeader::new(format!("Messages ({})", self.notes.len()))
+            .id_salt("messages")
+            .default_open(true)
+            .show(ui, |ui| {
+                if !self.notes.is_empty() && ui.small_button("Clear").clicked() {
+                    self.notes.clear();
+                }
+                let visuals = ui.visuals().clone();
+                for note in self.notes.iter().rev() {
+                    let (color, prefix) = match note.level {
+                        Level::Info => (visuals.text_color(), ""),
+                        Level::Warning => (visuals.warn_fg_color, "Warning: "),
+                        Level::Error => (visuals.error_fg_color, "Error: "),
+                    };
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!("{prefix}{}", note.text)).color(color),
+                        )
+                        .wrap(),
+                    );
+                }
+            });
     }
 
     /// The bed with the model outline or a sliced layer, with zoom and pan.
@@ -818,10 +834,10 @@ impl App {
         }
     }
 
-    /// Layer slider and legend above the preview.
-    fn preview_controls(&mut self, ui: &mut egui::Ui) {
+    /// The upright layer slider at the right of the preview; the arrow keys
+    /// move it too.
+    fn layer_slider(&mut self, ui: &mut egui::Ui) {
         let Some(sliced) = &self.sliced else {
-            ui.label("Slice the model to see the layers.");
             return;
         };
         let layers = &sliced.result.toolpaths.layers;
@@ -845,23 +861,81 @@ impl App {
         }
         self.layer = self.layer.min(last);
         let mut number = self.layer + 1;
-        ui.horizontal(|ui| {
-            ui.spacing_mut().slider_width = (ui.available_width() - 260.0).max(100.0);
-            ui.add(egui::Slider::new(&mut number, 1..=layers.len()).text("Layer"));
-            let layer = &layers[number - 1];
-            ui.label(format!("Z {:.2} mm", layer.z));
+        ui.vertical_centered(|ui| {
+            ui.add_space(4.0);
+            ui.label(RichText::new(format!("{:.2}", layers[self.layer].z)).strong())
+                .on_hover_text("Height of the layer in mm");
+            ui.spacing_mut().slider_width = (ui.available_height() - 40.0).max(80.0);
+            ui.add(egui::Slider::new(&mut number, 1..=layers.len()).vertical())
+                .on_hover_text("Layer; arrow keys up and down");
         });
+        if number - 1 != self.layer {
+            // The height above the slider belongs to the new layer.
+            ui.ctx().request_repaint();
+        }
         self.layer = number - 1;
-        ui.horizontal_wrapped(|ui| {
-            for kind in kinds_in(&layers[self.layer]) {
-                let [r, g, b] = path_color(kind);
-                let (swatch, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
-                ui.painter()
-                    .rect_filled(swatch, 2.0, Color32::from_rgb(r, g, b));
-                ui.label(kind_name(kind));
-                ui.add_space(8.0);
-            }
-        });
+    }
+
+    /// The legend over the top left of the preview at `at`: every line
+    /// type with its colour, length and share of the extruded length, and
+    /// the totals. Types not in the shown layer are dimmed.
+    fn legend(&self, ctx: &egui::Context, at: Pos2) {
+        let Some(sliced) = &self.sliced else {
+            return;
+        };
+        let stats = &sliced.result.output.stats;
+        let total: f64 = sliced.lengths.iter().map(|(_, length)| length).sum();
+        let in_layer = sliced
+            .result
+            .toolpaths
+            .layers
+            .get(self.layer)
+            .map(kinds_in)
+            .unwrap_or_default();
+        let current = self.slice_is_current();
+        egui::Area::new(egui::Id::unique("legend"))
+            .fixed_pos(at)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.strong("Line type");
+                    egui::Grid::new("legend_rows")
+                        .num_columns(4)
+                        .spacing([10.0, 3.0])
+                        .show(ui, |ui| {
+                            for &(kind, length) in &sliced.lengths {
+                                let [r, g, b] = path_color(kind);
+                                let (swatch, _) =
+                                    ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+                                ui.painter()
+                                    .rect_filled(swatch, 2.0, Color32::from_rgb(r, g, b));
+                                let name = RichText::new(kind_name(kind));
+                                if in_layer.contains(&kind) {
+                                    ui.label(name);
+                                } else {
+                                    ui.label(name.weak());
+                                }
+                                ui.label(format!("{:.1} m", length / 1000.0));
+                                let share = if total > 0.0 { length / total } else { 0.0 };
+                                ui.label(format!("{:.0} %", share * 100.0));
+                                ui.end_row();
+                            }
+                        });
+                    ui.separator();
+                    ui.label(format!(
+                        "{} layers · {}",
+                        stats.layers,
+                        format_duration(stats.print_time_s)
+                    ));
+                    ui.label(format!(
+                        "{:.2} m · {:.1} g filament",
+                        stats.filament_length_mm / 1000.0,
+                        stats.filament_weight_g
+                    ));
+                    if !current {
+                        ui.colored_label(ui.visuals().warn_fg_color, "Changed since this slice");
+                    }
+                });
+            });
     }
 }
 
@@ -893,24 +967,6 @@ impl App {
     }
 }
 
-/// A reset button next to a value that differs from the settings files.
-fn changed_marker<T: PartialEq + Copy>(
-    ui: &mut egui::Ui,
-    value: &mut T,
-    from_files: T,
-    show: impl Fn(T) -> String,
-) {
-    if *value == from_files {
-        ui.label("");
-    } else if ui
-        .small_button("reset")
-        .on_hover_text(format!("Changed; back to {}", show(from_files)))
-        .clicked()
-    {
-        *value = from_files;
-    }
-}
-
 fn file_name(path: &Path) -> String {
     path.file_name().map_or_else(
         || path.display().to_string(),
@@ -925,17 +981,20 @@ impl eframe::App for App {
         self.handle_dropped_files(&ctx);
         self.current = self.editor.build(&self.base, &self.common, &self.overrides);
 
+        egui::Panel::top("top").show(ui, |ui| {
+            ui.add_space(4.0);
+            self.top_bar(ui);
+            ui.add_space(4.0);
+        });
         egui::Panel::left("side")
             .resizable(true)
-            .default_size(320.0)
-            .min_size(260.0)
+            .default_size(340.0)
+            .min_size(280.0)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.model_section(ui);
-                    ui.separator();
                     self.settings_section(ui);
                     ui.separator();
-                    self.slice_section(ui);
+                    self.model_section(ui);
                     ui.separator();
                     self.messages_section(ui);
                 });
@@ -950,20 +1009,28 @@ impl eframe::App for App {
             self.current.as_ref().ok(),
         );
         egui::CentralPanel::default().show(ui, |ui| {
+            let preview = self.tab == Tab::Preview;
+            if preview && self.sliced.is_some() {
+                egui::Panel::right("layers")
+                    .resizable(false)
+                    .exact_size(76.0)
+                    .show(ui, |ui| self.layer_slider(ui));
+            }
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Plate, "Plate");
-                ui.selectable_value(&mut self.tab, Tab::Preview, "Preview");
-                ui.separator();
                 ui.selectable_value(&mut self.three_d, false, "2D");
                 ui.selectable_value(&mut self.three_d, true, "3D");
+                if preview && self.sliced.is_none() {
+                    ui.weak("Slice the plate to see the layers.");
+                }
             });
-            if self.tab == Tab::Preview {
-                self.preview_controls(ui);
-            }
+            let view = ui.available_rect_before_wrap();
             if self.three_d {
                 self.show_3d(ui);
             } else {
                 self.plate(ui);
+            }
+            if preview {
+                self.legend(&ctx, view.min + Vec2::new(10.0, 10.0));
             }
         });
     }

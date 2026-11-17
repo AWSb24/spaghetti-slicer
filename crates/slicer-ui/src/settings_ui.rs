@@ -1,5 +1,5 @@
-//! Drawing the profile picker, the list of all settings and the progress
-//! bar. The logic lives in `slicer_ui::profiles` and
+//! Drawing the profile pickers, the process tabs, the list of all settings
+//! and the progress bar. The logic lives in `slicer_ui::profiles` and
 //! `slicer_ui::settings_list`.
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -13,9 +13,9 @@ use slicer_fdm::Step;
 use slicer_profiles::{Settings, ValueKind};
 #[cfg(not(target_arch = "wasm32"))]
 use slicer_ui::profiles::import_orca_files;
-use slicer_ui::profiles::{ProfileSet, ROLES, find_profiles_dir, profile_name};
+use slicer_ui::profiles::{ProfileSet, find_profiles_dir, profile_name};
 use slicer_ui::settings::CommonSettings;
-use slicer_ui::settings_list::{Row, SettingsEditor};
+use slicer_ui::settings_list::{PROCESS_TABS, Row, SettingsEditor, rows_of, setting_label};
 
 /// What the profile picker asks the window to do.
 // The browser build has no Orca import, so two variants go unused there.
@@ -55,47 +55,57 @@ impl Profiles {
         }
     }
 
-    /// One drop-down per role, the folder and the Orca import. `files` are
-    /// the settings files in use.
-    pub fn ui(&mut self, ui: &mut egui::Ui, files: &[PathBuf]) -> Option<ProfileAction> {
+    /// The drop-down for one role of `slicer_ui::profiles::ROLES` (printer, material,
+    /// process), across the width of the panel. `files` are the settings
+    /// files in use.
+    pub fn combo(
+        &mut self,
+        ui: &mut egui::Ui,
+        files: &[PathBuf],
+        role: usize,
+    ) -> Option<ProfileAction> {
+        let Some(set) = &self.set else {
+            if role == 0 {
+                ui.weak("No profile folder found.");
+            }
+            return None;
+        };
         let mut action = None;
-        if let Some(set) = &self.set {
-            let choice = set.choice_of(files);
-            egui::Grid::new("profiles").num_columns(2).show(ui, |ui| {
-                for (role, (label, _)) in ROLES.iter().enumerate() {
-                    ui.label(*label);
-                    let shown = choice[role]
-                        .and_then(|index| set.files[role].get(index))
-                        .map_or_else(|| "(none)".to_owned(), |path| profile_name(path));
-                    egui::ComboBox::from_id_salt(("profile", role))
-                        .width(180.0)
-                        .selected_text(shown)
-                        .show_ui(ui, |ui| {
-                            let mut wanted = choice;
-                            ui.selectable_value(&mut wanted[role], None, "(none)");
-                            for (index, path) in set.files[role].iter().enumerate() {
-                                ui.selectable_value(
-                                    &mut wanted[role],
-                                    Some(index),
-                                    profile_name(path),
-                                );
-                            }
-                            if wanted != choice {
-                                action = Some(ProfileAction::Use {
-                                    old: set.chosen(&choice),
-                                    new: set.chosen(&wanted),
-                                });
-                            }
-                        });
-                    ui.end_row();
+        let choice = set.choice_of(files);
+        let shown = choice[role]
+            .and_then(|index| set.files[role].get(index))
+            .map_or_else(|| "(none)".to_owned(), |path| profile_name(path));
+        egui::ComboBox::from_id_salt(("profile", role))
+            .width(ui.available_width())
+            .selected_text(shown)
+            .show_ui(ui, |ui| {
+                let mut wanted = choice;
+                ui.selectable_value(&mut wanted[role], None, "(none)");
+                for (index, path) in set.files[role].iter().enumerate() {
+                    ui.selectable_value(&mut wanted[role], Some(index), profile_name(path));
+                }
+                if wanted != choice {
+                    action = Some(ProfileAction::Use {
+                        old: set.chosen(&choice),
+                        new: set.chosen(&wanted),
+                    });
                 }
             });
-        } else {
-            ui.weak("No profile folder found.");
-        }
-        // ponytail: the browser has no folders to choose and no files to
-        // save next to the profiles; both stay on the desktop for now.
-        #[cfg(not(target_arch = "wasm32"))]
+        action
+    }
+
+    /// Choosing the profile folder and importing Orca profiles.
+    // ponytail: the browser has no folders to choose and no files to save
+    // next to the profiles; both stay on the desktop for now.
+    #[cfg(target_arch = "wasm32")]
+    pub fn tools(&mut self, _ui: &mut egui::Ui) -> Option<ProfileAction> {
+        None
+    }
+
+    /// Choosing the profile folder and importing Orca profiles.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn tools(&mut self, ui: &mut egui::Ui) -> Option<ProfileAction> {
+        let mut action = None;
         ui.horizontal(|ui| {
             let folder = self.set.as_ref().map(|set| set.dir.clone());
             if ui
@@ -199,7 +209,7 @@ pub fn settings_window(
                         ui.label(RichText::new(group).strong());
                         ui.separator();
                     }
-                    setting_row(ui, row, editor, base, common, overrides);
+                    setting_row(ui, row, editor, base, common, overrides, false);
                 }
                 if rows.is_empty() {
                     ui.weak("No setting matches.");
@@ -208,6 +218,34 @@ pub fn settings_window(
         });
 }
 
+/// The process settings in tabs ([`PROCESS_TABS`]); `tab` is the open one.
+/// `current` are the settings sliced with, `base` those from the files.
+pub fn process_tabs(
+    ui: &mut egui::Ui,
+    tab: &mut usize,
+    editor: &mut SettingsEditor,
+    base: &Settings,
+    common: &mut CommonSettings,
+    overrides: &str,
+    current: &Settings,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.spacing_mut().button_padding.x = 6.0;
+        for (index, (name, _)) in PROCESS_TABS.iter().enumerate() {
+            ui.selectable_value(tab, index, *name);
+        }
+    });
+    ui.separator();
+    let (_, keys) = PROCESS_TABS[(*tab).min(PROCESS_TABS.len() - 1)];
+    for row in &rows_of(current, base, keys) {
+        setting_row(ui, row, editor, base, common, overrides, true);
+    }
+}
+
+/// One setting with its field. `friendly` shows the name as words and
+/// the allowed range only on hover, for the narrow side panel; otherwise
+/// the key and the range are shown.
 fn setting_row(
     ui: &mut egui::Ui,
     row: &Row,
@@ -215,6 +253,7 @@ fn setting_row(
     base: &Settings,
     common: &mut CommonSettings,
     overrides: &str,
+    friendly: bool,
 ) {
     let key = row.info.key;
     // A failed edit is shown below the row from `editor.errors`.
@@ -222,10 +261,28 @@ fn setting_row(
         let _ = editor.edit(base, common, overrides, key, value);
     };
     ui.horizontal(|ui| {
-        let name = RichText::new(key).monospace();
+        let (name, width) = if friendly {
+            (RichText::new(setting_label(key)), 150.0)
+        } else {
+            (RichText::new(key).monospace(), 210.0)
+        };
         let name = if row.changed() { name.strong() } else { name };
-        ui.add_sized([210.0, 18.0], egui::Label::new(name).truncate())
-            .on_hover_text(row.info.description);
+        let hover = match row.range {
+            Some((min, max)) if friendly => {
+                format!("{}\n\nAllowed: {min} – {max}", row.info.description)
+            }
+            _ => row.info.description.to_owned(),
+        };
+        // Left-aligned in a column of fixed width.
+        ui.allocate_ui_with_layout(
+            egui::Vec2::new(width, 18.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.set_min_width(width);
+                ui.add(egui::Label::new(name).truncate())
+                    .on_hover_text(hover);
+            },
+        );
         match row.info.kind {
             ValueKind::Flag => {
                 let mut on = row.value == "true";
@@ -258,7 +315,12 @@ fn setting_row(
                 } else {
                     egui::TextEdit::singleline(&mut text)
                 };
-                let response = ui.add(field.desired_width(if multiline { 220.0 } else { 90.0 }));
+                let width = match (multiline, friendly) {
+                    (true, _) => 220.0,
+                    (false, true) => 70.0,
+                    (false, false) => 90.0,
+                };
+                let response = ui.add(field.desired_width(width));
                 if response.changed() {
                     editor.drafts.insert(key.to_owned(), text.clone());
                 }
@@ -267,7 +329,7 @@ fn setting_row(
                 }
             }
         }
-        if let Some((min, max)) = row.range {
+        if let Some((min, max)) = row.range.filter(|_| !friendly) {
             ui.weak(format!("{min} – {max}"));
         }
         if row.changed()
@@ -288,6 +350,7 @@ fn setting_row(
 pub fn progress_bar(ui: &mut egui::Ui, step: Step, fraction: f64, seconds: f64) {
     ui.add(
         egui::ProgressBar::new(fraction as f32)
+            .desired_width(260.0)
             .text(format!(
                 "{} … {:.0} % · {seconds:.0} s",
                 step.label(),
