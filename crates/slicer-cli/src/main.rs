@@ -97,6 +97,40 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Write the G-code of a calibration print
+    ///
+    /// temperature: a tower of blocks, one per nozzle temperature (M104 at
+    /// the first layer of each block). retraction: two towers whose
+    /// retraction length changes per band of height. flow: flat blocks side
+    /// by side, each with its own share of the flow ratio. Start, end and
+    /// step default to values that suit the settings.
+    Calibrate {
+        /// Kind of print: temperature, retraction or flow
+        #[arg(value_parser = parse_calibration_kind)]
+        kind: slicer_gcode::calibration::Kind,
+        /// First value: °C, mm, or % of the flow ratio (bottom block or
+        /// first flow block)
+        #[arg(long, allow_hyphen_values = true)]
+        start: Option<f64>,
+        /// Last value
+        #[arg(long, allow_hyphen_values = true)]
+        end: Option<f64>,
+        /// Distance between two values (positive)
+        #[arg(long)]
+        step: Option<f64>,
+        /// G-code file to write [default: calibration-KIND.gcode]
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Settings file in TOML format; may be given several times
+        #[arg(short, long)]
+        config: Vec<PathBuf>,
+        /// Override a single setting, e.g. --set nozzle_temp=200
+        #[arg(short, long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        /// Print the result (or the error) as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Print all settings with their default values as TOML
     DefaultConfig,
     /// Turn profiles saved by Orca Slicer (JSON) into a settings file
@@ -219,6 +253,107 @@ fn main() -> ExitCode {
             set,
             json,
         } => report(slice_sla(input, output, &set), json, print_sla_summary),
+        Command::Calibrate {
+            kind,
+            start,
+            end,
+            step,
+            output,
+            config,
+            set,
+            json,
+        } => report(
+            calibrate(kind, [start, end, step], output, &config, &set),
+            json,
+            print_calibration_summary,
+        ),
+    }
+}
+
+/// Reads the kind of a calibration print from the command line.
+fn parse_calibration_kind(name: &str) -> Result<slicer_gcode::calibration::Kind, String> {
+    slicer_gcode::calibration::Kind::from_name(name)
+        .ok_or_else(|| "expected temperature, retraction or flow".to_owned())
+}
+
+/// Builds the test models of a calibration print, slices them and writes
+/// the calibration G-code. `range` holds start, end and step; missing ones
+/// come from [`slicer_gcode::calibration::Kind::default_range`].
+fn calibrate(
+    kind: slicer_gcode::calibration::Kind,
+    range: [Option<f64>; 3],
+    output: Option<PathBuf>,
+    config: &[PathBuf],
+    overrides: &[String],
+) -> Result<serde_json::Value, Diagnostic> {
+    use slicer_gcode::calibration::Calibration;
+
+    let base = read_settings(config, overrides)?;
+    let defaults = kind.default_range(&base);
+    let [start, end, step] = [0, 1, 2].map(|i| range[i].unwrap_or(defaults[i]));
+    let calibration = Calibration::new(kind, start, end, step).map_err(|e| e.diagnostic())?;
+    let settings = calibration.settings(&base);
+    let (names, meshes): (Vec<String>, Vec<slicer_core::Mesh>) =
+        calibration.placed_models(&settings).into_iter().unzip();
+    let mut warnings = Diagnostics::new();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let toolpaths = slicer_fdm::generate_plate(
+        &meshes,
+        slicer_fdm::Placement::AsGiven,
+        &settings,
+        &mut warnings,
+        &stop,
+    )
+    .map_err(|e| e.diagnostic())?;
+    let mut result =
+        slicer_gcode::write_gcode(&toolpaths, &settings).map_err(|e| e.diagnostic())?;
+    let objects: Vec<(usize, &slicer_core::Mesh)> = meshes.iter().enumerate().collect();
+    calibration.apply(&mut result, &objects, &settings);
+
+    let output =
+        output.unwrap_or_else(|| PathBuf::from(format!("calibration-{}.gcode", kind.name())));
+    fs::write(&output, &result.gcode).map_err(|e| io_error("io.write", &output, &e))?;
+    let objects: Vec<serde_json::Value> = names
+        .iter()
+        .zip(&meshes)
+        .map(|(name, mesh)| {
+            let center = mesh.bounds().map_or([0.0, 0.0], |(lo, hi)| {
+                [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0]
+            });
+            json!({ "name": name, "x": center[0], "y": center[1] })
+        })
+        .collect();
+    Ok(json!({
+        "output": output.display().to_string(),
+        "stats": result.stats,
+        "warnings": warnings.as_slice(),
+        "calibration": {
+            "kind": kind.name(),
+            "unit": kind.unit(),
+            "values": calibration.values(),
+            "summary": format!("{}: {}", kind.title(), calibration.summary()),
+            "objects": objects,
+        },
+    }))
+}
+
+/// Prints the result of `calibrate` as a summary.
+fn print_calibration_summary(result: &serde_json::Value) {
+    print_summary(result);
+    let calibration = &result["calibration"];
+    println!("{}", calibration["summary"].as_str().unwrap_or_default());
+    if calibration["kind"] == "flow" {
+        for object in calibration["objects"].as_array().into_iter().flatten() {
+            println!(
+                "  {} at X {:.0}, Y {:.0}",
+                object["name"].as_str().unwrap_or_default(),
+                object["x"].as_f64().unwrap_or(0.0),
+                object["y"].as_f64().unwrap_or(0.0)
+            );
+        }
+        println!(
+            "Set flow_ratio to the current value times (1 + percent of the best block / 100)."
+        );
     }
 }
 
@@ -294,6 +429,23 @@ fn place(
     slicer_fdm::Placement::AsGiven
 }
 
+/// Settings from the files in `config`, layered in order, with the
+/// `--set` overrides on top.
+fn read_settings(config: &[PathBuf], overrides: &[String]) -> Result<Settings, Diagnostic> {
+    let mut settings = Settings::default();
+    for path in config {
+        let text = fs::read_to_string(path).map_err(|e| io_error("io.read", path, &e))?;
+        settings
+            .apply_toml(&text)
+            .map_err(|e| in_file(path)(e.diagnostic()))?;
+    }
+    for item in overrides {
+        let (key, value) = split_override(item)?;
+        settings.set(key, value).map_err(|e| e.diagnostic())?;
+    }
+    Ok(settings)
+}
+
 // The command line arguments of `slice`, passed on one to one.
 #[allow(clippy::too_many_arguments)]
 fn slice(
@@ -306,17 +458,7 @@ fn slice(
     svg: Option<PathBuf>,
     printer: Option<(Target, bool)>,
 ) -> Result<serde_json::Value, Diagnostic> {
-    let mut settings = Settings::default();
-    for path in config {
-        let text = fs::read_to_string(path).map_err(|e| io_error("io.read", path, &e))?;
-        settings
-            .apply_toml(&text)
-            .map_err(|e| in_file(path)(e.diagnostic()))?;
-    }
-    for item in overrides {
-        let (key, value) = split_override(item)?;
-        settings.set(key, value).map_err(|e| e.diagnostic())?;
-    }
+    let settings = read_settings(config, overrides)?;
 
     let mut warnings = Diagnostics::new();
     let mut meshes = Vec::new();

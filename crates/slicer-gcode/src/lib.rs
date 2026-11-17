@@ -3,6 +3,8 @@
 //! Marlin and Klipper are implemented and currently produce the same
 //! commands; the Bambu flavor does not exist yet.
 
+pub mod calibration;
+
 use std::collections::BTreeMap;
 use std::f64::consts::PI;
 use std::fmt::{self, Write};

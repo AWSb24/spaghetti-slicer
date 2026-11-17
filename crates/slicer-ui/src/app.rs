@@ -41,6 +41,8 @@ use crate::theme;
 use crate::view3d::{Event, Scene, View3d};
 use crate::wizard::{Wizard, WizardEnd};
 
+mod calibrate;
+
 /// How serious a message in the side panel is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Level {
@@ -158,6 +160,8 @@ pub struct App {
     cut: Option<CutDialog>,
     /// Whether the G-code view of the preview is unfolded.
     gcode_open: bool,
+    /// The Calibration menu.
+    calibrate: calibrate::Calibrate,
 }
 
 impl App {
@@ -201,6 +205,7 @@ impl App {
             face_mode: false,
             cut: None,
             gcode_open: true,
+            calibrate: Default::default(),
             setup,
         };
         app.refresh_builtin();
@@ -403,6 +408,7 @@ impl App {
             objects: self.plate.meshes(),
             settings: settings.clone(),
         };
+        let request = self.calibrated(request);
         let ctx = ctx.clone();
         self.job = Some(SliceJob::start(request, move || ctx.request_repaint()));
     }
@@ -415,6 +421,7 @@ impl App {
         self.job = None;
         match outcome {
             Ok(result) => {
+                let result = self.finish_calibration(result);
                 self.note(
                     Level::Info,
                     format!(
@@ -1038,6 +1045,7 @@ impl App {
                     self.save(true);
                 }
             });
+            self.calibration_menu(ui);
             ui.add_space(8.0);
             for (tab, icon, name) in [
                 (Tab::Plate, Icon::Prepare, "Prepare"),
@@ -2033,6 +2041,7 @@ impl eframe::App for App {
             &self.overrides,
             self.current.as_ref().ok(),
         );
+        self.calibration_window(&ctx);
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::CANVAS))
             .show(ui, |ui| {
