@@ -83,6 +83,7 @@ All three must pass. New behaviour needs a test.
 | 3D view (orbit camera, look-at and perspective matrices, flat shading) | Textbook OpenGL matrices as documented for `gluLookAt`/`gluPerspective`; drawn with `glow`/`egui_glow` (MIT OR Apache-2.0, already used by eframe); own design |
 | Browser build of the desktop app | eframe's web runner; `wasm-bindgen`, `wasm-bindgen-futures`, `js-sys`, `web-sys`, `web-time` (MIT OR Apache-2.0); downloads through a Blob URL after the MDN Web API documentation |
 | Default start and end G-code | Generic Marlin commands, not taken from any profile |
+| Calibration prints (temperature tower with `M104` per block, retraction length per band of height, flow per block; test models and the changes made to the written G-code) | Own design; `M104` from the Marlin G-code documentation |
 | Resin layer images (scanline fill with non-zero winding, supersampling) | Standard scanline fill, own design |
 | PNG writer for resin layers | PNG specification (ISO/IEC 15948); `flate2` and `crc32fast` crates (MIT OR Apache-2.0) |
 | Resin print archive (`.sla.zip`) | Own design, described in `docs/sla-format.md` |

@@ -66,6 +66,14 @@ Thinner layers where the surface is shallow, thicker ones on steep walls (top an
 cargo run --release -p slicer-cli -- slice model.stl -s adaptive_layers=true -s min_layer_height=0.1 -s max_layer_height=0.3
 ```
 
+### Calibration prints
+
+```bash
+cargo run --release -p slicer-cli -- calibrate temperature --start 225 --end 195 --step 5 -c printer.toml -c pla.toml
+```
+
+writes `calibration-temperature.gcode`: a tower with one 10 mm block per temperature, the start value at the bottom, and `M104` at the first layer of each block. `calibrate retraction` prints two towers 30 mm apart whose retraction length changes every 5 mm of height; `calibrate flow` prints flat 20 mm blocks side by side, left to right from the front row, each with its own share of the flow ratio (`--start -10 --end 10 --step 5` in percent; multiply `flow_ratio` by 1 + the percentage of the best block / 100). Without `--start`, `--end` and `--step` the values suit the settings. The models are sliced like any other with the settings given; afterwards the G-code gets the temperature commands, or the retraction or extrusion amounts are scaled per band of height or per block. The desktop app has the same three prints in its Calibration menu; they replace the models on the plate, and slicing the plate gives the calibration G-code. None of them has been printed yet.
+
 ### Resin (MSLA) printers (experimental)
 
 `slice-sla` writes one PNG per layer and a JSON manifest into a ZIP archive, described in [docs/sla-format.md](docs/sla-format.md). The defaults follow the screen of the Anycubic Photon Mono X; exposure and lift values are typical starting points, not tested with a resin. No printer reads this archive directly yet.
@@ -119,6 +127,7 @@ Errors go to stderr with exit code 1. With `--json`, errors and warnings are obj
 | `slicing.prime_tower_overlap` (warning) | The prime tower overlaps the model; move it with `prime_tower_x`/`prime_tower_y` |
 | `slicing.outside_bed` | An object placed as given (`--keep-positions`, the desktop app) reaches over the edge of the bed, or arranged objects do not fit |
 | `slicing.objects_overlap` (warning) | The outlines of two objects overlap seen from above; they are printed as one |
+| `calibration.invalid_range` | Start, end and step of a calibration print are invalid, out of range, or give more than 20 values |
 | `send.invalid_target`, `send.connection`, `send.unauthorized`, `send.too_large`, `send.rejected` | A printer address is malformed, the printer cannot be reached, refused the API key, refused the file as too large, or refused the upload otherwise |
 | `send.not_started` (warning) | The file was uploaded but the printer did not start it |
 | `slicing.thin_regions` (warning) | Some layers have parts narrower than half a line width that are not printed (parts between half and one line width get a single line of their own width) |

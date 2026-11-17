@@ -624,3 +624,51 @@ fn build_items_of_a_3mf_can_keep_their_positions() {
     let error: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
     assert_eq!(error["error"]["code"], "slicing.outside_bed");
 }
+
+#[test]
+fn writes_calibration_prints() {
+    let dir = workdir("calibrate");
+    let tower = dir.join("tower.gcode");
+    let out = run(&[
+        "calibrate",
+        "temperature",
+        "--start",
+        "220",
+        "--end",
+        "200",
+        "--step",
+        "10",
+        "-o",
+        tower.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["calibration"]["values"],
+        serde_json::json!([220.0, 210.0, 200.0])
+    );
+    // Three blocks of 10 mm.
+    assert_eq!(report["stats"]["layers"], 150);
+    let gcode = fs::read_to_string(&tower).unwrap();
+    assert!(gcode.contains("M109 S220\n"));
+    assert!(gcode.contains("\nM104 S210\n") && gcode.contains("\nM104 S200\n"));
+
+    // Negative values for the flow test; without -o the file goes into the
+    // working directory.
+    let out = bin()
+        .current_dir(&dir)
+        .args(["calibrate", "flow", "--start", "-5", "--end", "5"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let summary = text(&out.stdout);
+    assert!(summary.contains("Flow -5 % at X"), "{summary}");
+    assert!(dir.join("calibration-flow.gcode").exists());
+
+    let out = run(&["calibrate", "retraction", "--step", "0", "--json"]);
+    assert!(!out.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "calibration.invalid_range");
+    assert!(!run(&["calibrate", "pressure"]).status.success());
+}
