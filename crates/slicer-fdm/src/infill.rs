@@ -25,10 +25,18 @@ const ON_EDGE: f64 = 1e-6;
 /// next end along the boundary means that no other line ends on the
 /// connection, so it lies inside the area and crosses no line. Lines are
 /// taken in the given order.
-// ponytail: where the area borders solid infill rather than a wall, the
-// connection lies on the edge of the solid infill and overlaps the ends of
-// its lines by half a line width.
-pub(crate) fn connect(area: &Shapes, lines: &[[Point; 2]], max_walk: f64) -> Vec<Vec<Point>> {
+///
+/// `fill` is the whole area infill goes into, `area` included. Where the
+/// boundary of `area` runs through `fill` (along solid infill or a bridge,
+/// found by looking `probe` to both sides of it), nothing is connected: a
+/// connection there would overlap the ends of the lines on the other side.
+pub(crate) fn connect(
+    area: &Shapes,
+    lines: &[[Point; 2]],
+    max_walk: f64,
+    fill: &Shapes,
+    probe: f64,
+) -> Vec<Vec<Point>> {
     // End 2i is where line i starts, end 2i + 1 where it ends.
     let ends: Vec<Point> = lines.iter().flatten().copied().collect();
     let contours: Vec<&Vec<Point>> = area.iter().flatten().collect();
@@ -134,6 +142,15 @@ pub(crate) fn connect(area: &Shapes, lines: &[[Point; 2]], max_walk: f64) -> Vec
                 d += edge(v);
             }
         }
+        let mut stretch = vec![ends[k]];
+        stretch.extend(&corners);
+        stretch.push(ends[other]);
+        if stretch
+            .windows(2)
+            .any(|w| inside_fill(fill, w[0], w[1], probe))
+        {
+            return None;
+        }
         Some((other, length, corners))
     };
 
@@ -168,6 +185,22 @@ pub(crate) fn connect(area: &Shapes, lines: &[[Point; 2]], max_walk: f64) -> Vec
         chains.push(chain);
     }
     chains
+}
+
+/// Whether the segment from `a` to `b` has `fill` on both sides: points
+/// `probe` off its middle to the left and right both lie in it.
+fn inside_fill(fill: &Shapes, a: Point, b: Point, probe: f64) -> bool {
+    let length = distance(a, b);
+    if length <= ON_EDGE {
+        return false;
+    }
+    let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+    let off = [
+        -(b[1] - a[1]) / length * probe,
+        (b[0] - a[0]) / length * probe,
+    ];
+    crate::point_inside(fill, [mid[0] + off[0], mid[1] + off[1]])
+        && crate::point_inside(fill, [mid[0] - off[0], mid[1] - off[1]])
 }
 
 /// Lines in three directions 60° apart, starting at `angle`, each set
@@ -401,7 +434,7 @@ mod tests {
         area[0].push(vec![[8.0, 8.0], [8.0, 12.0], [12.0, 12.0], [12.0, 8.0]]);
         let spacing = 2.0;
         let lines = polygon::hatch(&area, spacing, HatchDirection::Diagonal45, 0.0);
-        let chains = connect(&area, &lines, 2.0 * spacing);
+        let chains = connect(&area, &lines, 2.0 * spacing, &area, 0.1);
         assert!(
             chains.len() < lines.len() / 4,
             "{} of {}",
@@ -438,5 +471,35 @@ mod tests {
         assert!(joined >= lines.len() - chains.len(), "{joined}");
         // Every line is printed once.
         assert_eq!(whole, lines.len());
+    }
+
+    #[test]
+    fn no_connections_along_other_infill() {
+        // Sparse infill on the left of a fill area whose right third is
+        // solid; horizontal lines end on the wall at x = 0 and on the solid
+        // infill at x = 20.
+        let area = square(0.0, 20.0);
+        let fill = vec![vec![vec![
+            [0.0, 0.0],
+            [30.0, 0.0],
+            [30.0, 20.0],
+            [0.0, 20.0],
+        ]]];
+        let spacing = 2.0;
+        let lines = polygon::hatch(&area, spacing, HatchDirection::Horizontal, 0.0);
+        let chains = connect(&area, &lines, 2.0 * spacing, &fill, 0.1);
+        let mut joined = 0;
+        for chain in &chains {
+            for w in chain.windows(2) {
+                if lines.contains(&[w[0], w[1]]) || lines.contains(&[w[1], w[0]]) {
+                    continue;
+                }
+                assert!(w[0][0] < 1e-9 && w[1][0] < 1e-9, "{w:?}");
+                joined += 1;
+            }
+        }
+        // Lines join in pairs at the wall only.
+        assert!(joined >= lines.len() / 2 - 1, "{joined} of {}", lines.len());
+        assert!(chains.len() <= lines.len() / 2 + 1, "{}", chains.len());
     }
 }

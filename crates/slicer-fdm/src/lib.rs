@@ -1202,8 +1202,18 @@ fn region_work(
                     // are connected; the other patterns would cross lines.
                     let spacing = width / density;
                     let lines = polygon::hatch(&sparse, spacing, direction, min_length);
-                    let lines = infill::connect(&sparse, &lines, 2.0 * spacing);
-                    work.push(Work::Polylines(lines, PathKind::SparseInfill, 0.0));
+                    if settings.infill_connect {
+                        let lines = infill::connect(
+                            &sparse,
+                            &lines,
+                            2.0 * spacing,
+                            &fill_area,
+                            width / 4.0,
+                        );
+                        work.push(Work::Polylines(lines, PathKind::SparseInfill, 0.0));
+                    } else {
+                        work.push(Work::Lines(lines, PathKind::SparseInfill, 0.0));
+                    }
                 }
                 InfillPattern::Grid => {
                     // Two directions share the material, so each is half as dense.
@@ -1303,7 +1313,7 @@ fn shell_layers(heights: &[f64], index: usize, settings: &Settings) -> Option<(u
 }
 
 /// Whether `point` lies inside the shapes (even-odd).
-fn point_inside(shapes: &Shapes, point: Point) -> bool {
+pub(crate) fn point_inside(shapes: &Shapes, point: Point) -> bool {
     let mut inside = false;
     for contour in shapes.iter().flatten() {
         for (i, &p) in contour.iter().enumerate() {
@@ -2315,6 +2325,17 @@ mod tests {
         assert!(lines > 100, "{lines}");
         assert!(paths <= 12 * 2, "{paths} paths for {lines} lines");
         assert!(connections >= lines - paths, "{connections}");
+
+        // Switched off, every line is a path of its own.
+        settings.infill_connect = false;
+        let toolpaths = generate(&Mesh::cuboid(30.0, 30.0, 6.0), &settings).unwrap();
+        let sparse: Vec<_> = toolpaths.layers[8..20]
+            .iter()
+            .flat_map(|layer| &layer.paths)
+            .filter(|p| p.kind == PathKind::SparseInfill)
+            .collect();
+        assert!(sparse.len() > 100, "{}", sparse.len());
+        assert!(sparse.iter().all(|p| p.points.len() == 2));
     }
 
     const PATTERNS: [InfillPattern; 4] = [

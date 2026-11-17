@@ -38,6 +38,7 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `infill_density` | 15 | 0 to 100 | Sparse infill density in percent. |
 | `infill_pattern` | grid | `rectilinear`, `grid`, `triangles`, `gyroid` | Sparse infill pattern. |
 | `infill_angle` | 45 | 0 to 180 | Direction of the infill lines in degrees from the X axis; every other layer is turned by 90 degrees. Triangles and the gyroid keep it on every layer. |
+| `infill_connect` | true | `true`, `false` | Whether the lines of rectilinear sparse infill are joined into zig-zags along the walls. Saves travel moves and retractions but uses more material (on small areas up to a third more infill). Along solid infill and bridges the lines stay apart. |
 | `infill_overlap` | 15 | 0 to 50 | How far infill reaches into the innermost wall, in percent of the line width. |
 | `skirt_loops` | 2 | 0 to 20 | Number of skirt loops around the first layer. |
 | `skirt_distance` | 4 | 0 to 50 | Distance between skirt and model. |

@@ -184,6 +184,11 @@ pub struct Settings {
     /// other layer is turned by 90 degrees. Triangles and the gyroid keep
     /// it on every layer.
     pub infill_angle: f64,
+    /// Whether the lines of rectilinear sparse infill are joined into
+    /// zig-zags along the walls. Saves travel moves and retractions but
+    /// uses more material (on small areas up to a third more infill).
+    /// Along solid infill and bridges the lines stay apart.
+    pub infill_connect: bool,
     /// How far infill reaches into the innermost wall, in percent of the line width.
     pub infill_overlap: f64,
     /// Number of skirt loops around the first layer.
@@ -293,6 +298,7 @@ impl Default for Settings {
             infill_density: 15.0,
             infill_pattern: InfillPattern::Grid,
             infill_angle: 45.0,
+            infill_connect: true,
             infill_overlap: 15.0,
             skirt_loops: 2,
             skirt_distance: 4.0,
