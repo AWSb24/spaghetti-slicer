@@ -159,11 +159,102 @@ pub fn kinds_in(layer: &Layer) -> Vec<PathKind> {
     kinds
 }
 
+/// Where the lines and layers of a G-code text start, to show the code of
+/// the layer in the preview.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GcodeIndex {
+    /// Byte offset of every line.
+    lines: Vec<usize>,
+    /// First line of every layer: the `;LAYER_CHANGE` comment.
+    layers: Vec<usize>,
+}
+
+impl GcodeIndex {
+    /// Indexes `gcode`.
+    pub fn new(gcode: &str) -> Self {
+        let mut lines = vec![0];
+        let mut layers = Vec::new();
+        for (offset, _) in gcode.match_indices('\n') {
+            if gcode[lines[lines.len() - 1]..offset].starts_with(";LAYER_CHANGE") {
+                layers.push(lines.len() - 1);
+            }
+            lines.push(offset + 1);
+        }
+        if lines.last() == Some(&gcode.len()) {
+            lines.pop();
+        }
+        Self { lines, layers }
+    }
+
+    /// Number of lines.
+    pub fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Whether there are no lines.
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// Line `n` (from 0) of `gcode`, without its line break.
+    pub fn line<'a>(&self, gcode: &'a str, n: usize) -> &'a str {
+        let Some(&start) = self.lines.get(n) else {
+            return "";
+        };
+        let end = self.lines.get(n + 1).map_or(gcode.len(), |&next| next - 1);
+        gcode
+            .get(start..end)
+            .unwrap_or("")
+            .trim_end_matches(['\r', '\n'])
+    }
+
+    /// The lines of layer `layer` (from 0), up to the next layer or the end
+    /// of the print.
+    pub fn layer(&self, layer: usize) -> std::ops::Range<usize> {
+        let start = self.layers.get(layer).copied().unwrap_or(self.lines.len());
+        let end = self
+            .layers
+            .get(layer + 1)
+            .copied()
+            .unwrap_or(self.lines.len());
+        start..end
+    }
+
+    /// The line about `fraction` (0 to 1) of the way through layer `layer`.
+    // ponytail: lines are spread evenly over the moves of the layer, so
+    // the line found is near the move shown, not exactly it; exact would
+    // need the writer to record the line of every move.
+    pub fn line_at(&self, layer: usize, fraction: f64) -> usize {
+        let range = self.layer(layer);
+        let last = range.end.saturating_sub(1).max(range.start);
+        range.start + ((last - range.start) as f64 * fraction.clamp(0.0, 1.0)).round() as usize
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn gcode_lines_and_layers_are_found() {
+        let gcode =
+            "; head\nG28\n;LAYER_CHANGE\n;Z:0.2\nG1 X1 E1\n;LAYER_CHANGE\r\nG1 X2 E1\nM84\n";
+        let index = GcodeIndex::new(gcode);
+        assert_eq!(index.len(), 8);
+        assert_eq!(index.line(gcode, 0), "; head");
+        assert_eq!(index.line(gcode, 5), ";LAYER_CHANGE");
+        assert_eq!(index.line(gcode, 7), "M84");
+        assert_eq!(index.line(gcode, 8), "");
+        assert_eq!(index.layer(0), 2..5);
+        assert_eq!(index.layer(1), 5..8);
+        assert_eq!(index.layer(2), 8..8);
+        assert_eq!(index.line_at(0, 0.0), 2);
+        assert_eq!(index.line_at(0, 1.0), 4);
+        assert_eq!(index.line_at(1, 0.5), 6);
+        assert!(GcodeIndex::new("").is_empty() || GcodeIndex::new("").len() == 1);
+    }
 
     #[test]
     fn colour_modes_spread_their_values() {

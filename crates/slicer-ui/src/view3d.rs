@@ -14,12 +14,14 @@
 
 use std::sync::{Arc, Mutex};
 
-use eframe::egui::{self, Align2, FontId, PointerButton, Pos2, Rect, Sense, Vec2};
+use eframe::egui::{
+    self, Align2, Color32, FontId, PointerButton, Pos2, Rect, Sense, Shape, Stroke, Vec2,
+};
 use eframe::egui_glow::{self, ShaderVersion};
 use eframe::glow::{self, HasContext};
 use slicer_fdm::{Layer, Path, PathKind, Toolpaths};
-use slicer_ui::camera::{Mat4, OrbitCamera, multiply, ray_plane_z};
-use slicer_ui::plate::{Model, Placement};
+use slicer_ui::camera::{Mat4, OrbitCamera, multiply, ray_plane_z, transform_point};
+use slicer_ui::plate::{Model, Placement, bounds_2d, placed_outline};
 use slicer_ui::scene::{
     INDICES_PER_SEGMENT, Lines, Strands, Triangles, bed_grid, bed_plate, mesh_triangles,
     model_matrix, pick, toolpath_strands,
@@ -50,6 +52,59 @@ pub struct Scene<'a> {
     pub moves: Option<usize>,
     /// A click picks a face to lay a model on instead of selecting.
     pub face_mode: bool,
+    /// Show the handles to turn and scale the selected model.
+    pub handles: bool,
+    /// Draw the plane a model is about to be cut with: model index and
+    /// height above the bed in millimetres.
+    pub cut: Option<(usize, f64)>,
+}
+
+/// How far from a handle, in pixels, a press still grabs it.
+const GRAB: f32 = 9.0;
+
+/// A handle being dragged.
+#[derive(Debug, Clone, Copy)]
+enum Grip {
+    /// The ring around the model: turns it. Angle of the pointer on the
+    /// bed and rotation of the model when the drag started.
+    Turn {
+        index: usize,
+        angle: f64,
+        rotation: f64,
+    },
+    /// The corner box: scales it. Distance of the pointer from the
+    /// model's middle on screen and scale when the drag started.
+    Scale {
+        index: usize,
+        distance: f32,
+        scale: f64,
+        middle: Pos2,
+    },
+}
+
+/// The handles of the selected model on screen.
+struct Handles {
+    index: usize,
+    center: [f64; 2],
+    rotation: f64,
+    scale: f64,
+    ring: Vec<Pos2>,
+    knob: Option<Pos2>,
+    corner: Option<Pos2>,
+    middle: Option<Pos2>,
+}
+
+/// Distance from `p` to the polyline through `points`.
+fn polyline_distance(points: &[Pos2], p: Pos2) -> f32 {
+    points
+        .windows(2)
+        .map(|w| {
+            let (a, b) = (w[0], w[1]);
+            let ab = b - a;
+            let t = ((p - a).dot(ab) / ab.length_sq().max(1e-6)).clamp(0.0, 1.0);
+            (a + ab * t).distance(p)
+        })
+        .fold(f32::INFINITY, f32::min)
 }
 
 /// What the user did to the models in the 3D view in this frame.
@@ -61,6 +116,10 @@ pub enum Event {
     Select(Option<usize>),
     /// Dragged a model across the bed by this many millimetres.
     Move(usize, [f64; 2]),
+    /// Turned a model with its ring to this rotation in degrees.
+    Turn(usize, f64),
+    /// Scaled a model with its corner box to this factor.
+    Scale(usize, f64),
     /// Clicked triangle `.1` of model `.0` to lay the model on.
     Face(usize, usize),
 }
@@ -77,6 +136,8 @@ pub struct View3d {
     /// The model being dragged, the height it was grabbed at and where the
     /// pointer was on that plane last.
     dragging: Option<(usize, f32, [f32; 3])>,
+    /// The handle being dragged.
+    grip: Option<Grip>,
     gpu: Arc<Mutex<Gpu>>,
 }
 
@@ -146,9 +207,108 @@ impl View3d {
             })
         };
 
+        let view_projection = camera.view_projection(aspect);
+        let project = |p: [f64; 3]| {
+            let n = transform_point(&view_projection, p.map(|c| c as f32))?;
+            Some(Pos2::new(
+                rect.center().x + n[0] * rect.width() / 2.0,
+                rect.center().y - n[1] * rect.height() / 2.0,
+            ))
+        };
+        let handles = scene
+            .models
+            .iter()
+            .position(|m| m.2)
+            .filter(|_| scene.handles && pickable && !scene.face_mode)
+            .map(|index| {
+                let (model, placement, ..) = &scene.models[index];
+                let outline = placed_outline(model, placement);
+                let c = placement.center;
+                let radius = outline
+                    .iter()
+                    .map(|p| (p[0] - c[0]).hypot(p[1] - c[1]))
+                    .fold(0.0, f64::max)
+                    + 4.0;
+                let on_ring = |a: f64| [c[0] + radius * a.cos(), c[1] + radius * a.sin(), 0.3];
+                let ring = (0..=72)
+                    .filter_map(|i| project(on_ring(f64::from(i) / 72.0 * std::f64::consts::TAU)))
+                    .collect();
+                let height = model.size[2] * placement.scale;
+                let corner = bounds_2d(outline).and_then(|(_, hi)| project([hi[0], hi[1], height]));
+                Handles {
+                    index,
+                    center: c,
+                    rotation: placement.rotation_deg,
+                    scale: placement.scale,
+                    ring,
+                    knob: project(on_ring(placement.rotation_deg.to_radians())),
+                    corner,
+                    middle: project([c[0], c[1], height / 2.0]),
+                }
+            });
+        let bed_angle = |camera: &OrbitCamera, pos: Pos2, center: [f64; 2]| {
+            let (origin, dir) = ray_at(camera, pos);
+            ray_plane_z(origin, dir, 0.0)
+                .map(|p| (f64::from(p[1]) - center[1]).atan2(f64::from(p[0]) - center[0]))
+        };
+
         let mut event = Event::None;
         let shift = ui.input(|i| i.modifiers.shift);
         if response.drag_started_by(PointerButton::Primary)
+            && let Some(handles) = &handles
+            && let Some(press) = ui.input(|i| i.pointer.press_origin())
+        {
+            let near_corner = handles
+                .corner
+                .is_some_and(|c| c.distance(press) < GRAB + 2.0);
+            if near_corner && let Some(middle) = handles.middle {
+                self.grip = Some(Grip::Scale {
+                    index: handles.index,
+                    distance: middle.distance(press).max(1.0),
+                    scale: handles.scale,
+                    middle,
+                });
+            } else if polyline_distance(&handles.ring, press) < GRAB
+                && let Some(angle) = bed_angle(camera, press, handles.center)
+            {
+                self.grip = Some(Grip::Turn {
+                    index: handles.index,
+                    angle,
+                    rotation: handles.rotation,
+                });
+            }
+        }
+        if let Some(grip) = self.grip {
+            if let Some(pos) = response.interact_pointer_pos() {
+                event = match grip {
+                    Grip::Turn {
+                        index,
+                        angle,
+                        rotation,
+                    } => {
+                        let center = handles.as_ref().map_or([0.0, 0.0], |h| h.center);
+                        bed_angle(camera, pos, center).map_or(Event::None, |now| {
+                            let turned = rotation + (now - angle).to_degrees();
+                            // Whole degrees, between -180 and 180.
+                            let turned = (turned + 180.0).rem_euclid(360.0) - 180.0;
+                            Event::Turn(index, turned.round())
+                        })
+                    }
+                    Grip::Scale {
+                        index,
+                        distance,
+                        scale,
+                        middle,
+                    } => {
+                        let factor = f64::from(middle.distance(pos) / distance);
+                        Event::Scale(index, (scale * factor * 1000.0).round() / 1000.0)
+                    }
+                };
+            }
+            if response.drag_stopped() || !ui.input(|i| i.pointer.primary_down()) {
+                self.grip = None;
+            }
+        } else if response.drag_started_by(PointerButton::Primary)
             && !shift
             && pickable
             && !scene.face_mode
@@ -160,7 +320,9 @@ impl View3d {
             }
         }
         let delta = response.drag_delta();
-        if let Some((index, z, last)) = self.dragging {
+        if self.grip.is_some() {
+            // The handle takes the drag.
+        } else if let Some((index, z, last)) = self.dragging {
             if let Some(pos) = response.interact_pointer_pos() {
                 let (origin, dir) = ray_at(camera, pos);
                 if let Some(point) = ray_plane_z(origin, dir, z) {
@@ -250,6 +412,62 @@ impl View3d {
                 FontId::proportional(12.0),
                 ui.visuals().error_fg_color,
             );
+        }
+        if let Some(handles) = &handles {
+            let hover = response.hover_pos();
+            let hot = |near: bool| {
+                if near {
+                    theme::ACCENT
+                } else {
+                    theme::ACCENT_DARK
+                }
+            };
+            let on_ring = hover.is_some_and(|p| polyline_distance(&handles.ring, p) < GRAB)
+                || matches!(self.grip, Some(Grip::Turn { .. }));
+            painter.add(Shape::line(
+                handles.ring.clone(),
+                Stroke::new(2.5, hot(on_ring)),
+            ));
+            if let Some(knob) = handles.knob {
+                painter.circle_filled(knob, 5.0, hot(on_ring));
+            }
+            if let Some(corner) = handles.corner {
+                let on_corner = hover.is_some_and(|p| p.distance(corner) < GRAB + 2.0)
+                    || matches!(self.grip, Some(Grip::Scale { .. }));
+                let square = Rect::from_center_size(corner, Vec2::splat(10.0));
+                painter.rect_filled(square, 1.0, hot(on_corner));
+                painter.rect_stroke(
+                    square,
+                    1.0,
+                    Stroke::new(1.0, Color32::WHITE),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            if hover.is_some_and(|p| polyline_distance(&handles.ring, p) < GRAB) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            }
+        }
+        if let Some((index, height)) = scene.cut
+            && let Some((model, placement, ..)) = scene.models.get(index)
+            && let Some((lo, hi)) = bounds_2d(placed_outline(model, placement))
+        {
+            let m = 6.0;
+            let corners: Vec<Pos2> = [
+                [lo[0] - m, lo[1] - m],
+                [hi[0] + m, lo[1] - m],
+                [hi[0] + m, hi[1] + m],
+                [lo[0] - m, hi[1] + m],
+            ]
+            .iter()
+            .filter_map(|p| project([p[0], p[1], height]))
+            .collect();
+            if corners.len() == 4 {
+                painter.add(Shape::convex_polygon(
+                    corners,
+                    theme::ACCENT.gamma_multiply(0.35),
+                    Stroke::new(1.5, theme::ACCENT),
+                ));
+            }
         }
         self.view_buttons(ui, rect);
         (event, response)

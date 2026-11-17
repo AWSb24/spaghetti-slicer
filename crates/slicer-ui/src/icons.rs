@@ -55,6 +55,8 @@ pub enum Icon {
     AutoOrient,
     /// Mirror the model: two triangles either side of an axis.
     Mirror,
+    /// Cut the model: a box with a plane through it.
+    Cut,
 }
 
 /// Draws `icon` into `rect` in `color`.
@@ -250,6 +252,13 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                 painter.add(Shape::line(vec![tip + a, tip, tip - b], stroke));
             }
             painter.add(Shape::line(points, stroke));
+        }
+        Icon::Cut => {
+            closed(&[(0.25, 0.12), (0.75, 0.12), (0.75, 0.88), (0.25, 0.88)]);
+            painter.line_segment(
+                [at(0.02, 0.5), at(0.98, 0.5)],
+                Stroke::new(stroke.width * 1.4, theme::ACCENT),
+            );
         }
         Icon::Mirror => {
             closed(&[(0.08, 0.82), (0.4, 0.82), (0.4, 0.22)]);

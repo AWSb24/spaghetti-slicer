@@ -27,7 +27,9 @@ use slicer_ui::profiles::{
 };
 use slicer_ui::settings::{CommonSettings, SettingsFile, load_settings};
 use slicer_ui::settings_list::{PROCESS_TABS, SettingsEditor};
-use slicer_ui::view::{ColorBy, gradient, kind_name, kinds_in, length_by_kind, path_color};
+use slicer_ui::view::{
+    ColorBy, GcodeIndex, gradient, kind_name, kinds_in, length_by_kind, path_color,
+};
 
 use crate::icons::{self, Icon};
 use crate::platform;
@@ -87,6 +89,21 @@ struct Sliced {
     settings: Settings,
     placements: Vec<Placement>,
     serial: u64,
+    /// Lines and layers of the G-code, for the G-code view.
+    gcode: GcodeIndex,
+}
+
+/// The open cut dialog.
+#[derive(Debug, Clone, Copy)]
+struct CutDialog {
+    /// The model to cut.
+    index: usize,
+    /// Height of the cut above the bed in millimetres.
+    height: f64,
+    /// Keep the part below and the part above.
+    keep: [bool; 2],
+    /// Turn the upper part upside down.
+    flip: bool,
 }
 
 /// The application state.
@@ -137,6 +154,10 @@ pub struct App {
     wizard: Option<Wizard>,
     /// Whether the next click on a model picks the face to lay it on.
     face_mode: bool,
+    /// The cut dialog, if open.
+    cut: Option<CutDialog>,
+    /// Whether the G-code view of the preview is unfolded.
+    gcode_open: bool,
 }
 
 impl App {
@@ -178,6 +199,8 @@ impl App {
             profile_dialog: None,
             wizard: (!setup.done).then(|| Wizard::new(&setup)),
             face_mode: false,
+            cut: None,
+            gcode_open: true,
             setup,
         };
         app.refresh_builtin();
@@ -404,6 +427,7 @@ impl App {
                 if let Ok(settings) = &self.current {
                     self.moves = None;
                     self.sliced = Some(Sliced {
+                        gcode: GcodeIndex::new(&result.output.gcode),
                         lengths: length_by_kind(&result.toolpaths.layers),
                         result,
                         settings: settings.clone(),
@@ -657,6 +681,153 @@ impl App {
             self.plate.set_model(index, model);
             self.note(Level::Info, "Turned the model for the least overhang");
         }
+    }
+
+    /// Opens the cut dialog for the selected model, halfway up.
+    fn open_cut(&mut self) {
+        if let Some(index) = self.plate.selected
+            && let Some(item) = self.plate.items.get(index)
+        {
+            self.face_mode = false;
+            self.cut = Some(CutDialog {
+                index,
+                height: item.model.size[2] * item.placement.scale / 2.0,
+                keep: [true, true],
+                flip: false,
+            });
+        }
+    }
+
+    /// The cut dialog: height, which parts to keep, and whether the upper
+    /// part is turned upside down.
+    fn cut_window(&mut self, ctx: &egui::Context, canvas: Rect) {
+        let Some(mut dialog) = self.cut else {
+            return;
+        };
+        // Another model selected, or this one gone: the dialog is done.
+        let item = self.plate.items.get(dialog.index);
+        let Some(item) = item.filter(|_| self.plate.selected == Some(dialog.index)) else {
+            self.cut = None;
+            return;
+        };
+        let name = item.model.name.clone();
+        let top = item.model.size[2] * item.placement.scale;
+        let (mut apply, mut close) = (false, false);
+        egui::Window::new("Cut")
+            .id(egui::Id::unique("cut_window"))
+            .collapsible(false)
+            .resizable(false)
+            .pivot(Align2::RIGHT_TOP)
+            .default_pos(canvas.right_top() + Vec2::new(-16.0, 56.0))
+            .show(ctx, |ui| {
+                ui.label(RichText::new(&name).strong());
+                ui.horizontal(|ui| {
+                    ui.label("Height");
+                    ui.add(
+                        egui::Slider::new(&mut dialog.height, 0.0..=top)
+                            .suffix(" mm")
+                            .max_decimals(2),
+                    );
+                });
+                ui.checkbox(&mut dialog.keep[1], "Keep upper part");
+                ui.add_enabled(
+                    dialog.keep[1],
+                    egui::Checkbox::new(&mut dialog.flip, "Turn it upside down"),
+                );
+                ui.checkbox(&mut dialog.keep[0], "Keep lower part");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let can = dialog.keep.iter().any(|&k| k)
+                        && dialog.height > 0.0
+                        && dialog.height < top;
+                    let cut = egui::Button::new(RichText::new("Cut").color(Color32::WHITE))
+                        .fill(theme::ACCENT);
+                    apply = ui.add_enabled(can, cut).clicked();
+                    close = ui.button("Cancel").clicked();
+                });
+            });
+        self.cut = Some(dialog);
+        if apply {
+            let settings = self.current.as_ref().unwrap_or(&self.base).clone();
+            if self.plate.cut(
+                dialog.index,
+                dialog.height,
+                dialog.keep,
+                dialog.flip,
+                &settings,
+            ) {
+                self.note(
+                    Level::Info,
+                    format!("Cut {name} at {:.2} mm", dialog.height),
+                );
+            } else {
+                self.note(Level::Warning, "Nothing to keep at that height");
+            }
+            close = true;
+        }
+        if close {
+            self.cut = None;
+        }
+    }
+
+    /// The G-code of the shown layer at the top left of the preview, with
+    /// the line near the last shown move marked.
+    fn gcode_view(&mut self, ctx: &egui::Context, canvas: Rect) {
+        let Some(sliced) = &self.sliced else {
+            return;
+        };
+        let gcode = &sliced.result.output.gcode;
+        let index = &sliced.gcode;
+        let count = self.segments.get(self.layer).copied().unwrap_or(0);
+        let fraction = match self.moves {
+            Some(shown) if count > 0 => shown as f64 / count as f64,
+            _ => 1.0,
+        };
+        let current = index.line_at(self.layer, fraction);
+        let mut open = self.gcode_open;
+        egui::Area::new(egui::Id::unique("gcode_view"))
+            .pivot(Align2::LEFT_TOP)
+            .fixed_pos(canvas.left_top() + Vec2::new(12.0, 12.0))
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(theme::POPUP)
+                    .corner_radius(4)
+                    .inner_margin(8)
+                    .show(ui, |ui| {
+                        let title = if open { "G-code  ▾" } else { "G-code  ▸" };
+                        if ui
+                            .add(
+                                egui::Label::new(RichText::new(title).strong())
+                                    .sense(Sense::click()),
+                            )
+                            .on_hover_text("Show or hide the G-code of this layer")
+                            .clicked()
+                        {
+                            open = !open;
+                        }
+                        if !open {
+                            return;
+                        }
+                        ui.set_width(320.0);
+                        let first = current.saturating_sub(8);
+                        let last = (first + 18).min(index.len());
+                        for n in first..last {
+                            let line = index.line(gcode, n);
+                            let text: String = line.chars().take(44).collect();
+                            let text = RichText::new(format!("{:>7}  {text}", n + 1))
+                                .monospace()
+                                .size(11.0);
+                            let text = if n == current {
+                                text.color(Color32::WHITE)
+                                    .background_color(theme::ACCENT_DARK)
+                            } else {
+                                text.color(theme::TEXT)
+                            };
+                            ui.label(text);
+                        }
+                    });
+            });
+        self.gcode_open = open;
     }
 
     /// Lays model `index` on its triangle `triangle`.
@@ -1034,6 +1205,24 @@ impl App {
                                 .inner;
                             if mirror.clicked() {
                                 self.mirror_selected(0);
+                            }
+                            let cut = ui
+                                .add_enabled_ui(selected, |ui| {
+                                    icons::button(
+                                        ui,
+                                        Icon::Cut,
+                                        34.0,
+                                        "Cut at a height",
+                                        self.cut.is_some(),
+                                    )
+                                })
+                                .inner;
+                            if cut.clicked() {
+                                if self.cut.is_some() {
+                                    self.cut = None;
+                                } else {
+                                    self.open_cut();
+                                }
                             }
                             ui.separator();
                             let bed = self.bed();
@@ -1511,6 +1700,10 @@ impl App {
             self.orient_selected();
             ui.close();
         }
+        if ui.button("Cut…").clicked() {
+            self.open_cut();
+            ui.close();
+        }
     }
 
     /// Keyboard shortcuts, when no text field has the keyboard: undo and
@@ -1566,7 +1759,9 @@ impl App {
             self.plate.remove_selected();
         }
         if pressed(egui::Key::Escape) {
-            if self.face_mode {
+            if self.cut.is_some() {
+                self.cut = None;
+            } else if self.face_mode {
                 self.face_mode = false;
             } else {
                 self.plate.selected = None;
@@ -1618,6 +1813,11 @@ impl App {
             layer,
             moves: self.moves,
             face_mode: self.face_mode && self.tab == Tab::Plate,
+            handles: self.tab == Tab::Plate && self.cut.is_none(),
+            cut: self
+                .cut
+                .filter(|_| self.tab == Tab::Plate)
+                .map(|c| (c.index, c.height)),
         };
         let (event, response) = self.view3d.show(ui, &scene);
         if self.face_mode {
@@ -1630,6 +1830,19 @@ impl App {
             Event::None => {}
             Event::Select(index) => self.plate.selected = index,
             Event::Face(index, triangle) => self.lay_on_face(index, triangle),
+            Event::Turn(index, degrees) => {
+                self.plate.selected = Some(index);
+                if let Some(item) = self.plate.items.get_mut(index) {
+                    item.placement.rotation_deg = degrees;
+                }
+            }
+            Event::Scale(index, scale) => {
+                self.plate.selected = Some(index);
+                if let Some(item) = self.plate.items.get_mut(index) {
+                    let (min, max) = SCALE_RANGE;
+                    item.placement.scale = scale.clamp(min, max);
+                }
+            }
             Event::Move(index, [dx, dy]) => {
                 self.plate.selected = Some(index);
                 if let Some(item) = self.plate.items.get_mut(index) {
@@ -1837,6 +2050,7 @@ impl eframe::App for App {
                     if self.sliced.is_some() {
                         self.legend(&ctx, canvas);
                         self.moves_slider(&ctx, canvas);
+                        self.gcode_view(&ctx, canvas);
                     } else {
                         egui::Area::new(egui::Id::unique("no_slice"))
                             .pivot(Align2::CENTER_TOP)
@@ -1851,6 +2065,7 @@ impl eframe::App for App {
                 } else {
                     self.toolbar(&ctx, canvas);
                     self.object_info(&ctx, canvas);
+                    self.cut_window(&ctx, canvas);
                 }
                 // Above the slider along the bottom of the preview.
                 let lift = if preview && self.sliced.is_some() {

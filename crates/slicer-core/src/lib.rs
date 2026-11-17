@@ -2,6 +2,7 @@
 //!
 //! All lengths are millimetres.
 
+mod cut;
 pub mod diagnostics;
 pub mod mesh;
 pub mod parallel;

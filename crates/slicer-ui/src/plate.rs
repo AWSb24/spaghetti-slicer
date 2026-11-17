@@ -505,6 +505,77 @@ impl Plate {
         }
     }
 
+    /// Cuts model `index` at `height` millimetres above the bed. `keep`
+    /// says whether the part below and the part above stay. The lower part
+    /// stays where it was; the upper part, turned upside down if
+    /// `flip_upper`, goes beside it (right, or left at the bed edge), or
+    /// in its place if the lower part is not kept. The kept part is
+    /// selected. Returns false and changes nothing if no part with volume
+    /// is kept. The upper part already stands on its cut face; `flip_upper`
+    /// turns it upside down, for a top that is flat.
+    pub fn cut(
+        &mut self,
+        index: usize,
+        height: f64,
+        keep: [bool; 2],
+        flip_upper: bool,
+        settings: &Settings,
+    ) -> bool {
+        let Some(item) = self.items.get(index).cloned() else {
+            return false;
+        };
+        let placement = item.placement;
+        let parts = item.model.mesh.cut(height / placement.scale);
+        // Each part with where its middle lies on the bed.
+        let [lower, upper] = [0, 1].map(|side| {
+            let mesh = &parts[side];
+            let (lo, hi) = mesh.bounds()?;
+            if !keep[side] || mesh.volume() < 1e-9 {
+                return None;
+            }
+            let name = format!("{} ({})", item.model.name, ["bottom", "top"][side]);
+            let mut model = Model::from_mesh(name, mesh.clone()).ok()?;
+            if side == 1 && flip_upper {
+                model = model.laid_on([0.0, 0.0, 1.0]);
+            }
+            let offset = placement.turn([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0]);
+            let mut at = placement;
+            at.center = [
+                placement.center[0] + offset[0],
+                placement.center[1] + offset[1],
+            ];
+            Some(Item {
+                model: Arc::new(model),
+                placement: at,
+            })
+        });
+        let width = |item: &Item| {
+            bounds_2d(placed_outline(&item.model, &item.placement))
+                .map_or(0.0, |(lo, hi)| hi[0] - lo[0])
+        };
+        match (lower, upper) {
+            (None, None) => return false,
+            (Some(lower), None) => self.items[index] = lower,
+            (None, Some(upper)) => self.items[index] = upper,
+            (Some(lower), Some(mut upper)) => {
+                let step = (width(&lower) + width(&upper)) / 2.0 + COPY_GAP;
+                let x = lower.placement.center[0];
+                upper.placement.center[0] = if x + step + width(&upper) / 2.0 <= settings.bed_size_x
+                {
+                    x + step
+                } else {
+                    (x - step).max(width(&upper) / 2.0)
+                };
+                upper.placement.center[1] = lower.placement.center[1];
+                self.items[index] = lower;
+                self.items.push(upper);
+            }
+        }
+        self.selected = Some(index);
+        self.serial += 1;
+        true
+    }
+
     /// The selected model.
     pub fn selected_mut(&mut self) -> Option<&mut Item> {
         self.items.get_mut(self.selected?)
@@ -815,6 +886,41 @@ mod tests {
         assert!((standing.size[2] - 40.0).abs() < 1e-9);
         let down = standing.laid_on(standing.best_down());
         assert!((down.size[2] - 2.0).abs() < 1e-9, "{:?}", down.size);
+    }
+
+    #[test]
+    fn cutting_keeps_parts_beside_each_other() {
+        let settings = Settings::default();
+        let mut plate = Plate::default();
+        plate.add(cube_model(20.0, 10.0, 10.0), &settings);
+        plate.items[0].placement.scale = 2.0;
+        let serial = plate.serial;
+        // 6 mm of the 20 mm tall (scaled) cube below, 14 mm above.
+        assert!(plate.cut(0, 6.0, [true, true], true, &settings));
+        assert!(plate.serial > serial);
+        assert_eq!(plate.items.len(), 2);
+        let [lower, upper] = [&plate.items[0], &plate.items[1]];
+        assert!((lower.model.size[2] * 2.0 - 6.0).abs() < 1e-3);
+        assert!((upper.model.size[2] * 2.0 - 14.0).abs() < 1e-3);
+        assert_eq!(lower.placement.center, [110.0, 110.0]);
+        // 40 mm wide parts with a 5 mm gap.
+        assert!(
+            near(upper.placement.center, [155.0, 110.0]),
+            "{:?}",
+            upper.placement
+        );
+        assert_eq!(upper.model.name, "cube (top)");
+        assert!(upper.model.mesh.signed_volume() > 0.0);
+
+        // Keeping only the top, it takes the place of the model.
+        let mut plate = Plate::default();
+        plate.add(cube_model(20.0, 10.0, 10.0), &settings);
+        assert!(plate.cut(0, 4.0, [false, true], false, &settings));
+        assert_eq!(plate.items.len(), 1);
+        assert!((plate.items[0].model.size[2] - 6.0).abs() < 1e-3);
+        // Above the model nothing is left on top: nothing changes.
+        assert!(!plate.cut(0, 50.0, [false, true], false, &settings));
+        assert_eq!(plate.items.len(), 1);
     }
 
     #[test]
