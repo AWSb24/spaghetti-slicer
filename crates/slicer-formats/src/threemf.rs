@@ -17,10 +17,11 @@ use quick_xml::name::{Namespace, ResolveResult};
 use quick_xml::reader::NsReader;
 use slicer_core::{Diagnostic, Diagnostics, Mesh};
 
-const CORE_NS: &str = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02";
+pub(crate) const CORE_NS: &str = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02";
 const PRODUCTION_NS: &str = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06";
-const MODEL_RELATIONSHIP: &str = "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel";
-const DEFAULT_MODEL_PART: &str = "3D/3dmodel.model";
+pub(crate) const MODEL_RELATIONSHIP: &str =
+    "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel";
+pub(crate) const DEFAULT_MODEL_PART: &str = "3D/3dmodel.model";
 
 /// Largest model part that is unpacked, as a guard against archive bombs.
 const MAX_PART_BYTES: u64 = 1 << 30;
@@ -173,9 +174,9 @@ impl slicer_core::Diagnose for ThreeMfError {
 
 /// An affine transform in 3MF order: three rows of the linear part, then the
 /// translation. Points are row vectors, so `p' = p · M`.
-type Transform = [f64; 12];
+pub(crate) type Transform = [f64; 12];
 
-const IDENTITY: Transform = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0];
+pub(crate) const IDENTITY: Transform = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0];
 
 fn apply(m: &Transform, p: [f64; 3]) -> [f64; 3] {
     [
@@ -209,15 +210,18 @@ fn determinant(m: &Transform) -> f64 {
 }
 
 /// A reference to an object, from a build item or a component.
-struct Reference {
+#[derive(Clone)]
+pub(crate) struct Reference {
     /// Model part holding the object; `None` means the referring part.
-    path: Option<String>,
-    object: u32,
-    transform: Transform,
+    pub(crate) path: Option<String>,
+    pub(crate) object: u32,
+    pub(crate) transform: Transform,
 }
 
 #[derive(Default)]
-struct Object {
+pub(crate) struct Object {
+    /// The object's `name` attribute.
+    pub(crate) name: Option<String>,
     printable: bool,
     vertices: Vec<[f64; 3]>,
     triangles: Vec<[u32; 3]>,
@@ -226,9 +230,9 @@ struct Object {
 
 /// One parsed model part, already converted to millimetres.
 #[derive(Default)]
-struct Part {
-    objects: HashMap<u32, Object>,
-    build: Vec<Reference>,
+pub(crate) struct Part {
+    pub(crate) objects: HashMap<u32, Object>,
+    pub(crate) build: Vec<Reference>,
     extensions: Vec<String>,
 }
 
@@ -335,11 +339,12 @@ fn parse_part(name: &str, text: &str) -> Result<Part, ThreeMfError> {
                         }
                     }
                     "object" => {
-                        let [id, kind] = attributes(&element, ["id", "type"]);
+                        let [id, kind, name] = attributes(&element, ["id", "type", "name"]);
                         let id = id
                             .and_then(|v| v.trim().parse().ok())
                             .ok_or_else(|| invalid("object", "id"))?;
                         let object = Object {
+                            name,
                             printable: kind.is_none_or(|k| k == "model"),
                             ..Object::default()
                         };
@@ -412,15 +417,41 @@ fn root_part(rels: &str) -> Option<String> {
     }
 }
 
-struct Package<'a> {
+/// An opened 3MF package and the model parts read from it so far.
+pub(crate) struct Package<'a> {
     archive: zip::ZipArchive<Cursor<&'a [u8]>>,
-    parts: HashMap<String, Part>,
+    pub(crate) parts: HashMap<String, Part>,
 }
 
-impl Package<'_> {
+impl<'a> Package<'a> {
+    /// Opens a package and reads its root model part. Returns the package
+    /// and the name of the root part.
+    pub(crate) fn open(bytes: &'a [u8]) -> Result<(Self, String), ThreeMfError> {
+        let archive = zip::ZipArchive::new(Cursor::new(bytes))
+            .map_err(|e| ThreeMfError::Archive(e.to_string()))?;
+        let mut package = Package::from_archive(archive);
+        let root = match package.read("_rels/.rels")? {
+            Some(rels) => root_part(&rels).ok_or_else(|| ThreeMfError::MissingPart {
+                part: DEFAULT_MODEL_PART.to_string(),
+            })?,
+            None => DEFAULT_MODEL_PART.to_string(),
+        };
+        let root = root.trim_start_matches('/').to_string();
+        package.load(&root)?;
+        Ok((package, root))
+    }
+
+    /// A package with no model part read yet.
+    pub(crate) fn from_archive(archive: zip::ZipArchive<Cursor<&'a [u8]>>) -> Self {
+        Package {
+            archive,
+            parts: HashMap::new(),
+        }
+    }
+
     /// Reads a part as text. Part names are case-insensitive and may be
     /// written with a leading slash.
-    fn read(&mut self, name: &str) -> Result<Option<String>, ThreeMfError> {
+    pub(crate) fn read(&mut self, name: &str) -> Result<Option<String>, ThreeMfError> {
         let wanted = name.trim_start_matches('/');
         let Some(actual) = self
             .archive
@@ -462,7 +493,7 @@ impl Package<'_> {
     }
 
     /// Appends the object `reference` points to, with all its components.
-    fn emit(
+    pub(crate) fn emit(
         &mut self,
         part: &str,
         reference: &Reference,
@@ -630,20 +661,7 @@ pub fn parse_3mf_plate(
     plate: Option<u32>,
     diagnostics: &mut Diagnostics,
 ) -> Result<Mesh, ThreeMfError> {
-    let archive = zip::ZipArchive::new(Cursor::new(bytes))
-        .map_err(|e| ThreeMfError::Archive(e.to_string()))?;
-    let mut package = Package {
-        archive,
-        parts: HashMap::new(),
-    };
-    let root = match package.read("_rels/.rels")? {
-        Some(rels) => root_part(&rels).ok_or_else(|| ThreeMfError::MissingPart {
-            part: DEFAULT_MODEL_PART.to_string(),
-        })?,
-        None => DEFAULT_MODEL_PART.to_string(),
-    };
-    let root = root.trim_start_matches('/').to_string();
-    package.load(&root)?;
+    let (mut package, root) = Package::open(bytes)?;
 
     let (plates, extruders) = package
         .read(PLATE_PART)?
@@ -744,19 +762,11 @@ pub fn looks_like_3mf(bytes: &[u8]) -> bool {
 pub fn write_3mf(mesh: &Mesh) -> Result<Vec<u8>, ThreeMfError> {
     let mut model = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     model.push_str(&format!(
-        "<model unit=\"millimeter\" xml:lang=\"en-US\" xmlns=\"{CORE_NS}\">\n <resources>\n  <object id=\"1\" type=\"model\">\n   <mesh>\n    <vertices>\n"
+        "<model unit=\"millimeter\" xml:lang=\"en-US\" xmlns=\"{CORE_NS}\">\n <resources>\n  <object id=\"1\" type=\"model\">\n"
     ));
-    for [x, y, z] in &mesh.vertices {
-        model.push_str(&format!("     <vertex x=\"{x}\" y=\"{y}\" z=\"{z}\"/>\n"));
-    }
-    model.push_str("    </vertices>\n    <triangles>\n");
-    for [a, b, c] in &mesh.triangles {
-        model.push_str(&format!(
-            "     <triangle v1=\"{a}\" v2=\"{b}\" v3=\"{c}\"/>\n"
-        ));
-    }
+    push_mesh(&mut model, mesh);
     model.push_str(
-        "    </triangles>\n   </mesh>\n  </object>\n </resources>\n <build>\n  <item objectid=\"1\"/>\n </build>\n</model>\n",
+        "  </object>\n </resources>\n <build>\n  <item objectid=\"1\"/>\n </build>\n</model>\n",
     );
     let content_types = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\n <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\n <Default Extension=\"model\" ContentType=\"application/vnd.ms-package.3dmanufacturing-3dmodel+xml\"/>\n</Types>\n";
     let rels = format!(
@@ -767,6 +777,21 @@ pub fn write_3mf(mesh: &Mesh) -> Result<Vec<u8>, ThreeMfError> {
         ("_rels/.rels", &rels),
         (DEFAULT_MODEL_PART, &model),
     ])
+}
+
+/// Appends the `<mesh>` element of an object to model XML.
+pub(crate) fn push_mesh(model: &mut String, mesh: &Mesh) {
+    model.push_str("   <mesh>\n    <vertices>\n");
+    for [x, y, z] in &mesh.vertices {
+        model.push_str(&format!("     <vertex x=\"{x}\" y=\"{y}\" z=\"{z}\"/>\n"));
+    }
+    model.push_str("    </vertices>\n    <triangles>\n");
+    for [a, b, c] in &mesh.triangles {
+        model.push_str(&format!(
+            "     <triangle v1=\"{a}\" v2=\"{b}\" v3=\"{c}\"/>\n"
+        ));
+    }
+    model.push_str("    </triangles>\n   </mesh>\n");
 }
 
 /// Packs named parts into a ZIP archive.

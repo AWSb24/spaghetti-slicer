@@ -25,6 +25,10 @@ use slicer_ui::profiles::{
     ROLES, Setup, builtin_path, builtin_text, fit_processes, profile_name, replace_profiles,
     standard_process,
 };
+use slicer_ui::project::{
+    ProjectSettings, is_project, load_project, project_file_name, save_project,
+    with_project_extension,
+};
 use slicer_ui::settings::{CommonSettings, SettingsFile, load_settings};
 use slicer_ui::settings_list::{PROCESS_TABS, SettingsEditor};
 use slicer_ui::view::{
@@ -298,13 +302,19 @@ impl App {
         }
     }
 
+    /// Opens a model, or a project file in place of the plate and the
+    /// settings.
     fn open_model(&mut self, path: &Path) {
         let name = file_name(path);
-        let loaded = platform::read(path)
-            .map_err(|e| format!("{}: {e}", path.display()))
-            .and_then(|bytes| {
-                load_model(&name, &bytes).map_err(|e| format!("{name}: {}", e.message))
-            });
+        let bytes = match platform::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) => return self.note(Level::Error, format!("{}: {e}", path.display())),
+        };
+        if is_project(&bytes) {
+            self.open_project(&name, &bytes);
+            return;
+        }
+        let loaded = load_model(&name, &bytes).map_err(|e| format!("{name}: {}", e.message));
         match loaded {
             Ok((model, warnings)) => {
                 self.note(
@@ -321,6 +331,69 @@ impl App {
             }
             Err(text) => self.note(Level::Error, text),
         }
+    }
+
+    /// Replaces the plate and the settings with those of a project file.
+    /// If its settings files cannot be used, the settings stay as they are.
+    fn open_project(&mut self, name: &str, bytes: &[u8]) {
+        let (project, warnings) = match load_project(bytes) {
+            Ok(loaded) => loaded,
+            Err(error) => return self.note(Level::Error, format!("{name}: {}", error.message)),
+        };
+        let settings = project.settings;
+        self.use_settings_files(settings.files.clone());
+        if self.files == settings.files {
+            self.common = settings.common;
+            self.editor.set_edits(settings.edits);
+            self.overrides = settings.overrides;
+            self.current = self.editor.build(&self.base, &self.common, &self.overrides);
+        }
+        self.refresh_builtin();
+        let serial = self.plate.serial + 1;
+        self.plate = project.plate;
+        self.plate.serial = serial;
+        self.history.reset(&self.plate);
+        self.sliced = None;
+        self.job = None;
+        self.cut = None;
+        self.face_mode = false;
+        self.tab = Tab::Plate;
+        let count = self.plate.items.len();
+        self.note(
+            Level::Info,
+            format!("Opened project {name} ({count} model(s))"),
+        );
+        self.notes
+            .extend(warnings.as_slice().iter().map(Note::from));
+    }
+
+    /// Asks where to save the plate and the settings as a project file.
+    fn save_project_as(&mut self) {
+        let settings = ProjectSettings {
+            files: self.files.clone(),
+            common: self.common,
+            edits: self.editor.edits().clone(),
+            overrides: self.overrides.clone(),
+        };
+        let model_name = self.plate.items.first().map_or("", |i| &i.model.name);
+        let Some(path) = platform::save_path(&project_file_name(model_name), "3MF project", "3mf")
+        else {
+            return;
+        };
+        let path = PathBuf::from(with_project_extension(&path.to_string_lossy()));
+        let name = path.to_string_lossy().into_owned();
+        let written = save_project(&self.plate, &settings)
+            .map_err(|e| e.message)
+            .and_then(|bytes| platform::write(&path, &bytes).map_err(|e| format!("{name}: {e}")));
+        match written {
+            Ok(()) => self.note(Level::Info, format!("Saved project {name}")),
+            Err(text) => self.note(Level::Error, text),
+        }
+    }
+
+    fn pick_project(&mut self, ctx: &egui::Context) {
+        let paths = platform::pick_files(ctx, "3MF project", &["3mf"], false);
+        self.open_paths(&paths);
     }
 
     /// Adds settings files after the ones already loaded. Nothing changes
@@ -1010,6 +1083,21 @@ impl App {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             ui.menu_button(RichText::new("  File  ").color(theme::TEXT), |ui| {
+                if ui
+                    .add(egui::Button::new("Open project…").shortcut_text("Ctrl+O"))
+                    .on_hover_text("Replace the plate and the settings with a saved project")
+                    .clicked()
+                {
+                    self.pick_project(ui.ctx());
+                }
+                if ui
+                    .add(egui::Button::new("Save project…").shortcut_text("Ctrl+S"))
+                    .on_hover_text("Models, placements and settings in one 3MF file")
+                    .clicked()
+                {
+                    self.save_project_as();
+                }
+                ui.separator();
                 if ui.button("Add models…").clicked() {
                     self.pick_models(ui.ctx());
                 }
@@ -1706,8 +1794,8 @@ impl App {
         }
     }
 
-    /// Keyboard shortcuts, when no text field has the keyboard: undo and
-    /// redo, copy and paste, duplicate, delete, arrange, move the selected
+    /// Keyboard shortcuts, when no text field has the keyboard: open and
+    /// save a project, undo and redo, copy and paste, duplicate, delete, arrange, move the selected
     /// model with the arrow keys (Shift for 10 mm), Escape to deselect.
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.egui_wants_keyboard_input() {
@@ -1726,6 +1814,14 @@ impl App {
         }
         if command && pressed(egui::Key::Y) {
             self.history.redo(&mut self.plate);
+            return;
+        }
+        if command && pressed(egui::Key::O) {
+            self.pick_project(ctx);
+            return;
+        }
+        if command && pressed(egui::Key::S) {
+            self.save_project_as();
             return;
         }
         // Copy and paste arrive as events; Ctrl+C and Ctrl+V are not keys.

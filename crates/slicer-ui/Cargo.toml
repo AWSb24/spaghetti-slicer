@@ -30,6 +30,10 @@ slicer-fdm.workspace = true
 slicer-gcode.workspace = true
 slicer-formats.workspace = true
 slicer-profiles.workspace = true
+# The project file's own part (TOML); both are already used by
+# slicer-profiles.
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.1"
 # OpenGL renderer: much less to compile than wgpu and enough for drawing
 # lines. `persistence` keeps the setup assistant's choice and the settings
 # files in use between runs (in the browser: local storage). X11 and Wayland libraries are loaded at run time, so building on

@@ -249,6 +249,19 @@ impl SettingsEditor {
         self.edits.len()
     }
 
+    /// The values set in the list, by key, as text.
+    pub fn edits(&self) -> &BTreeMap<String, String> {
+        &self.edits
+    }
+
+    /// Replaces the values set in the list, for example with those of an
+    /// opened project; text typed and not accepted is dropped.
+    pub fn set_edits(&mut self, edits: BTreeMap<String, String>) {
+        self.edits = edits;
+        self.drafts.clear();
+        self.errors.clear();
+    }
+
     /// Every setting that matches the search, in the order of
     /// [`SETTINGS_INFO`]. `current` are the settings sliced with, `base`
     /// those from the settings files.

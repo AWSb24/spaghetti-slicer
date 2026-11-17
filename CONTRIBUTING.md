@@ -71,6 +71,7 @@ All three must pass. New behaviour needs a test.
 | 3MF parsing | 3MF Core Specification and Production Extension (3MF Consortium, public); `zip` (MIT) and `quick-xml` (MIT) crates |
 | Sliced project file for Bambu Lab printers (`.gcode.3mf`) | Worked out from a file exported by Bambu Studio (names of the parts, checksum file, description files); no source code read. MD5 from RFC 1321 |
 | Build plates and object extruders of Bambu Studio projects | Worked out from the `Metadata/model_settings.config` part of project files written by the program; no source code read |
+| Project files of the desktop app (3MF objects and build items with transforms, own TOML part for settings and placements) | 3MF Core Specification and Open Packaging Conventions (content types, relationships); layout of the own part is an own design |
 | HTTP server | `axum` and `tokio` (MIT), `uuid` (MIT OR Apache-2.0); API is an own design |
 | Sending G-code to Moonraker and OctoPrint (`slicer-send`) | Public API documentation: Moonraker file manager and authorization pages (moonraker.readthedocs.io/en/latest/external_api/file_manager/, …/authorization/), OctoPrint file and general API pages (docs.octoprint.org/en/master/api/files.html, …/general.html); multipart body after RFC 7578; HTTP client `ureq` (MIT OR Apache-2.0) with `rustls`/`ring` (Apache-2.0/ISC/MIT) and the Mozilla root certificates from `webpki-roots` (CDLA-Permissive-2.0); never tried against a real printer |
 | G-code commands | Marlin and RepRap G-code documentation |

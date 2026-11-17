@@ -660,6 +660,15 @@ impl History {
         }
     }
 
+    /// Forgets all steps and starts over from `plate`, for example after
+    /// opening a project.
+    pub fn reset(&mut self, plate: &Plate) {
+        *self = Self {
+            current: plate.clone(),
+            ..Self::default()
+        };
+    }
+
     /// Whether there is a step to undo.
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
