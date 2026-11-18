@@ -277,6 +277,31 @@ async fn a_job_is_sliced_in_the_background() {
     assert_eq!(body["error"]["code"], "job.not_found");
 }
 
+/// Whether `bytes` contain `part`.
+fn contains(bytes: &[u8], part: &[u8]) -> bool {
+    bytes.windows(part.len()).any(|window| window == part)
+}
+
+#[tokio::test]
+async fn thumbnails_go_into_the_gcode_and_the_project_file() {
+    let router = App::new(Config::default()).router();
+    let (_, created) = create(&router, &[("model", &cube()), ("set", b"thumbnails=32x24")]).await;
+    let job = finished(&router, created["id"].as_str().unwrap()).await;
+    assert_eq!(job["status"], "done", "{job}");
+    let request = |uri: &str| Request::builder().uri(uri).body(Body::empty()).unwrap();
+    let (_, gcode) = send(&router, request(job["gcode_url"].as_str().unwrap())).await;
+    let gcode = String::from_utf8(gcode).unwrap();
+    assert!(
+        gcode.contains("\n; thumbnail begin 32x24 "),
+        "{}",
+        &gcode[..400]
+    );
+    assert_eq!(gcode.matches("; thumbnail end\n").count(), 1);
+    let (status, package) = send(&router, request(job["gcode_3mf_url"].as_str().unwrap())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(contains(&package, b"Metadata/plate_1.png"));
+}
+
 #[tokio::test]
 async fn a_3mf_model_is_accepted() {
     let router = App::new(Config::default()).router();
@@ -678,6 +703,11 @@ async fn finished_jobs_survive_a_restart() {
         send(&router, request(&gcode_url)).await,
         (StatusCode::OK, gcode)
     );
+    // The pictures of the plate are kept for the project file.
+    let (status, package) = send(&router, request(done["gcode_3mf_url"].as_str().unwrap())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(contains(&package, b"Metadata/plate_1.png"));
+    assert!(contains(&package, b"Metadata/plate_1_small.png"));
 
     // Deleting a job deletes its files.
     let path = format!("/v1/jobs/{}", done["id"].as_str().unwrap());

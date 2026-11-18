@@ -8,8 +8,11 @@ use slicer_core::Mesh;
 
 use crate::threemf::{
     CORE_NS, DEFAULT_MODEL_PART, IDENTITY, MODEL_RELATIONSHIP, Package, Reference, ThreeMfError,
-    push_mesh, write_package,
+    push_mesh, write_binary_package,
 };
+
+/// Where a project keeps the picture of its plate.
+pub const THUMBNAIL_PART: &str = "Metadata/thumbnail.png";
 
 /// An object of a project: a mesh in its own coordinates.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -40,6 +43,11 @@ pub struct ProjectPackage {
     /// Further text parts by name inside the package, such as
     /// `Metadata/app.toml`.
     pub parts: Vec<(String, String)>,
+    /// Picture of the plate as PNG, written to [`THUMBNAIL_PART`] and
+    /// named the package thumbnail (3MF core specification, OPC), which
+    /// file managers and other programs show; empty for none. Not read
+    /// back.
+    pub thumbnail: Vec<u8>,
 }
 
 /// Content type of an extra part, by its extension.
@@ -87,6 +95,9 @@ pub fn write_project(project: &ProjectPackage) -> Result<Vec<u8>, ThreeMfError> 
     let mut content_types = format!(
         "{XML}<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\n <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\n <Default Extension=\"model\" ContentType=\"application/vnd.ms-package.3dmanufacturing-3dmodel+xml\"/>\n"
     );
+    if !project.thumbnail.is_empty() {
+        content_types.push_str(" <Default Extension=\"png\" ContentType=\"image/png\"/>\n");
+    }
     for (name, _) in &project.parts {
         content_types.push_str(&format!(
             " <Override PartName=\"/{}\" ContentType=\"{}\"/>\n",
@@ -95,21 +106,31 @@ pub fn write_project(project: &ProjectPackage) -> Result<Vec<u8>, ThreeMfError> 
         ));
     }
     content_types.push_str("</Types>\n");
+    let thumbnail = if project.thumbnail.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " <Relationship Target=\"/{THUMBNAIL_PART}\" Id=\"rel1\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail\"/>\n"
+        )
+    };
     let rels = format!(
-        "{XML}<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n <Relationship Target=\"/{DEFAULT_MODEL_PART}\" Id=\"rel0\" Type=\"{MODEL_RELATIONSHIP}\"/>\n</Relationships>\n"
+        "{XML}<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n <Relationship Target=\"/{DEFAULT_MODEL_PART}\" Id=\"rel0\" Type=\"{MODEL_RELATIONSHIP}\"/>\n{thumbnail}</Relationships>\n"
     );
-    let mut parts = vec![
-        ("[Content_Types].xml", content_types.as_str()),
-        ("_rels/.rels", rels.as_str()),
-        (DEFAULT_MODEL_PART, model.as_str()),
+    let mut parts: Vec<(&str, &[u8])> = vec![
+        ("[Content_Types].xml", content_types.as_bytes()),
+        ("_rels/.rels", rels.as_bytes()),
+        (DEFAULT_MODEL_PART, model.as_bytes()),
     ];
     parts.extend(
         project
             .parts
             .iter()
-            .map(|(name, text)| (name.as_str(), text.as_str())),
+            .map(|(name, text)| (name.as_str(), text.as_bytes())),
     );
-    write_package(&parts)
+    if !project.thumbnail.is_empty() {
+        parts.push((THUMBNAIL_PART, &project.thumbnail));
+    }
+    write_binary_package(&parts)
 }
 
 /// Reads one part of a 3MF package as text; `None` if the package has no
@@ -236,6 +257,7 @@ mod tests {
                 "Metadata/test.toml".into(),
                 "version = 1\nname = \"ä\"\n".into(),
             )],
+            thumbnail: Vec::new(),
         }
     }
 
@@ -284,6 +306,31 @@ mod tests {
         assert_eq!(
             read_project(&bytes, &["Metadata/test.toml"]).unwrap(),
             project
+        );
+    }
+
+    #[test]
+    fn the_picture_is_the_package_thumbnail() {
+        let png = slicer_core::png::encode(1, 1, slicer_core::png::ColorType::Rgba, &[1, 2, 3, 4])
+            .unwrap();
+        let project = ProjectPackage {
+            thumbnail: png.clone(),
+            ..sample()
+        };
+        let bytes = write_project(&project).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes[..])).unwrap();
+        let mut stored = Vec::new();
+        std::io::Read::read_to_end(&mut archive.by_name(THUMBNAIL_PART).unwrap(), &mut stored)
+            .unwrap();
+        assert_eq!(stored, png);
+        let rels = read_part(&bytes, "_rels/.rels").unwrap().unwrap();
+        assert!(rels.contains("Target=\"/Metadata/thumbnail.png\" Id=\"rel1\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail\""), "{rels}");
+        let types = read_part(&bytes, "[Content_Types].xml").unwrap().unwrap();
+        assert!(types.contains("Extension=\"png\""), "{types}");
+        // The objects read as before; the picture is not read back.
+        assert_eq!(
+            read_project(&bytes, &["Metadata/test.toml"]).unwrap(),
+            sample()
         );
     }
 

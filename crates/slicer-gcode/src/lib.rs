@@ -4,6 +4,7 @@
 //! commands; the Bambu flavor does not exist yet.
 
 pub mod calibration;
+pub mod thumbnails;
 
 use std::collections::BTreeMap;
 use std::f64::consts::PI;

@@ -5,8 +5,6 @@
 //! scanline technique). Only additions, multiplications and divisions of
 //! `f64` are used, so every platform gets the same pixels.
 
-use std::io::Write;
-
 use slicer_core::{Point, Shape};
 
 use crate::SlaSettings;
@@ -98,37 +96,8 @@ pub fn rasterize(shapes: &[Shape], settings: &SlaSettings) -> Vec<u8> {
     pixels
 }
 
-/// Encodes an 8-bit grey-scale image (rows top to bottom) as PNG
-/// (PNG specification, ISO/IEC 15948): one IHDR, one IDAT, one IEND chunk,
-/// no filtering, zlib compression.
+/// Encodes an 8-bit grey-scale image (rows top to bottom) as PNG with
+/// [`slicer_core::png::encode`]: unfiltered, zlib compression.
 pub fn encode_png(width: u32, height: u32, pixels: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut raw = Vec::with_capacity(pixels.len() + height as usize);
-    for row in pixels.chunks(width.max(1) as usize) {
-        raw.push(0); // filter type: none
-        raw.extend_from_slice(row);
-    }
-    let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
-    zlib.write_all(&raw)?;
-    let data = zlib.finish()?;
-
-    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
-    let mut header = Vec::with_capacity(13);
-    header.extend_from_slice(&width.to_be_bytes());
-    header.extend_from_slice(&height.to_be_bytes());
-    // Bit depth 8, colour type 0 (grey), deflate, adaptive filtering, no interlace.
-    header.extend_from_slice(&[8, 0, 0, 0, 0]);
-    chunk(&mut png, b"IHDR", &header);
-    chunk(&mut png, b"IDAT", &data);
-    chunk(&mut png, b"IEND", &[]);
-    Ok(png)
-}
-
-/// Appends a PNG chunk: length, type, data, CRC-32 of type and data.
-fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
-    png.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    let start = png.len();
-    png.extend_from_slice(kind);
-    png.extend_from_slice(data);
-    let crc = crc32fast::hash(&png[start..]);
-    png.extend_from_slice(&crc.to_be_bytes());
+    slicer_core::png::encode(width, height, slicer_core::png::ColorType::Grey, pixels)
 }

@@ -74,8 +74,15 @@ pub fn slice(
     if stop.load(Ordering::Relaxed) {
         return Err(slicer_fdm::FdmError::Cancelled.diagnostic());
     }
-    let output = slicer_gcode::write_gcode_with_progress(&toolpaths, settings, progress)
+    let mut output = slicer_gcode::write_gcode_with_progress(&toolpaths, settings, progress)
         .map_err(|e| e.diagnostic())?;
+    slicer_gcode::thumbnails::add_thumbnails(
+        &mut output.gcode,
+        &request.objects,
+        slicer_fdm::Placement::AsGiven,
+        settings,
+    )
+    .map_err(|e| Diagnostic::error("thumbnail.encode", e.to_string()))?;
     Ok(SliceResult {
         toolpaths,
         output,
@@ -206,6 +213,9 @@ pub fn encode_output(
         filament_m: output.stats.filament_length_mm / 1000.0,
         layers: output.stats.layers,
         nozzle_diameter: settings.nozzle_diameter,
+        // ponytail: no picture of the plate here, the meshes are not at
+        // hand; the command line tool and the server add one.
+        ..slicer_formats::PrintInfo::default()
     };
     slicer_formats::write_gcode_3mf(&output.gcode, &info).map_err(|e| e.diagnostic())
 }
@@ -285,6 +295,28 @@ mod tests {
         let center = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0];
         assert!((center[0] - 60.0).abs() < 0.01 && (center[1] - 130.0).abs() < 0.01);
         assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn thumbnails_leave_the_layers_of_the_gcode_view() {
+        let plain = SliceJob::start(request(), || {}).wait().unwrap();
+        let mut pictured = request();
+        pictured.settings.thumbnails = "32x32".into();
+        let pictured = SliceJob::start(pictured, || {}).wait().unwrap();
+        let gcode = &pictured.output.gcode;
+        assert!(gcode.contains("\n; thumbnail begin 32x32 "));
+        assert_eq!(pictured.output.stats, plain.output.stats);
+        let (before, after) = (
+            crate::view::GcodeIndex::new(&plain.output.gcode),
+            crate::view::GcodeIndex::new(gcode),
+        );
+        let lines = |index: &crate::view::GcodeIndex, layer| index.layer(layer).len();
+        for layer in 0..10 {
+            assert_eq!(lines(&before, layer), lines(&after, layer), "layer {layer}");
+            let first = after.layer(layer).start;
+            assert_eq!(after.line(gcode, first), ";LAYER_CHANGE");
+        }
+        assert!(after.layer(10).is_empty());
     }
 
     #[test]

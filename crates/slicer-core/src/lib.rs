@@ -6,9 +6,11 @@ mod cut;
 pub mod diagnostics;
 pub mod mesh;
 pub mod parallel;
+pub mod png;
 pub mod polygon;
 pub mod primitives;
 pub mod slice;
+pub mod thumbnail;
 
 pub use diagnostics::{Diagnose, Diagnostic, Diagnostics, Severity};
 pub use mesh::Mesh;

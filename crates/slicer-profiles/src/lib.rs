@@ -172,6 +172,12 @@ pub struct Settings {
     /// objects are called `object_1`, `object_2` and so on, in the order
     /// they were given.
     pub label_objects: bool,
+    /// Pictures of the plate to put into the G-code header, as sizes in
+    /// pixels separated by commas, such as `48x48,300x300`; empty for none.
+    /// They are PNG images in the comment blocks (`; thumbnail begin`)
+    /// that Klipper front-ends (Mainsail, Fluidd), OctoPrint plugins and
+    /// many printer screens show.
+    pub thumbnails: String,
     /// Number of extruders (tools or filament slots) of the printer. With
     /// more than one, every object prints with the extruder it names (Bambu
     /// Studio projects) and the G-code changes tools with `T<n>`; with one,
@@ -427,6 +433,7 @@ impl Default for Settings {
             arc_fitting: false,
             arc_tolerance: 0.01,
             label_objects: false,
+            thumbnails: String::new(),
             extruder_count: 1,
             filament_diameter: 1.75,
             filament_density: 1.24,
@@ -590,6 +597,9 @@ fn range(key: &'static str, value: f64, min: f64, max: f64) -> Result<(), Settin
     }
 }
 
+/// Largest width or height of a picture in `thumbnails`, in pixels.
+pub const MAX_THUMBNAIL_SIZE: u32 = 1024;
+
 impl Settings {
     /// Parses settings from TOML. Missing keys take their default value,
     /// unknown keys are rejected.
@@ -716,7 +726,43 @@ impl Settings {
         for (key, value, min, max) in self.limits() {
             range(key, value, min, max)?;
         }
+        self.thumbnail_sizes()?;
         Ok(())
+    }
+
+    /// The sizes of `thumbnails` as width and height in pixels, in the
+    /// order given. Each side must be from 1 to [`MAX_THUMBNAIL_SIZE`]; a
+    /// `/PNG` after a size, as other programs write it, is accepted.
+    pub fn thumbnail_sizes(&self) -> Result<Vec<[u32; 2]>, SettingsError> {
+        let invalid = |entry: &str| {
+            SettingsError::Parse(format!(
+                "thumbnails: '{entry}' is not a size like 300x300 (each side 1 to {MAX_THUMBNAIL_SIZE})"
+            ))
+        };
+        let mut sizes = Vec::new();
+        for entry in self.thumbnails.split(',').map(str::trim) {
+            if entry.is_empty() {
+                continue;
+            }
+            let size = entry
+                .strip_suffix("/PNG")
+                .or_else(|| entry.strip_suffix("/png"))
+                .unwrap_or(entry);
+            let side = |text: &str| {
+                text.trim()
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|side| (1..=MAX_THUMBNAIL_SIZE).contains(side))
+            };
+            match size.split_once(['x', 'X']) {
+                Some((width, height)) => match (side(width), side(height)) {
+                    (Some(width), Some(height)) => sizes.push([width, height]),
+                    _ => return Err(invalid(entry)),
+                },
+                None => return Err(invalid(entry)),
+            }
+        }
+        Ok(sizes)
     }
 
     /// Every numeric setting with its value and the smallest and largest
@@ -921,6 +967,22 @@ mod tests {
         assert!(settings.apply_toml("layer_height = 9.0").is_err());
         assert!(settings.apply_toml("layer_height = \"thin\"").is_err());
         assert_eq!(settings, before);
+    }
+
+    #[test]
+    fn thumbnail_sizes_are_read_and_checked() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.thumbnail_sizes().unwrap(), Vec::<[u32; 2]>::new());
+        settings.set("thumbnails", "48x48, 300X200/PNG,,").unwrap();
+        assert_eq!(
+            settings.thumbnail_sizes().unwrap(),
+            vec![[48, 48], [300, 200]]
+        );
+        for wrong in ["48", "0x48", "48x2000", "axb", "32x32/QOI"] {
+            let error = settings.set("thumbnails", wrong).unwrap_err();
+            assert!(error.to_string().contains("thumbnails"), "{error}");
+        }
+        assert_eq!(settings.thumbnails, "48x48, 300X200/PNG,,");
     }
 
     #[test]

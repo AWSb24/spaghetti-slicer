@@ -223,7 +223,24 @@ pub fn save_project(plates: &[&Plate], settings: &ProjectSettings) -> Result<Vec
         )
     })?;
     package.parts.push((PROJECT_PART.to_owned(), text));
+    package.thumbnail = project_thumbnail(&plates.first().map(|p| p.meshes()).unwrap_or_default());
     slicer_formats::write_project(&package).map_err(|e| e.diagnostic())
+}
+
+/// Size in pixels of the picture of the first plate in a project file.
+const THUMBNAIL_SIZE: u32 = 256;
+
+/// The picture of a plate for its project file as PNG; empty for a plate
+/// without models.
+fn project_thumbnail(meshes: &[Mesh]) -> Vec<u8> {
+    if meshes.is_empty() {
+        return Vec::new();
+    }
+    let size = [THUMBNAIL_SIZE, THUMBNAIL_SIZE];
+    slicer_gcode::thumbnails::render_thumbnails(meshes, slicer_fdm::Placement::AsGiven, &[size])
+        .ok()
+        .and_then(|pictures| pictures.into_iter().next())
+        .map_or(Vec::new(), |picture| picture.png)
 }
 
 /// Reads a project file. The warnings say what could not be taken over.
@@ -610,6 +627,7 @@ mod tests {
                 transform: quarter,
             }],
             parts: vec![(PROJECT_PART.into(), text.into())],
+            thumbnail: Vec::new(),
         };
         let bytes = slicer_formats::write_project(&package).unwrap();
         let (project, warnings) = load_project(&bytes).unwrap();

@@ -4,13 +4,22 @@
 //! package that carries the G-code of a plate, its MD5 checksum and a few
 //! small description files. Which of these the printer needs is not known;
 //! the writer includes what could be produced without copying anything.
-//! Thumbnails and the full settings file are left out. **No file written
-//! here has been loaded on a printer.**
+//! The picture of the plate is `Metadata/plate_1.png` (with a small one,
+//! `Metadata/plate_1_small.png`), referenced as in the project files a
+//! user saved: as the package thumbnail of the 3MF/OPC format, as the
+//! covers of the Bambu Lab relationship types and in
+//! `model_settings.config`. The full settings file is left out. **No file
+//! written here has been loaded on a printer.**
 
-use crate::threemf::{ThreeMfError, write_package};
+use crate::threemf::{ThreeMfError, write_binary_package};
+
+/// Size in pixels of [`PrintInfo::thumbnail`], as in the files a user saved.
+pub const PLATE_THUMBNAIL_SIZE: u32 = 512;
+/// Size in pixels of [`PrintInfo::thumbnail_small`].
+pub const PLATE_THUMBNAIL_SMALL_SIZE: u32 = 128;
 
 /// What the description files say about a print.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PrintInfo {
     /// Estimated print time in seconds.
     pub seconds: f64,
@@ -22,6 +31,12 @@ pub struct PrintInfo {
     pub layers: usize,
     /// Nozzle diameter in millimetres.
     pub nozzle_diameter: f64,
+    /// Picture of the plate as PNG, [`PLATE_THUMBNAIL_SIZE`] pixels square;
+    /// empty for none.
+    pub thumbnail: Vec<u8>,
+    /// Smaller picture of the plate as PNG,
+    /// [`PLATE_THUMBNAIL_SMALL_SIZE`] pixels square; empty for none.
+    pub thumbnail_small: Vec<u8>,
 }
 
 /// Sine-derived constants of MD5 (RFC 1321).
@@ -88,12 +103,27 @@ fn md5_hex(data: &[u8]) -> String {
 /// Packs G-code into a sliced project file with one plate.
 pub fn write_gcode_3mf(gcode: &str, info: &PrintInfo) -> Result<Vec<u8>, ThreeMfError> {
     const XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+    const LARGE: &str = "Metadata/plate_1.png";
+    const SMALL: &str = "Metadata/plate_1_small.png";
     let content_types = format!(
-        "{XML}<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\n <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\n <Default Extension=\"model\" ContentType=\"application/vnd.ms-package.3dmanufacturing-3dmodel+xml\"/>\n <Default Extension=\"gcode\" ContentType=\"text/x.gcode\"/>\n</Types>\n"
+        "{XML}<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\n <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\n <Default Extension=\"model\" ContentType=\"application/vnd.ms-package.3dmanufacturing-3dmodel+xml\"/>\n <Default Extension=\"png\" ContentType=\"image/png\"/>\n <Default Extension=\"gcode\" ContentType=\"text/x.gcode\"/>\n</Types>\n"
     );
-    let rels = format!(
-        "{XML}<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n <Relationship Target=\"/3D/3dmodel.model\" Id=\"rel-1\" Type=\"http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel\"/>\n</Relationships>\n"
+    let mut rels = format!(
+        "{XML}<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n <Relationship Target=\"/3D/3dmodel.model\" Id=\"rel-1\" Type=\"http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel\"/>\n"
     );
+    let mut thumbnail_file = String::new();
+    if !info.thumbnail.is_empty() {
+        rels.push_str(&format!(
+            " <Relationship Target=\"/{LARGE}\" Id=\"rel-2\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail\"/>\n <Relationship Target=\"/{LARGE}\" Id=\"rel-4\" Type=\"http://schemas.bambulab.com/package/2021/cover-thumbnail-middle\"/>\n"
+        ));
+        thumbnail_file = format!("    <metadata key=\"thumbnail_file\" value=\"{LARGE}\"/>\n");
+    }
+    if !info.thumbnail_small.is_empty() {
+        rels.push_str(&format!(
+            " <Relationship Target=\"/{SMALL}\" Id=\"rel-5\" Type=\"http://schemas.bambulab.com/package/2021/cover-thumbnail-small\"/>\n"
+        ));
+    }
+    rels.push_str("</Relationships>\n");
     // The model part is required by the 3MF format; the geometry itself is
     // not needed to print.
     let model = format!(
@@ -104,7 +134,7 @@ pub fn write_gcode_3mf(gcode: &str, info: &PrintInfo) -> Result<Vec<u8>, ThreeMf
         "{XML}<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n <Relationship Target=\"/Metadata/plate_1.gcode\" Id=\"rel-1\" Type=\"http://schemas.bambulab.com/package/2021/gcode\"/>\n</Relationships>\n"
     );
     let model_settings = format!(
-        "{XML}<config>\n  <plate>\n    <metadata key=\"plater_id\" value=\"1\"/>\n    <metadata key=\"plater_name\" value=\"\"/>\n    <metadata key=\"locked\" value=\"false\"/>\n    <metadata key=\"gcode_file\" value=\"Metadata/plate_1.gcode\"/>\n  </plate>\n</config>\n"
+        "{XML}<config>\n  <plate>\n    <metadata key=\"plater_id\" value=\"1\"/>\n    <metadata key=\"plater_name\" value=\"\"/>\n    <metadata key=\"locked\" value=\"false\"/>\n    <metadata key=\"gcode_file\" value=\"Metadata/plate_1.gcode\"/>\n{thumbnail_file}  </plate>\n</config>\n"
     );
     let slice_info = format!(
         "{XML}<config>\n  <header>\n    <header_item key=\"X-BBL-Client-Type\" value=\"slicer\"/>\n    <header_item key=\"X-BBL-Client-Version\" value=\"\"/>\n  </header>\n  <plate>\n    <metadata key=\"index\" value=\"1\"/>\n    <metadata key=\"nozzle_diameters\" value=\"{}\"/>\n    <metadata key=\"prediction\" value=\"{:.0}\"/>\n    <metadata key=\"weight\" value=\"{:.2}\"/>\n    <metadata key=\"outside\" value=\"false\"/>\n    <metadata key=\"support_used\" value=\"false\"/>\n    <filament id=\"1\" type=\"PLA\" color=\"#FFFFFF\" used_m=\"{:.2}\" used_g=\"{:.2}\"/>\n    <layer_filament_lists>\n      <layer_filament_list filament_list=\"0\" layer_ranges=\"0 {}\" />\n    </layer_filament_lists>\n  </plate>\n</config>\n",
@@ -115,16 +145,26 @@ pub fn write_gcode_3mf(gcode: &str, info: &PrintInfo) -> Result<Vec<u8>, ThreeMf
         info.weight_g,
         info.layers.saturating_sub(1)
     );
-    write_package(&[
-        ("[Content_Types].xml", &content_types),
-        ("_rels/.rels", &rels),
-        ("3D/3dmodel.model", &model),
-        ("Metadata/plate_1.gcode", gcode),
-        ("Metadata/plate_1.gcode.md5", &md5_hex(gcode.as_bytes())),
-        ("Metadata/_rels/model_settings.config.rels", &settings_rels),
-        ("Metadata/model_settings.config", &model_settings),
-        ("Metadata/slice_info.config", &slice_info),
-    ])
+    let checksum = md5_hex(gcode.as_bytes());
+    let mut parts: Vec<(&str, &[u8])> = vec![
+        ("[Content_Types].xml", content_types.as_bytes()),
+        ("_rels/.rels", rels.as_bytes()),
+        ("3D/3dmodel.model", model.as_bytes()),
+        ("Metadata/plate_1.gcode", gcode.as_bytes()),
+        ("Metadata/plate_1.gcode.md5", checksum.as_bytes()),
+        (
+            "Metadata/_rels/model_settings.config.rels",
+            settings_rels.as_bytes(),
+        ),
+        ("Metadata/model_settings.config", model_settings.as_bytes()),
+        ("Metadata/slice_info.config", slice_info.as_bytes()),
+    ];
+    for (name, png) in [(LARGE, &info.thumbnail), (SMALL, &info.thumbnail_small)] {
+        if !png.is_empty() {
+            parts.push((name, png));
+        }
+    }
+    write_binary_package(&parts)
 }
 
 #[cfg(test)]
@@ -158,6 +198,7 @@ mod tests {
             filament_m: 1.2,
             layers: 100,
             nozzle_diameter: 0.4,
+            ..PrintInfo::default()
         };
         let bytes = write_gcode_3mf(gcode, &info).unwrap();
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
@@ -183,5 +224,42 @@ mod tests {
         for name in ["[Content_Types].xml", "_rels/.rels", "3D/3dmodel.model"] {
             assert!(read(name).starts_with("<?xml"), "{name}");
         }
+        assert!(!read("_rels/.rels").contains("png"));
+        assert!(archive.by_name("Metadata/plate_1.png").is_err());
+    }
+
+    #[test]
+    fn container_holds_the_pictures_of_the_plate() {
+        let info = PrintInfo {
+            thumbnail: b"large png".to_vec(),
+            thumbnail_small: b"small png".to_vec(),
+            ..PrintInfo::default()
+        };
+        let bytes = write_gcode_3mf("G28\n", &info).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut read = |name: &str| {
+            let mut text = String::new();
+            archive
+                .by_name(name)
+                .unwrap()
+                .read_to_string(&mut text)
+                .unwrap();
+            text
+        };
+        assert_eq!(read("Metadata/plate_1.png"), "large png");
+        assert_eq!(read("Metadata/plate_1_small.png"), "small png");
+        let rels = read("_rels/.rels");
+        assert!(rels.contains("Target=\"/Metadata/plate_1.png\" Id=\"rel-2\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail\""), "{rels}");
+        assert!(
+            rels.contains("Target=\"/Metadata/plate_1_small.png\""),
+            "{rels}"
+        );
+        assert!(
+            read("[Content_Types].xml").contains("Extension=\"png\" ContentType=\"image/png\"")
+        );
+        assert!(
+            read("Metadata/model_settings.config")
+                .contains("<metadata key=\"thumbnail_file\" value=\"Metadata/plate_1.png\"/>")
+        );
     }
 }
