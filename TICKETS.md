@@ -343,6 +343,13 @@ Die beiden Spikes **T-003** und **T-004** zuerst erledigen: Beide können den Pl
 5. **Parallel nebenher:** T-040 (Profile) und T-051 (Server-Gerüst) hängen kaum am Kern.
 6. **Abschluss:** Epic F, dann Epic G.
 
+## Später (nach den offenen Slicer-Aufgaben)
+
+| ID | Typ | Titel | Größe | Hängt ab von |
+|---|---|---|---|---|
+| T-070 | Task | Nicht-planare Deckschichten: die obersten Schichten folgen flach geneigten Oberseiten statt Stufen zu bilden; Bahnen mit echten 3D-Punkten, Neigung begrenzt durch einen Düsenwinkel je Drucker, Kollisionsprüfung mit Düse und Lüfterhaube | XL | T-060 (Test am Drucker) |
+| T-071 | Task | CMYK-Druck: Farben und Texturen aus 3MF/OBJ lesen und aus wenigen Grundfarben (CMY(K) und Weiß) durch Rastern und Schichten nachbilden; Mischdüse (`M163`/`M164`) oder Werkzeugwechsel (AMS) mit Spülmengen je Filamentpaar | XL | Farben in 3MF/OBJ, Spülmengen, T-004 (AMS) |
+
 ## Nicht in diesem Breakdown
 
 Stützstrukturen (über die einfache Form hinaus), Nahtsteuerung, Brücken, UI, AMS, LAN-Versand, Resin: Phase 2–5 laut PRD. Ohne Stützen müssen die Referenzmodelle in T-007 so gewählt werden, dass sie ohne druckbar sind.
