@@ -66,7 +66,7 @@ Project files (3MF) of Orca Slicer and Bambu Studio store their print settings: 
 cargo run --release -p slicer-cli -- slice project.3mf --project-settings -c my-printer.toml -s nozzle_temp=215
 ```
 
-The layers, from bottom to top: the defaults, the project's settings (of several project files in the order given), the `-c` files, the `--set` overrides. On a single object its settings from the project go over the plate's, and `--object` files over those; so `--set infill_density=30` does not change an object to which the project gives an infill of its own. Of the settings of an object only those that an object can have here are taken (see [several models](#several-models-on-one-plate) below); an object with settings of its own is sliced as an object of its own, so the project file then counts as several objects that keep their places relative to each other, and `--object N:FILE` applies to all objects of the N-th file. Of values per filament or extruder the first is taken. Everything that is left out is reported as a warning with the setting names in `keys`: `project.settings_skipped` for the project (project files saved by Bambu Studio hold 440 to 500 settings, of which about 40 are taken), `project.object_settings_skipped` per object, `project.part_settings_skipped` for settings of parts and modifiers, which are not read; a 3MF without such settings gives `project.no_settings`. Without the option the stored settings are ignored and the G-code stays the same. The server does the same with the form field `project_settings=true` (see [Server](#server)); the desktop app does not read them yet.
+The layers, from bottom to top: the defaults, the project's settings (of several project files in the order given), the `-c` files, the `--set` overrides. On a single object its settings from the project go over the plate's, and `--object` files over those; so `--set infill_density=30` does not change an object to which the project gives an infill of its own. Of the settings of an object only those that an object can have here are taken (see [several models](#several-models-on-one-plate) below); an object with settings of its own is sliced as an object of its own, so the project file then counts as several objects that keep their places relative to each other, and `--object N:FILE` applies to all objects of the N-th file. Of values per filament or extruder the first is taken. Everything that is left out is reported as a warning with the setting names in `keys`: `project.settings_skipped` for the project (project files saved by Bambu Studio hold 440 to 500 settings, of which about 40 are taken), `project.object_settings_skipped` per object, `project.part_settings_skipped` for settings of parts and modifiers, which are not read; a 3MF without such settings gives `project.no_settings`. Height ranges of an object (height range modifiers) are read as `<range min_z="…" max_z="…">` elements inside the object in `Metadata/model_settings.config`, with their settings as `<metadata key value>` entries or `<option opt_key>` elements, and used like `--range` for that object, below the `--range` files; an object with ranges is sliced as an object of its own. Settings a range cannot have, typically its layer height, are reported as `project.range_settings_skipped`, ranges without valid heights as `project.range_invalid`. This layout is inferred: none of the project files examined so far had height ranges, so it has only been tested with a file built to match. Without the option the stored settings are ignored and the G-code stays the same. The server does the same with the form field `project_settings=true` (see [Server](#server)); the desktop app does not read them yet.
 
 Thinner layers where the surface is shallow, thicker ones on steep walls (top and bottom shells then keep their thickness, `top_layers`/`bottom_layers` × `layer_height`):
 
@@ -127,6 +127,13 @@ printf 'infill_density = 40\nwall_loops = 4\n' > strong.toml
 cargo run --release -p slicer-cli -- slice a.stl b.stl --object 2:strong.toml -o plate.gcode
 ```
 
+Settings can also change with the height of a model ("height ranges"): `--range [N:]Z1-Z2:FILE` layers a settings file over the model's settings for the layers whose middle lies at least Z1 and less than Z2 millimetres above the bed, of the N-th model file only or, without `N:`, of every model. A range may set wall loops, wall order, seam position, top and bottom layers, sparse infill (density, pattern, angle, connection, overlap) and supports on or off (`slicer_fdm::RANGE_SETTINGS`); other keys, among them the layer height and the speeds, are refused (`settings.not_per_range`), as are malformed arguments (`cli.invalid_range`). Files for the same heights are layered in order; where ranges overlap, the later one counts. A range belongs to the model's region on every layer, so top and bottom surfaces are found across its borders as without it: a denser infill from 10 mm up does not make the layer below a top surface, and no infill from 10 mm up does not make the first layer above a bottom surface. Models without ranges, or with ranges that change nothing, print as before. In Rust, `slicer_fdm::generate_plate_with_own_settings` takes the ranges per object (`slicer_fdm::HeightRange`). The desktop app does not offer height ranges yet.
+
+```bash
+printf 'infill_density = 100\nwall_loops = 4\n' > solid.toml
+cargo run --release -p slicer-cli -- slice a.stl b.stl --range 2:10-20:solid.toml -o plate.gcode
+```
+
 ### Sending to a printer
 
 ```bash
@@ -144,13 +151,15 @@ Errors go to stderr with exit code 1. With `--json`, errors and warnings are obj
 | `settings.parse`, `settings.unknown_key`, `settings.out_of_range` | A settings file, `--set` value or Orca profile is invalid |
 | `slicing.empty_model`, `slicing.too_large`, `slicing.nothing_to_print` | The model cannot be sliced |
 | `gcode.unknown_placeholder`, `gcode.unclosed_placeholder` | Custom start or end G-code is invalid |
-| `io.read`, `io.write`, `cli.invalid_override`, `cli.invalid_object` | A file cannot be accessed or an argument is malformed |
+| `io.read`, `io.write`, `cli.invalid_override`, `cli.invalid_object`, `cli.invalid_range` | A file cannot be accessed or an argument is malformed |
 | `settings.not_per_object` | A settings file for one object (`--object`, `object_settings_<n>`) sets a key that only the whole plate can have |
+| `settings.not_per_range`, `settings.too_many_ranges` | A settings file for a height range (`--range`, `range_settings_...`) sets a key that a range cannot have, or an object has more than 256 ranges |
 | `model.unknown_plate` | The build plate chosen with `--plate` does not exist in the file |
 | `model.multiple_plates` (warning) | The project file has several build plates; only the first is sliced unless one is chosen |
 | `model.unsupported_extension` (warning) | The 3MF file requires extensions that are not supported; they are ignored |
 | `model.skipped_objects` (warning) | The 3MF file has objects that are not of type `model`; they are not printed |
 | `project.settings_skipped`, `project.object_settings_skipped`, `project.part_settings_skipped`, `project.no_settings` (warnings) | With `--project-settings`: settings stored in the project file without a counterpart, not settable per object, on parts or modifiers, or none at all |
+| `project.range_settings_skipped`, `project.range_invalid` (warnings) | With `--project-settings`: settings of a height range of an object that a range cannot have here, or a range without valid heights |
 | `mesh.repaired` (warning) | Small holes in the surface of the mesh were closed before slicing |
 | `mesh.reoriented` (warning) | Triangles that faced the other way than their neighbours were turned around before slicing |
 | `mesh.non_manifold` (warning) | Edges of the mesh belong to more than two triangles |
@@ -211,7 +220,13 @@ Several `model` fields put several objects on the plate, arranged side by side a
 curl -F model=@a.stl -F model=@b.stl -F object_settings_2=@strong.toml localhost:8080/v1/jobs
 ```
 
-The field `project_settings=true` uses the print settings stored in project files of Orca Slicer and Bambu Studio, as `--project-settings` does on the command line: the project's settings below the `settings` and `set` fields, the settings the project gives single objects over the plate's and below `object_settings_<n>`, and a project whose objects have settings of their own is sliced as those objects. What is left out appears in the job's `warnings` (`project.settings_skipped`, `project.object_settings_skipped`, `project.part_settings_skipped`, `project.no_settings`); with several models their messages start with `model <n>:`. Without the field the stored settings are ignored:
+A field `range_settings_<z1>-<z2>` holds a settings file for the layers from z1 up to z2 millimetres of every object, `range_settings_<n>_<z1>-<z2>` for those of object n only, with the same keys and rules as `--range` on the command line:
+
+```bash
+curl -F model=@a.stl -F model=@b.stl -F range_settings_2_10-20=@solid.toml localhost:8080/v1/jobs
+```
+
+The field `project_settings=true` uses the print settings stored in project files of Orca Slicer and Bambu Studio, as `--project-settings` does on the command line: the project's settings below the `settings` and `set` fields, the settings the project gives single objects over the plate's and below `object_settings_<n>`, the height ranges of objects below `range_settings_...`, and a project whose objects have settings or height ranges of their own is sliced as those objects. What is left out appears in the job's `warnings` (`project.settings_skipped`, `project.object_settings_skipped`, `project.part_settings_skipped`, `project.range_settings_skipped`, `project.range_invalid`, `project.no_settings`); with several models their messages start with `model <n>:`. Without the field the stored settings are ignored:
 
 ```bash
 curl -F model=@project.3mf -F project_settings=true -F set=nozzle_temp=215 localhost:8080/v1/jobs
@@ -221,7 +236,7 @@ curl -F model=@project.3mf -F project_settings=true -F set=nozzle_temp=215 local
 |---|---|
 | `GET /health` | Liveness check, never needs a token |
 | `GET /openapi.json` | Description of this API (OpenAPI 3.1), never needs a token |
-| `POST /v1/jobs` | Create a job (multipart fields `model`, `settings`, `set`, `plate`, `project_settings`, `object_settings_<n>`; several `settings` files are layered in order); answers `202` at once |
+| `POST /v1/jobs` | Create a job (multipart fields `model`, `settings`, `set`, `plate`, `project_settings`, `object_settings_<n>`, `range_settings_[<n>_]<z1>-<z2>`; several `settings` files are layered in order); answers `202` at once |
 | `GET /v1/jobs/{id}` | Status (`queued`, `running`, `done`, `failed`, `cancelled`), statistics, warnings or the error |
 | `GET /v1/jobs/{id}/gcode` | The G-code of a finished job |
 | `POST /v1/jobs/{id}/send` | Upload the G-code of a finished job to a printer configured on the server; JSON body `{"printer": NAME, "start": false}`; 502 if the printer fails |

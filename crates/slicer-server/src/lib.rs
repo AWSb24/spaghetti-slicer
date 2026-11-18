@@ -530,6 +530,10 @@ pub fn openapi() -> Value {
         "Settings in TOML form for model N only (object_settings_1 is the first model; every object of a project split by project_settings), layered over the plate's settings and, with project_settings, the values the project stores for the object; may only set {} (otherwise 400 settings.not_per_object); may be repeated, later ones override earlier ones",
         slicer_fdm::OBJECT_SETTINGS.join(", ")
     );
+    let range_settings = format!(
+        "Settings in TOML form for the layers whose middle lies from Z1 up to (not including) Z2 millimetres above the bed: range_settings_<z1>-<z2> for every model, range_settings_<n>_<z1>-<z2> for model N only (e.g. range_settings_10-20, range_settings_2_0.5-3.5), layered over the settings of the object; may only set {} (otherwise 400 settings.not_per_range); may be repeated, later ones override earlier ones for the same heights",
+        slicer_fdm::RANGE_SETTINGS.join(", ")
+    );
     json!({
         "openapi": "3.1.0",
         "info": {
@@ -559,10 +563,11 @@ pub fn openapi() -> Value {
                         "settings": { "type": "string", "description": "Settings in TOML form; may be repeated, later ones override earlier ones" },
                         "set": { "type": "string", "description": "One override KEY=VALUE; may be repeated" },
                         "plate": { "type": "integer", "description": "Build plate of a project file with several plates" },
-                        "project_settings": { "type": "boolean", "default": false, "description": "Use the print settings stored in project files of Orca Slicer or Bambu Studio (3MF): the project's settings below the settings and set fields, the settings of single objects over the plate's and below object_settings_<n>; a project whose objects have settings of their own is sliced as those objects. Settings without a counterpart are reported as warnings (project.settings_skipped, project.object_settings_skipped, project.part_settings_skipped, project.no_settings)" }
+                        "project_settings": { "type": "boolean", "default": false, "description": "Use the print settings stored in project files of Orca Slicer or Bambu Studio (3MF): the project's settings below the settings and set fields, the settings of single objects over the plate's and below object_settings_<n>, the settings of height ranges of objects below range_settings_...; a project whose objects have settings or height ranges of their own is sliced as those objects. Settings without a counterpart are reported as warnings (project.settings_skipped, project.object_settings_skipped, project.part_settings_skipped, project.range_settings_skipped, project.range_invalid, project.no_settings)" }
                     },
                     "patternProperties": {
-                        "^object_settings_[1-9][0-9]*$": { "type": "string", "description": object_settings }
+                        "^object_settings_[1-9][0-9]*$": { "type": "string", "description": object_settings },
+                        "^range_settings_([1-9][0-9]*_)?[0-9.]+-[0-9.]+$": { "type": "string", "description": range_settings }
                     }
                 } } } },
                 "responses": {
@@ -825,7 +830,7 @@ struct JobInput {
     /// `project_settings`, over the settings the project files store.
     settings: PlateSettings,
     /// The `object_settings_<n>` fields of every model, in the order they
-    /// were sent.
+    /// were sent, followed by the `range_settings_...` fields.
     objects: Vec<Vec<load::ObjectLayer>>,
     /// Whether to use the stored settings of project files, and the plate.
     options: load::Options,
@@ -868,9 +873,13 @@ fn slice(
         &mut warnings,
     )?;
     let settings = &plate.settings;
-    let toolpaths = slicer_fdm::generate_plate_with_object_settings(
+    let own = slicer_fdm::OwnSettings {
+        objects: &plate.objects.settings,
+        ranges: &plate.objects.ranges,
+    };
+    let toolpaths = slicer_fdm::generate_plate_with_own_settings(
         &plate.objects.meshes,
-        &plate.objects.settings,
+        own,
         plate.placement,
         settings,
         &mut warnings,
@@ -927,6 +936,7 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
     let mut plate_settings = PlateSettings::default();
     let mut overrides = Vec::new();
     let mut object_texts = Vec::new();
+    let mut range_texts = Vec::new();
     let mut options = load::Options::default();
     loop {
         let field = match multipart.next_field().await {
@@ -940,6 +950,7 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
             Err(error) => return multipart_error(&error),
         };
         let object = name.strip_prefix("object_settings_");
+        let range = name.strip_prefix("range_settings_").map(str::to_string);
         match name.as_str() {
             "model" => models.push(bytes),
             "settings" | "set" | "plate" | "project_settings" => {
@@ -977,6 +988,12 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
                 };
                 let number = object.and_then(|n| n.parse::<usize>().ok());
                 object_texts.push((name, number, text));
+            }
+            _ if range.is_some() => {
+                let Ok(text) = String::from_utf8(bytes.to_vec()) else {
+                    return invalid(format!("field '{name}' is not valid UTF-8"));
+                };
+                range_texts.push((name, range.unwrap_or_default(), text));
             }
             _ => return invalid(format!("unknown field '{name}'")),
         }
@@ -1016,7 +1033,55 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
         if let Err(e) = slicer_fdm::apply_object_toml(object, &text) {
             return error_response(StatusCode::BAD_REQUEST, &name.apply(e));
         }
-        layers.push(load::ObjectLayer { text, name });
+        layers.push(load::ObjectLayer {
+            text,
+            name,
+            range: None,
+        });
+    }
+    // Height ranges of every model (range_settings_<z1>-<z2>) or of one
+    // (range_settings_<n>_<z1>-<z2>), checked over the plate's settings.
+    if range_texts.len() > load::MAX_RANGES {
+        return invalid(format!(
+            "{} range_settings fields; at most {} are allowed",
+            range_texts.len(),
+            load::MAX_RANGES
+        ));
+    }
+    for (name, suffix, text) in range_texts {
+        let (model, heights) = match suffix.split_once('_') {
+            Some((number, heights)) => (Some(number), heights),
+            None => (None, suffix.as_str()),
+        };
+        let model = match model.map(|n| n.parse::<usize>().ok().and_then(|n| n.checked_sub(1))) {
+            Some(Some(index)) if index < models.len() => Some(index),
+            None => None,
+            Some(_) => {
+                return invalid(format!(
+                    "field '{name}' names no object; range_settings_1_<z1>-<z2> to range_settings_{}_<z1>-<z2> name the models in the order they are sent",
+                    models.len()
+                ));
+            }
+        };
+        let Some((from, to)) = load::parse_height_range(heights) else {
+            return invalid(format!(
+                "field '{name}' expects heights <z1>-<z2> in millimetres with 0 <= z1 < z2"
+            ));
+        };
+        let name = load::Name::new(name.clone(), "field", name);
+        let mut range = slicer_fdm::HeightRange::new(from, to);
+        if let Err(e) = slicer_fdm::apply_range_toml(&mut range, &settings, &text) {
+            return error_response(StatusCode::BAD_REQUEST, &name.apply(e));
+        }
+        for (index, layers) in objects.iter_mut().enumerate() {
+            if model.is_none_or(|model| model == index) {
+                layers.push(load::ObjectLayer {
+                    text: text.clone(),
+                    name: name.clone(),
+                    range: Some((from, to)),
+                });
+            }
+        }
     }
 
     let id = Uuid::new_v4();

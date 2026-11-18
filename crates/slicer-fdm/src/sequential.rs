@@ -7,7 +7,7 @@ use slicer_core::{Diagnostics, Mesh, polygon};
 use slicer_profiles::Settings;
 
 use crate::plate::{self, Placement};
-use crate::{FdmError, NO_OBJECT, Progress, Toolpaths};
+use crate::{FdmError, NO_OBJECT, OwnSettings, Progress, Toolpaths};
 
 /// Area in mm² by which the outlines of two objects, grown by half the
 /// clearance each, must overlap for the objects to count as too close.
@@ -22,7 +22,7 @@ const MIN_OVERLAP: f64 = 0.01;
 // the progress starts over with every object.
 pub(crate) fn generate(
     objects: &[Mesh],
-    own: &[Option<Settings>],
+    own: OwnSettings,
     placement: Placement,
     settings: &Settings,
     diagnostics: &mut Diagnostics,
@@ -66,10 +66,15 @@ pub(crate) fn generate(
             prime_tower_width: 0.0,
             ..settings.clone()
         };
-        let own = [own.get(index).cloned().flatten()];
-        let toolpaths = crate::generate_plate_with_object_settings(
+        let settings_of_one = [own.objects.get(index).cloned().flatten()];
+        let ranges_of_one = [own.ranges.get(index).cloned().unwrap_or_default()];
+        let one = OwnSettings {
+            objects: &settings_of_one,
+            ranges: &ranges_of_one,
+        };
+        let toolpaths = crate::generate_plate_with_own_settings(
             std::slice::from_ref(&placed[index]),
-            &own,
+            one,
             Placement::AsGiven,
             &alone,
             diagnostics,
@@ -87,7 +92,7 @@ pub(crate) fn generate(
     }
     Ok(Toolpaths {
         layers,
-        object_settings: crate::objects::speed_table(objects.len(), own, settings),
+        object_settings: crate::objects::speed_table(objects.len(), own.objects, settings),
     })
 }
 

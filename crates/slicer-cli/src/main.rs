@@ -58,6 +58,14 @@ enum Command {
         /// several times, also for the same object
         #[arg(long = "object", value_name = "N:FILE")]
         object: Vec<String>,
+        /// Settings file in TOML format for the layers whose middle lies
+        /// from Z1 up to (not including) Z2 millimetres above the bed, of
+        /// object N only (1 is the first model file) or, without N, of
+        /// every object; layered over the object's settings. It may only
+        /// set walls, seam, top and bottom layers, infill and supports. May
+        /// be given several times
+        #[arg(long = "range", value_name = "[N:]Z1-Z2:FILE")]
+        range: Vec<String>,
         /// Use the print settings stored in project files of Orca Slicer or
         /// Bambu Studio (3MF): the project's settings below the -c files
         /// and --set overrides, the settings of single objects over the
@@ -247,6 +255,7 @@ fn main() -> ExitCode {
             config,
             set,
             object,
+            range,
             project_settings,
             plate,
             svg,
@@ -266,6 +275,7 @@ fn main() -> ExitCode {
                             config: &config,
                             overrides: &set,
                             objects: &object,
+                            ranges: &range,
                             project: project_settings,
                         };
                         slice(&input, output, placement, &stored, plate, svg, send)
@@ -472,9 +482,63 @@ fn read_object_files(
         slot.push(load::ObjectLayer {
             text,
             name: file_name(path),
+            range: None,
         });
     }
     Ok(own)
+}
+
+/// Adds the settings files of the `--range [N:]Z1-Z2:FILE` arguments to
+/// `own`, the settings files of every model file: to those of model N, or
+/// without N to those of every model. Every file is checked by layering it
+/// over `settings`.
+fn read_range_files(
+    own: &mut [Vec<load::ObjectLayer>],
+    ranges: &[String],
+    settings: &Settings,
+) -> Result<(), Diagnostic> {
+    let count = own.len();
+    for item in ranges {
+        let invalid = || {
+            Diagnostic::error(
+                "cli.invalid_range",
+                format!(
+                    "--range expects [N:]Z1-Z2:FILE with N from 1 to {count} and heights 0 <= Z1 < Z2 in millimetres, got '{item}'"
+                ),
+            )
+            .with("argument", item)
+        };
+        let (first, rest) = item.split_once(':').ok_or_else(invalid)?;
+        // A number alone names the model; heights have a dash.
+        let (model, heights, path) = if first.contains('-') {
+            (None, first, rest)
+        } else {
+            let (heights, path) = rest.split_once(':').ok_or_else(invalid)?;
+            let model = first
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| n.checked_sub(1))
+                .filter(|&index| index < count)
+                .ok_or_else(invalid)?;
+            (Some(model), heights, path)
+        };
+        let (from, to) = load::parse_height_range(heights).ok_or_else(invalid)?;
+        let path = Path::new(path);
+        let text = fs::read_to_string(path).map_err(|e| io_error("io.read", path, &e))?;
+        let mut range = slicer_fdm::HeightRange::new(from, to);
+        slicer_fdm::apply_range_toml(&mut range, settings, &text).map_err(in_file(path))?;
+        for (index, layers) in own.iter_mut().enumerate() {
+            if model.is_none_or(|model| model == index) {
+                layers.push(load::ObjectLayer {
+                    text: text.clone(),
+                    name: file_name(path),
+                    range: Some((from, to)),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Settings from the files in `config`, layered in order over `base`, with
@@ -500,11 +564,13 @@ fn read_settings(
 
 /// Where the settings of `slice` come from, in the order they are layered:
 /// the project files (if `project`), the files in `config`, the
-/// `overrides`, and for single objects the `objects` arguments.
+/// `overrides`, for single objects the `objects` arguments and for height
+/// ranges of objects the `ranges` arguments.
 struct SettingsArgs<'a> {
     config: &'a [PathBuf],
     overrides: &'a [String],
     objects: &'a [String],
+    ranges: &'a [String],
     project: bool,
 }
 
@@ -535,7 +601,8 @@ fn slice(
         }
     }
     let settings = read_settings(base, args.config, args.overrides)?;
-    let object_files = read_object_files(inputs.len(), args.objects, &settings)?;
+    let mut object_files = read_object_files(inputs.len(), args.objects, &settings)?;
+    read_range_files(&mut object_files, args.ranges, &settings)?;
     if files.is_empty() {
         for input in inputs {
             files.push(fs::read(input).map_err(|e| io_error("io.read", input, &e))?);
@@ -550,7 +617,7 @@ fn slice(
             name: Some(name),
         })
         .collect();
-    // --object files go over every object of their model file.
+    // --object and --range files go over every object of their model file.
     let mut objects = load::Objects::read(
         &models,
         &stored,
@@ -561,9 +628,13 @@ fn slice(
     )?;
     let placement = objects.place(inputs.len(), placing, &settings);
     let stop = std::sync::atomic::AtomicBool::new(false);
-    let toolpaths = slicer_fdm::generate_plate_with_object_settings(
+    let own = slicer_fdm::OwnSettings {
+        objects: &objects.settings,
+        ranges: &objects.ranges,
+    };
+    let toolpaths = slicer_fdm::generate_plate_with_own_settings(
         &objects.meshes,
-        &objects.settings,
+        own,
         placement,
         &settings,
         &mut warnings,

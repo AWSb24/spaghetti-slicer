@@ -11,6 +11,12 @@
 //!   the settings changed for this object only. Its `<part>` elements
 //!   (parts, modifiers) carry their own entries, among them settings of
 //!   modifiers, which are not read here.
+//! - Settings for a range of the height of an object ("height range
+//!   modifiers") are not in any of the project files seen so far. They are
+//!   read from `<range min_z="…" max_z="…">` elements inside the object
+//!   (usually wrapped in `<layer_config_ranges>`), with the settings as
+//!   `<metadata key="…" value="…"/>` entries or as
+//!   `<option opt_key="…">value</option>` elements.
 //!
 //! The values are returned as text; turning them into settings is up to the
 //! caller (`slicer_profiles::orca`).
@@ -42,8 +48,21 @@ const NOT_SETTINGS: &[&str] = &[
     "source_in_meters",
 ];
 
+/// Settings changed for a range of the height of one object.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RangeSettings {
+    /// Height where the range starts, in millimetres above the bottom of
+    /// the object; not a number if the file gives none.
+    pub min_z: f64,
+    /// Height where the range ends; not a number if the file gives none.
+    pub max_z: f64,
+    /// The settings by the program's own names, with their values as text,
+    /// in the order of the file.
+    pub values: Vec<(String, String)>,
+}
+
 /// Settings changed for one object of a project.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ObjectSettings {
     /// Identifier of the object in the 3D model, as build items name it.
     pub id: u32,
@@ -55,10 +74,12 @@ pub struct ObjectSettings {
     /// Names of settings on parts or modifiers of the object, which are not
     /// read.
     pub part_keys: Vec<String>,
+    /// Settings changed for ranges of its height, in the order of the file.
+    pub ranges: Vec<RangeSettings>,
 }
 
 /// The print settings a project file stores.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProjectSettings {
     /// The JSON text of the project's settings, if the file has them.
     pub config: Option<String>,
@@ -97,6 +118,10 @@ fn object_settings(text: &str) -> Result<Vec<ObjectSettings>, ThreeMfError> {
     let mut objects = Vec::new();
     let mut current: Option<ObjectSettings> = None;
     let mut in_part = false;
+    // The height range being read, and the setting of the `<option>`
+    // element being read with its text so far.
+    let mut range: Option<RangeSettings> = None;
+    let mut option: Option<(String, String)> = None;
     let mut reader = quick_xml::Reader::from_str(text);
     loop {
         let event = reader.read_event().map_err(|e| ThreeMfError::Xml {
@@ -114,10 +139,32 @@ fn object_settings(text: &str) -> Result<Vec<ObjectSettings>, ThreeMfError> {
                                 ..ObjectSettings::default()
                             });
                     in_part = false;
+                    range = None;
                 }
                 "part" => in_part = true,
+                "range" if current.is_some() && !in_part => {
+                    let [min, max] = attributes(&element, ["min_z", "max_z"]);
+                    let height = |text: Option<String>| {
+                        text.and_then(|t| t.trim().parse::<f64>().ok())
+                            .unwrap_or(f64::NAN)
+                    };
+                    range = Some(RangeSettings {
+                        min_z: height(min),
+                        max_z: height(max),
+                        values: Vec::new(),
+                    });
+                }
+                "option" if range.is_some() => {
+                    let [key] = attributes(&element, ["opt_key"]);
+                    option = key.map(|key| (key, String::new()));
+                }
                 _ => {}
             },
+            Event::Text(text) => {
+                if let Some((_, value)) = option.as_mut() {
+                    value.push_str(&text.xml_content(quick_xml::XmlVersion::Implicit1_0));
+                }
+            }
             Event::Empty(element) if element.local_name().into_inner() == "metadata" => {
                 let Some(object) = current.as_mut() else {
                     continue;
@@ -126,7 +173,11 @@ fn object_settings(text: &str) -> Result<Vec<ObjectSettings>, ThreeMfError> {
                 let (Some(key), Some(value)) = (key, value) else {
                     continue;
                 };
-                if key == "name" && !in_part {
+                if let Some(range) = range.as_mut() {
+                    if !NOT_SETTINGS.contains(&key.as_str()) {
+                        range.values.push((key, value));
+                    }
+                } else if key == "name" && !in_part {
                     object.name = Some(value);
                 } else if NOT_SETTINGS.contains(&key.as_str()) {
                     // Describes the object or part.
@@ -139,12 +190,24 @@ fn object_settings(text: &str) -> Result<Vec<ObjectSettings>, ThreeMfError> {
             Event::End(element) => match element.local_name().into_inner() {
                 "object" => {
                     if let Some(object) = current.take()
-                        && !(object.values.is_empty() && object.part_keys.is_empty())
+                        && !(object.values.is_empty()
+                            && object.part_keys.is_empty()
+                            && object.ranges.is_empty())
                     {
                         objects.push(object);
                     }
                 }
                 "part" => in_part = false,
+                "range" => {
+                    if let (Some(object), Some(range)) = (current.as_mut(), range.take()) {
+                        object.ranges.push(range);
+                    }
+                }
+                "option" => {
+                    if let (Some(range), Some((key, value))) = (range.as_mut(), option.take()) {
+                        range.values.push((key, value.trim().to_string()));
+                    }
+                }
                 _ => {}
             },
             Event::Eof => break,
@@ -184,6 +247,23 @@ mod tests {
     <metadata key="name" value="Plain"/>
     <metadata key="extruder" value="2"/>
   </object>
+  <object id="5">
+    <metadata key="name" value="Ranged"/>
+    <layer_config_ranges>
+      <range min_z="10" max_z="20.5">
+        <metadata key="extruder" value="1"/>
+        <metadata key="sparse_infill_density" value="100%"/>
+        <metadata key="layer_height" value="0.1"/>
+      </range>
+      <range min_z="25" max_z="30">
+        <option opt_key="wall_loops">4</option>
+      </range>
+      <range max_z="40"/>
+    </layer_config_ranges>
+  </object>
+  <object id="6">
+    <metadata key="extruder" value="2"/>
+  </object>
   <plate>
     <metadata key="plater_id" value="1"/>
     <model_instance>
@@ -205,9 +285,10 @@ mod tests {
             read.config.as_deref(),
             Some("{ \"layer_height\": \"0.16\" }")
         );
-        // Object 4 sets nothing and is left out.
+        // Objects 4 and 6 set nothing and are left out.
+        assert_eq!(read.objects.len(), 2);
         assert_eq!(
-            read.objects,
+            read.objects[..1],
             [ObjectSettings {
                 id: 3,
                 name: Some("Body & lid".into()),
@@ -216,10 +297,33 @@ mod tests {
                     ("brim_type".into(), "no_brim".into()),
                 ],
                 part_keys: vec!["wall_loops".into()],
+                ranges: Vec::new(),
             }]
         );
         assert_eq!(read.object(3).map(|o| o.values.len()), Some(2));
         assert!(read.object(4).is_none());
+        // Object 5 sets nothing but has height ranges; the empty range is
+        // left out.
+        let ranged = read.object(5).unwrap();
+        assert!(ranged.values.is_empty());
+        assert_eq!(
+            ranged.ranges,
+            [
+                RangeSettings {
+                    min_z: 10.0,
+                    max_z: 20.5,
+                    values: vec![
+                        ("sparse_infill_density".into(), "100%".into()),
+                        ("layer_height".into(), "0.1".into()),
+                    ],
+                },
+                RangeSettings {
+                    min_z: 25.0,
+                    max_z: 30.0,
+                    values: vec![("wall_loops".into(), "4".into())],
+                },
+            ]
+        );
     }
 
     #[test]

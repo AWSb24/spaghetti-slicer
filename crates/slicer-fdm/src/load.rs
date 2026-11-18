@@ -8,6 +8,9 @@
 //! for the plate. A single object starts from the plate's settings, takes
 //! the values the project stores for it ([`model_objects`]) and then the
 //! caller's settings for the objects of its model file ([`ObjectLayer`]).
+//! Height ranges of an object ([`HeightRange`]) come from the project and
+//! from the caller in the same order; they set their keys over whatever
+//! the object ends up with.
 //! [`read_plate`] does all of it; the steps are public for callers that
 //! read their files in between.
 //!
@@ -17,11 +20,27 @@ use slicer_core::{Diagnose, Diagnostic, Diagnostics, Mesh};
 use slicer_formats::{ObjectSettings, ProjectSettings};
 use slicer_profiles::Settings;
 
-use crate::{ARRANGE_GAP, Placement, apply_object_orca, apply_object_toml};
+use crate::{
+    ARRANGE_GAP, HeightRange, Placement, apply_object_orca, apply_object_toml, apply_range_orca,
+    apply_range_toml,
+};
 
 /// Largest number of setting names a warning lists in its message; the
 /// `keys` field of the warning holds them all.
 const LISTED_KEYS: usize = 12;
+
+/// Largest number of height ranges of one object.
+pub const MAX_RANGES: usize = 256;
+
+/// The heights `Z1-Z2` of a height range in millimetres, as the command
+/// line and the server take them, e.g. `10-20` or `2.5-7.25`; `None` unless
+/// both are numbers with 0 <= Z1 < Z2.
+pub fn parse_height_range(text: &str) -> Option<(f64, f64)> {
+    let (from, to) = text.trim().split_once('-')?;
+    let from: f64 = from.trim().parse().ok()?;
+    let to: f64 = to.trim().parse().ok()?;
+    (from.is_finite() && to.is_finite() && 0.0 <= from && from < to).then_some((from, to))
+}
 
 /// How messages name a model file or a settings text, e.g. by its path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,13 +91,18 @@ pub struct Model<'a> {
 
 /// Settings in TOML form for every object of one model file, layered over
 /// the settings of each of them. They may only set
-/// [`crate::OBJECT_SETTINGS`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// [`crate::OBJECT_SETTINGS`], or, for a height range,
+/// [`crate::RANGE_SETTINGS`].
+#[derive(Debug, Clone, PartialEq)]
 pub struct ObjectLayer {
     /// The settings in TOML form.
     pub text: String,
     /// How errors about the text name it.
     pub name: Name,
+    /// The heights in millimetres above the bed from which and up to which
+    /// the settings count (see [`HeightRange`]); `None` for the whole
+    /// object. Layers for the same heights go into one range.
+    pub range: Option<(f64, f64)>,
 }
 
 /// How the objects are put on the bed.
@@ -108,6 +132,9 @@ pub struct Objects {
     /// The settings of every object that has its own, for
     /// [`crate::generate_plate_with_object_settings`].
     pub settings: Vec<Option<Settings>>,
+    /// The height ranges of every object, for
+    /// [`crate::generate_plate_with_own_settings`].
+    pub ranges: Vec<Vec<HeightRange>>,
     /// The model file (its index) every object comes from.
     pub model: Vec<usize>,
 }
@@ -178,14 +205,15 @@ pub fn project_base(
 }
 
 /// The settings of one object of a project file over `settings`, the
-/// plate's; `None` if they change nothing. Settings that are not taken
-/// are reported.
+/// plate's, `None` if they change nothing, and its height ranges. Settings
+/// that are not taken are reported, as are ranges whose heights are not
+/// valid.
 fn project_object(
     name: Option<&Name>,
     object: &ObjectSettings,
     settings: &Settings,
     warnings: &mut Diagnostics,
-) -> Option<Settings> {
+) -> (Option<Settings>, Vec<HeightRange>) {
     let object_name = match &object.name {
         Some(object_name) => format!("object '{object_name}' (id {})", object.id),
         None => format!("object {}", object.id),
@@ -233,51 +261,127 @@ fn project_object(
             .with("keys", keys.join(" ")),
         ));
     }
-    (own != *settings).then_some(own)
+    let ranges = project_ranges(name, object, &object_name, &own, warnings);
+    ((own != *settings).then_some(own), ranges)
 }
 
+/// The height ranges of one object of a project file, whose settings are
+/// `own`. Settings that are not taken are reported
+/// (`project.range_settings_skipped`), as are ranges without valid heights
+/// (`project.range_invalid`), which are left out.
+// ponytail: the heights of a range are taken as heights above the bed;
+// the project counts them from the bottom of the object, which is the
+// same for objects standing on the bed.
+fn project_ranges(
+    name: Option<&Name>,
+    object: &ObjectSettings,
+    object_name: &str,
+    own: &Settings,
+    warnings: &mut Diagnostics,
+) -> Vec<HeightRange> {
+    let mut ranges = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut reasons: Vec<String> = Vec::new();
+    for stored in &object.ranges {
+        let (from, to) = (stored.min_z, stored.max_z);
+        if !(from.is_finite() && to.is_finite() && from < to) {
+            warnings.push(named(
+                name,
+                Diagnostic::warning(
+                    "project.range_invalid",
+                    format!(
+                        "{object_name}: a height range from {from} to {to} mm is not valid and was left out"
+                    ),
+                )
+                .with("object", object.id),
+            ));
+            continue;
+        }
+        let mut range = HeightRange::new(from, to);
+        for (key, reason) in apply_range_orca(&mut range, own, &stored.values) {
+            if !skipped.contains(&key) {
+                if reasons.len() < LISTED_KEYS {
+                    reasons.push(format!("{key} ({reason})"));
+                }
+                skipped.push(key);
+            }
+        }
+        if !range.values.is_empty() {
+            ranges.push(range);
+        }
+    }
+    if !skipped.is_empty() {
+        let more = if skipped.len() > LISTED_KEYS {
+            ", ..."
+        } else {
+            ""
+        };
+        warnings.push(named(
+            name,
+            Diagnostic::warning(
+                "project.range_settings_skipped",
+                format!(
+                    "{object_name}: {} setting(s) of its height ranges were left out: {}{more}",
+                    skipped.len(),
+                    reasons.join(", "),
+                ),
+            )
+            .with("object", object.id)
+            .with("keys", skipped.join(" ")),
+        ));
+    }
+    ranges
+}
+
+/// One object read by [`model_objects`]: its mesh, its settings if it has
+/// its own, and its height ranges.
+pub type ModelObject = (Mesh, Option<Settings>, Vec<HeightRange>);
+
 /// Reads `model` as one object, or, if `stored` (what [`project_base`]
-/// returned for it) gives settings of their own to objects on the plate
-/// (over `settings`, the plate's), as one object per build item, each with
-/// the settings of its object. `plate` selects a build plate of a project
-/// file with several plates.
+/// returned for it) gives settings of their own or height ranges to
+/// objects on the plate (over `settings`, the plate's), as one object per
+/// build item, each with the settings and ranges of its object. `plate`
+/// selects a build plate of a project file with several plates.
 pub fn model_objects(
     model: Model,
     stored: Option<&ProjectSettings>,
     settings: &Settings,
     plate: Option<u32>,
     warnings: &mut Diagnostics,
-) -> Result<Vec<(Mesh, Option<Settings>)>, Diagnostic> {
+) -> Result<Vec<ModelObject>, Diagnostic> {
     let name = model.name;
     if let Some(stored) = stored.filter(|stored| !stored.objects.is_empty()) {
         let mut found = Diagnostics::new();
         let objects = slicer_formats::parse_3mf_plate_objects(model.bytes, plate, &mut found)
             .map_err(|e| named(name, e.diagnostic()))?;
         // The settings of every object on the plate, once per object.
-        let mut by_id: Vec<(u32, Option<Settings>)> = Vec::new();
+        let mut by_id: Vec<(u32, Option<Settings>, Vec<HeightRange>)> = Vec::new();
         for (id, _) in &objects {
-            if by_id.iter().all(|(known, _)| known != id) {
-                let own = stored
-                    .object(*id)
-                    .and_then(|object| project_object(name, object, settings, &mut found));
-                by_id.push((*id, own));
+            if by_id.iter().all(|(known, ..)| known != id) {
+                let (own, ranges) = match stored.object(*id) {
+                    Some(object) => project_object(name, object, settings, &mut found),
+                    None => (None, Vec::new()),
+                };
+                by_id.push((*id, own, ranges));
             }
         }
         // Without settings of their own the objects are read as one, as
         // without the project's settings.
-        if by_id.iter().any(|(_, own)| own.is_some()) {
+        if by_id
+            .iter()
+            .any(|(_, own, ranges)| own.is_some() || !ranges.is_empty())
+        {
             for warning in found.as_slice() {
                 warnings.push(warning.clone());
             }
             return Ok(objects
                 .into_iter()
-                .map(|(id, mesh)| {
-                    let own = by_id
-                        .iter()
-                        .find(|(known, _)| *known == id)
-                        .and_then(|(_, own)| own.clone());
-                    (mesh, own)
-                })
+                .map(
+                    |(id, mesh)| match by_id.iter().find(|(known, ..)| *known == id) {
+                        Some((_, own, ranges)) => (mesh, own.clone(), ranges.clone()),
+                        None => (mesh, None, Vec::new()),
+                    },
+                )
                 .collect());
         }
         // Only what was found about the settings counts, the rest is
@@ -290,14 +394,17 @@ pub fn model_objects(
     }
     let mesh =
         slicer_formats::parse_model(model.bytes, plate, warnings).map_err(|e| named(name, e))?;
-    Ok(vec![(mesh, None)])
+    Ok(vec![(mesh, None, Vec::new())])
 }
 
 impl Objects {
     /// Reads the objects of every one of `models` with [`model_objects`];
     /// `stored[i]` is what [`project_base`] returned for model `i` (none if
     /// the slice is shorter), `layers[i]` the settings for the objects of
-    /// model `i`, layered over each of them in order.
+    /// model `i`, layered over each of them in order: first those for the
+    /// whole object, then those for height ranges. Fails if an object ends
+    /// up with more than [`MAX_RANGES`] height ranges
+    /// (`settings.too_many_ranges`).
     pub fn read(
         models: &[Model],
         stored: &[Option<ProjectSettings>],
@@ -309,13 +416,46 @@ impl Objects {
         let mut objects = Self::default();
         for (index, model) in models.iter().enumerate() {
             let stored = stored.get(index).and_then(Option::as_ref);
-            for (mesh, mut own) in model_objects(*model, stored, settings, plate, warnings)? {
-                for layer in layers.get(index).into_iter().flatten() {
+            let layers = layers.get(index).map_or(&[][..], Vec::as_slice);
+            for (mesh, mut own, mut ranges) in
+                model_objects(*model, stored, settings, plate, warnings)?
+            {
+                for layer in layers.iter().filter(|layer| layer.range.is_none()) {
                     let object = own.get_or_insert_with(|| settings.clone());
                     apply_object_toml(object, &layer.text).map_err(|e| layer.name.apply(e))?;
                 }
+                let object = own.as_ref().unwrap_or(settings);
+                for layer in layers {
+                    let Some((from, to)) = layer.range else {
+                        continue;
+                    };
+                    let at = match ranges.iter().position(|r| r.from == from && r.to == to) {
+                        Some(at) => at,
+                        None => {
+                            ranges.push(HeightRange::new(from, to));
+                            ranges.len() - 1
+                        }
+                    };
+                    apply_range_toml(&mut ranges[at], object, &layer.text)
+                        .map_err(|e| layer.name.apply(e))?;
+                }
+                if ranges.len() > MAX_RANGES {
+                    return Err(named(
+                        model.name,
+                        Diagnostic::error(
+                            "settings.too_many_ranges",
+                            format!(
+                                "an object has {} height ranges; at most {MAX_RANGES} are allowed",
+                                ranges.len()
+                            ),
+                        )
+                        .with("ranges", ranges.len())
+                        .with("max", MAX_RANGES),
+                    ));
+                }
                 objects.meshes.push(mesh);
                 objects.settings.push(own);
+                objects.ranges.push(ranges);
                 objects.model.push(index);
             }
         }
@@ -450,6 +590,13 @@ mod tests {
     /// A project file of Orca Slicer reduced to what is read: two cubes,
     /// the project's settings and settings of object 2 of its own.
     fn project() -> Vec<u8> {
+        let settings = "<config><object id=\"2\"><metadata key=\"name\" value=\"Right\"/><metadata key=\"sparse_infill_density\" value=\"60%\"/><metadata key=\"layer_height\" value=\"0.1\"/></object></config>";
+        project_with(settings)
+    }
+
+    /// The project of [`project`] with `settings` as its
+    /// `Metadata/model_settings.config`.
+    fn project_with(settings: &str) -> Vec<u8> {
         let cube = Mesh::cuboid(20.0, 20.0, 6.0);
         let vertices: String = cube
             .vertices
@@ -468,7 +615,6 @@ mod tests {
             "<?xml version=\"1.0\"?><model unit=\"millimeter\" xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\"><resources><object id=\"1\" type=\"model\">{mesh}</object><object id=\"2\" type=\"model\">{mesh}</object></resources><build><item objectid=\"1\" transform=\"1 0 0 0 1 0 0 0 1 80 100 0\"/><item objectid=\"2\" transform=\"1 0 0 0 1 0 0 0 1 140 100 0\"/></build></model>"
         );
         let config = r#"{ "layer_height": "0.25", "wall_loops": "3", "made_up_setting": "7" }"#;
-        let settings = "<config><object id=\"2\"><metadata key=\"name\" value=\"Right\"/><metadata key=\"sparse_infill_density\" value=\"60%\"/><metadata key=\"layer_height\" value=\"0.1\"/></object></config>";
         slicer_formats::write_package(&[
             ("3D/3dmodel.model", &model),
             ("Metadata/project_settings.config", config),
@@ -492,6 +638,7 @@ mod tests {
         let layers = vec![vec![ObjectLayer {
             text: "wall_loops = 5".into(),
             name: Name::new("one.toml", "path", "one.toml"),
+            range: None,
         }]];
         let mut warnings = Diagnostics::new();
         let plate = read_plate(
@@ -536,6 +683,78 @@ mod tests {
         assert_eq!(plate.settings, Settings::default());
         assert_eq!(plate.objects.meshes.len(), 1);
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn height_ranges_come_from_the_project_and_the_caller() {
+        let settings = concat!(
+            "<config><object id=\"1\"><metadata key=\"name\" value=\"Left\"/>",
+            "<layer_config_ranges>",
+            "<range min_z=\"2\" max_z=\"4\"><metadata key=\"sparse_infill_density\" value=\"100%\"/>",
+            "<metadata key=\"layer_height\" value=\"0.1\"/></range>",
+            "<range min_z=\"5\" max_z=\"1\"><metadata key=\"wall_loops\" value=\"4\"/></range>",
+            "</layer_config_ranges></object></config>"
+        );
+        let bytes = project_with(settings);
+        let name = Name::new("a.3mf", "path", "a.3mf");
+        let models = [Model {
+            bytes: &bytes,
+            name: Some(&name),
+        }];
+        let options = Options {
+            project_settings: true,
+            ..Options::default()
+        };
+        let layer = |text: &str, range| ObjectLayer {
+            text: text.into(),
+            name: Name::new("r.toml", "path", "r.toml"),
+            range,
+        };
+        let layers = vec![vec![
+            layer("wall_loops = 4", Some((2.0, 4.0))),
+            layer("top_layers = 2", Some((4.0, 6.0))),
+            layer("infill_density = 30.0", None),
+        ]];
+        let mut warnings = Diagnostics::new();
+        let plate = read_plate(&models, options, Ok, &layers, &mut warnings).unwrap();
+        // The ranges alone split the project into its objects.
+        let objects = &plate.objects;
+        assert_eq!(objects.meshes.len(), 2);
+        let first = &objects.ranges[0];
+        assert_eq!(first.len(), 2);
+        assert_eq!((first[0].from, first[0].to), (2.0, 4.0));
+        let low = crate::range_settings(objects.settings[0].as_ref().unwrap(), &first[0]);
+        assert_eq!((low.infill_density, low.wall_loops), (100.0, 4));
+        // The caller's ranges go to every object of the model.
+        assert_eq!(objects.ranges[1].len(), 2);
+        assert_eq!(
+            objects.ranges[1][0].values,
+            [("wall_loops".into(), "4".into())]
+        );
+        assert_eq!(
+            objects.ranges[1][1].values,
+            [("top_layers".into(), "2".into())]
+        );
+        assert_eq!(objects.settings[1].as_ref().unwrap().infill_density, 30.0);
+        assert_eq!(
+            warnings.codes(),
+            [
+                "project.settings_skipped",
+                "project.range_invalid",
+                "project.range_settings_skipped"
+            ]
+        );
+        assert_eq!(warnings.as_slice()[2].context["keys"], "layer_height");
+
+        // Settings that a range cannot have fail, naming their file.
+        let layers = vec![vec![layer("layer_height = 0.1", Some((1.0, 2.0)))]];
+        let error = read_plate(&models, options, Ok, &layers, &mut Diagnostics::new()).unwrap_err();
+        assert_eq!(error.code, "settings.not_per_range");
+        assert!(error.message.starts_with("r.toml: "));
+        assert_eq!(parse_height_range(" 2.5-7.25 "), Some((2.5, 7.25)));
+        for text in ["", "5", "5-5", "6-5", "-1-5", "a-b", "inf-5"] {
+            assert_eq!(parse_height_range(text), None, "{text}");
+        }
     }
 
     #[test]
