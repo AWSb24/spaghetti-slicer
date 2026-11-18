@@ -73,6 +73,9 @@ More print options, all off by default (see `docs/settings.md`):
 - `elephant_foot_compensation = 0.15` prints the first layer that much smaller all round.
 - `spiral_vase = true` prints the outer wall alone above the solid bottom, as one line rising continuously, without seams.
 - `ironing = true` passes over every top surface once more with 10 % of the material (`ironing_flow`), lines `ironing_spacing` apart at `ironing_speed`.
+- `avoid_crossing_walls = true` sends travel moves round holes and notches inside the part instead of over open air, which also saves their retraction.
+- `fuzzy_skin = true` gives the outer wall a rough texture: its points are moved in and out at random by up to half of `fuzzy_skin_thickness`, one every `fuzzy_skin_point_distance`, the same on every run. The first layer stays smooth.
+- `wipe_distance = 2` retracts while going back 2 mm along the line just printed.
 
 None of them has been tried on a printer yet.
 

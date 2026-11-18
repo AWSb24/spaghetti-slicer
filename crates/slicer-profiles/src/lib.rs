@@ -183,6 +183,18 @@ pub struct Settings {
     pub wall_order: WallOrder,
     /// Where the walls of a layer start and end.
     pub seam_position: SeamPosition,
+    /// Whether travel moves go round holes and notches inside the part
+    /// instead of crossing them over open air, which also spares their
+    /// retraction.
+    pub avoid_crossing_walls: bool,
+    /// Whether the outer wall gets a rough, textured surface: its points
+    /// are moved in and out at random.
+    pub fuzzy_skin: bool,
+    /// How far fuzzy skin moves the points of the outer wall, in and out
+    /// together.
+    pub fuzzy_skin_thickness: f64,
+    /// Distance between the moved points of fuzzy skin.
+    pub fuzzy_skin_point_distance: f64,
     /// Number of solid layers at the top.
     pub top_layers: u32,
     /// Number of solid layers at the bottom.
@@ -278,6 +290,9 @@ pub struct Settings {
     pub retraction_min_travel: f64,
     /// Nozzle lift during retracted travel moves; 0 disables it.
     pub z_hop: f64,
+    /// Before a travel, the nozzle goes back this far along the line just
+    /// printed while it retracts, wiping off what oozes; 0 turns it off.
+    pub wipe_distance: f64,
 
     // Custom G-code
     /// G-code inserted before the print. `{setting_name}` placeholders are replaced.
@@ -324,6 +339,10 @@ impl Default for Settings {
             wall_loops: 2,
             wall_order: WallOrder::InnerOuter,
             seam_position: SeamPosition::Rear,
+            avoid_crossing_walls: false,
+            fuzzy_skin: false,
+            fuzzy_skin_thickness: 0.3,
+            fuzzy_skin_point_distance: 0.8,
             top_layers: 5,
             bottom_layers: 4,
             spiral_vase: false,
@@ -361,6 +380,7 @@ impl Default for Settings {
             retraction_speed: 35.0,
             retraction_min_travel: 1.5,
             z_hop: 0.0,
+            wipe_distance: 0.0,
             start_gcode: "M140 S{bed_temp_first_layer}\nM104 S{nozzle_temp_first_layer}\nG28\nM190 S{bed_temp_first_layer}\nM109 S{nozzle_temp_first_layer}"
                 .to_owned(),
             end_gcode: "M104 S0\nM140 S0\nM107\nG91\nG1 Z10 F600\nG90\nM84".to_owned(),
@@ -697,6 +717,14 @@ impl Settings {
             ("ironing_flow", self.ironing_flow, 0.0, 100.0),
             ("ironing_spacing", self.ironing_spacing, 0.01, 2.0),
             ("ironing_speed", self.ironing_speed, 1.0, 1000.0),
+            ("fuzzy_skin_thickness", self.fuzzy_skin_thickness, 0.0, 2.0),
+            (
+                "fuzzy_skin_point_distance",
+                self.fuzzy_skin_point_distance,
+                0.1,
+                10.0,
+            ),
+            ("wipe_distance", self.wipe_distance, 0.0, 20.0),
         ]
     }
 }

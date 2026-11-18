@@ -284,6 +284,8 @@ struct Writer<'a> {
     moves: Vec<Move>,
     /// Height of the nozzle; unknown before the first Z move.
     nozzle_z: Option<f64>,
+    /// The points of the line printed last, up to the nozzle, for wiping.
+    trail: Vec<Point>,
 }
 
 /// What the layers hand on to the next one besides the printer's state.
@@ -321,6 +323,7 @@ impl<'a> Writer<'a> {
             e: self.e,
             moves: Vec::new(),
             nozzle_z: self.nozzle_z,
+            trail: self.trail.clone(),
         }
     }
 
@@ -406,30 +409,40 @@ impl<'a> Writer<'a> {
         }
     }
 
-    /// Moves without extruding. `inside` says that the way stays over the
-    /// part, where a little oozing does no harm and retraction is skipped.
-    fn travel(&mut self, to: Point, inside: bool) {
+    /// Moves without extruding, past the corners `via` if the way stays
+    /// over the part. `inside` says that it does, where a little oozing
+    /// does no harm and retraction is skipped.
+    fn travel(&mut self, via: &[Point], to: Point, inside: bool) {
+        if inside {
+            for &corner in via {
+                self.go(corner);
+            }
+        }
         let length = self
             .position
             .map_or(f64::INFINITY, |from| distance(from, to));
         if length < 1e-4 {
             return;
         }
-        // The travel is recorded between the hop moves, where it happens.
-        let direction = self
-            .position
-            .map(|from| [(to[0] - from[0]) / length, (to[1] - from[1]) / length]);
         let long =
             self.position.is_some() && !inside && length >= self.settings.retraction_min_travel;
         let hop = long && self.settings.z_hop > 0.0 && self.settings.retraction_length > 0.0;
         if long {
-            self.retract();
+            self.wipe_and_retract();
         }
+        // The travel is recorded between the hop moves, where it happens,
+        // from where a wipe left the nozzle.
+        let length = self.position.map_or(length, |from| distance(from, to));
+        let direction = self
+            .position
+            .filter(|_| length > 0.0)
+            .map(|from| [(to[0] - from[0]) / length, (to[1] - from[1]) / length]);
         if hop {
             self.move_z(self.z + self.settings.z_hop);
         }
         let f = self.feed_word(self.settings.travel_speed);
         let _ = writeln!(self.out, "G0 X{:.3} Y{:.3}{f}", to[0], to[1]);
+        self.trail.clear();
         if let Some(direction) = direction {
             self.record(direction, length, self.settings.travel_speed, None);
         }
@@ -465,6 +478,21 @@ impl<'a> Writer<'a> {
         self.nozzle_z = Some(z);
     }
 
+    /// A straight move without extrusion, retraction or lift.
+    fn go(&mut self, to: Point) {
+        let Some(from) = self.position else { return };
+        let length = distance(from, to);
+        if length < 1e-4 {
+            return;
+        }
+        let f = self.feed_word(self.settings.travel_speed);
+        let _ = writeln!(self.out, "G0 X{:.3} Y{:.3}{f}", to[0], to[1]);
+        self.trail.clear();
+        let direction = [(to[0] - from[0]) / length, (to[1] - from[1]) / length];
+        self.record(direction, length, self.settings.travel_speed, None);
+        self.position = Some(to);
+    }
+
     fn extrude(&mut self, to: Point, filament_per_mm: f64, speed: f64, kind: PathKind) {
         let Some(from) = self.position else { return };
         let length = distance(from, to);
@@ -480,6 +508,73 @@ impl<'a> Writer<'a> {
         let direction = [(to[0] - from[0]) / length, (to[1] - from[1]) / length];
         self.record(direction, length, speed, Some(kind));
         self.position = Some(to);
+        self.extend_trail(from, to);
+    }
+
+    /// Adds the move from `from` to `to` to the line printed last.
+    // ponytail: only the last 64 points are kept; a wipe never needs more
+    // than a few millimetres of the line.
+    fn extend_trail(&mut self, from: Point, to: Point) {
+        if self.trail.last() != Some(&from) {
+            self.trail.clear();
+            self.trail.push(from);
+        }
+        self.trail.push(to);
+        if self.trail.len() > 128 {
+            self.trail.drain(..64);
+        }
+    }
+
+    /// Retracts while going back along the line printed last for
+    /// `wipe_distance`, the filament pulled back in proportion to the way;
+    /// a plain retraction without that setting or without a line.
+    fn wipe_and_retract(&mut self) {
+        let length = self.settings.retraction_length;
+        let wipe = self.settings.wipe_distance;
+        let Some(start) = self.position else {
+            return self.retract();
+        };
+        if wipe <= 0.0 || length <= 0.0 || self.retracted[self.tool] || self.trail.len() < 2 {
+            return self.retract();
+        }
+        let mut legs = Vec::new();
+        let (mut at, mut left) = (start, wipe);
+        for &p in self.trail.iter().rev().skip(1) {
+            let d = distance(at, p);
+            if d >= left {
+                legs.push([
+                    at[0] + (p[0] - at[0]) * left / d,
+                    at[1] + (p[1] - at[1]) * left / d,
+                ]);
+                left = 0.0;
+                break;
+            }
+            legs.push(p);
+            left -= d;
+            at = p;
+        }
+        let total = wipe - left;
+        if total < 1e-4 {
+            return self.retract();
+        }
+        let speed = self.settings.travel_speed;
+        let mut from = start;
+        for to in legs {
+            let d = distance(from, to);
+            if d < 1e-9 {
+                continue;
+            }
+            let f = self.feed_word(speed);
+            let e = self.e_word(-length * d / total);
+            let _ = writeln!(self.out, "G1 X{:.3} Y{:.3}{e}{f}", to[0], to[1]);
+            let direction = [(to[0] - from[0]) / d, (to[1] - from[1]) / d];
+            self.record(direction, d, speed, None);
+            from = to;
+        }
+        self.retracted[self.tool] = true;
+        self.filament[self.tool] -= length;
+        self.position = Some(from);
+        self.trail.clear();
     }
 }
 
@@ -562,7 +657,7 @@ fn write_layer(
             carry.selected = Some(next);
             w.select(next as usize);
         }
-        w.travel(first, path.travel_inside);
+        w.travel(&path.travel, first, path.travel_inside);
         if carry.restore_z {
             w.move_z(layer.z);
             carry.restore_z = false;
@@ -740,6 +835,7 @@ pub fn write_gcode_with_progress(
         e: 0.0,
         moves: Vec::new(),
         nozzle_z: None,
+        trail: Vec::new(),
     };
     w.out.push_str(&start);
     let absolute = settings.extrusion_mode == ExtrusionMode::Absolute;
@@ -1116,6 +1212,93 @@ SET_PRESSURE_ADVANCE ADVANCE=0.04
             .map(slicer_fdm::Path::length)
             .sum();
         assert!((extra - ironed_length * full * 0.1).abs() < 1e-3, "{extra}");
+    }
+
+    #[test]
+    fn travels_go_round_the_hole_of_a_tube() {
+        let mut tube = Mesh::cuboid(30.0, 30.0, 2.0);
+        let mut hole = Mesh::cuboid(10.0, 10.0, 2.0);
+        hole.translate([10.0, 10.0, 0.0]);
+        hole.flip();
+        tube.merge(&hole);
+        // Travels that pass over the hole, more than a line width inside it,
+        // and retractions; the tube sits in the middle of the bed.
+        let over_the_hole = |gcode: &str| {
+            let (mut crossing, mut retractions) = (0, 0);
+            let mut at: Option<Point> = None;
+            let lo = 110.0 - 15.0 + 10.0 + 0.5;
+            let hi = 110.0 - 15.0 + 20.0 - 0.5;
+            for line in gcode.lines() {
+                let (Some(x), Some(y)) = (word(line, 'X'), word(line, 'Y')) else {
+                    if line.starts_with("G1 E-") {
+                        retractions += 1;
+                    }
+                    continue;
+                };
+                if let (true, Some(from)) = (line.starts_with("G0"), at) {
+                    let over = (1..20).any(|k| {
+                        let t = f64::from(k) / 20.0;
+                        let p = [from[0] + (x - from[0]) * t, from[1] + (y - from[1]) * t];
+                        p[0] > lo && p[0] < hi && p[1] > lo && p[1] < hi
+                    });
+                    crossing += usize::from(over);
+                }
+                at = Some([x, y]);
+            }
+            (crossing, retractions)
+        };
+        let plain = Settings::default();
+        let combing = Settings {
+            avoid_crossing_walls: true,
+            ..Settings::default()
+        };
+        let (crossed, retracted) = over_the_hole(&slice(&tube, &plain).gcode);
+        assert!(crossed > 0, "the test needs travels over the hole");
+        let output = slice(&tube, &combing);
+        let (crossed_now, retracted_now) = over_the_hole(&output.gcode);
+        assert_eq!(crossed_now, 0);
+        assert!(retracted_now < retracted, "{retracted_now} {retracted}");
+        // Same material.
+        assert!(
+            (output.stats.filament_length_mm - slice(&tube, &plain).stats.filament_length_mm).abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn wiping_retracts_along_the_last_line() {
+        let mesh = Mesh::cuboid(20.0, 20.0, 1.0);
+        let plain = Settings::default();
+        let wiping = Settings {
+            wipe_distance: 2.0,
+            ..plain.clone()
+        };
+        let (a, b) = (slice(&mesh, &plain), slice(&mesh, &wiping));
+        assert!((a.stats.filament_length_mm - b.stats.filament_length_mm).abs() < 1e-6);
+        // Every retraction moves the nozzle now, pulling back the whole
+        // length on its way.
+        let retractions = |gcode: &str| {
+            let mut found = Vec::new();
+            let mut current: Option<(bool, f64)> = None;
+            for line in gcode.lines() {
+                match (word(line, 'E'), word(line, 'X')) {
+                    (Some(e), x) if e < 0.0 => {
+                        let entry = current.get_or_insert((x.is_some(), 0.0));
+                        entry.1 += e;
+                    }
+                    _ => found.extend(current.take()),
+                }
+            }
+            found.extend(current);
+            found
+        };
+        let without = retractions(&a.gcode);
+        let with = retractions(&b.gcode);
+        assert!(!without.is_empty() && without.iter().all(|&(moving, _)| !moving));
+        assert!(with.iter().filter(|&&(moving, _)| moving).count() + 1 >= with.len());
+        for (_, pulled) in with {
+            assert!((pulled + plain.retraction_length).abs() < 1e-4, "{pulled}");
+        }
     }
 
     #[test]

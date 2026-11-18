@@ -1,6 +1,7 @@
 //! FDM toolpath generation: perimeters, infill, supports and path planning.
 
 mod adaptive;
+mod comb;
 mod infill;
 mod objects;
 mod plate;
@@ -145,6 +146,10 @@ pub struct Path {
     /// line width setting: lines along the middle of regions too narrow for
     /// a wall loop (up to two line widths wide).
     pub width: Option<f64>,
+    /// Corners the travel to this path goes round, between the end of the
+    /// previous path and the start of this one; empty for a straight move
+    /// (see `Settings::avoid_crossing_walls`).
+    pub travel: Vec<Point>,
 }
 
 impl Path {
@@ -780,12 +785,21 @@ pub fn generate_plate_with_object_settings(
     // order of a layer, so all cores can work on it again.
     let inside = parallel_map(layers.len(), |index| {
         let flags = travels_inside(&layers[index], &slices[index]);
+        let routes = if settings.avoid_crossing_walls {
+            combed(&layers[index], &slices[index], &flags, settings)
+        } else {
+            Vec::new()
+        };
         progress.advance();
-        flags
+        (flags, routes)
     });
-    for (layer, flags) in layers.iter_mut().zip(inside) {
-        for (path, flag) in layer.paths.iter_mut().zip(flags) {
+    for (layer, (flags, routes)) in layers.iter_mut().zip(inside) {
+        for (index, (path, flag)) in layer.paths.iter_mut().zip(flags).enumerate() {
             path.travel_inside = flag;
+            if let Some(Some(route)) = routes.get(index) {
+                path.travel.clone_from(route);
+                path.travel_inside = true;
+            }
         }
     }
     // Without supports, say where they would be needed.
@@ -977,6 +991,38 @@ impl PrimeTower {
 /// the outline of the layer. Only asked for infill and inner walls; before
 /// an outer wall the nozzle always retracts, to keep the visible surface
 /// clean.
+/// For every path of a layer whose travel would leave the part, the way
+/// round inside it (see [`comb::route`]), if there is one; `None` where the
+/// travel stays straight. The way keeps a quarter line width inside the
+/// outline, over the outer wall at most.
+fn combed(
+    layer: &Layer,
+    slice: &Shapes,
+    inside: &[bool],
+    settings: &Settings,
+) -> Vec<Option<Vec<Point>>> {
+    let region = polygon::offset(slice, -0.25 * settings.line_width);
+    let mut routes = vec![None];
+    for (index, pair) in layer.paths.windows(2).enumerate() {
+        let (previous, path) = (&pair[0], &pair[1]);
+        let from = if previous.closed {
+            previous.points.first()
+        } else {
+            previous.points.last()
+        };
+        let route = match (from, path.points.first()) {
+            (Some(&from), Some(&to))
+                if !inside[index + 1] && previous.extruder == path.extruder =>
+            {
+                comb::route(&region, from, to)
+            }
+            _ => None,
+        };
+        routes.push(route);
+    }
+    routes
+}
+
 fn travels_inside(layer: &Layer, slice: &Shapes) -> Vec<bool> {
     // The first path of a layer is reached from the layer below.
     let mut flags = vec![false];
@@ -1273,10 +1319,18 @@ fn region_work(
         } else {
             PathKind::InnerWall
         };
-        let loops = contours(&wall_shapes[k])
+        let mut loops: Vec<Contour> = contours(&wall_shapes[k])
             .iter()
             .map(|contour| polygon::simplify(contour, PATH_RESOLUTION))
             .collect();
+        // The first layer stays smooth, so that it sticks.
+        if k == 0 && settings.fuzzy_skin && index > 0 {
+            loops = loops
+                .iter()
+                .enumerate()
+                .map(|(number, contour)| fuzz(contour, index, number, settings))
+                .collect();
+        }
         work.push(Work::Loops(loops, kind, width));
         if k == 0 && !thin_lines.is_empty() {
             work.push(Work::Centred(std::mem::take(&mut thin_lines), kind));
@@ -1375,6 +1429,50 @@ fn region_work(
         }
     }
     (work, thin)
+}
+
+/// `contour` with a point every `fuzzy_skin_point_distance` along it, each
+/// moved sideways by a random amount of up to half the
+/// `fuzzy_skin_thickness` either way. The amounts come from the layer, the
+/// number of the contour and of the point, so every run is the same.
+fn fuzz(contour: &[Point], layer: usize, number: usize, settings: &Settings) -> Contour {
+    let step = settings.fuzzy_skin_point_distance;
+    let half = settings.fuzzy_skin_thickness / 2.0;
+    let mut points = Vec::new();
+    let mut count: u64 = 0;
+    for (i, &a) in contour.iter().enumerate() {
+        let b = contour[(i + 1) % contour.len()];
+        let length = distance(a, b);
+        if length < 1e-9 {
+            continue;
+        }
+        // Right of the direction of travel: away from the material.
+        let normal = [(b[1] - a[1]) / length, -(b[0] - a[0]) / length];
+        let parts = (length / step).ceil().max(1.0) as usize;
+        for k in 0..parts {
+            let t = k as f64 / parts as f64;
+            let shift = (2.0 * noise(layer as u64, number as u64, count) - 1.0) * half;
+            count += 1;
+            points.push([
+                a[0] + (b[0] - a[0]) * t + normal[0] * shift,
+                a[1] + (b[1] - a[1]) * t + normal[1] * shift,
+            ]);
+        }
+    }
+    points
+}
+
+/// A number from 0 to 1 that looks random but depends only on the three
+/// inputs (SplitMix64 on their mix).
+fn noise(a: u64, b: u64, c: u64) -> f64 {
+    let mut x = a
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(b.wrapping_mul(0xc2b2_ae3d_27d4_eb4f))
+        .wrapping_add(c.wrapping_mul(0x1656_67b1_9e37_79f9));
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    (x >> 11) as f64 / (1u64 << 53) as f64
 }
 
 /// Splits the fill area of a layer into the part that needs solid infill
@@ -1908,6 +2006,7 @@ fn push_loops(
             travel_inside: false,
             extruder: 0,
             width: None,
+            travel: Vec::new(),
         };
         if path.length() >= width {
             *position = path.points[0];
@@ -1957,6 +2056,7 @@ fn push_lines<L: AsRef<[Point]>>(
                     travel_inside: false,
                     extruder: 0,
                     width: None,
+                    travel: Vec::new(),
                 });
             }
         }
@@ -2002,6 +2102,7 @@ fn push_centred(
             travel_inside: false,
             extruder: 0,
             width: Some(width),
+            travel: Vec::new(),
         });
     }
 }
@@ -3228,6 +3329,56 @@ mod tests {
             let ratio = deposited_area(layer, &settings) / expected;
             assert!((ratio - 1.0).abs() < 0.1, "z {}: {ratio}", layer.z);
         }
+    }
+
+    #[test]
+    fn fuzzy_skin_roughens_the_outer_wall_only() {
+        let mesh = Mesh::cuboid(20.0, 20.0, 1.0);
+        let plain = Settings {
+            skirt_loops: 0,
+            ..Settings::default()
+        };
+        let fuzzy = Settings {
+            fuzzy_skin: true,
+            ..plain.clone()
+        };
+        let (a, b) = (
+            generate(&mesh, &plain).unwrap(),
+            generate(&mesh, &fuzzy).unwrap(),
+        );
+        assert_eq!(a.layers[0], b.layers[0], "the first layer stays smooth");
+        let outer = |t: &Toolpaths, layer: usize| -> Vec<Point> {
+            t.layers[layer]
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::OuterWall)
+                .flat_map(|p| p.points.clone())
+                .collect()
+        };
+        let (smooth, rough) = (outer(&a, 2), outer(&b, 2));
+        // A point about every 0.8 mm round the 19.55 mm square.
+        assert!(rough.len() > 90 && smooth.len() < 10, "{}", rough.len());
+        // Within 0.15 mm of the smooth square, both ways.
+        let (lo, hi) = (110.0 - 10.0 + 0.225, 110.0 + 10.0 - 0.225);
+        let edge = |p: &Point| {
+            [p[0] - lo, hi - p[0], p[1] - lo, hi - p[1]]
+                .into_iter()
+                .map(f64::abs)
+                .fold(f64::INFINITY, f64::min)
+        };
+        assert!(rough.iter().all(|p| edge(p) <= 0.15 + 1e-9));
+        assert!(rough.iter().any(|p| edge(p) > 0.05));
+        // The same every time, and inner walls untouched.
+        assert_eq!(generate(&mesh, &fuzzy).unwrap(), b);
+        let inner = |t: &Toolpaths| {
+            t.layers[2]
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::InnerWall)
+                .map(|p| p.points.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(inner(&a), inner(&b));
     }
 
     #[test]

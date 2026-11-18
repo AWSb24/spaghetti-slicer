@@ -357,6 +357,7 @@ mod tests {
             travel_inside: false,
             extruder: 0,
             width: None,
+            travel: Vec::new(),
         }
     }
 

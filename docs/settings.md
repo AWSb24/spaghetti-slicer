@@ -36,6 +36,10 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `wall_loops` | 2 | 1 to 50 | Number of wall loops. |
 | `wall_order` | inner_outer | `inner_outer`, `outer_inner` | Order in which the walls of a layer are printed. |
 | `seam_position` | rear | `rear`, `corner`, `nearest` | Where the walls of a layer start and end. |
+| `avoid_crossing_walls` | false | `true`, `false` | Whether travel moves go round holes and notches inside the part instead of crossing them over open air, which also spares their retraction. |
+| `fuzzy_skin` | false | `true`, `false` | Whether the outer wall gets a rough, textured surface: its points are moved in and out at random. |
+| `fuzzy_skin_thickness` | 0.3 | 0 to 2 | How far fuzzy skin moves the points of the outer wall, in and out together. |
+| `fuzzy_skin_point_distance` | 0.8 | 0.1 to 10 | Distance between the moved points of fuzzy skin. |
 | `top_layers` | 5 | 0 to 1000 | Number of solid layers at the top. |
 | `bottom_layers` | 4 | 0 to 1000 | Number of solid layers at the bottom. |
 | `spiral_vase` | false | `true`, `false` | Vase mode: above the solid bottom layers, the outer wall alone is printed as one line rising continuously, without seams, infill or top layers. One wall loop, no supports. |
@@ -73,6 +77,7 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `retraction_speed` | 35 | 1 to 200 | Speed of retraction and unretraction. |
 | `retraction_min_travel` | 1.5 | 0 to 100 | Travel moves shorter than this do not retract. |
 | `z_hop` | 0 | 0 to 10 | Nozzle lift during retracted travel moves; 0 disables it. |
+| `wipe_distance` | 0 | 0 to 20 | Before a travel, the nozzle goes back this far along the line just printed while it retracts, wiping off what oozes; 0 turns it off. |
 | `start_gcode` | see `default-config` | text with `{key}` placeholders | G-code inserted before the print. `{setting_name}` placeholders are replaced. |
 | `end_gcode` | see `default-config` | text with `{key}` placeholders | G-code inserted after the print. `{setting_name}` placeholders are replaced. |
 | `toolchange_gcode` | see `default-config` | text with `{key}` placeholders | G-code inserted at every tool change, after the old extruder has retracted and before `T<n>` selects the new one. Besides `{setting_name}`, `{previous_extruder}` and `{next_extruder}` are replaced, counted from 0 as in `T<n>`. |
