@@ -368,6 +368,167 @@ async fn object_settings_are_checked() {
     }
 }
 
+/// A project file as Orca Slicer and Bambu Studio write it, reduced to
+/// what is read: two cubes (objects 1 and 2), the project's settings and,
+/// with `object_settings`, settings of object 2 of its own. The same as in
+/// the command line tool's tests.
+fn orca_project(object_settings: bool) -> Vec<u8> {
+    let cube = Mesh::cuboid(20.0, 20.0, 6.0);
+    let vertices: String = cube
+        .vertices
+        .iter()
+        .map(|[x, y, z]| format!("<vertex x=\"{x}\" y=\"{y}\" z=\"{z}\"/>"))
+        .collect();
+    let triangles: String = cube
+        .triangles
+        .iter()
+        .map(|[a, b, c]| format!("<triangle v1=\"{a}\" v2=\"{b}\" v3=\"{c}\"/>"))
+        .collect();
+    let mesh =
+        format!("<mesh><vertices>{vertices}</vertices><triangles>{triangles}</triangles></mesh>");
+    let model = format!(
+        "<?xml version=\"1.0\"?><model unit=\"millimeter\" xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\"><resources><object id=\"1\" type=\"model\">{mesh}</object><object id=\"2\" type=\"model\">{mesh}</object></resources><build><item objectid=\"1\" transform=\"1 0 0 0 1 0 0 0 1 80 100 0\"/><item objectid=\"2\" transform=\"1 0 0 0 1 0 0 0 1 140 100 0\"/></build></model>"
+    );
+    let config = r#"{
+    "name": "project_settings",
+    "from": "project",
+    "layer_height": "0.25",
+    "initial_layer_print_height": "0.25",
+    "wall_loops": "3",
+    "sparse_infill_density": ["15%"],
+    "brim_type": "no_brim",
+    "brim_width": "5",
+    "made_up_setting": "7"
+}"#;
+    let own = if object_settings {
+        "<metadata key=\"sparse_infill_density\" value=\"60%\"/><metadata key=\"layer_height\" value=\"0.1\"/><part id=\"1\" subtype=\"normal_part\"><metadata key=\"name\" value=\"Cube\"/></part><part id=\"2\" subtype=\"modifier_part\"><metadata key=\"wall_loops\" value=\"6\"/></part>"
+    } else {
+        ""
+    };
+    let settings = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><config><object id=\"1\"><metadata key=\"name\" value=\"Left\"/><metadata key=\"extruder\" value=\"1\"/></object><object id=\"2\"><metadata key=\"name\" value=\"Right\"/><metadata key=\"extruder\" value=\"1\"/>{own}</object><plate><metadata key=\"plater_id\" value=\"1\"/><model_instance><metadata key=\"object_id\" value=\"1\"/></model_instance><model_instance><metadata key=\"object_id\" value=\"2\"/></model_instance></plate></config>"
+    );
+    slicer_formats::write_package(&[
+        ("3D/3dmodel.model", &model),
+        ("Metadata/project_settings.config", config),
+        ("Metadata/model_settings.config", &settings),
+    ])
+    .unwrap()
+}
+
+/// Slices a job to the end and returns its G-code and the codes of its
+/// warnings, with the warnings themselves.
+async fn sliced_with_warnings(router: &Router, fields: &[(&str, &[u8])]) -> (String, Vec<Value>) {
+    let (status, created) = create(router, fields).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+    let job = finished(router, created["id"].as_str().unwrap()).await;
+    assert_eq!(job["status"], "done", "{job}");
+    let request = Request::builder()
+        .uri(job["gcode_url"].as_str().unwrap())
+        .body(Body::empty())
+        .unwrap();
+    let (status, gcode) = send(router, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let warnings = job["warnings"].as_array().unwrap().clone();
+    (String::from_utf8(gcode).unwrap(), warnings)
+}
+
+#[tokio::test]
+async fn settings_stored_in_a_project_file_are_used_on_request() {
+    let router = App::new(Config::default()).router();
+    let project = orca_project(true);
+    let plain = orca_project(false);
+    let codes = |warnings: &[Value]| -> Vec<String> {
+        warnings
+            .iter()
+            .map(|w| w["code"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let on: (&str, &[u8]) = ("project_settings", b"true");
+
+    // Without the field (or with false) the stored settings are ignored.
+    let (without, warnings) = sliced_with_warnings(&router, &[("model", &project)]).await;
+    assert!(without.contains("; layer_height = 0.2\n"));
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let off: (&str, &[u8]) = ("project_settings", b"false");
+    assert_eq!(without, sliced(&router, &[("model", &project), off]).await);
+
+    // With it the project's settings apply, and what has no counterpart is
+    // reported, for the plate and for the object.
+    let (with, warnings) = sliced_with_warnings(&router, &[("model", &project), on]).await;
+    assert!(with.contains("; layer_height = 0.25\n"), "{with}");
+    assert!(with.contains("; wall_loops = 3\n"));
+    assert!(with.contains("; brim_width = 0\n"));
+    let skipped = warnings
+        .iter()
+        .find(|w| w["code"] == "project.settings_skipped")
+        .unwrap();
+    assert_eq!(skipped["context"]["keys"], "made_up_setting");
+    let object = warnings
+        .iter()
+        .find(|w| w["code"] == "project.object_settings_skipped")
+        .unwrap();
+    assert_eq!(object["context"]["keys"], "layer_height");
+    assert!(object["message"].as_str().unwrap().contains("'Right'"));
+    assert!(codes(&warnings).contains(&"project.part_settings_skipped".to_string()));
+
+    // The object's own infill makes a difference.
+    let plate_only = sliced(&router, &[("model", &plain), on]).await;
+    assert_ne!(with, plate_only);
+    // object_settings_<n> go over the object's settings from the project:
+    // at the project's 15 % object 2 prints as without its own.
+    let sparse: (&str, &[u8]) = ("object_settings_1", b"infill_density = 15");
+    assert_eq!(
+        sliced(&router, &[("model", &project), on, sparse]).await,
+        plate_only
+    );
+    // The settings and set fields go over the project's settings.
+    let fields = [
+        ("model", &project[..]),
+        ("settings", b"wall_loops = 2"),
+        ("set", b"layer_height=0.3"),
+        on,
+    ];
+    let set = sliced(&router, &fields).await;
+    assert!(set.contains("; layer_height = 0.3\n"));
+    assert!(set.contains("; wall_loops = 2\n"));
+    assert!(set.contains("; brim_width = 0\n"));
+
+    // With several models the warnings name the model by its number; a
+    // model without stored settings is reported.
+    let bare = slicer_formats::write_3mf(&Mesh::cuboid(10.0, 10.0, 4.0)).unwrap();
+    let (_, warnings) =
+        sliced_with_warnings(&router, &[("model", &project), ("model", &bare), on]).await;
+    let skipped = warnings
+        .iter()
+        .find(|w| w["code"] == "project.settings_skipped")
+        .unwrap();
+    assert_eq!(skipped["context"]["model"], "1");
+    assert!(
+        skipped["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("model 1: ")
+    );
+    let none = warnings
+        .iter()
+        .find(|w| w["code"] == "project.no_settings")
+        .unwrap();
+    assert_eq!(none["context"]["model"], "2");
+
+    // The field takes true or false only, and is described.
+    let (status, body) = create(
+        &router,
+        &[("model", &project), ("project_settings", b"yes")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "request.invalid");
+    let fields = &slicer_server::openapi()["paths"]["/v1/jobs"]["post"]["requestBody"]["content"]["multipart/form-data"]
+        ["schema"]["properties"];
+    assert_eq!(fields["project_settings"]["type"], "boolean");
+}
+
 #[tokio::test]
 async fn errors_have_the_same_shape_as_the_command_line() {
     let router = App::new(Config::default()).router();

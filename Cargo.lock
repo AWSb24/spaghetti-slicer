@@ -2616,6 +2616,7 @@ name = "slicer-fdm"
 version = "0.1.0"
 dependencies = [
  "slicer-core",
+ "slicer-formats",
  "slicer-profiles",
 ]
 

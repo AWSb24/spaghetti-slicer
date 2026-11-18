@@ -4,6 +4,7 @@ mod adaptive;
 mod comb;
 mod infill;
 mod lightning;
+pub mod load;
 mod objects;
 mod plate;
 pub mod preview;

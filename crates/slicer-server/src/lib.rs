@@ -20,6 +20,7 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 use slicer_core::{Diagnose, Diagnostic, Diagnostics};
 use slicer_fdm::Progress;
+use slicer_fdm::load;
 use slicer_profiles::Settings;
 use slicer_send::Target;
 use tokio::sync::Semaphore;
@@ -511,7 +512,7 @@ pub fn openapi() -> Value {
     });
     let id = json!([{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }]);
     let object_settings = format!(
-        "Settings in TOML form for object N only (object_settings_1 is the first model), layered over the plate's settings; may only set {} (otherwise 400 settings.not_per_object); may be repeated, later ones override earlier ones",
+        "Settings in TOML form for model N only (object_settings_1 is the first model; every object of a project split by project_settings), layered over the plate's settings and, with project_settings, the values the project stores for the object; may only set {} (otherwise 400 settings.not_per_object); may be repeated, later ones override earlier ones",
         slicer_fdm::OBJECT_SETTINGS.join(", ")
     );
     json!({
@@ -542,7 +543,8 @@ pub fn openapi() -> Value {
                         "model": { "type": "string", "format": "binary", "description": "STL or 3MF file, one object; may be repeated: several objects are arranged side by side and numbered from 1 in the order sent" },
                         "settings": { "type": "string", "description": "Settings in TOML form; may be repeated, later ones override earlier ones" },
                         "set": { "type": "string", "description": "One override KEY=VALUE; may be repeated" },
-                        "plate": { "type": "integer", "description": "Build plate of a project file with several plates" }
+                        "plate": { "type": "integer", "description": "Build plate of a project file with several plates" },
+                        "project_settings": { "type": "boolean", "default": false, "description": "Use the print settings stored in project files of Orca Slicer or Bambu Studio (3MF): the project's settings below the settings and set fields, the settings of single objects over the plate's and below object_settings_<n>; a project whose objects have settings of their own is sliced as those objects. Settings without a counterpart are reported as warnings (project.settings_skipped, project.object_settings_skipped, project.part_settings_skipped, project.no_settings)" }
                     },
                     "patternProperties": {
                         "^object_settings_[1-9][0-9]*$": { "type": "string", "description": object_settings }
@@ -775,40 +777,84 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
 }
 
-/// Slices the models, one object each, object `i` with `own[i]` where
-/// given; the body of every background job. One model is centred on the
-/// bed, several are arranged side by side.
+/// The settings fields of a job for the whole plate, in the order they
+/// are layered.
+#[derive(Debug, Default)]
+struct PlateSettings {
+    /// The `settings` fields (TOML), in the order they were sent.
+    texts: Vec<String>,
+    /// The `set` fields as key and value, in the order they were sent.
+    overrides: Vec<(String, String)>,
+}
+
+impl PlateSettings {
+    /// `base` with the `settings` fields and then the `set` fields layered
+    /// over it.
+    fn apply(&self, mut base: Settings) -> Result<Settings, Diagnostic> {
+        for text in &self.texts {
+            base.apply_toml(text).map_err(|e| e.diagnostic())?;
+        }
+        for (key, value) in &self.overrides {
+            base.set(key, value).map_err(|e| e.diagnostic())?;
+        }
+        Ok(base)
+    }
+}
+
+/// Everything a job slices.
+#[derive(Debug)]
+struct JobInput {
+    /// The `model` fields, in the order they were sent.
+    models: Vec<axum::body::Bytes>,
+    /// The settings of the plate, over the defaults or, with
+    /// `project_settings`, over the settings the project files store.
+    settings: PlateSettings,
+    /// The `object_settings_<n>` fields of every model, in the order they
+    /// were sent.
+    objects: Vec<Vec<load::ObjectLayer>>,
+    /// Whether to use the stored settings of project files, and the plate.
+    options: load::Options,
+}
+
+/// Slices a job's models; the body of every background job. One model is
+/// centred on the bed, several are arranged side by side; with
+/// `project_settings` a project file whose objects have settings of their
+/// own is split into them, as the command line tool does. Returns the
+/// G-code, the warnings and the nozzle diameter of the plate.
 fn slice(
-    models: &[axum::body::Bytes],
-    own: &[Option<Settings>],
-    plate: Option<u32>,
-    settings: &Settings,
+    input: &JobInput,
     stop: &AtomicBool,
     progress: &Progress,
-) -> Result<(slicer_gcode::Output, Diagnostics), Diagnostic> {
+) -> Result<(slicer_gcode::Output, Diagnostics, f64), Diagnostic> {
     let mut warnings = Diagnostics::new();
-    let mut meshes = Vec::with_capacity(models.len());
-    for (index, model) in models.iter().enumerate() {
-        let mesh =
-            slicer_formats::parse_model(model, plate, &mut warnings).map_err(|mut error| {
-                if models.len() > 1 {
-                    error.message = format!("model {}: {}", index + 1, error.message);
-                    error = error.with("model", index + 1);
-                }
-                error
-            })?;
-        meshes.push(mesh);
-    }
-    let placement = if meshes.len() < 2 {
-        slicer_fdm::Placement::Centre
-    } else {
-        slicer_fdm::arrange_objects(&mut meshes, settings, slicer_fdm::ARRANGE_GAP);
-        slicer_fdm::Placement::AsGiven
-    };
+    // Messages name the model by its number when there are several.
+    let names: Vec<Option<load::Name>> = (1..=input.models.len())
+        .map(|number| {
+            (input.models.len() > 1)
+                .then(|| load::Name::new(format!("model {number}"), "model", number))
+        })
+        .collect();
+    let models: Vec<load::Model> = input
+        .models
+        .iter()
+        .zip(&names)
+        .map(|(bytes, name)| load::Model {
+            bytes,
+            name: name.as_ref(),
+        })
+        .collect();
+    let plate = load::read_plate(
+        &models,
+        input.options,
+        |base| input.settings.apply(base),
+        &input.objects,
+        &mut warnings,
+    )?;
+    let settings = &plate.settings;
     let toolpaths = slicer_fdm::generate_plate_with_object_settings(
-        &meshes,
-        own,
-        placement,
+        &plate.objects.meshes,
+        &plate.objects.settings,
+        plate.placement,
         settings,
         &mut warnings,
         stop,
@@ -817,7 +863,7 @@ fn slice(
     .map_err(|e| e.diagnostic())?;
     let output = slicer_gcode::write_gcode_with_progress(&toolpaths, settings, progress)
         .map_err(|e| e.diagnostic())?;
-    Ok((output, warnings))
+    Ok((output, warnings, settings.nozzle_diameter))
 }
 
 async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Response {
@@ -828,10 +874,13 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
         )
     };
     let mut models = Vec::new();
+    // The plate's settings over the defaults, to check them at once; with
+    // project_settings the job layers them again over the project's.
     let mut settings = Settings::default();
+    let mut plate_settings = PlateSettings::default();
     let mut overrides = Vec::new();
     let mut object_texts = Vec::new();
-    let mut plate = None;
+    let mut options = load::Options::default();
     loop {
         let field = match multipart.next_field().await {
             Ok(Some(field)) => field,
@@ -846,7 +895,7 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
         let object = name.strip_prefix("object_settings_");
         match name.as_str() {
             "model" => models.push(bytes),
-            "settings" | "set" | "plate" => {
+            "settings" | "set" | "plate" | "project_settings" => {
                 let Ok(text) = std::str::from_utf8(&bytes) else {
                     return invalid(format!("field '{name}' is not valid UTF-8"));
                 };
@@ -855,11 +904,22 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
                     if let Err(e) = settings.apply_toml(text) {
                         return error_response(StatusCode::BAD_REQUEST, &e.diagnostic());
                     }
+                    plate_settings.texts.push(text.to_string());
                 } else if name == "plate" {
                     let Ok(number) = text.trim().parse::<u32>() else {
                         return invalid(format!("field 'plate' expects a number, got '{text}'"));
                     };
-                    plate = Some(number);
+                    options.plate = Some(number);
+                } else if name == "project_settings" {
+                    options.project_settings = match text.trim() {
+                        "true" => true,
+                        "false" => false,
+                        _ => {
+                            return invalid(format!(
+                                "field 'project_settings' expects true or false, got '{text}'"
+                            ));
+                        }
+                    };
                 } else {
                     overrides.push(text.to_string());
                 }
@@ -881,18 +941,23 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
         if let Err(e) = settings.set(key.trim(), value.trim()) {
             return error_response(StatusCode::BAD_REQUEST, &e.diagnostic());
         }
+        plate_settings
+            .overrides
+            .push((key.trim().to_string(), value.trim().to_string()));
     }
     if models.is_empty() {
         return invalid("field 'model' is missing".to_string());
     }
     // Settings of single objects start from those of the plate, so they are
-    // read once the plate's are complete; several fields for one object
-    // are layered in the order they are sent.
+    // checked once the plate's are complete; several fields for one object
+    // are layered in the order they are sent. The job layers them again
+    // over the settings of every object of their model.
     let mut own: Vec<Option<Settings>> = vec![None; models.len()];
-    for (name, number, text) in &object_texts {
-        let Some(object) = number
-            .and_then(|n| n.checked_sub(1))
-            .and_then(|index| own.get_mut(index))
+    let mut objects: Vec<Vec<load::ObjectLayer>> = vec![Vec::new(); models.len()];
+    for (name, number, text) in object_texts {
+        let index = number.and_then(|n| n.checked_sub(1));
+        let Some((object, layers)) =
+            index.and_then(|i| Some((own.get_mut(i)?, objects.get_mut(i)?)))
         else {
             return invalid(format!(
                 "field '{name}' names no object; object_settings_1 to object_settings_{} name the models in the order they are sent",
@@ -900,10 +965,11 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
             ));
         };
         let object = object.get_or_insert_with(|| settings.clone());
-        if let Err(mut e) = slicer_fdm::apply_object_toml(object, text) {
-            e.message = format!("{name}: {}", e.message);
-            return error_response(StatusCode::BAD_REQUEST, &e.with("field", name));
+        let name = load::Name::new(name.clone(), "field", name);
+        if let Err(e) = slicer_fdm::apply_object_toml(object, &text) {
+            return error_response(StatusCode::BAD_REQUEST, &name.apply(e));
         }
+        layers.push(load::ObjectLayer { text, name });
     }
 
     let id = Uuid::new_v4();
@@ -940,7 +1006,13 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
             "bytes": models.iter().map(|model| model.len()).sum::<usize>(),
         }),
     );
-    tokio::spawn(run_job(app.clone(), id, models, own, plate, settings));
+    let input = JobInput {
+        models,
+        settings: plate_settings,
+        objects,
+        options,
+    };
+    tokio::spawn(run_job(app.clone(), id, input));
 
     let mut response = (
         StatusCode::ACCEPTED,
@@ -968,14 +1040,7 @@ fn multipart_error(error: &axum::extract::multipart::MultipartError) -> Response
     }
 }
 
-async fn run_job(
-    app: App,
-    id: Uuid,
-    models: Vec<axum::body::Bytes>,
-    own: Vec<Option<Settings>>,
-    plate: Option<u32>,
-    settings: Settings,
-) {
+async fn run_job(app: App, id: Uuid, input: JobInput) {
     let Ok(_slot) = app.slots.clone().acquire_owned().await else {
         return;
     };
@@ -991,17 +1056,14 @@ async fn run_job(
         }
     };
     let started = Instant::now();
-    let nozzle_diameter = settings.nozzle_diameter;
-    let outcome = tokio::task::spawn_blocking(move || {
-        slice(&models, &own, plate, &settings, &stop, &progress)
-    })
-    .await
-    .unwrap_or_else(|_| {
-        Err(Diagnostic::error(
-            "server.internal",
-            "slicing stopped unexpectedly",
-        ))
-    });
+    let outcome = tokio::task::spawn_blocking(move || slice(&input, &stop, &progress))
+        .await
+        .unwrap_or_else(|_| {
+            Err(Diagnostic::error(
+                "server.internal",
+                "slicing stopped unexpectedly",
+            ))
+        });
 
     let mut job = {
         let jobs = app.jobs();
@@ -1013,7 +1075,7 @@ async fn run_job(
     };
     job.finished_at = Some(Instant::now());
     match outcome {
-        Ok((output, warnings)) => {
+        Ok((output, warnings, nozzle_diameter)) => {
             job.status = Status::Done;
             job.stats = Some(json!(output.stats));
             job.info = Some(slicer_formats::PrintInfo {

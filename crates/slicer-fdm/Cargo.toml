@@ -11,4 +11,5 @@ repository.workspace = true
 workspace = true
 [dependencies]
 slicer-core.workspace = true
+slicer-formats.workspace = true
 slicer-profiles.workspace = true
