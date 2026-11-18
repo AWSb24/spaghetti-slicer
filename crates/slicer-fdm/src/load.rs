@@ -338,6 +338,23 @@ impl Objects {
             crate::arrange_objects(meshes, settings, placing.gap);
             return Placement::AsGiven;
         }
+        if crate::arranges_outlines(settings) {
+            // The outline of every file's objects together, arranged as one
+            // and turned together.
+            let mut points: Vec<Vec<[f64; 2]>> = vec![Vec::new(); files];
+            for (mesh, &file) in meshes.iter().zip(&self.model) {
+                if let Some(slot) = points.get_mut(file) {
+                    slot.extend(crate::footprint(mesh));
+                }
+            }
+            let spots = crate::arrange_outlines(&points, settings, placing.gap);
+            for (mesh, &file) in meshes.iter_mut().zip(&self.model) {
+                if let Some(spot) = spots.get(file) {
+                    spot.apply(mesh);
+                }
+            }
+            return Placement::AsGiven;
+        }
         // The bounds of every file's objects together, arranged as one.
         let mut bounds: Vec<Option<([f64; 3], [f64; 3])>> = vec![None; files];
         for (mesh, &file) in meshes.iter().zip(&self.model) {

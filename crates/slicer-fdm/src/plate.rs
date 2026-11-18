@@ -75,7 +75,7 @@ pub(crate) fn check(
     }
     // ponytail: convex outlines, so an object standing in the hole of a ring
     // is reported too. Comparing the first layers is the upgrade.
-    let outlines: Vec<_> = objects.iter().map(|o| vec![vec![outline(o)]]).collect();
+    let outlines: Vec<_> = objects.iter().map(|o| vec![vec![footprint(o)]]).collect();
     for i in 0..outlines.len() {
         for j in i + 1..outlines.len() {
             let area = polygon::area(&polygon::intersection(&outlines[i], &outlines[j]));
@@ -98,8 +98,9 @@ pub(crate) fn check(
     Ok(())
 }
 
-/// Convex hull of a mesh seen from above.
-pub(crate) fn outline(mesh: &Mesh) -> Contour {
+/// Convex hull of a mesh seen from above: the outline that arranging
+/// packs, the overlap warning compares and `sequential_print` keeps apart.
+pub fn footprint(mesh: &Mesh) -> Contour {
     let points: Vec<Point> = mesh
         .triangles
         .iter()
@@ -108,6 +109,18 @@ pub(crate) fn outline(mesh: &Mesh) -> Contour {
         .map(|v| [v[0], v[1]])
         .collect();
     polygon::convex_hull(&points)
+}
+
+/// The distance between arranged objects asked for as `gap`: at least
+/// `extruder_clearance_radius` with `sequential_print`, plus room for the
+/// brim of both.
+pub(crate) fn spacing(settings: &Settings, gap: f64) -> f64 {
+    let gap = if settings.sequential_print {
+        gap.max(settings.extruder_clearance_radius)
+    } else {
+        gap
+    };
+    gap + 2.0 * settings.brim_width
 }
 
 /// Places objects whose bounding boxes seen from above have the given sizes
@@ -123,15 +136,12 @@ pub(crate) fn outline(mesh: &Mesh) -> Contour {
 /// beyond the back edge, where [`crate::generate_plate`] reports them. The
 /// result depends only on the sizes and their order.
 // ponytail: bounding boxes, so L-shapes and round parts waste room, and
-// nothing is rotated. Packing the outlines (bottom-left fill with no-fit
-// polygons) is the upgrade.
+// nothing is rotated; [`crate::arrange_outlines`] packs outlines, with
+// `arrange_outlines` or `arrange_rotation`. This stays the default so
+// that existing arrangements keep their places.
 pub fn arrange(sizes: &[[f64; 2]], settings: &Settings, gap: f64) -> Vec<Point> {
     let bed = [settings.bed_size_x, settings.bed_size_y];
-    let gap = if settings.sequential_print {
-        gap.max(settings.extruder_clearance_radius)
-    } else {
-        gap
-    } + 2.0 * settings.brim_width;
+    let gap = spacing(settings, gap);
     let mut order: Vec<usize> = (0..sizes.len()).collect();
     // Deepest first, then widest; the sort is stable, so equal objects keep
     // their order.
@@ -163,9 +173,20 @@ pub fn arrange(sizes: &[[f64; 2]], settings: &Settings, gap: f64) -> Vec<Point> 
     corners
 }
 
-/// Moves `objects` side by side on the bed where [`arrange`] puts their
-/// bounding boxes seen from above, for [`Placement::AsGiven`].
+/// Moves `objects` side by side on the bed, for [`Placement::AsGiven`]:
+/// where [`arrange`] puts their bounding boxes seen from above, or, with
+/// `arrange_outlines` or `arrange_rotation`, where
+/// [`crate::arrange_outlines`] puts their outlines, turned about Z as it
+/// says.
 pub fn arrange_objects(objects: &mut [Mesh], settings: &Settings, gap: f64) {
+    if crate::arranges_outlines(settings) {
+        let outlines: Vec<Contour> = objects.iter().map(footprint).collect();
+        let spots = crate::arrange_outlines(&outlines, settings, gap);
+        for (mesh, spot) in objects.iter_mut().zip(spots) {
+            spot.apply(mesh);
+        }
+        return;
+    }
     let bounds: Vec<_> = objects.iter().map(Mesh::bounds).collect();
     let sizes: Vec<[f64; 2]> = bounds
         .iter()

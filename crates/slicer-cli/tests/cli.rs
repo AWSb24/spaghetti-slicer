@@ -565,6 +565,78 @@ fn several_models_are_arranged_side_by_side() {
 }
 
 #[test]
+fn outlines_and_turns_arrange_closer() {
+    let dir = workdir("arrange_outlines");
+    let triangle = slicer_core::primitives::extrude(
+        &[[0.0, 0.0], [60.0, 0.0], [0.0, 60.0]],
+        [20.0, 20.0],
+        5.0,
+        1,
+        0.0,
+    );
+    let (a, b) = (dir.join("a.stl"), dir.join("b.stl"));
+    fs::write(&a, slicer_formats::write_stl_binary(&triangle)).unwrap();
+    fs::write(&b, slicer_formats::write_stl_binary(&triangle)).unwrap();
+    // Two cubes 10 mm apart in one file: 30 by 10 mm together.
+    let cube = Mesh::cuboid(10.0, 10.0, 5.0);
+    let vertices: String = cube
+        .vertices
+        .iter()
+        .map(|[x, y, z]| format!("<vertex x=\"{x}\" y=\"{y}\" z=\"{z}\"/>"))
+        .collect();
+    let triangles: String = cube
+        .triangles
+        .iter()
+        .map(|[a, b, c]| format!("<triangle v1=\"{a}\" v2=\"{b}\" v3=\"{c}\"/>"))
+        .collect();
+    let model = format!(
+        "<?xml version=\"1.0\"?><model unit=\"millimeter\" xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\"><resources><object id=\"1\" type=\"model\"><mesh><vertices>{vertices}</vertices><triangles>{triangles}</triangles></mesh></object></resources><build><item objectid=\"1\" transform=\"1 0 0 0 1 0 0 0 1 0 0 0\"/><item objectid=\"1\" transform=\"1 0 0 0 1 0 0 0 1 20 0 0\"/></build></model>"
+    );
+    let pair = dir.join("pair.3mf");
+    fs::write(
+        &pair,
+        slicer_formats::write_package(&[("3D/3dmodel.model", &model)]).unwrap(),
+    )
+    .unwrap();
+    let slice = |files: [&PathBuf; 2], settings: &[&str]| {
+        let mut command = bin();
+        command.args([
+            "slice",
+            "--json",
+            "-s",
+            "bed_size_x=72",
+            "-s",
+            "bed_size_y=72",
+        ]);
+        command.args(files).arg("-o").arg(dir.join("plate.gcode"));
+        for setting in settings {
+            command.args(["-s", setting]);
+        }
+        command.output().unwrap()
+    };
+
+    // In rows of rectangles neither pair fits the 72 mm bed.
+    for files in [[&a, &b], [&a, &pair]] {
+        let out = slice(files, &[]);
+        assert!(!out.status.success());
+        let error: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+        assert_eq!(error["error"]["code"], "slicing.outside_bed");
+    }
+    // By outlines the cubes stand beside the slanted side of the triangle.
+    let out = slice([&a, &pair], &["arrange_outlines=true"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["warnings"].as_array().unwrap().len(), 0);
+    // Two triangles need a half turn as well.
+    let out = slice([&a, &b], &["arrange_outlines=true"]);
+    assert!(!out.status.success());
+    let out = slice([&a, &b], &["arrange_rotation=true"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["warnings"].as_array().unwrap().len(), 0);
+}
+
+#[test]
 fn an_object_gets_settings_of_its_own() {
     let dir = workdir("object_settings");
     let cube = slicer_formats::write_stl_binary(&Mesh::cuboid(10.0, 10.0, 4.0));

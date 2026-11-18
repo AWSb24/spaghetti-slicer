@@ -103,7 +103,7 @@ fn order(objects: &[Mesh], settings: &Settings) -> Result<Vec<usize>, FdmError> 
     let reach = settings.extruder_clearance_radius / 2.0;
     let grown: Vec<_> = objects
         .iter()
-        .map(|o| polygon::offset(&vec![vec![plate::outline(o)]], reach))
+        .map(|o| polygon::offset(&vec![vec![plate::footprint(o)]], reach))
         .collect();
     for i in 0..grown.len() {
         for j in i + 1..grown.len() {

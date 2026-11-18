@@ -641,8 +641,31 @@ impl Plate {
     }
 
     /// Places all models side by side without overlap (see
-    /// [`slicer_fdm::arrange`]); rotation and scale stay.
+    /// [`slicer_fdm::arrange`]); rotation and scale stay. With
+    /// `arrange_outlines` or `arrange_rotation` it packs their outlines
+    /// instead ([`slicer_fdm::arrange_outlines`]), and with
+    /// `arrange_rotation` adds the turns it chose to their rotation.
     pub fn arrange(&mut self, settings: &Settings) {
+        if slicer_fdm::arranges_outlines(settings) {
+            let outlines: Vec<Vec<[f64; 2]>> = self
+                .items
+                .iter()
+                .map(|item| placed_outline(&item.model, &item.placement))
+                .collect();
+            let spots = slicer_fdm::arrange_outlines(&outlines, settings, slicer_fdm::ARRANGE_GAP);
+            for ((item, outline), spot) in self.items.iter_mut().zip(&outlines).zip(spots) {
+                // The centre of the bounding box of the outline as placed,
+                // which is what the placement keeps.
+                let Some((lo, hi)) = bounds_2d(outline.iter().map(|&p| spot.place(p))) else {
+                    continue;
+                };
+                item.placement.center = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0];
+                if spot.turn != 0.0 {
+                    item.placement.rotation_deg = (item.placement.rotation_deg + spot.turn) % 360.0;
+                }
+            }
+            return;
+        }
         let sizes: Vec<[f64; 2]> = self
             .items
             .iter()
@@ -1172,6 +1195,54 @@ mod tests {
         assert!(plate.serial > serial);
         plate.remove_selected();
         assert_eq!(plate.items.len(), 1);
+    }
+
+    #[test]
+    fn arranging_turns_models_with_arrange_rotation() {
+        let settings = Settings {
+            bed_size_x: 72.0,
+            bed_size_y: 72.0,
+            arrange_rotation: true,
+            ..Settings::default()
+        };
+        let triangle = slicer_core::primitives::extrude(
+            &[[0.0, 0.0], [60.0, 0.0], [0.0, 60.0]],
+            [20.0, 20.0],
+            5.0,
+            1,
+            0.0,
+        );
+        let mut plate = Plate::default();
+        for _ in 0..2 {
+            plate.add(
+                Model::from_mesh("triangle", triangle.clone()).unwrap(),
+                &settings,
+            );
+        }
+        plate.items[0].placement.rotation_deg = 90.0;
+        // In rows they do not fit the bed; turned against each other they do.
+        plate.arrange(&Settings {
+            arrange_rotation: false,
+            ..settings.clone()
+        });
+        assert!(plate.check(&settings).is_err());
+        plate.arrange(&settings);
+        assert!(plate.check(&settings).is_ok());
+        let turns: Vec<f64> = plate.placements().iter().map(|p| p.rotation_deg).collect();
+        assert!(
+            (turns[0] - turns[1]).rem_euclid(360.0) == 180.0,
+            "{turns:?}"
+        );
+        let mut diagnostics = Diagnostics::new();
+        slicer_fdm::generate_plate(
+            &plate.meshes(),
+            slicer_fdm::Placement::AsGiven,
+            &settings,
+            &mut diagnostics,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     #[test]

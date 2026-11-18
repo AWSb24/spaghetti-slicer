@@ -100,6 +100,7 @@ pub const PROCESS_TABS: [ProcessTab; 5] = [
         &[
             ("Skirt", &["skirt_loops", "skirt_distance"]),
             ("Brim", &["brim_width"]),
+            ("Arrange", &["arrange_outlines", "arrange_rotation"]),
             (
                 "Prime tower",
                 &["prime_tower_width", "prime_tower_x", "prime_tower_y"],
