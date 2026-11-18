@@ -368,6 +368,55 @@ async fn object_settings_are_checked() {
     }
 }
 
+#[tokio::test]
+async fn height_ranges_get_settings_of_their_own() {
+    let router = App::new(Config::default()).router();
+    let stl = cube();
+    let two = [("model", &stl[..]), ("model", &stl[..])];
+    let plain = sliced(&router, &two).await;
+    let dense: &[u8] = b"wall_loops = 4";
+    let all = sliced(
+        &router,
+        &[&two[..], &[("range_settings_1-2", dense)]].concat(),
+    )
+    .await;
+    let one = sliced(
+        &router,
+        &[&two[..], &[("range_settings_2_0.5-1.5", dense)]].concat(),
+    )
+    .await;
+    assert_ne!(plain, all);
+    assert_ne!(plain, one);
+    assert_ne!(all, one);
+    // The object's own values print as without a range.
+    let same: &[u8] = b"infill_density = 15";
+    let fields = [&two[..], &[("range_settings_1_0-1", same)]].concat();
+    assert_eq!(plain, sliced(&router, &fields).await);
+
+    let (status, body) = create(
+        &router,
+        &[
+            ("model", &stl),
+            ("range_settings_0-1", b"layer_height = 0.1"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "settings.not_per_range");
+    assert_eq!(body["error"]["context"]["field"], "range_settings_0-1");
+    for name in [
+        "range_settings_2_0-1",
+        "range_settings_0_0-1",
+        "range_settings_1-0",
+        "range_settings_x",
+        "range_settings_",
+    ] {
+        let (status, body) = create(&router, &[("model", &stl), (name, dense)]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}");
+        assert_eq!(body["error"]["code"], "request.invalid", "{name}");
+    }
+}
+
 /// A project file as Orca Slicer and Bambu Studio write it, reduced to
 /// what is read: two cubes (objects 1 and 2), the project's settings and,
 /// with `object_settings`, settings of object 2 of its own. The same as in

@@ -718,6 +718,61 @@ fn object_settings_are_checked() {
 }
 
 #[test]
+fn height_ranges_get_settings_of_their_own() {
+    let dir = workdir("range_settings");
+    let cube = slicer_formats::write_stl_binary(&Mesh::cuboid(10.0, 10.0, 8.0));
+    let (a, b) = (dir.join("a.stl"), dir.join("b.stl"));
+    fs::write(&a, &cube).unwrap();
+    fs::write(&b, &cube).unwrap();
+    let dense = dir.join("dense.toml");
+    fs::write(&dense, "infill_density = 100\n").unwrap();
+    // The plate's own value.
+    let same = dir.join("same.toml");
+    fs::write(&same, "infill_density = 15\n").unwrap();
+    let layers = dir.join("layers.toml");
+    fs::write(&layers, "layer_height = 0.1\n").unwrap();
+    let slice = |name: &str, ranges: &[String]| {
+        let output = dir.join(name);
+        let mut command = bin();
+        command
+            .args(["slice", a.to_str().unwrap(), b.to_str().unwrap(), "-o"])
+            .arg(&output)
+            .arg("--json");
+        for range in ranges {
+            command.arg(format!("--range={range}"));
+        }
+        let out = command.output().unwrap();
+        let text = fs::read_to_string(&output).unwrap_or_default();
+        (out, text)
+    };
+    let range = |prefix: &str, file: &PathBuf| format!("{prefix}{}", file.display());
+    let (out, plain) = slice("plain.gcode", &[]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let (_, all) = slice("all.gcode", &[range("4-8:", &dense)]);
+    let (_, one) = slice("one.gcode", &[range("2:4-8:", &dense)]);
+    assert_ne!(plain, all);
+    assert_ne!(plain, one);
+    assert_ne!(all, one);
+    // A range with the object's own values prints as without it.
+    let (_, unchanged) = slice("same.gcode", &[range("1:2-6:", &same)]);
+    assert_eq!(plain, unchanged);
+
+    let error = |ranges: &[String]| {
+        let (out, _) = slice("error.gcode", ranges);
+        assert!(!out.status.success());
+        let error: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+        error["error"].clone()
+    };
+    let wrong = error(&[range("4-8:", &layers)]);
+    assert_eq!(wrong["code"], "settings.not_per_range");
+    assert_eq!(wrong["context"]["key"], "layer_height");
+    for prefix in ["3:4-8:", "0:4-8:", "8-4:", "x:4-8:", "4:", "-1-4:"] {
+        let wrong = error(&[range(prefix, &dense)]);
+        assert_eq!(wrong["code"], "cli.invalid_range", "{prefix}");
+    }
+}
+
+#[test]
 fn build_items_of_a_3mf_can_keep_their_positions() {
     let dir = workdir("keep");
     let cube = Mesh::cuboid(10.0, 10.0, 10.0);

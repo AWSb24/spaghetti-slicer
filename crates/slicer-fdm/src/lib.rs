@@ -13,7 +13,10 @@ mod sequential;
 mod tree;
 
 pub use arrange::{Spot, arrange_outlines, arranges_outlines};
-pub use objects::{OBJECT_SETTINGS, apply_object_orca, apply_object_toml, object_settings};
+pub use objects::{
+    HeightRange, OBJECT_SETTINGS, RANGE_SETTINGS, apply_object_orca, apply_object_toml,
+    apply_range_orca, apply_range_toml, object_settings, range_settings,
+};
 pub use plate::{ARRANGE_GAP, Placement, arrange, arrange_objects, footprint};
 pub mod progress;
 
@@ -506,6 +509,53 @@ pub fn generate_plate_with_object_settings(
     stop: &AtomicBool,
     progress: &Progress,
 ) -> Result<Toolpaths, FdmError> {
+    let own = OwnSettings {
+        objects: own,
+        ranges: &[],
+    };
+    generate_plate_with_own_settings(
+        objects,
+        own,
+        placement,
+        settings,
+        diagnostics,
+        stop,
+        progress,
+    )
+}
+
+/// Settings of their own for the objects on a plate, counted like the
+/// objects.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OwnSettings<'a> {
+    /// The settings of object `i` over its whole height, if it has its
+    /// own (see [`generate_plate_with_object_settings`]); objects beyond
+    /// the end of the slice have none.
+    pub objects: &'a [Option<Settings>],
+    /// The height ranges of object `i` (see [`HeightRange`]), over its
+    /// settings; objects beyond the end of the slice have none.
+    pub ranges: &'a [Vec<HeightRange>],
+}
+
+/// Like [`generate_plate_with_object_settings`] with `own.objects`, and the
+/// layers of object `i` whose middle lies in one of its height ranges
+/// `own.ranges[i]` print with the settings of that range over those of the
+/// object (see [`range_settings`]; only the keys of [`RANGE_SETTINGS`]
+/// count). A height range belongs to the region of its object on every
+/// layer, so top and bottom shells are found across the borders of ranges
+/// as without them: a range does not start or end a surface. Objects
+/// without ranges, or with ranges that change nothing, print exactly as
+/// with [`generate_plate_with_object_settings`]. Vase mode leaves the
+/// ranges out like the settings of objects.
+pub fn generate_plate_with_own_settings(
+    objects: &[Mesh],
+    own: OwnSettings,
+    placement: Placement,
+    settings: &Settings,
+    diagnostics: &mut Diagnostics,
+    stop: &AtomicBool,
+    progress: &Progress,
+) -> Result<Toolpaths, FdmError> {
     if settings.sequential_print && objects.len() > 1 {
         return sequential::generate(
             objects,
@@ -521,7 +571,7 @@ pub fn generate_plate_with_object_settings(
     // Vase mode prints one wall and nothing inside or on top, the same for
     // every object.
     let vase;
-    let (settings, own) = if settings.spiral_vase {
+    let (settings, own, ranges) = if settings.spiral_vase {
         vase = Settings {
             wall_loops: 1,
             top_layers: 0,
@@ -529,21 +579,23 @@ pub fn generate_plate_with_object_settings(
             supports: false,
             ..settings.clone()
         };
-        (&vase, &[][..])
+        (&vase, &[][..], &[][..])
     } else {
-        (settings, own)
+        (settings, own.objects, own.ranges)
     };
-    // Objects with equal settings form a group. With a single group its
-    // settings are those of the whole plate.
-    let (groups, membership) = objects::groups(objects.len(), own, settings);
+    // Objects with equal settings and height ranges form a group. With a
+    // single group its settings are those of the whole plate.
+    let (groups, membership) = objects::groups(objects.len(), own, ranges, settings);
     // Speeds of objects only reach the writer, through this table.
     let object_settings = objects::speed_table(objects.len(), own, settings);
     let plate_settings = settings;
-    let settings = match groups.as_slice() {
+    let several = objects::Group::plain(settings.clone());
+    let single = match groups.as_slice() {
         [only] => only,
-        _ => settings,
+        _ => &several,
     };
-    let any_supports = groups.iter().any(|g| g.supports);
+    let settings = &single.settings;
+    let any_supports = groups.iter().any(|g| g.any(|s| s.supports));
     // Turning, removing degenerate triangles, closing holes, checking.
     progress.start(Step::Preparing, 4);
     plate::check(objects, placement, settings, diagnostics)?;
@@ -709,13 +761,25 @@ pub fn generate_plate_with_object_settings(
     } else {
         Vec::new()
     };
-    // Where only some groups have supports, those only go under them, and
-    // only the others are warned about.
-    let mixed = !object_regions.is_empty() && groups.iter().any(|g| !g.supports) && any_supports;
+    // Where only some groups (or some of their height ranges) have
+    // supports, those only go under them, and only the others are warned
+    // about. A single group takes every layer whole.
+    let varied = groups.len() > 1 || groups.iter().any(|g| !g.ranges.is_empty());
+    let mixed = varied && groups.iter().any(|g| g.any(|s| !s.supports)) && any_supports;
     let (supported, unsupported) = if mixed {
+        let regions = if object_regions.is_empty() {
+            std::slice::from_ref(&slices)
+        } else {
+            object_regions.as_slice()
+        };
         (
-            Some(objects::with_supports(&object_regions, &groups, true)),
-            Some(objects::with_supports(&object_regions, &groups, false)),
+            Some(objects::with_supports(regions, &groups, &cut_heights, true)),
+            Some(objects::with_supports(
+                regions,
+                &groups,
+                &cut_heights,
+                false,
+            )),
         )
     } else {
         (None, None)
@@ -789,21 +853,15 @@ pub fn generate_plate_with_object_settings(
     };
     // Every region with its extruder and settings; empty if one extruder
     // prints the whole model with the plate's settings.
-    let regions = objects::split(
-        extruder_regions,
-        object_regions,
-        &groups,
-        extruder,
-        settings,
-    );
+    let regions = objects::split(extruder_regions, object_regions, &groups, extruder, single);
     // Lightning infill depends on the layers above, so it is planned for
     // all layers of a region before their work.
     let lightning: Vec<Vec<Vec<[Point; 2]>>> = if regions.is_empty() {
-        vec![lightning_infill(&slices, &heights, settings)]
+        vec![lightning_infill(&slices, &heights, &cut_heights, single)]
     } else {
         regions
             .iter()
-            .map(|(_, region_settings, region)| lightning_infill(region, &heights, region_settings))
+            .map(|(_, group, region)| lightning_infill(region, &heights, &cut_heights, group))
             .collect()
     };
     let lightning_lines = |region: usize, index: usize| -> &[[Point; 2]] {
@@ -820,20 +878,24 @@ pub fn generate_plate_with_object_settings(
         }
         progress.advance();
         let mut groups = vec![(extruder, shared_work(&slices, &supports, index, settings))];
+        // The settings of a group on this layer, by the height of its middle.
+        let z = cut_heights[index];
         if regions.is_empty() {
             let lines = lightning_lines(0, index);
-            let (work, thin) = region_work(&slices, &slices, &heights, index, lines, settings);
+            let layer_settings = single.at(z);
+            let (work, thin) =
+                region_work(&slices, &slices, &heights, index, lines, layer_settings);
             groups[0].1.extend(work);
             return (groups, thin);
         }
         let mut thin = false;
-        for (r, (e, region_settings, region)) in regions.iter().enumerate() {
+        for (r, (e, group, region)) in regions.iter().enumerate() {
             if region[index].is_empty() {
                 continue;
             }
             let lines = lightning_lines(r, index);
             let (work, region_thin) =
-                region_work(region, &slices, &heights, index, lines, region_settings);
+                region_work(region, &slices, &heights, index, lines, group.at(z));
             thin |= region_thin;
             match groups.iter_mut().find(|(g, _)| g == e) {
                 Some(group) => group.1.extend(work),
@@ -1955,25 +2017,39 @@ fn fill_area(slice: &Shapes, settings: &Settings) -> Shapes {
 /// Lightning infill of every layer of a region (see [`lightning::plan`]),
 /// or nothing when the region has another pattern or no sparse infill. The
 /// support points lie as far apart as rectilinear lines at the density.
+/// `group` gives the settings of every layer by the height of its middle
+/// (`cut_heights`); layers with another pattern have no sparse area.
 // ponytail: the sparse areas are worked out here and again for the work of
-// every layer, which costs part of the infill time twice.
+// every layer, which costs part of the infill time twice. With height
+// ranges of different lightning densities the lowest one sets the spacing
+// for the whole region.
 fn lightning_infill(
     slices: &[Shapes],
     heights: &[f64],
-    settings: &Settings,
+    cut_heights: &[f64],
+    group: &objects::Group,
 ) -> Vec<Vec<[Point; 2]>> {
-    let density = settings.infill_density / 100.0;
-    if settings.infill_pattern != InfillPattern::Lightning || density <= 0.0 || density >= 1.0 {
+    let lightning = |settings: &Settings| {
+        let density = settings.infill_density / 100.0;
+        settings.infill_pattern == InfillPattern::Lightning && density > 0.0 && density < 1.0
+    };
+    let at = |index: usize| group.at(cut_heights.get(index).copied().unwrap_or(0.0));
+    let Some(first) = (0..slices.len()).map(at).find(|s| lightning(s)) else {
         return Vec::new();
-    }
+    };
     let sparse = parallel_map(slices.len(), |index| {
+        let settings = at(index);
+        if !lightning(settings) {
+            return Vec::new();
+        }
         let fill_area = fill_area(&printed_slice(slices, index, settings), settings);
         if fill_area.is_empty() {
             return fill_area;
         }
         split_solid_sparse(slices, heights, index, &fill_area, settings).1
     });
-    let width = settings.line_width;
+    let width = first.line_width;
+    let density = first.infill_density / 100.0;
     lightning::plan(&sparse, heights, width / density, 0.5 * width)
 }
 

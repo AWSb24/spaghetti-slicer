@@ -37,6 +37,183 @@ pub const OBJECT_SETTINGS: &[&str] = &[
     "ironing_speed",
 ];
 
+/// Settings of [`OBJECT_SETTINGS`] that an object may also set for a range
+/// of its height (see [`HeightRange`]): walls and their seam, top and
+/// bottom shells, sparse infill and whether it gets supports. The speeds
+/// stay those of the whole object.
+// ponytail: speeds per height range would need the G-code writer to look
+// up the settings of a path by its layer as well as its object; the layer
+// height per range would need layers of different heights side by side.
+pub const RANGE_SETTINGS: &[&str] = &[
+    "wall_loops",
+    "wall_order",
+    "seam_position",
+    "top_layers",
+    "bottom_layers",
+    "infill_density",
+    "infill_pattern",
+    "infill_angle",
+    "infill_connect",
+    "infill_overlap",
+    "supports",
+];
+
+/// Settings of an object for a range of its height: every layer whose
+/// middle lies at least `from` and less than `to` millimetres above the bed
+/// prints with the object's settings and `values` over them. Where ranges
+/// overlap, the later one counts.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct HeightRange {
+    /// Height above the bed where the range starts, in millimetres.
+    pub from: f64,
+    /// Height above the bed where the range ends, in millimetres; a layer
+    /// whose middle lies exactly there is above the range.
+    pub to: f64,
+    /// Settings by name with their values as text, in the form
+    /// [`Settings::set`] takes; only those of [`RANGE_SETTINGS`] count.
+    pub values: Vec<(String, String)>,
+}
+
+impl HeightRange {
+    /// A range from `from` to `to` millimetres that changes nothing yet.
+    pub fn new(from: f64, to: f64) -> Self {
+        Self {
+            from,
+            to,
+            values: Vec::new(),
+        }
+    }
+
+    /// Whether a layer whose middle lies `z` millimetres above the bed is
+    /// in the range.
+    pub fn contains(&self, z: f64) -> bool {
+        self.from <= z && z < self.to
+    }
+
+    /// Sets `key` to `value`, replacing an earlier value of it.
+    fn put(&mut self, key: &str, value: String) {
+        match self.values.iter_mut().find(|(k, _)| k == key) {
+            Some(entry) => entry.1 = value,
+            None => self.values.push((key.to_string(), value)),
+        }
+    }
+}
+
+/// The settings the layers of `range` print with: `object`, the settings
+/// of the object, with the values of `range` that are settings of
+/// [`RANGE_SETTINGS`] over them.
+pub fn range_settings(object: &Settings, range: &HeightRange) -> Settings {
+    let mut settings = object.clone();
+    let values = range
+        .values
+        .iter()
+        .filter(|(key, _)| RANGE_SETTINGS.contains(&key.as_str()))
+        .map(|(key, value)| (key.as_str(), value.as_str()));
+    // The values were checked when the range was made; values that do not
+    // fit those of the object leave the object's settings as they are.
+    if settings.set_all(values).is_err() {
+        return object.clone();
+    }
+    settings
+}
+
+/// Layers a settings file in TOML form over `range`, a height range of an
+/// object whose settings are `object`, as the command line and the server
+/// do. Fails, changing nothing, if the file names a setting outside
+/// [`RANGE_SETTINGS`] (`settings.not_per_range`) or holds a value that is
+/// not valid.
+pub fn apply_range_toml(
+    range: &mut HeightRange,
+    object: &Settings,
+    text: &str,
+) -> Result<(), Diagnostic> {
+    let keys = Settings::toml_keys(text).map_err(|e| e.diagnostic())?;
+    for key in &keys {
+        if !RANGE_SETTINGS.contains(&key.as_str()) {
+            let allowed = RANGE_SETTINGS.join(", ");
+            return Err(Diagnostic::error(
+                "settings.not_per_range",
+                format!("setting '{key}' cannot be set per height range (allowed: {allowed})"),
+            )
+            .with("key", key)
+            .with("allowed", allowed));
+        }
+    }
+    let mut trial = range_settings(object, range);
+    trial.apply_toml(text).map_err(|e| e.diagnostic())?;
+    let values = trial.values();
+    for key in keys {
+        if let Some(value) = values.get(&key) {
+            range.put(&key, value.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Layers settings by the names of Orca Slicer and Bambu Studio, as their
+/// project files store them for a height range of an object, over
+/// `range`; `object` are the settings of the object. Only settings of
+/// [`RANGE_SETTINGS`] are taken; the others are returned by their Orca
+/// name with the reason, as by [`apply_object_orca`].
+pub fn apply_range_orca(
+    range: &mut HeightRange,
+    object: &Settings,
+    values: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut trial = range_settings(object, range);
+    let pairs = values
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()));
+    let import = slicer_profiles::import_orca_values(pairs, &mut trial.clone());
+    let mut skipped = import.skipped;
+    for (ours, value, orca) in import.taken {
+        if !RANGE_SETTINGS.contains(&ours.as_str()) {
+            skipped.push((orca, format!("'{ours}' cannot be set per height range")));
+        } else if let Err(error) = trial.set(&ours, &value) {
+            skipped.push((orca, error.to_string()));
+        } else {
+            range.put(&ours, value);
+        }
+    }
+    skipped
+}
+
+/// The settings of a group of objects: those of their whole height and
+/// those of their height ranges.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Group {
+    /// The settings outside the ranges.
+    pub(crate) settings: Settings,
+    /// Where a range starts and ends (see [`HeightRange`]) and the
+    /// settings of its layers, which differ from `settings`. Where ranges
+    /// overlap, the later one counts.
+    pub(crate) ranges: Vec<(f64, f64, Settings)>,
+}
+
+impl Group {
+    /// A group with `settings` over its whole height.
+    pub(crate) fn plain(settings: Settings) -> Self {
+        Self {
+            settings,
+            ranges: Vec::new(),
+        }
+    }
+
+    /// The settings of the layer whose middle lies `z` above the bed.
+    pub(crate) fn at(&self, z: f64) -> &Settings {
+        self.ranges
+            .iter()
+            .rev()
+            .find(|(from, to, _)| *from <= z && z < *to)
+            .map_or(&self.settings, |(_, _, settings)| settings)
+    }
+
+    /// Whether `test` holds for the settings of some height of the group.
+    pub(crate) fn any(&self, test: impl Fn(&Settings) -> bool) -> bool {
+        test(&self.settings) || self.ranges.iter().any(|(_, _, s)| test(s))
+    }
+}
+
 /// `settings` with the speeds an object may set for itself taken from
 /// `speeds`. They change only how fast the G-code writer prints the lines
 /// of an object (and whether its overhanging walls are slowed down), not
@@ -142,22 +319,35 @@ pub fn apply_object_orca(own: &mut Settings, values: &[(String, String)]) -> Vec
 
 /// The different settings among `count` objects, the first of them those
 /// of the first object, and for every object the index of its settings.
-/// Object `i` has `own[i]` if given, otherwise the plate's. Speeds do not
-/// count: every group has the plate's, and the G-code writer takes those
-/// of every object from [`speed_table`], so objects that differ only in
-/// speeds are laid out exactly as if they did not.
+/// Object `i` has `own[i]` if given, otherwise the plate's, and the height
+/// ranges `ranges[i]` (none if the slice is shorter); ranges that change
+/// nothing are left out. Speeds do not count: every group has the plate's,
+/// and the G-code writer takes those of every object from
+/// [`speed_table`], so objects that differ only in speeds are laid out
+/// exactly as if they did not.
 pub(crate) fn groups(
     count: usize,
     own: &[Option<Settings>],
+    ranges: &[Vec<HeightRange>],
     plate: &Settings,
-) -> (Vec<Settings>, Vec<usize>) {
-    let mut groups: Vec<Settings> = Vec::new();
+) -> (Vec<Group>, Vec<usize>) {
+    let mut groups: Vec<Group> = Vec::new();
     let mut membership = Vec::with_capacity(count);
     for index in 0..count {
         let settings = match own.get(index) {
             Some(Some(own)) => with_speeds(&object_settings(plate, own), plate),
             _ => plate.clone(),
         };
+        let ranges = ranges
+            .get(index)
+            .into_iter()
+            .flatten()
+            .filter_map(|range| {
+                let own = range_settings(&settings, range);
+                (own != settings).then_some((range.from, range.to, own))
+            })
+            .collect();
+        let settings = Group { settings, ranges };
         let group = match groups.iter().position(|g| *g == settings) {
             Some(group) => group,
             None => {
@@ -168,7 +358,7 @@ pub(crate) fn groups(
         membership.push(group);
     }
     if groups.is_empty() {
-        groups.push(plate.clone());
+        groups.push(Group::plain(plate.clone()));
     }
     (groups, membership)
 }
@@ -220,14 +410,21 @@ pub(crate) fn regions(
         .collect()
 }
 
-/// On every layer, everything that groups whose supports are `on` take.
-pub(crate) fn with_supports(regions: &[Vec<Shapes>], groups: &[Settings], on: bool) -> Vec<Shapes> {
+/// On every layer (cut at `cut_heights`), everything that groups whose
+/// supports are `on` on that layer take.
+pub(crate) fn with_supports(
+    regions: &[Vec<Shapes>],
+    groups: &[Group],
+    cut_heights: &[f64],
+    on: bool,
+) -> Vec<Shapes> {
     let layers = regions.first().map_or(0, Vec::len);
     parallel_map(layers, |index| {
+        let z = cut_heights.get(index).copied().unwrap_or(0.0);
         regions
             .iter()
             .zip(groups)
-            .filter(|(_, settings)| settings.supports == on)
+            .filter(|(_, group)| group.at(z).supports == on)
             .fold(Vec::new(), |area, (region, _)| {
                 polygon::union(&area, &region[index])
             })
@@ -237,34 +434,35 @@ pub(crate) fn with_supports(regions: &[Vec<Shapes>], groups: &[Settings], on: bo
 /// The regions to print with their extruder and settings: the regions of
 /// the extruders (`extruders`, empty if one extruder prints everything)
 /// split by the regions of the groups of objects (`objects`, empty if all
-/// objects have the same settings). Without either, empty.
+/// objects have the same settings, which are `single`). Without either,
+/// empty.
 pub(crate) fn split<'a>(
     extruders: Vec<(u32, Vec<Shapes>)>,
     objects: Vec<Vec<Shapes>>,
-    groups: &'a [Settings],
+    groups: &'a [Group],
     extruder: u32,
-    settings: &'a Settings,
-) -> Vec<(u32, &'a Settings, Vec<Shapes>)> {
+    single: &'a Group,
+) -> Vec<(u32, &'a Group, Vec<Shapes>)> {
     if objects.is_empty() {
         return extruders
             .into_iter()
-            .map(|(e, region)| (e, settings, region))
+            .map(|(e, region)| (e, single, region))
             .collect();
     }
     if extruders.is_empty() {
         return objects
             .into_iter()
             .zip(groups)
-            .map(|(region, settings)| (extruder, settings, region))
+            .map(|(region, group)| (extruder, group, region))
             .collect();
     }
     let mut regions = Vec::new();
     for (e, region) in &extruders {
-        for (group, settings) in objects.iter().zip(groups) {
+        for (area, group) in objects.iter().zip(groups) {
             let part = parallel_map(region.len(), |index| {
-                polygon::intersection(&region[index], &group[index])
+                polygon::intersection(&region[index], &area[index])
             });
-            regions.push((*e, settings, part));
+            regions.push((*e, group, part));
         }
     }
     regions
@@ -280,7 +478,10 @@ mod tests {
     use slicer_profiles::{InfillPattern, SeamPosition, WallOrder};
 
     use super::*;
-    use crate::{Layer, PathKind, Progress, Toolpaths, generate_plate_with_object_settings};
+    use crate::{
+        Layer, OwnSettings, PathKind, Progress, Toolpaths, generate_plate_with_object_settings,
+        generate_plate_with_own_settings,
+    };
 
     /// Slices `objects` where they are, object `i` with `own[i]`.
     fn slice(
@@ -568,11 +769,242 @@ mod tests {
             ..Settings::default()
         };
         let own = [None, Some(dense.clone()), Some(thin), Some(dense)];
-        let (groups, membership) = groups(5, &own, &plate);
+        let (groups, membership) = groups(5, &own, &[], &plate);
         assert_eq!(membership, [0, 1, 0, 1, 0]);
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0], plate);
-        assert_eq!(groups[1].infill_density, 100.0);
-        assert_eq!(super::groups(0, &[], &plate).0, [plate]);
+        assert_eq!(groups[0], Group::plain(plate.clone()));
+        assert_eq!(groups[1].settings.infill_density, 100.0);
+        assert_eq!(
+            super::groups(0, &[], &[], &plate).0,
+            [Group::plain(plate.clone())]
+        );
+        // Ranges that change nothing are none; others make a group of
+        // their own.
+        let mut same = HeightRange::new(5.0, 10.0);
+        same.put("infill_density", plate.infill_density.to_string());
+        let mut walls = HeightRange::new(5.0, 10.0);
+        walls.put("wall_loops", "5".into());
+        let ranges = [vec![], vec![], vec![same], vec![walls]];
+        let (groups, membership) = super::groups(4, &own, &ranges, &plate);
+        assert_eq!(membership, [0, 1, 0, 2]);
+        assert_eq!(groups[2].settings, groups[1].settings);
+        assert_eq!(groups[2].at(4.9).wall_loops, plate.wall_loops);
+        assert_eq!(groups[2].at(5.0).wall_loops, 5);
+        assert_eq!(groups[2].at(9.9).infill_density, 100.0);
+        assert_eq!(groups[2].at(10.0).wall_loops, plate.wall_loops);
+    }
+
+    /// Slices `objects` where they are, object `i` with the height ranges
+    /// `ranges[i]`.
+    fn slice_ranges(
+        objects: &[Mesh],
+        ranges: &[Vec<HeightRange>],
+        settings: &Settings,
+    ) -> (Toolpaths, Diagnostics) {
+        let mut diagnostics = Diagnostics::new();
+        let own = OwnSettings {
+            objects: &[],
+            ranges,
+        };
+        let toolpaths = generate_plate_with_own_settings(
+            objects,
+            own,
+            Placement::AsGiven,
+            settings,
+            &mut diagnostics,
+            &AtomicBool::new(false),
+            &Progress::new(),
+        )
+        .unwrap();
+        (toolpaths, diagnostics)
+    }
+
+    /// A range from `from` to `to` millimetres with the settings `text`
+    /// over `settings`.
+    fn range(from: f64, to: f64, settings: &Settings, text: &str) -> HeightRange {
+        let mut range = HeightRange::new(from, to);
+        apply_range_toml(&mut range, settings, text).unwrap();
+        range
+    }
+
+    /// Height of the middle of `layer` above the bed.
+    fn middle(layer: &Layer) -> f64 {
+        layer.z - layer.height / 2.0
+    }
+
+    #[test]
+    fn layers_in_a_height_range_print_with_its_settings() {
+        let settings = Settings {
+            skirt_loops: 0,
+            ..Settings::default()
+        };
+        let objects = [cube(20.0)];
+        let (plain, plain_warnings) = slice(&objects, &[], &settings);
+        let dense = range(
+            10.0,
+            20.0,
+            &settings,
+            "infill_density = 100.0\nwall_loops = 4",
+        );
+        let (toolpaths, warnings) = slice_ranges(&objects, &[vec![dense]], &settings);
+        assert_eq!(warnings.codes(), plain_warnings.codes());
+        assert_eq!(toolpaths.layers.len(), plain.layers.len());
+        use PathKind::*;
+        let inner = |layer: &Layer| layer.paths.iter().filter(|p| p.kind == InnerWall).count();
+        let below: Vec<usize> = (0..plain.layers.len())
+            .filter(|&i| middle(&plain.layers[i]) < 10.0)
+            .collect();
+        let border = below.len();
+        // Below the range everything is as without it, up to the last layer
+        // under the border, which stays sparse: no top surface there.
+        assert_eq!(toolpaths.layers[..border], plain.layers[..border]);
+        assert_eq!(
+            kinds(&toolpaths.layers[border - 1], true),
+            [OuterWall, InnerWall, SparseInfill]
+        );
+        // From the first layer whose middle lies above 10 mm, the range's.
+        for layer in &toolpaths.layers[border..toolpaths.layers.len() - 6] {
+            assert!(middle(layer) >= 10.0);
+            assert_eq!(kinds(layer, true), [OuterWall, InnerWall, SolidInfill]);
+            assert_eq!(inner(layer), 3);
+        }
+        assert_eq!(inner(&plain.layers[border]), 1);
+
+        // Without infill above the border, the first layer of the range is
+        // no bottom surface either.
+        let empty = range(10.0, 20.0, &settings, "infill_density = 0.0");
+        let (toolpaths, _) = slice_ranges(&objects, &[vec![empty]], &settings);
+        assert_eq!(toolpaths.layers[..border], plain.layers[..border]);
+        assert_eq!(
+            kinds(&toolpaths.layers[border], true),
+            [OuterWall, InnerWall]
+        );
+        assert_eq!(
+            kinds(&toolpaths.layers[border + 5], true),
+            [OuterWall, InnerWall]
+        );
+        // The top stays solid.
+        let top = toolpaths.layers.last().unwrap();
+        assert_eq!(kinds(top, true), [OuterWall, InnerWall, SolidInfill]);
+    }
+
+    #[test]
+    fn ranges_that_change_nothing_print_as_before() {
+        let settings = Settings::default();
+        let objects = [cube(20.0), tee(140.0)];
+        let (plain, warnings) = slice(&objects, &[], &settings);
+        // The plate's own values, and no ranges at all.
+        let text = settings.to_toml_keys(&["wall_loops", "infill_density", "supports"]);
+        let same = range(5.0, 15.0, &settings, &text);
+        assert_eq!(same.values.len(), 3);
+        for ranges in [vec![vec![same.clone()], vec![same]], vec![vec![], vec![]]] {
+            let (own, own_warnings) = slice_ranges(&objects, &ranges, &settings);
+            assert_eq!(own, plain);
+            assert_eq!(own_warnings.codes(), warnings.codes());
+        }
+        // A range above the object makes it a group of its own, which
+        // prints the same kinds of paths.
+        let outside = range(30.0, 40.0, &settings, "wall_loops = 5");
+        let (own, _) = slice_ranges(&objects, &[vec![], vec![outside]], &settings);
+        assert_eq!(own.layers.len(), plain.layers.len());
+        for (layer, before) in own.layers.iter().zip(&plain.layers) {
+            for left in [true, false] {
+                assert_eq!(kinds(layer, left), kinds(before, left));
+            }
+        }
+    }
+
+    #[test]
+    fn supports_follow_the_height_ranges() {
+        let objects = [tee(20.0)];
+        let plate = Settings::default();
+        let supported = |toolpaths: &Toolpaths| {
+            toolpaths
+                .layers
+                .iter()
+                .any(|layer| kinds(layer, true).contains(&PathKind::Support))
+        };
+        // The overhang is at 10 mm: a range around it brings supports, one
+        // below it does not.
+        let around = range(9.0, 20.0, &plate, "supports = true");
+        let (toolpaths, warnings) = slice_ranges(&objects, &[vec![around]], &plate);
+        assert!(supported(&toolpaths));
+        assert!(warnings.is_empty(), "{:?}", warnings.codes());
+        let low = range(0.0, 5.0, &plate, "supports = true");
+        let (toolpaths, warnings) = slice_ranges(&objects, &[vec![low]], &plate);
+        assert!(!supported(&toolpaths));
+        assert_eq!(warnings.codes(), ["slicing.unsupported_overhangs"]);
+        // And the other way round.
+        let with = Settings {
+            supports: true,
+            ..plate.clone()
+        };
+        let around = range(9.0, 20.0, &with, "supports = false");
+        let (toolpaths, _) = slice_ranges(&objects, &[vec![around]], &with);
+        assert!(!supported(&toolpaths));
+    }
+
+    #[test]
+    fn ranges_take_only_their_own_keys() {
+        let object = Settings {
+            wall_loops: 3,
+            ..Settings::default()
+        };
+        let mut range = HeightRange::new(10.0, 20.0);
+        apply_range_toml(
+            &mut range,
+            &object,
+            "infill_density = 100.0\ntop_layers = 2",
+        )
+        .unwrap();
+        apply_range_toml(&mut range, &object, "infill_density = 50.0").unwrap();
+        assert_eq!(range.values.len(), 2);
+        let layers = range_settings(&object, &range);
+        assert_eq!(layers.infill_density, 50.0);
+        assert_eq!(layers.top_layers, 2);
+        assert_eq!(layers.wall_loops, 3);
+        // Speeds and layer heights stay those of the object.
+        for text in ["infill_speed = 20.0", "layer_height = 0.1"] {
+            let error = apply_range_toml(&mut range, &object, text).unwrap_err();
+            assert_eq!(error.code, "settings.not_per_range");
+        }
+        assert!(apply_range_toml(&mut range, &object, "wall_loops = -1").is_err());
+        assert_eq!(range.values.len(), 2);
+        // Values set by hand outside the keys are ignored.
+        range.put("layer_height", "0.1".into());
+        assert_eq!(
+            range_settings(&object, &range).layer_height,
+            object.layer_height
+        );
+        for key in RANGE_SETTINGS {
+            assert!(OBJECT_SETTINGS.contains(key), "{key}");
+        }
+        assert!(range.contains(10.0) && range.contains(19.99) && !range.contains(20.0));
+    }
+
+    #[test]
+    fn project_values_of_a_range_are_restricted_to_its_keys() {
+        let object = Settings::default();
+        let mut range = HeightRange::new(0.0, 5.0);
+        let values: Vec<(String, String)> = [
+            ("sparse_infill_density", "100%"),
+            ("wall_loops", "4"),
+            ("layer_height", "0.1"),
+            ("outer_wall_speed", "30"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let skipped = apply_range_orca(&mut range, &object, &values);
+        let layers = range_settings(&object, &range);
+        assert_eq!((layers.infill_density, layers.wall_loops), (100.0, 4));
+        let mut keys: Vec<&str> = skipped.iter().map(|(key, _)| key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["layer_height", "outer_wall_speed"]);
+        assert!(
+            skipped
+                .iter()
+                .all(|(_, reason)| reason.contains("height range"))
+        );
     }
 }
