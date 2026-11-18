@@ -119,6 +119,14 @@ pub struct Settings {
     pub flavor: Flavor,
     /// Whether extrusion amounts in the G-code are relative or absolute.
     pub extrusion_mode: ExtrusionMode,
+    /// Whether runs of short extrusion moves that lie on a circle are
+    /// written as one arc (`G2` clockwise, `G3` counter-clockwise) instead
+    /// of many straight `G1` lines: smaller files and smoother curves.
+    /// Klipper needs `[gcode_arcs]` in `printer.cfg` for it.
+    pub arc_fitting: bool,
+    /// With `arc_fitting`: how far any point of the original lines (and
+    /// the middle of every line) may lie from the arc that replaces them.
+    pub arc_tolerance: f64,
     /// Number of extruders (tools or filament slots) of the printer. With
     /// more than one, every object prints with the extruder it names (Bambu
     /// Studio projects) and the G-code changes tools with `T<n>`; with one,
@@ -330,6 +338,8 @@ impl Default for Settings {
             nozzle_diameter: 0.4,
             flavor: Flavor::Marlin,
             extrusion_mode: ExtrusionMode::Relative,
+            arc_fitting: false,
+            arc_tolerance: 0.01,
             extruder_count: 1,
             filament_diameter: 1.75,
             filament_density: 1.24,
@@ -747,6 +757,7 @@ impl Settings {
                 10.0,
             ),
             ("wipe_distance", self.wipe_distance, 0.0, 20.0),
+            ("arc_tolerance", self.arc_tolerance, 0.001, 0.5),
         ]
     }
 }

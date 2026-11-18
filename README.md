@@ -76,6 +76,7 @@ More print options, all off by default (see `docs/settings.md`):
 - `avoid_crossing_walls = true` sends travel moves round holes and notches inside the part instead of over open air, which also saves their retraction.
 - `fuzzy_skin = true` gives the outer wall a rough texture: its points are moved in and out at random by up to half of `fuzzy_skin_thickness`, one every `fuzzy_skin_point_distance`, the same on every run. The first layer stays smooth.
 - `wipe_distance = 2` retracts while going back 2 mm along the line just printed.
+- `arc_fitting = true` writes runs of short lines that lie on a circle within `arc_tolerance` (0.01 mm) as one `G2`/`G3` arc; the G-code of Benchy shrinks from 2.49 to 1.66 MB. Klipper needs `[gcode_arcs]` in `printer.cfg`.
 - `fan_layer_time = 30` turns the fan up on layers that take less than 30 seconds, the shorter the more, up to `fan_max_speed` at `min_layer_time`.
 - `overhang_speed = 15` prints the parts of walls where more than half the line hangs over the layer below at 15 mm/s and with `overhang_fan_speed`; they show as "Overhang wall" in the G-code and the preview.
 
