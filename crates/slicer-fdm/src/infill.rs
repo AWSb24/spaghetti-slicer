@@ -6,7 +6,7 @@ use std::f64::consts::SQRT_2;
 
 use slicer_core::polygon::{self, HatchDirection, distance};
 use slicer_core::{Contour, Point, Shapes};
-use slicer_profiles::SurfacePattern;
+use slicer_profiles::{SeamPosition, SurfacePattern};
 
 use crate::{CentreLine, PATH_RESOLUTION, PathKind, Work};
 
@@ -664,7 +664,10 @@ pub(crate) fn surface(
     let work = match pattern {
         SurfacePattern::Concentric => {
             let (loops, gaps) = concentric(&surface, width, width, true);
-            vec![Work::Loops(loops, kind, width), Work::Centred(gaps, kind)]
+            vec![
+                Work::Loops(loops, kind, width, SeamPosition::Nearest),
+                Work::Centred(gaps, kind),
+            ]
         }
         _ => vec![Work::Ordered(
             monotonic(&surface, width, angle, 0.5 * width),

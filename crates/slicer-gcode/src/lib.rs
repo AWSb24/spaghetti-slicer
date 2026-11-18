@@ -315,6 +315,9 @@ struct Context<'a> {
     filament_area: f64,
     several: bool,
     absolute: bool,
+    /// The print, for the speeds of its objects
+    /// ([`Toolpaths::settings_of`]).
+    toolpaths: &'a Toolpaths,
 }
 
 impl<'a> Writer<'a> {
@@ -852,7 +855,10 @@ fn write_layer(
             current_kind = Some(path.kind);
             let _ = writeln!(w.out, ";TYPE:{}", label(path.kind));
         }
-        let speed = slowed(path_speed(settings, path.kind, index), slow, settings);
+        // Paths of an object print at its speeds, all others at the
+        // plate's; `slow` stretches them all alike.
+        let own = context.toolpaths.settings_of(path, settings);
+        let speed = slowed(path_speed(own, path.kind, index), slow, settings);
         if let Some(from) = rise_from {
             // Z climbs in proportion to the length gone round.
             let mut corners: Vec<Point> = path.points.clone();
@@ -1035,6 +1041,12 @@ fn slowed(speed: f64, slow: f64, settings: &Settings) -> f64 {
 /// move; at every later change the old extruder retracts, `toolchange_gcode`
 /// follows, then `T<n>`, the travel to the next path and the move back to
 /// the height of the layer (the custom G-code may have moved the nozzle).
+///
+/// The paths of objects with speeds of their own
+/// ([`Toolpaths::object_settings`]) print at those; everything else, and
+/// every path on the first layer, at the speeds of `settings`.
+// ponytail: only the speeds of lines come from the objects; fan, flow,
+// retraction and the slowdown for `min_layer_time` stay the plate's.
 pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output, GcodeError> {
     write_gcode_with_progress(toolpaths, settings, &Progress::new())
 }
@@ -1125,6 +1137,7 @@ pub fn write_gcode_with_progress(
         filament_area,
         several,
         absolute,
+        toolpaths,
     };
     let mut carry = Carry::default();
     // Layers are counted within their object: a layer no higher than the
@@ -2217,5 +2230,168 @@ SET_PRESSURE_ADVANCE ADVANCE=0.04
         assert!(one_by_one.print_time_s > 0.0);
         let sum: f64 = one_by_one.times.iter().map(|(_, t)| t).sum();
         assert!((sum - one_by_one.print_time_s).abs() < 1e-6);
+    }
+
+    /// A house lying on its side, its smallest corner at `x`, 50 mm: the
+    /// rearmost point is the blunt ridge, the sharpest corners are the two
+    /// at the front.
+    fn house(x: f64) -> Mesh {
+        let outline = [
+            [0.0, 0.0],
+            [20.0, 0.0],
+            [20.0, 10.0],
+            [10.0, 14.0],
+            [0.0, 10.0],
+        ];
+        let mut mesh = slicer_core::primitives::extrude(&outline, [10.0, 5.0], 4.0, 1, 0.0);
+        mesh.translate([x, 50.0, 0.0]);
+        mesh
+    }
+
+    /// Toolpaths of `objects` where they are, object `i` with `own[i]`.
+    fn plate(objects: &[Mesh], own: &[Option<Settings>], settings: &Settings) -> Toolpaths {
+        slicer_fdm::generate_plate_with_object_settings(
+            objects,
+            own,
+            slicer_fdm::Placement::AsGiven,
+            settings,
+            &mut slicer_core::Diagnostics::new(),
+            &std::sync::atomic::AtomicBool::new(false),
+            &Progress::new(),
+        )
+        .unwrap()
+    }
+
+    /// The feed rates in mm/min of the extruding moves of line type `kind`
+    /// above the first layer, left of X = 100 (the first house) and right
+    /// of it (the second).
+    fn feeds(gcode: &str, kind: &str, first_layer: f64) -> (Vec<f64>, Vec<f64>) {
+        let (mut left, mut right) = (Vec::new(), Vec::new());
+        let (mut z, mut x, mut feed, mut this) = (0.0, 0.0, 0.0, false);
+        for line in gcode.lines() {
+            if let Some(height) = line.strip_prefix(";Z:") {
+                z = height.parse().unwrap();
+            }
+            if let Some(name) = line.strip_prefix(";TYPE:") {
+                this = name == kind;
+            }
+            if let Some(f) = word(line, 'F') {
+                feed = f;
+            }
+            if let Some(at) = word(line, 'X') {
+                x = at;
+            }
+            // Moves in X or Y; not the filament pushed back after a retraction.
+            let moving = word(line, 'X').is_some() || word(line, 'Y').is_some();
+            let extruding = moving && word(line, 'E').is_some_and(|e| e > 0.0);
+            if this && extruding && z > first_layer + 1e-6 {
+                if x < 100.0 { &mut left } else { &mut right }.push(feed);
+            }
+        }
+        (left, right)
+    }
+
+    #[test]
+    fn objects_print_at_their_own_speeds_and_seams() {
+        let objects = [house(20.0), house(140.0)];
+        let own = Settings {
+            outer_wall_speed: 15.0,
+            seam_position: slicer_profiles::SeamPosition::Corner,
+            ..Settings::default()
+        };
+        for sequential_print in [false, true] {
+            let settings = Settings {
+                min_layer_time: 0.0,
+                fan_layer_time: 0.0,
+                sequential_print,
+                ..Settings::default()
+            };
+            let toolpaths = plate(&objects, &[None, Some(own.clone())], &settings);
+            // The first house starts its walls at the ridge, the second in a
+            // front corner.
+            let walls = toolpaths.layers.iter().flat_map(|l| &l.paths);
+            let mut seams = 0;
+            for path in walls.filter(|p| p.kind == PathKind::OuterWall) {
+                let [x, y] = path.points[0];
+                if x < 100.0 {
+                    assert!(y > 63.0, "{:?}", path.points[0]);
+                } else {
+                    assert!(y < 51.0, "{:?}", path.points[0]);
+                }
+                seams += 1;
+            }
+            assert_eq!(seams, 40);
+            let gcode = write_gcode(&toolpaths, &settings).unwrap().gcode;
+            let first = settings.first_layer_height;
+            let (left, right) = feeds(&gcode, "Outer wall", first);
+            assert!(left.len() > 10 && right.len() > 10);
+            assert!(left.iter().all(|&f| f == settings.outer_wall_speed * 60.0));
+            assert!(right.iter().all(|&f| f == own.outer_wall_speed * 60.0));
+            // Its other lines keep the plate's speeds, as does its first
+            // layer.
+            let (left, right) = feeds(&gcode, "Inner wall", first);
+            assert!(!right.is_empty() && left == right);
+            assert!(right.iter().all(|&f| f == settings.inner_wall_speed * 60.0));
+            let (left, right) = feeds(&gcode, "Outer wall", 0.0);
+            assert!(left.contains(&(settings.first_layer_speed * 60.0)));
+            assert!(right.contains(&(settings.first_layer_speed * 60.0)));
+        }
+
+        // The minimum layer time slows both down alike.
+        let settings = Settings {
+            min_layer_time: 60.0,
+            min_print_speed: 1.0,
+            ..Settings::default()
+        };
+        let toolpaths = plate(&objects, &[None, Some(own.clone())], &settings);
+        let gcode = write_gcode(&toolpaths, &settings).unwrap().gcode;
+        let (left, right) = feeds(&gcode, "Outer wall", settings.first_layer_height);
+        let (left, right) = (left[0], right[0]);
+        assert!(left < settings.outer_wall_speed * 60.0, "{left}");
+        let ratio = right / left;
+        let expected = own.outer_wall_speed / settings.outer_wall_speed;
+        assert!((ratio - expected).abs() < 0.01, "{ratio}");
+    }
+
+    #[test]
+    fn objects_without_own_speeds_print_as_before() {
+        let objects = [house(20.0), house(140.0)];
+        let settings = Settings::default();
+        let plain = plate(&objects, &[], &settings);
+        assert!(plain.object_settings.is_empty());
+        let plain = write_gcode(&plain, &settings).unwrap().gcode;
+        // Own values equal to the plate's, or differing only in keys an
+        // object cannot set, are none.
+        let elsewhere = Settings {
+            first_layer_speed: 5.0,
+            travel_speed: 99.0,
+            ..settings.clone()
+        };
+        let own = [Some(settings.clone()), Some(elsewhere)];
+        let toolpaths = plate(&objects, &own, &settings);
+        assert!(toolpaths.object_settings.is_empty());
+        assert_eq!(write_gcode(&toolpaths, &settings).unwrap().gcode, plain);
+        // Own speeds change the speeds and nothing else.
+        let fast = Settings {
+            infill_speed: 120.0,
+            bridge_speed: 50.0,
+            ..settings.clone()
+        };
+        let toolpaths = plate(&objects, &[None, Some(fast)], &settings);
+        assert_eq!(toolpaths.object_settings.len(), 2);
+        let fast = write_gcode(&toolpaths, &settings).unwrap().gcode;
+        assert_ne!(fast, plain);
+        let moves = |gcode: &str| -> Vec<String> {
+            gcode
+                .lines()
+                .filter(|l| !l.starts_with(';'))
+                .map(|l| {
+                    let words = l.split_whitespace().filter(|w| !w.starts_with('F'));
+                    words.collect::<Vec<_>>().join(" ")
+                })
+                .filter(|l| l != "G1")
+                .collect()
+        };
+        assert_eq!(moves(&fast), moves(&plain));
     }
 }

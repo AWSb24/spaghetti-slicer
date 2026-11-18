@@ -164,8 +164,9 @@ pub struct Path {
     /// Object on the plate the path belongs to, counted from 0 in the order
     /// the objects were given; [`NO_OBJECT`] for skirt, brim, supports and
     /// the prime tower. On a plate of several objects printed together it
-    /// is only worked out with `Settings::label_objects` and is
-    /// [`NO_OBJECT`] for every path otherwise.
+    /// is only worked out with `Settings::label_objects` or speeds of
+    /// objects ([`Toolpaths::object_settings`]) and is [`NO_OBJECT`] for
+    /// every path otherwise.
     pub object: u32,
     /// Width of the extruded line in millimetres where it differs from the
     /// line width setting: lines along the middle of regions too narrow for
@@ -214,6 +215,28 @@ pub struct Toolpaths {
     /// layers of every object follow those of the object printed before;
     /// a layer no higher than the one before it starts the next object.
     pub layers: Vec<Layer>,
+    /// The settings of every object on the plate, counted like
+    /// [`Path::object`], where an object prints at speeds of its own
+    /// (see [`OBJECT_SETTINGS`]); empty if every object prints at the
+    /// plate's speeds. Every path of an object then has its object set.
+    pub object_settings: Vec<Settings>,
+}
+
+impl Toolpaths {
+    /// The settings `path` prints with: those of its object from
+    /// [`Toolpaths::object_settings`], `plate` for paths of no object and
+    /// without settings of objects.
+    pub fn settings_of<'a>(&'a self, path: &Path, plate: &'a Settings) -> &'a Settings {
+        settings_of(&self.object_settings, path, plate)
+    }
+}
+
+/// [`Toolpaths::settings_of`] with the settings of the objects `table`.
+fn settings_of<'a>(table: &'a [Settings], path: &Path, plate: &'a Settings) -> &'a Settings {
+    usize::try_from(path.object)
+        .ok()
+        .and_then(|object| table.get(object))
+        .unwrap_or(plate)
 }
 
 /// Why toolpaths could not be generated.
@@ -509,6 +532,9 @@ pub fn generate_plate_with_object_settings(
     // Objects with equal settings form a group. With a single group its
     // settings are those of the whole plate.
     let (groups, membership) = objects::groups(objects.len(), own, settings);
+    // Speeds of objects only reach the writer, through this table.
+    let object_settings = objects::speed_table(objects.len(), own, settings);
+    let plate_settings = settings;
     let settings = match groups.as_slice() {
         [only] => only,
         _ => settings,
@@ -854,7 +880,7 @@ pub fn generate_plate_with_object_settings(
                     tower.push(index, e, &mut position, &mut paths);
                 }
                 for piece in work {
-                    push_work(piece, settings, &mut position, &mut paths);
+                    push_work(piece, &mut position, &mut paths);
                 }
                 for path in &mut paths[start..] {
                     path.extruder = e;
@@ -885,13 +911,17 @@ pub fn generate_plate_with_object_settings(
         placement,
         shift,
         &cut_heights,
-        settings,
+        settings.label_objects || !object_settings.is_empty(),
     );
-    if settings.overhang_speed > 0.0 {
-        let free = match settings.overhang_speed_full {
-            speed if speed > 0.0 => 0.5 * settings.line_width,
-            _ => 0.0,
-        };
+    // Every wall is split with the overhang speeds of its object.
+    let overhangs = |path: &Path| {
+        let own = settings_of(&object_settings, path, plate_settings);
+        (own.overhang_speed > 0.0).then_some(own.overhang_speed_full > 0.0)
+    };
+    if std::iter::once(plate_settings)
+        .chain(&object_settings)
+        .any(|s| s.overhang_speed > 0.0)
+    {
         let split = parallel_map(layers.len(), |index| match index {
             0 => None,
             _ if layers[index].spiral => None,
@@ -899,7 +929,8 @@ pub fn generate_plate_with_object_settings(
                 &layers[index].paths,
                 &slices[index],
                 &slices[index - 1],
-                free,
+                0.5 * settings.line_width,
+                overhangs,
             ),
         });
         for (layer, paths) in layers.iter_mut().zip(split) {
@@ -980,22 +1011,27 @@ pub fn generate_plate_with_object_settings(
             .with("first_layer", first + 1),
         );
     }
-    Ok(Toolpaths { layers })
+    Ok(Toolpaths {
+        layers,
+        object_settings,
+    })
 }
 
 /// Sets [`Path::object`] of every path that belongs to an object: with one
-/// object to it, with several and `label_objects` to the object whose part
-/// of the layer the path starts in (see [`objects::regions`]), trying the
-/// other points of the path if the first lies in none.
+/// object to it, with several and `several` (for `label_objects` or speeds
+/// of objects) to the object whose part of the layer the path starts in
+/// (see [`objects::regions`]), trying the other points of the path if the
+/// first lies in none.
 // ponytail: objects whose outlines overlap are printed as one, and a path
-// running from one into the other belongs to the first one it starts in.
+// running from one into the other belongs to the first one it starts in;
+// for speeds of objects every object is cut once more on its own.
 fn assign_objects(
     layers: &mut [Layer],
     objects: &[Mesh],
     placement: Placement,
     shift: Option<[f64; 3]>,
     cut_heights: &[f64],
-    settings: &Settings,
+    several: bool,
 ) {
     let own = |path: &Path| {
         !matches!(
@@ -1011,7 +1047,7 @@ fn assign_objects(
         }
         return;
     }
-    if !settings.label_objects {
+    if !several {
         return;
     }
     let membership: Vec<usize> = (0..objects.len()).collect();
@@ -1062,15 +1098,9 @@ fn with_extruder(mesh: &Mesh, extruder: u32) -> Mesh {
 }
 
 /// Puts one piece of geometry in printing order and appends it to `paths`.
-fn push_work(piece: Work, settings: &Settings, position: &mut Point, paths: &mut Vec<Path>) {
+fn push_work(piece: Work, position: &mut Point, paths: &mut Vec<Path>) {
     match piece {
-        Work::Loops(loops, kind, min_length) => {
-            let wall = matches!(kind, PathKind::OuterWall | PathKind::InnerWall);
-            let seam = if wall {
-                settings.seam_position
-            } else {
-                SeamPosition::Nearest
-            };
+        Work::Loops(loops, kind, min_length, seam) => {
             push_loops(loops, kind, min_length, seam, position, paths);
         }
         Work::Lines(lines, kind, join_distance) => {
@@ -1228,23 +1258,33 @@ fn combed(
 /// nothing changes. Where a wall changes between overhanging and supported
 /// it is cut into open pieces that follow on one another, starting where
 /// the wall started. Short changes are evened out, see
-/// [`MIN_OVERHANG_RUN`]. With a `free` distance above 0, the parts whose
-/// line middle lies farther than that outside `below` become overhang
-/// walls that hang free entirely.
-fn split_overhangs(paths: &[Path], slice: &Shapes, below: &Shapes, free: f64) -> Option<Vec<Path>> {
+/// [`MIN_OVERHANG_RUN`]. `overhangs` tells for every path whether it is
+/// split at all (`None`: no) and whether the parts whose line middle lies
+/// farther than `free` outside `below` become overhang walls that hang
+/// free entirely.
+fn split_overhangs(
+    paths: &[Path],
+    slice: &Shapes,
+    below: &Shapes,
+    free: f64,
+    overhangs: impl Fn(&Path) -> Option<bool>,
+) -> Option<Vec<Path>> {
     let hanging = polygon::difference(slice, below);
     if hanging.is_empty() {
         return None;
     }
-    let free = (free > 0.0).then(|| polygon::difference(slice, &polygon::offset(below, free)));
+    let free = paths
+        .iter()
+        .any(|p| overhangs(p) == Some(true))
+        .then(|| polygon::difference(slice, &polygon::offset(below, free)));
     let mut out = Vec::with_capacity(paths.len());
     let mut changed = false;
     for path in paths {
         let wall = matches!(path.kind, PathKind::OuterWall | PathKind::InnerWall);
-        if !wall || path.points.len() < 2 {
+        let Some(whole_free) = overhangs(path).filter(|_| wall && path.points.len() >= 2) else {
             out.push(path.clone());
             continue;
-        }
+        };
         let mut corners = path.points.clone();
         if path.closed {
             corners.push(path.points[0]);
@@ -1276,7 +1316,7 @@ fn split_overhangs(paths: &[Path], slice: &Shapes, below: &Shapes, free: f64) ->
         // hang only partly, short stretches that hang partly next to it
         // hang free.
         let mut whole = vec![false; flags.len()];
-        if let Some(free) = &free {
+        if let Some(free) = free.as_ref().filter(|_| whole_free) {
             whole = middles.iter().map(|&m| point_inside(free, m)).collect();
             for (w, &hangs) in whole.iter_mut().zip(&flags) {
                 *w &= hangs;
@@ -1463,8 +1503,10 @@ fn tidy_support(area: Shapes) -> Shapes {
 
 /// Geometry of one kind that still has to be put in printing order.
 enum Work {
-    /// Closed loops, their kind and the shortest loop worth printing.
-    Loops(Vec<Contour>, PathKind, f64),
+    /// Closed loops, their kind, the shortest loop worth printing and
+    /// where they start: `seam_position` of the region for walls,
+    /// [`SeamPosition::Nearest`] for everything else.
+    Loops(Vec<Contour>, PathKind, f64, SeamPosition),
     /// Line segments, their kind and the distance up to which consecutive
     /// segments are joined into one path.
     Lines(Vec<[Point; 2]>, PathKind, f64),
@@ -1509,7 +1551,12 @@ fn shared_work(
             .iter()
             .map(|contour| polygon::simplify(contour, PATH_RESOLUTION))
             .collect();
-        work.push(Work::Loops(loops, PathKind::Support, width));
+        work.push(Work::Loops(
+            loops,
+            PathKind::Support,
+            width,
+            SeamPosition::Nearest,
+        ));
         // The same direction on every layer, so the lines stack up to walls.
         let lines = polygon::hatch(
             &polygon::difference(&inner, dense),
@@ -1673,7 +1720,7 @@ fn region_work(
                 .map(|(number, contour)| fuzz(contour, index, number, settings))
                 .collect();
         }
-        work.push(Work::Loops(loops, kind, width));
+        work.push(Work::Loops(loops, kind, width, settings.seam_position));
         if k == 0 && !thin_lines.is_empty() {
             work.push(Work::Centred(std::mem::take(&mut thin_lines), kind));
         }
@@ -1779,7 +1826,12 @@ fn region_work(
                 }
                 InfillPattern::Concentric => {
                     let (loops, _) = infill::concentric(&sparse, width / density, width, false);
-                    work.push(Work::Loops(loops, PathKind::SparseInfill, width));
+                    work.push(Work::Loops(
+                        loops,
+                        PathKind::SparseInfill,
+                        width,
+                        SeamPosition::Nearest,
+                    ));
                 }
             }
         }
@@ -2084,11 +2136,21 @@ fn adhesion_work(
             &hull,
             skirt_start + (0.5 + k as f64) * width,
         ));
-        work.push(Work::Loops(loops, PathKind::Skirt, width));
+        work.push(Work::Loops(
+            loops,
+            PathKind::Skirt,
+            width,
+            SeamPosition::Nearest,
+        ));
     }
     for k in (0..brim_loops).rev() {
         let loops = outer_contours(&polygon::offset(&outlines, (0.5 + k as f64) * width));
-        work.push(Work::Loops(loops, PathKind::Brim, width));
+        work.push(Work::Loops(
+            loops,
+            PathKind::Brim,
+            width,
+            SeamPosition::Nearest,
+        ));
     }
 }
 

@@ -51,13 +51,15 @@ impl ColorBy {
         }
     }
 
-    /// Smallest and largest value over all paths; `None` for line types or
-    /// without paths.
+    /// Smallest and largest value over all paths, every path with the
+    /// settings of its object ([`Toolpaths::settings_of`]); `None` for line
+    /// types or without paths.
     pub fn range(self, toolpaths: &Toolpaths, settings: &Settings) -> Option<(f64, f64)> {
         let mut range: Option<(f64, f64)> = None;
         for (index, layer) in toolpaths.layers.iter().enumerate() {
             for path in &layer.paths {
-                if let Some(v) = self.value(path, index, layer, settings) {
+                let own = toolpaths.settings_of(path, settings);
+                if let Some(v) = self.value(path, index, layer, own) {
                     range = Some(range.map_or((v, v), |(lo, hi)| (lo.min(v), hi.max(v))));
                 }
             }

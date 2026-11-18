@@ -52,7 +52,8 @@ enum Command {
         set: Vec<String>,
         /// Settings file in TOML format for object N only (1 is the first
         /// model file), layered over the plate's settings; it may only set
-        /// walls, top and bottom layers, infill and supports. May be given
+        /// walls, seam, top and bottom layers, infill, supports and the
+        /// speeds of walls, infill, bridges, overhangs and ironing. May be given
         /// several times, also for the same object
         #[arg(long = "object", value_name = "N:FILE")]
         object: Vec<String>,
