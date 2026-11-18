@@ -158,6 +158,22 @@ pub fn arrange(sizes: &[[f64; 2]], settings: &Settings, gap: f64) -> Vec<Point> 
     corners
 }
 
+/// Moves `objects` side by side on the bed where [`arrange`] puts their
+/// bounding boxes seen from above, for [`Placement::AsGiven`].
+pub fn arrange_objects(objects: &mut [Mesh], settings: &Settings, gap: f64) {
+    let bounds: Vec<_> = objects.iter().map(Mesh::bounds).collect();
+    let sizes: Vec<[f64; 2]> = bounds
+        .iter()
+        .map(|b| b.map_or([0.0, 0.0], |(lo, hi)| [hi[0] - lo[0], hi[1] - lo[1]]))
+        .collect();
+    let corners = arrange(&sizes, settings, gap);
+    for ((mesh, bounds), corner) in objects.iter_mut().zip(&bounds).zip(corners) {
+        if let Some((lo, _)) = bounds {
+            mesh.translate([corner[0] - lo[0], corner[1] - lo[1], 0.0]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]

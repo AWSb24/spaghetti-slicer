@@ -8,8 +8,8 @@ mod plate;
 pub mod preview;
 mod tree;
 
-pub use objects::{OBJECT_SETTINGS, object_settings};
-pub use plate::{ARRANGE_GAP, Placement, arrange};
+pub use objects::{OBJECT_SETTINGS, apply_object_toml, object_settings};
+pub use plate::{ARRANGE_GAP, Placement, arrange, arrange_objects};
 pub mod progress;
 
 pub use progress::{Progress, Step};

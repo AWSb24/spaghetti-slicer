@@ -50,6 +50,12 @@ enum Command {
         /// Override a single setting, e.g. --set layer_height=0.1
         #[arg(short, long = "set", value_name = "KEY=VALUE")]
         set: Vec<String>,
+        /// Settings file in TOML format for object N only (1 is the first
+        /// model file), layered over the plate's settings; it may only set
+        /// walls, top and bottom layers, infill and supports. May be given
+        /// several times, also for the same object
+        #[arg(long = "object", value_name = "N:FILE")]
+        object: Vec<String>,
         /// Build plate to slice from a project file with several plates
         #[arg(long, value_name = "NUMBER")]
         plate: Option<u32>,
@@ -215,6 +221,7 @@ fn main() -> ExitCode {
             gap,
             config,
             set,
+            object,
             plate,
             svg,
             send,
@@ -229,7 +236,9 @@ fn main() -> ExitCode {
                 send.map(|address| printer.target(&address))
                     .transpose()
                     .and_then(|send| {
-                        slice(&input, output, placement, &config, &set, plate, svg, send)
+                        slice(
+                            &input, output, placement, &config, &set, &object, plate, svg, send,
+                        )
                     }),
                 json,
                 print_summary,
@@ -415,18 +424,41 @@ fn place(
     if meshes.len() < 2 {
         return slicer_fdm::Placement::Centre;
     }
-    let bounds: Vec<_> = meshes.iter().map(slicer_core::Mesh::bounds).collect();
-    let sizes: Vec<[f64; 2]> = bounds
-        .iter()
-        .map(|b| b.map_or([0.0, 0.0], |(lo, hi)| [hi[0] - lo[0], hi[1] - lo[1]]))
-        .collect();
-    let corners = slicer_fdm::arrange(&sizes, settings, placing.gap);
-    for ((mesh, bounds), corner) in meshes.iter_mut().zip(&bounds).zip(corners) {
-        if let Some((lo, _)) = bounds {
-            mesh.translate([corner[0] - lo[0], corner[1] - lo[1], 0.0]);
-        }
-    }
+    slicer_fdm::arrange_objects(meshes, settings, placing.gap);
     slicer_fdm::Placement::AsGiven
+}
+
+/// The settings of every one of `count` objects of its own: the files of
+/// the `--object N:FILE` arguments layered in order over `settings`, or
+/// `None` for an object without.
+fn read_object_settings(
+    count: usize,
+    objects: &[String],
+    settings: &Settings,
+) -> Result<Vec<Option<Settings>>, Diagnostic> {
+    let mut own: Vec<Option<Settings>> = vec![None; count];
+    for item in objects {
+        let invalid = || {
+            Diagnostic::error(
+                "cli.invalid_object",
+                format!("--object expects N:FILE with N from 1 to {count}, got '{item}'"),
+            )
+            .with("argument", item)
+        };
+        let (number, path) = item.split_once(':').ok_or_else(invalid)?;
+        let slot = number
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|index| own.get_mut(index))
+            .ok_or_else(invalid)?;
+        let path = Path::new(path);
+        let text = fs::read_to_string(path).map_err(|e| io_error("io.read", path, &e))?;
+        let object = slot.get_or_insert_with(|| settings.clone());
+        slicer_fdm::apply_object_toml(object, &text).map_err(in_file(path))?;
+    }
+    Ok(own)
 }
 
 /// Settings from the files in `config`, layered in order, with the
@@ -454,11 +486,13 @@ fn slice(
     placing: Placing,
     config: &[PathBuf],
     overrides: &[String],
+    objects: &[String],
     plate: Option<u32>,
     svg: Option<PathBuf>,
     printer: Option<(Target, bool)>,
 ) -> Result<serde_json::Value, Diagnostic> {
     let settings = read_settings(config, overrides)?;
+    let own = read_object_settings(inputs.len(), objects, &settings)?;
 
     let mut warnings = Diagnostics::new();
     let mut meshes = Vec::new();
@@ -470,14 +504,22 @@ fn slice(
     }
     let placement = place(&mut meshes, placing, &settings);
     let stop = std::sync::atomic::AtomicBool::new(false);
-    let toolpaths = slicer_fdm::generate_plate(&meshes, placement, &settings, &mut warnings, &stop)
-        .map_err(|e| match (&e, inputs.len()) {
-            // Name the file rather than its number.
-            (slicer_fdm::FdmError::OutsideBed { object, .. }, 2..) => {
-                in_file(&inputs[*object])(e.diagnostic())
-            }
-            _ => e.diagnostic(),
-        })?;
+    let toolpaths = slicer_fdm::generate_plate_with_object_settings(
+        &meshes,
+        &own,
+        placement,
+        &settings,
+        &mut warnings,
+        &stop,
+        &slicer_fdm::Progress::new(),
+    )
+    .map_err(|e| match (&e, inputs.len()) {
+        // Name the file rather than its number.
+        (slicer_fdm::FdmError::OutsideBed { object, .. }, 2..) => {
+            in_file(&inputs[*object])(e.diagnostic())
+        }
+        _ => e.diagnostic(),
+    })?;
     let result = slicer_gcode::write_gcode(&toolpaths, &settings).map_err(|e| e.diagnostic())?;
 
     let first = inputs.first().map_or_else(PathBuf::new, PathBuf::clone);

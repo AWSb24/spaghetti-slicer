@@ -3,7 +3,7 @@
 //! objects with the same settings takes.
 
 use slicer_core::slice::slice_mesh;
-use slicer_core::{Mesh, Shapes, parallel_map, polygon};
+use slicer_core::{Diagnose, Diagnostic, Mesh, Shapes, parallel_map, polygon};
 use slicer_profiles::Settings;
 
 use crate::plate::{self, Placement};
@@ -43,6 +43,25 @@ pub fn object_settings(plate: &Settings, own: &Settings) -> Settings {
         supports: own.supports,
         ..plate.clone()
     }
+}
+
+/// Layers a settings file in TOML form over `own`, the settings of one
+/// object, as the command line and the server do. Fails, changing nothing,
+/// if the file names a setting outside [`OBJECT_SETTINGS`] or holds a value
+/// that is not valid.
+pub fn apply_object_toml(own: &mut Settings, text: &str) -> Result<(), Diagnostic> {
+    for key in Settings::toml_keys(text).map_err(|e| e.diagnostic())? {
+        if !OBJECT_SETTINGS.contains(&key.as_str()) {
+            let allowed = OBJECT_SETTINGS.join(", ");
+            return Err(Diagnostic::error(
+                "settings.not_per_object",
+                format!("setting '{key}' cannot be set per object (allowed: {allowed})"),
+            )
+            .with("key", key)
+            .with("allowed", allowed));
+        }
+    }
+    own.apply_toml(text).map_err(|e| e.diagnostic())
 }
 
 /// The different settings among `count` objects, the first of them those

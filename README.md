@@ -107,7 +107,12 @@ cargo run --release -p slicer-cli -- slice a.stl b.stl -o plate.gcode
 
 arranges the models side by side (`--gap` sets the distance, default 5 mm plus the brim). `--keep-positions` keeps the coordinates of the files, for example the build item positions of a 3MF.
 
-A model can have settings of its own that override the plate's process: wall loops and wall order, top and bottom layers, sparse infill (density, pattern, angle, connection, overlap) and supports on or off. In the desktop app they are under "Object settings" below the selected model; models with own values are marked with ✱ in the object list. In Rust, `slicer_fdm::generate_plate_with_object_settings` takes them per object. Layer heights, line width, skirt, brim, the kind of supports, seam, speeds and travel stay the same for the whole plate, and models without own values print exactly as before. The command line and the server have no settings per object yet.
+A model can have settings of its own that override the plate's process: wall loops and wall order, top and bottom layers, sparse infill (density, pattern, angle, connection, overlap) and supports on or off. In the desktop app they are under "Object settings" below the selected model; models with own values are marked with ✱ in the object list. In Rust, `slicer_fdm::generate_plate_with_object_settings` takes them per object. Layer heights, line width, skirt, brim, the kind of supports, seam, speeds and travel stay the same for the whole plate, and models without own values print exactly as before. On the command line, `--object N:FILE` layers a settings file over the plate's settings for the N-th model file only (1 is the first); it may be given several times, also for the same model, and a key outside those settings is refused (`settings.not_per_object`):
+
+```bash
+printf 'infill_density = 40\nwall_loops = 4\n' > strong.toml
+cargo run --release -p slicer-cli -- slice a.stl b.stl --object 2:strong.toml -o plate.gcode
+```
 
 ### Sending to a printer
 
@@ -126,7 +131,8 @@ Errors go to stderr with exit code 1. With `--json`, errors and warnings are obj
 | `settings.parse`, `settings.unknown_key`, `settings.out_of_range` | A settings file, `--set` value or Orca profile is invalid |
 | `slicing.empty_model`, `slicing.too_large`, `slicing.nothing_to_print` | The model cannot be sliced |
 | `gcode.unknown_placeholder`, `gcode.unclosed_placeholder` | Custom start or end G-code is invalid |
-| `io.read`, `io.write`, `cli.invalid_override` | A file cannot be accessed or an argument is malformed |
+| `io.read`, `io.write`, `cli.invalid_override`, `cli.invalid_object` | A file cannot be accessed or an argument is malformed |
+| `settings.not_per_object` | A settings file for one object (`--object`, `object_settings_<n>`) sets a key that only the whole plate can have |
 | `model.unknown_plate` | The build plate chosen with `--plate` does not exist in the file |
 | `model.multiple_plates` (warning) | The project file has several build plates; only the first is sliced unless one is chosen |
 | `model.unsupported_extension` (warning) | The 3MF file requires extensions that are not supported; they are ignored |
@@ -185,11 +191,17 @@ Create a job from a model, optionally with a settings file and single overrides.
 curl -F model=@examples/cube_20mm.stl -F settings=@settings.toml -F set=infill_density=30 localhost:8080/v1/jobs
 ```
 
+Several `model` fields put several objects on the plate, arranged side by side and numbered from 1 in the order sent. A field `object_settings_<n>` holds a settings file for object n only, with the same keys and rules as `--object` on the command line:
+
+```bash
+curl -F model=@a.stl -F model=@b.stl -F object_settings_2=@strong.toml localhost:8080/v1/jobs
+```
+
 | Request | Purpose |
 |---|---|
 | `GET /health` | Liveness check, never needs a token |
 | `GET /openapi.json` | Description of this API (OpenAPI 3.1), never needs a token |
-| `POST /v1/jobs` | Create a job (multipart fields `model`, `settings`, `set`, `plate`; several `settings` files are layered in order); answers `202` at once |
+| `POST /v1/jobs` | Create a job (multipart fields `model`, `settings`, `set`, `plate`, `object_settings_<n>`; several `settings` files are layered in order); answers `202` at once |
 | `GET /v1/jobs/{id}` | Status (`queued`, `running`, `done`, `failed`, `cancelled`), statistics, warnings or the error |
 | `GET /v1/jobs/{id}/gcode` | The G-code of a finished job |
 | `POST /v1/jobs/{id}/send` | Upload the G-code of a finished job to a printer configured on the server; JSON body `{"printer": NAME, "start": false}`; 502 if the printer fails |
