@@ -150,7 +150,7 @@ fn label(kind: PathKind) -> &'static str {
         PathKind::SparseInfill => "Sparse infill",
         PathKind::PrimeTower => "Prime tower",
         PathKind::Ironing => "Ironing",
-        PathKind::OverhangWall => "Overhang wall",
+        PathKind::OverhangWall | PathKind::OverhangWallFull => "Overhang wall",
     }
 }
 
@@ -791,7 +791,7 @@ fn write_layer(
         let bridge = path.kind == PathKind::Bridge;
         let wanted = match path.kind {
             PathKind::Bridge => settings.bridge_fan_speed,
-            PathKind::OverhangWall => settings.overhang_fan_speed,
+            PathKind::OverhangWall | PathKind::OverhangWallFull => settings.overhang_fan_speed,
             _ => layer_fan,
         };
         if wanted != carry.fan {
@@ -937,6 +937,10 @@ pub fn path_speed(settings: &Settings, kind: PathKind, layer: usize) -> f64 {
     match kind {
         PathKind::OuterWall => settings.outer_wall_speed,
         PathKind::OverhangWall => settings.overhang_speed,
+        PathKind::OverhangWallFull if settings.overhang_speed_full > 0.0 => {
+            settings.overhang_speed_full
+        }
+        PathKind::OverhangWallFull => settings.overhang_speed,
         PathKind::InnerWall | PathKind::GapFill => settings.inner_wall_speed,
         PathKind::SolidInfill
         | PathKind::SparseInfill
@@ -1829,26 +1833,33 @@ SET_PRESSURE_ADVANCE ADVANCE=0.04
         settings.bridge_fan_speed = 40.0;
         settings.overhang_speed = 15.0;
         settings.overhang_fan_speed = 80.0;
-        let output = slice(&mesh, &settings);
-        let mut overhang = false;
-        let mut moves = 0;
-        for line in output.gcode.lines() {
-            if let Some(kind) = line.strip_prefix(";TYPE:") {
-                overhang = kind == "Overhang wall";
-            } else if overhang && line.starts_with("G1 X") && word(line, 'E').is_some() {
-                moves += 1;
-                if let Some(f) = word(line, 'F') {
-                    assert_eq!(f, 900.0, "{line}");
+        let overhang_feeds = |settings: &Settings, feed: f64| {
+            let output = slice(&mesh, settings);
+            let mut overhang = false;
+            let mut moves = 0;
+            for line in output.gcode.lines() {
+                if let Some(kind) = line.strip_prefix(";TYPE:") {
+                    overhang = kind == "Overhang wall";
+                } else if overhang && line.starts_with("G1 X") && word(line, 'E').is_some() {
+                    moves += 1;
+                    if let Some(f) = word(line, 'F') {
+                        assert_eq!(f, feed, "{line}");
+                    }
                 }
             }
-        }
-        assert!(moves > 4, "{moves}");
+            assert!(moves > 4, "{moves}");
+            output
+        };
+        let output = overhang_feeds(&settings, 900.0);
         let fans: Vec<&str> = output
             .gcode
             .lines()
             .filter(|l| l.starts_with("M106"))
             .collect();
         assert!(fans.contains(&"M106 S204"), "{fans:?}");
+        // The slab hangs free entirely: with its own speed.
+        settings.overhang_speed_full = 5.0;
+        overhang_feeds(&settings, 300.0);
     }
 
     /// The G-code without the settings dump at its end.
