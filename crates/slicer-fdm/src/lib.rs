@@ -3,6 +3,7 @@
 mod adaptive;
 mod comb;
 mod infill;
+mod lightning;
 mod objects;
 mod plate;
 pub mod preview;
@@ -766,6 +767,19 @@ pub fn generate_plate_with_object_settings(
         extruder,
         settings,
     );
+    // Lightning infill depends on the layers above, so it is planned for
+    // all layers of a region before their work.
+    let lightning: Vec<Vec<Vec<[Point; 2]>>> = if regions.is_empty() {
+        vec![lightning_infill(&slices, &heights, settings)]
+    } else {
+        regions
+            .iter()
+            .map(|(_, region_settings, region)| lightning_infill(region, &heights, region_settings))
+            .collect()
+    };
+    let lightning_lines = |region: usize, index: usize| -> &[[Point; 2]] {
+        lightning[region].get(index).map_or(&[], Vec::as_slice)
+    };
     if stopped() {
         return Err(FdmError::Cancelled);
     }
@@ -778,17 +792,19 @@ pub fn generate_plate_with_object_settings(
         progress.advance();
         let mut groups = vec![(extruder, shared_work(&slices, &supports, index, settings))];
         if regions.is_empty() {
-            let (work, thin) = region_work(&slices, &slices, &heights, index, settings);
+            let lines = lightning_lines(0, index);
+            let (work, thin) = region_work(&slices, &slices, &heights, index, lines, settings);
             groups[0].1.extend(work);
             return (groups, thin);
         }
         let mut thin = false;
-        for (e, region_settings, region) in &regions {
+        for (r, (e, region_settings, region)) in regions.iter().enumerate() {
             if region[index].is_empty() {
                 continue;
             }
+            let lines = lightning_lines(r, index);
             let (work, region_thin) =
-                region_work(region, &slices, &heights, index, region_settings);
+                region_work(region, &slices, &heights, index, lines, region_settings);
             thin |= region_thin;
             match groups.iter_mut().find(|(g, _)| g == e) {
                 Some(group) => group.1.extend(work),
@@ -1532,25 +1548,19 @@ fn shared_work(
 
 /// Generates the walls and infill of one layer of a region, in the order
 /// they are printed. `slices` is the region on every layer, `model` the
-/// whole model, which carries the region where it bridges. The flag tells
-/// whether a noticeable part of the layer is too narrow to be covered by a
-/// wall.
+/// whole model, which carries the region where it bridges. `lightning` are
+/// the lines of lightning infill planned for the layer (see
+/// [`lightning_infill`]). The flag tells whether a noticeable part of the
+/// layer is too narrow to be covered by a wall.
 fn region_work(
     slices: &[Shapes],
     model: &[Shapes],
     heights: &[f64],
     index: usize,
+    lightning: &[[Point; 2]],
     settings: &Settings,
 ) -> (Vec<Work>, bool) {
-    // The first layer squashes out wider than the model; it is printed
-    // that much smaller.
-    let shrunk;
-    let slice = if index == 0 && settings.elephant_foot_compensation > 0.0 {
-        shrunk = polygon::offset(&slices[0], -settings.elephant_foot_compensation);
-        &shrunk
-    } else {
-        &slices[index]
-    };
+    let slice = &*printed_slice(slices, index, settings);
     let width = settings.line_width;
     let walls = settings.wall_loops as usize;
     let mut work = Vec::new();
@@ -1581,12 +1591,8 @@ fn region_work(
         }
     }
 
-    // Infill centre lines stay half a width away from the inner edge of the
-    // innermost wall, so line ends and the links between lines do not
-    // deposit material twice. The overlap setting pushes them back out.
     let overlap = settings.infill_overlap / 100.0;
-    let inset = (walls as f64 + 0.5 - overlap) * width;
-    let fill_area = polygon::offset(slice, -inset);
+    let fill_area = fill_area(slice, settings);
 
     // Wall k covers its centre line grown by half a width, but nothing of
     // the area k + 1 widths inside the contour; the infill covers the fill
@@ -1781,6 +1787,13 @@ fn region_work(
                     let (loops, _) = infill::concentric(&sparse, width / density, width, false);
                     work.push(Work::Loops(loops, PathKind::SparseInfill, width));
                 }
+                InfillPattern::Lightning => {
+                    // Planned on the sparse area before bridges were taken
+                    // out of it; what reaches into a bridge goes.
+                    let lines: Vec<Vec<Point>> = lightning.iter().map(|l| l.to_vec()).collect();
+                    let lines = polygon::clip_polylines(&sparse, &lines);
+                    work.push(Work::Polylines(lines, PathKind::SparseInfill, 0.0));
+                }
             }
         }
     }
@@ -1855,6 +1868,58 @@ fn noise(a: u64, b: u64, c: u64) -> f64 {
     x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     x ^= x >> 31;
     (x >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// The outline layer `index` of a region is printed with: the first layer
+/// squashes out wider than the model, so it is printed that much smaller.
+fn printed_slice<'a>(
+    slices: &'a [Shapes],
+    index: usize,
+    settings: &Settings,
+) -> std::borrow::Cow<'a, Shapes> {
+    if index == 0 && settings.elephant_foot_compensation > 0.0 {
+        std::borrow::Cow::Owned(polygon::offset(
+            &slices[0],
+            -settings.elephant_foot_compensation,
+        ))
+    } else {
+        std::borrow::Cow::Borrowed(&slices[index])
+    }
+}
+
+/// The area the centre lines of the infill of a slice go into. They stay
+/// half a width away from the inner edge of the innermost wall, so line
+/// ends and the links between lines do not deposit material twice. The
+/// overlap setting pushes them back out.
+fn fill_area(slice: &Shapes, settings: &Settings) -> Shapes {
+    let overlap = settings.infill_overlap / 100.0;
+    let inset = (f64::from(settings.wall_loops) + 0.5 - overlap) * settings.line_width;
+    polygon::offset(slice, -inset)
+}
+
+/// Lightning infill of every layer of a region (see [`lightning::plan`]),
+/// or nothing when the region has another pattern or no sparse infill. The
+/// support points lie as far apart as rectilinear lines at the density.
+// ponytail: the sparse areas are worked out here and again for the work of
+// every layer, which costs part of the infill time twice.
+fn lightning_infill(
+    slices: &[Shapes],
+    heights: &[f64],
+    settings: &Settings,
+) -> Vec<Vec<[Point; 2]>> {
+    let density = settings.infill_density / 100.0;
+    if settings.infill_pattern != InfillPattern::Lightning || density <= 0.0 || density >= 1.0 {
+        return Vec::new();
+    }
+    let sparse = parallel_map(slices.len(), |index| {
+        let fill_area = fill_area(&printed_slice(slices, index, settings), settings);
+        if fill_area.is_empty() {
+            return fill_area;
+        }
+        split_solid_sparse(slices, heights, index, &fill_area, settings).1
+    });
+    let width = settings.line_width;
+    lightning::plan(&sparse, heights, width / density, 0.5 * width)
 }
 
 /// Splits the fill area of a layer into the part that needs solid infill
@@ -3179,6 +3244,52 @@ mod tests {
         directions.sort_unstable();
         directions.dedup();
         assert_eq!(directions, [45, 105, 165]);
+    }
+
+    #[test]
+    fn lightning_carries_only_the_roof() {
+        let mut settings = Settings::default();
+        settings.infill_pattern = InfillPattern::Lightning;
+        let mesh = Mesh::cuboid(30.0, 30.0, 60.0);
+        let toolpaths = generate(&mesh, &settings).unwrap();
+        assert_eq!(toolpaths, generate(&mesh, &settings).unwrap());
+        let sparse = |layer: &Layer| extruded_length(layer, PathKind::SparseInfill);
+        // Right below the roof every point is carried: about as much as one
+        // layer of rectilinear lines (the square is 27.8 mm wide inside).
+        let roof = toolpaths.layers.len() - 1 - settings.top_layers as usize;
+        let spacing = settings.line_width / (settings.infill_density / 100.0);
+        let below_roof = sparse(&toolpaths.layers[roof - 1]);
+        assert!(below_roof > 0.6 * 27.8 * 27.8 / spacing, "{below_roof}");
+        // Further down the branches shrink towards the walls; the lower
+        // half has no infill at all.
+        assert!(sparse(&toolpaths.layers[roof - 30]) < 0.7 * below_roof);
+        for layer in &toolpaths.layers {
+            if layer.z < 30.0 {
+                assert_eq!(sparse(layer), 0.0, "infill at z {}", layer.z);
+            }
+        }
+        // Far less material than grid at the same density.
+        let total = |toolpaths: &Toolpaths| -> f64 { toolpaths.layers.iter().map(sparse).sum() };
+        let lightning = total(&toolpaths);
+        settings.infill_pattern = InfillPattern::Grid;
+        let grid = total(&generate(&mesh, &settings).unwrap());
+        assert!(
+            lightning > 0.0 && lightning < 0.25 * grid,
+            "{lightning} vs {grid}"
+        );
+        // Every line lies in the fill area of the cube (95 to 125 mm,
+        // moved inwards by the walls).
+        let walls = f64::from(settings.wall_loops);
+        let inset = (walls + 0.5 - settings.infill_overlap / 100.0) * settings.line_width;
+        for path in toolpaths.layers.iter().flat_map(|layer| &layer.paths) {
+            if path.kind != PathKind::SparseInfill {
+                continue;
+            }
+            for p in &path.points {
+                let outer = (p[0] - 110.0).abs().max((p[1] - 110.0).abs());
+                assert!(outer <= 15.0 - inset + 1e-3, "{p:?} leaves the fill area");
+            }
+        }
     }
 
     /// The solid infill of the top layer of a frame with the given top

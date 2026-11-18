@@ -49,6 +49,11 @@ pub enum InfillPattern {
     Cubic,
     /// Loops following the outline of the area, one inside the other.
     Concentric,
+    /// Only what carries the top surfaces: trees of straight lines below
+    /// them that branch out towards the walls and get shorter further
+    /// down, like lightning. Areas with nothing above get no infill. Saves
+    /// much material and time, but makes the part hardly stronger.
+    Lightning,
 }
 
 /// Pattern of the solid infill of a top or bottom surface.
@@ -274,8 +279,8 @@ pub struct Settings {
     pub infill_pattern: InfillPattern,
     /// Direction of the infill lines in degrees from the X axis; every
     /// other layer is turned by 90 degrees. Triangles, the gyroid,
-    /// honeycomb and cubic keep it on every layer; concentric loops have no
-    /// direction.
+    /// honeycomb and cubic keep it on every layer; concentric loops and
+    /// lightning have no direction.
     pub infill_angle: f64,
     /// Whether the lines of rectilinear sparse infill are joined into
     /// zig-zags along the walls. Saves travel moves and retractions but

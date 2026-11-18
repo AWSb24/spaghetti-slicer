@@ -4,7 +4,7 @@ A 3D printing slicer written entirely in Rust, for desktop and server use.
 
 **Status: early prototype. The G-code has never been run on a printer. Do not print it unattended.**
 
-What works: STL and 3MF import (geometry only, one plate of a Bambu Studio project), closing small holes in a mesh, slicing, walls, solid top/bottom layers, sparse infill (rectilinear, grid, triangles, gyroid, honeycomb, cubic, concentric), optional adaptive layer height, thin walls and gap fill with lines of their own width, several objects on one plate, several extruders with tool changes and a prime tower, tree supports, skirt, brim, retraction, G-code for Marlin and Klipper, layered settings files with a set of [profiles](profiles/README.md), time and material estimates, per-layer SVG preview, sending to Klipper (Moonraker) and OctoPrint, an HTTP server with a job API, a container image, a desktop app that also runs in the browser, and a first resin (MSLA) pipeline.
+What works: STL and 3MF import (geometry only, one plate of a Bambu Studio project), closing small holes in a mesh, slicing, walls, solid top/bottom layers, sparse infill (rectilinear, grid, triangles, gyroid, honeycomb, cubic, concentric, lightning), optional adaptive layer height, thin walls and gap fill with lines of their own width, several objects on one plate, several extruders with tool changes and a prime tower, tree supports, skirt, brim, retraction, G-code for Marlin and Klipper, layered settings files with a set of [profiles](profiles/README.md), time and material estimates, per-layer SVG preview, sending to Klipper (Moonraker) and OctoPrint, an HTTP server with a job API, a container image, a desktop app that also runs in the browser, and a first resin (MSLA) pipeline.
 
 ## Known limitations
 

@@ -52,8 +52,8 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `bottom_surface_pattern` | rectilinear | `rectilinear`, `monotonic`, `concentric` | Pattern of the solid infill of the first layer, the bottom surface on the bed. |
 | `spiral_vase` | false | `true`, `false` | Vase mode: above the solid bottom layers, the outer wall alone is printed as one line rising continuously, without seams, infill or top layers. One wall loop, no supports. |
 | `infill_density` | 15 | 0 to 100 | Sparse infill density in percent. |
-| `infill_pattern` | grid | `rectilinear`, `grid`, `triangles`, `gyroid`, `honeycomb`, `cubic`, `concentric` | Sparse infill pattern. |
-| `infill_angle` | 45 | 0 to 180 | Direction of the infill lines in degrees from the X axis; every other layer is turned by 90 degrees. Triangles, the gyroid, honeycomb and cubic keep it on every layer; concentric loops have no direction. |
+| `infill_pattern` | grid | `rectilinear`, `grid`, `triangles`, `gyroid`, `honeycomb`, `cubic`, `concentric`, `lightning` | Sparse infill pattern. |
+| `infill_angle` | 45 | 0 to 180 | Direction of the infill lines in degrees from the X axis; every other layer is turned by 90 degrees. Triangles, the gyroid, honeycomb and cubic keep it on every layer; concentric loops and lightning have no direction. |
 | `infill_connect` | true | `true`, `false` | Whether the lines of rectilinear sparse infill are joined into zig-zags along the walls. Saves travel moves and retractions but uses more material (on small areas up to a third more infill). Along solid infill and bridges the lines stay apart. |
 | `infill_overlap` | 15 | 0 to 50 | How far infill reaches into the innermost wall, in percent of the line width. |
 | `ironing` | false | `true`, `false` | Whether top surfaces are ironed: the hot nozzle passes over them once more with very little material to smooth them. |
