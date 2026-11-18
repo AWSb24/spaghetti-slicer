@@ -753,3 +753,169 @@ fn writes_calibration_prints() {
     assert_eq!(error["error"]["code"], "calibration.invalid_range");
     assert!(!run(&["calibrate", "pressure"]).status.success());
 }
+
+/// A project file as Orca Slicer and Bambu Studio write it, reduced to
+/// what is read: two cubes (objects 1 and 2), the project's settings and,
+/// with `object_settings`, settings of object 2 of its own.
+fn orca_project(object_settings: bool) -> Vec<u8> {
+    let cube = Mesh::cuboid(20.0, 20.0, 6.0);
+    let vertices: String = cube
+        .vertices
+        .iter()
+        .map(|[x, y, z]| format!("<vertex x=\"{x}\" y=\"{y}\" z=\"{z}\"/>"))
+        .collect();
+    let triangles: String = cube
+        .triangles
+        .iter()
+        .map(|[a, b, c]| format!("<triangle v1=\"{a}\" v2=\"{b}\" v3=\"{c}\"/>"))
+        .collect();
+    let mesh =
+        format!("<mesh><vertices>{vertices}</vertices><triangles>{triangles}</triangles></mesh>");
+    let model = format!(
+        "<?xml version=\"1.0\"?><model unit=\"millimeter\" xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\"><resources><object id=\"1\" type=\"model\">{mesh}</object><object id=\"2\" type=\"model\">{mesh}</object></resources><build><item objectid=\"1\" transform=\"1 0 0 0 1 0 0 0 1 80 100 0\"/><item objectid=\"2\" transform=\"1 0 0 0 1 0 0 0 1 140 100 0\"/></build></model>"
+    );
+    let config = r#"{
+    "name": "project_settings",
+    "from": "project",
+    "layer_height": "0.25",
+    "initial_layer_print_height": "0.25",
+    "wall_loops": "3",
+    "sparse_infill_density": ["15%"],
+    "brim_type": "no_brim",
+    "brim_width": "5",
+    "made_up_setting": "7"
+}"#;
+    let own = if object_settings {
+        "<metadata key=\"sparse_infill_density\" value=\"60%\"/><metadata key=\"layer_height\" value=\"0.1\"/><part id=\"1\" subtype=\"normal_part\"><metadata key=\"name\" value=\"Cube\"/></part><part id=\"2\" subtype=\"modifier_part\"><metadata key=\"wall_loops\" value=\"6\"/></part>"
+    } else {
+        ""
+    };
+    let settings = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><config><object id=\"1\"><metadata key=\"name\" value=\"Left\"/><metadata key=\"extruder\" value=\"1\"/></object><object id=\"2\"><metadata key=\"name\" value=\"Right\"/><metadata key=\"extruder\" value=\"1\"/>{own}</object><plate><metadata key=\"plater_id\" value=\"1\"/><model_instance><metadata key=\"object_id\" value=\"1\"/></model_instance><model_instance><metadata key=\"object_id\" value=\"2\"/></model_instance></plate></config>"
+    );
+    slicer_formats::write_package(&[
+        ("3D/3dmodel.model", &model),
+        ("Metadata/project_settings.config", config),
+        ("Metadata/model_settings.config", &settings),
+    ])
+    .unwrap()
+}
+
+#[test]
+fn settings_stored_in_a_project_file_are_used_on_request() {
+    let dir = workdir("project_settings");
+    let project = dir.join("project.3mf");
+    fs::write(&project, orca_project(true)).unwrap();
+    let plain = dir.join("plain.3mf");
+    fs::write(&plain, orca_project(false)).unwrap();
+    let dense = dir.join("dense.toml");
+    fs::write(&dense, "infill_density = 60\n").unwrap();
+    let sparse = dir.join("sparse.toml");
+    fs::write(&sparse, "infill_density = 15\n").unwrap();
+    let slice = |name: &str, model: &PathBuf, args: &[&str]| {
+        let output = dir.join(name);
+        let out = bin()
+            .arg("slice")
+            .arg(model)
+            .arg("-o")
+            .arg(&output)
+            .args(args)
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        (fs::read_to_string(output).unwrap(), report)
+    };
+    let codes = |report: &serde_json::Value| -> Vec<String> {
+        report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["code"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // Without the option the stored settings are ignored.
+    let (without, report) = slice("without.gcode", &project, &[]);
+    assert!(without.contains("; layer_height = 0.2\n"));
+    assert!(codes(&report).iter().all(|c| !c.starts_with("project.")));
+    assert_eq!(without, slice("plain.gcode", &plain, &[]).0);
+
+    // With it the project's settings apply; what has no counterpart is
+    // reported, for the plate and for the object.
+    let (with, report) = slice("with.gcode", &project, &["--project-settings"]);
+    assert!(with.contains("; layer_height = 0.25\n"), "{with}");
+    assert!(with.contains("; wall_loops = 3\n"));
+    assert!(with.contains("; brim_width = 0\n"));
+    let warnings = report["warnings"].as_array().unwrap();
+    let skipped = warnings
+        .iter()
+        .find(|w| w["code"] == "project.settings_skipped")
+        .unwrap();
+    assert_eq!(skipped["context"]["keys"], "made_up_setting");
+    let object = warnings
+        .iter()
+        .find(|w| w["code"] == "project.object_settings_skipped")
+        .unwrap();
+    assert_eq!(object["context"]["keys"], "layer_height");
+    assert!(object["message"].as_str().unwrap().contains("'Right'"));
+    assert!(codes(&report).contains(&"project.part_settings_skipped".to_string()));
+
+    // The object's own infill makes a difference ...
+    let (plate_only, _) = slice("plate_only.gcode", &plain, &["--project-settings"]);
+    assert_ne!(with, plate_only);
+    // ... and is 60 %: with the plate at 60 % too, both objects print alike.
+    let set = ["--project-settings", "--set", "infill_density=60"];
+    assert_eq!(
+        slice("all_dense.gcode", &project, &set).0,
+        slice("all_dense_plain.gcode", &plain, &set).0
+    );
+    // --object goes over the object's settings from the project.
+    let object = format!("1:{}", sparse.display());
+    assert_eq!(
+        slice(
+            "object.gcode",
+            &project,
+            &["--project-settings", "--object", &object]
+        )
+        .0,
+        plate_only
+    );
+    let object = format!("1:{}", dense.display());
+    assert_ne!(
+        slice(
+            "object_dense.gcode",
+            &project,
+            &["--project-settings", "--object", &object]
+        )
+        .0,
+        with
+    );
+    // -c files and --set go over the project's settings.
+    let (set, _) = slice(
+        "set.gcode",
+        &project,
+        &["--project-settings", "--set", "layer_height=0.3"],
+    );
+    assert!(set.contains("; layer_height = 0.3\n"));
+    assert!(set.contains("; wall_loops = 3\n"));
+
+    // A model file without stored settings gives a warning.
+    let stl = dir.join("cube.stl");
+    fs::write(
+        &stl,
+        slicer_formats::write_stl_binary(&Mesh::cuboid(10.0, 10.0, 4.0)),
+    )
+    .unwrap();
+    let bare = dir.join("bare.3mf");
+    fs::write(
+        &bare,
+        slicer_formats::write_3mf(&Mesh::cuboid(10.0, 10.0, 4.0)).unwrap(),
+    )
+    .unwrap();
+    let (_, report) = slice("bare.gcode", &bare, &["--project-settings"]);
+    assert_eq!(codes(&report), ["project.no_settings"]);
+    let (_, report) = slice("stl.gcode", &stl, &["--project-settings"]);
+    assert!(codes(&report).is_empty());
+}

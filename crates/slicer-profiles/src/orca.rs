@@ -1,11 +1,13 @@
-//! Import of profiles exported or saved by Orca Slicer (JSON).
+//! Import of profiles exported or saved by Orca Slicer (JSON), and of the
+//! settings stored in project files of Orca Slicer and Bambu Studio, which
+//! use the same names.
 //!
-//! The key names and value formats were taken from profiles a user saved
-//! in Orca Slicer, read as data files; no source code or shipped profile of
-//! Orca Slicer was used. Only settings with a clear counterpart here are
-//! taken, everything else is reported.
+//! The key names and value formats were taken from profiles and project
+//! files a user saved, read as data files; no source code or shipped
+//! profile of Orca Slicer was used. Only settings with a clear counterpart
+//! here are taken, everything else is reported.
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::{Settings, SettingsError};
 
@@ -24,6 +26,9 @@ enum Kind {
     Angle,
     /// Text values with a counterpart each; others are not supported.
     Choice(&'static [(&'static str, &'static str)]),
+    /// The kind of brim: "no_brim" means a brim width of 0, the kinds that
+    /// go around the outside keep the width, the others are not supported.
+    BrimType,
 }
 
 /// Orca setting, our setting, and how to convert.
@@ -112,6 +117,7 @@ const MAPPING: &[(&str, &str, Kind)] = &[
     ("skirt_loops", "skirt_loops", Kind::Number),
     ("skirt_distance", "skirt_distance", Kind::Number),
     ("brim_width", "brim_width", Kind::Number),
+    ("brim_type", "brim_width", Kind::BrimType),
     ("enable_support", "supports", Kind::Flag),
     ("outer_wall_speed", "outer_wall_speed", Kind::Number),
     ("inner_wall_speed", "inner_wall_speed", Kind::Number),
@@ -141,6 +147,13 @@ const METADATA: &[&str] = &[
     "filament_vendor",
     "filament_cost",
     "default_filament_colour",
+    // Project files
+    "different_settings_to_system",
+    "inherits_group",
+    "printer_model",
+    "printer_variant",
+    "print_compatible_printers",
+    "upward_compatible_machine",
 ];
 
 /// What was found in one Orca profile.
@@ -198,6 +211,10 @@ fn convert(kind: Kind, value: &str) -> Result<String, String> {
             .ok_or_else(|| format!("'{value}' is not available")),
         // Needs the whole list; see `bed_size`.
         Kind::BedArea => Err(format!("'{value}' is not a list of corners")),
+        Kind::BrimType => match value {
+            "no_brim" => Ok("0".into()),
+            _ => Err(format!("'{value}' is not available")),
+        },
     }
 }
 
@@ -220,7 +237,9 @@ fn bed_size(value: &Value) -> Option<(f64, f64)> {
 
 /// Reads one Orca profile (printer, material or process) and checks every
 /// taken value against `settings`, which receives them. Values that our
-/// settings reject are reported as skipped.
+/// settings reject are reported as skipped. The settings of a project file
+/// (`Metadata/project_settings.config`) are read the same way; of lists
+/// with one value per filament or extruder the first is taken.
 pub fn import_orca(json: &str, settings: &mut Settings) -> Result<OrcaImport, SettingsError> {
     let profile: Value =
         serde_json::from_str(json).map_err(|e| SettingsError::Parse(e.to_string()))?;
@@ -229,9 +248,27 @@ pub fn import_orca(json: &str, settings: &mut Settings) -> Result<OrcaImport, Se
             "an Orca profile is a JSON object".into(),
         ));
     };
+    Ok(import_entries(entries, settings))
+}
+
+/// Like [`import_orca`], for settings given as pairs of Orca name and
+/// value text, as a project file stores those of a single object.
+pub fn import_orca_values<'a>(
+    values: impl IntoIterator<Item = (&'a str, &'a str)>,
+    settings: &mut Settings,
+) -> OrcaImport {
+    let entries: Map<String, Value> = values
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), Value::String(value.to_string())))
+        .collect();
+    import_entries(&entries, settings)
+}
+
+/// Takes the settings of `entries` into `settings`; see [`import_orca`].
+fn import_entries(entries: &Map<String, Value>, settings: &mut Settings) -> OrcaImport {
     let mut import = OrcaImport {
-        name: profile.get("name").and_then(text),
-        inherits: profile.get("inherits").and_then(text),
+        name: entries.get("name").and_then(text),
+        inherits: entries.get("inherits").and_then(text),
         ..OrcaImport::default()
     };
     // Keys in a fixed order, so the report does not depend on the file.
@@ -260,6 +297,14 @@ pub fn import_orca(json: &str, settings: &mut Settings) -> Result<OrcaImport, Se
             }
         } else {
             let Some(value) = text(value) else { continue };
+            let no_brim = entries.get("brim_type").and_then(text).as_deref() == Some("no_brim");
+            match kind {
+                // The width of a brim that is not printed does not matter.
+                Kind::Number if *ours == "brim_width" && no_brim => continue,
+                // These kinds use the width as it is.
+                Kind::BrimType if matches!(value.as_str(), "outer_only" | "auto_brim") => continue,
+                _ => {}
+            }
             convert(*kind, &value).map(|value| vec![((*ours).to_string(), value)])
         };
         let converted = converted.and_then(|pairs| {
@@ -279,7 +324,7 @@ pub fn import_orca(json: &str, settings: &mut Settings) -> Result<OrcaImport, Se
             Err(reason) => import.skipped.push((key.clone(), reason)),
         }
     }
-    Ok(import)
+    import
 }
 
 #[cfg(test)]
@@ -360,6 +405,45 @@ mod tests {
         assert_eq!(settings.infill_pattern, InfillPattern::Honeycomb);
         assert_eq!(settings.top_surface_pattern, SurfacePattern::Monotonic);
         assert_eq!(settings.bottom_surface_pattern, SurfacePattern::Concentric);
+    }
+
+    #[test]
+    fn brim_kind_and_value_pairs() {
+        // No brim: the width does not count.
+        let mut settings = Settings::default();
+        let project = r#"{ "brim_type": "no_brim", "brim_width": "5" }"#;
+        let import = import_orca(project, &mut settings).unwrap();
+        assert_eq!(settings.brim_width, 0.0);
+        assert!(import.skipped.is_empty(), "{:?}", import.skipped);
+        let outer = r#"{ "brim_type": "outer_only", "brim_width": "4" }"#;
+        let import = import_orca(outer, &mut settings).unwrap();
+        assert_eq!(settings.brim_width, 4.0);
+        assert!(import.skipped.is_empty(), "{:?}", import.skipped);
+        let ears = r#"{ "brim_type": "brim_ears" }"#;
+        let import = import_orca(ears, &mut settings).unwrap();
+        assert_eq!(import.skipped.len(), 1);
+        assert_eq!(settings.brim_width, 4.0);
+
+        // Pairs of text, as a project stores the settings of one object.
+        let mut settings = Settings::default();
+        let import = import_orca_values(
+            [
+                ("sparse_infill_density", "40%"),
+                ("wall_loops", "4"),
+                ("support_type", "tree(auto)"),
+            ],
+            &mut settings,
+        );
+        assert_eq!(settings.infill_density, 40.0);
+        assert_eq!(settings.wall_loops, 4);
+        assert_eq!(import.taken.len(), 2);
+        assert_eq!(
+            import.skipped,
+            [(
+                "support_type".to_string(),
+                "no matching setting".to_string()
+            )]
+        );
     }
 
     #[test]

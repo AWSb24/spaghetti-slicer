@@ -9,7 +9,7 @@ pub mod preview;
 mod sequential;
 mod tree;
 
-pub use objects::{OBJECT_SETTINGS, apply_object_toml, object_settings};
+pub use objects::{OBJECT_SETTINGS, apply_object_orca, apply_object_toml, object_settings};
 pub use plate::{ARRANGE_GAP, Placement, arrange, arrange_objects};
 pub mod progress;
 

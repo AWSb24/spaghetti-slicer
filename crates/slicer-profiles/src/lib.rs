@@ -14,7 +14,7 @@ pub mod catalog;
 pub mod info;
 pub mod orca;
 pub use info::{SETTINGS_INFO, SettingInfo, ValueKind, setting_info};
-pub use orca::{OrcaImport, import_orca};
+pub use orca::{OrcaImport, import_orca, import_orca_values};
 
 /// G-code dialect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
