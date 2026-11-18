@@ -516,6 +516,15 @@ impl Settings {
         Ok(())
     }
 
+    /// The names of the settings a TOML text sets, without checking that
+    /// they exist.
+    pub fn toml_keys(text: &str) -> Result<Vec<String>, SettingsError> {
+        let table = text
+            .parse::<toml::Table>()
+            .map_err(|e| SettingsError::Parse(e.message().to_owned()))?;
+        Ok(table.into_iter().map(|(key, _)| key).collect())
+    }
+
     /// Serializes all settings as TOML.
     pub fn to_toml(&self) -> String {
         toml::to_string(self).unwrap_or_default()

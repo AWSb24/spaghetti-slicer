@@ -565,6 +565,87 @@ fn several_models_are_arranged_side_by_side() {
 }
 
 #[test]
+fn an_object_gets_settings_of_its_own() {
+    let dir = workdir("object_settings");
+    let cube = slicer_formats::write_stl_binary(&Mesh::cuboid(10.0, 10.0, 4.0));
+    let (a, b) = (dir.join("a.stl"), dir.join("b.stl"));
+    fs::write(&a, &cube).unwrap();
+    fs::write(&b, &cube).unwrap();
+    let dense = dir.join("dense.toml");
+    fs::write(&dense, "infill_density = 40\n").unwrap();
+    // The plate's own value.
+    let same = dir.join("same.toml");
+    fs::write(&same, "infill_density = 15\n").unwrap();
+    let slice = |name: &str, objects: &[&PathBuf]| {
+        let output = dir.join(name);
+        let arguments: Vec<String> = objects
+            .iter()
+            .flat_map(|file| ["--object".to_string(), format!("2:{}", file.display())])
+            .collect();
+        let out = bin()
+            .args(["slice", a.to_str().unwrap(), b.to_str().unwrap(), "-o"])
+            .arg(&output)
+            .args(&arguments)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        fs::read_to_string(output).unwrap()
+    };
+    let plain = slice("plain.gcode", &[]);
+    assert_ne!(plain, slice("dense.gcode", &[&dense]));
+    // Files for the same object are layered in order; values equal to the
+    // plate's print as without settings of its own.
+    assert_eq!(plain, slice("same.gcode", &[&dense, &same]));
+}
+
+#[test]
+fn object_settings_are_checked() {
+    let dir = workdir("object_settings_errors");
+    let stl = dir.join("cube.stl");
+    fs::write(
+        &stl,
+        slicer_formats::write_stl_binary(&Mesh::cuboid(10.0, 10.0, 4.0)),
+    )
+    .unwrap();
+    let layers = dir.join("layers.toml");
+    fs::write(&layers, "wall_loops = 3\nlayer_height = 0.1\n").unwrap();
+    let object = format!("1:{}", layers.display());
+    let out = run(&["slice", stl.to_str().unwrap(), "--object", &object]);
+    assert!(!out.status.success());
+    let message = text(&out.stderr);
+    assert!(
+        message.contains("'layer_height' cannot be set per object")
+            && message.contains("wall_loops"),
+        "{message}"
+    );
+
+    let out = run(&[
+        "slice",
+        stl.to_str().unwrap(),
+        "--object",
+        &object,
+        "--json",
+    ]);
+    let error: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "settings.not_per_object");
+    assert_eq!(error["error"]["context"]["key"], "layer_height");
+
+    // There is no second object.
+    let walls = dir.join("walls.toml");
+    fs::write(&walls, "wall_loops = 3\n").unwrap();
+    let object = format!("2:{}", walls.display());
+    let out = run(&[
+        "slice",
+        stl.to_str().unwrap(),
+        "--object",
+        &object,
+        "--json",
+    ]);
+    let error: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "cli.invalid_object");
+}
+
+#[test]
 fn build_items_of_a_3mf_can_keep_their_positions() {
     let dir = workdir("keep");
     let cube = Mesh::cuboid(10.0, 10.0, 10.0);

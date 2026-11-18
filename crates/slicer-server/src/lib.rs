@@ -510,6 +510,10 @@ pub fn openapi() -> Value {
         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Job" } } }
     });
     let id = json!([{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }]);
+    let object_settings = format!(
+        "Settings in TOML form for object N only (object_settings_1 is the first model), layered over the plate's settings; may only set {} (otherwise 400 settings.not_per_object); may be repeated, later ones override earlier ones",
+        slicer_fdm::OBJECT_SETTINGS.join(", ")
+    );
     json!({
         "openapi": "3.1.0",
         "info": {
@@ -535,10 +539,13 @@ pub fn openapi() -> Value {
                     "type": "object",
                     "required": ["model"],
                     "properties": {
-                        "model": { "type": "string", "format": "binary", "description": "STL or 3MF file" },
+                        "model": { "type": "string", "format": "binary", "description": "STL or 3MF file, one object; may be repeated: several objects are arranged side by side and numbered from 1 in the order sent" },
                         "settings": { "type": "string", "description": "Settings in TOML form; may be repeated, later ones override earlier ones" },
                         "set": { "type": "string", "description": "One override KEY=VALUE; may be repeated" },
                         "plate": { "type": "integer", "description": "Build plate of a project file with several plates" }
+                    },
+                    "patternProperties": {
+                        "^object_settings_[1-9][0-9]*$": { "type": "string", "description": object_settings }
                     }
                 } } } },
                 "responses": {
@@ -768,19 +775,46 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
 }
 
-/// Slices a model; the body of every background job.
+/// Slices the models, one object each, object `i` with `own[i]` where
+/// given; the body of every background job. One model is centred on the
+/// bed, several are arranged side by side.
 fn slice(
-    model: &[u8],
+    models: &[axum::body::Bytes],
+    own: &[Option<Settings>],
     plate: Option<u32>,
     settings: &Settings,
     stop: &AtomicBool,
     progress: &Progress,
 ) -> Result<(slicer_gcode::Output, Diagnostics), Diagnostic> {
     let mut warnings = Diagnostics::new();
-    let mesh = slicer_formats::parse_model(model, plate, &mut warnings)?;
-    let toolpaths =
-        slicer_fdm::generate_with_progress(&mesh, settings, &mut warnings, stop, progress)
-            .map_err(|e| e.diagnostic())?;
+    let mut meshes = Vec::with_capacity(models.len());
+    for (index, model) in models.iter().enumerate() {
+        let mesh =
+            slicer_formats::parse_model(model, plate, &mut warnings).map_err(|mut error| {
+                if models.len() > 1 {
+                    error.message = format!("model {}: {}", index + 1, error.message);
+                    error = error.with("model", index + 1);
+                }
+                error
+            })?;
+        meshes.push(mesh);
+    }
+    let placement = if meshes.len() < 2 {
+        slicer_fdm::Placement::Centre
+    } else {
+        slicer_fdm::arrange_objects(&mut meshes, settings, slicer_fdm::ARRANGE_GAP);
+        slicer_fdm::Placement::AsGiven
+    };
+    let toolpaths = slicer_fdm::generate_plate_with_object_settings(
+        &meshes,
+        own,
+        placement,
+        settings,
+        &mut warnings,
+        stop,
+        progress,
+    )
+    .map_err(|e| e.diagnostic())?;
     let output = slicer_gcode::write_gcode_with_progress(&toolpaths, settings, progress)
         .map_err(|e| e.diagnostic())?;
     Ok((output, warnings))
@@ -793,9 +827,10 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
             &Diagnostic::error("request.invalid", message),
         )
     };
-    let mut model = None;
+    let mut models = Vec::new();
     let mut settings = Settings::default();
     let mut overrides = Vec::new();
+    let mut object_texts = Vec::new();
     let mut plate = None;
     loop {
         let field = match multipart.next_field().await {
@@ -808,8 +843,9 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
             Ok(bytes) => bytes,
             Err(error) => return multipart_error(&error),
         };
+        let object = name.strip_prefix("object_settings_");
         match name.as_str() {
-            "model" => model = Some(bytes),
+            "model" => models.push(bytes),
             "settings" | "set" | "plate" => {
                 let Ok(text) = std::str::from_utf8(&bytes) else {
                     return invalid(format!("field '{name}' is not valid UTF-8"));
@@ -828,6 +864,13 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
                     overrides.push(text.to_string());
                 }
             }
+            _ if object.is_some() => {
+                let Ok(text) = String::from_utf8(bytes.to_vec()) else {
+                    return invalid(format!("field '{name}' is not valid UTF-8"));
+                };
+                let number = object.and_then(|n| n.parse::<usize>().ok());
+                object_texts.push((name, number, text));
+            }
             _ => return invalid(format!("unknown field '{name}'")),
         }
     }
@@ -839,9 +882,29 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
             return error_response(StatusCode::BAD_REQUEST, &e.diagnostic());
         }
     }
-    let Some(model) = model else {
+    if models.is_empty() {
         return invalid("field 'model' is missing".to_string());
-    };
+    }
+    // Settings of single objects start from those of the plate, so they are
+    // read once the plate's are complete; several fields for one object
+    // are layered in the order they are sent.
+    let mut own: Vec<Option<Settings>> = vec![None; models.len()];
+    for (name, number, text) in &object_texts {
+        let Some(object) = number
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|index| own.get_mut(index))
+        else {
+            return invalid(format!(
+                "field '{name}' names no object; object_settings_1 to object_settings_{} name the models in the order they are sent",
+                models.len()
+            ));
+        };
+        let object = object.get_or_insert_with(|| settings.clone());
+        if let Err(mut e) = slicer_fdm::apply_object_toml(object, text) {
+            e.message = format!("{name}: {}", e.message);
+            return error_response(StatusCode::BAD_REQUEST, &e.with("field", name));
+        }
+    }
 
     let id = Uuid::new_v4();
     {
@@ -872,9 +935,12 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
     log(
         "info",
         "job.created",
-        json!({ "job": id.to_string(), "bytes": model.len() }),
+        json!({
+            "job": id.to_string(),
+            "bytes": models.iter().map(|model| model.len()).sum::<usize>(),
+        }),
     );
-    tokio::spawn(run_job(app.clone(), id, model, plate, settings));
+    tokio::spawn(run_job(app.clone(), id, models, own, plate, settings));
 
     let mut response = (
         StatusCode::ACCEPTED,
@@ -905,7 +971,8 @@ fn multipart_error(error: &axum::extract::multipart::MultipartError) -> Response
 async fn run_job(
     app: App,
     id: Uuid,
-    model: axum::body::Bytes,
+    models: Vec<axum::body::Bytes>,
+    own: Vec<Option<Settings>>,
     plate: Option<u32>,
     settings: Settings,
 ) {
@@ -925,15 +992,16 @@ async fn run_job(
     };
     let started = Instant::now();
     let nozzle_diameter = settings.nozzle_diameter;
-    let outcome =
-        tokio::task::spawn_blocking(move || slice(&model, plate, &settings, &stop, &progress))
-            .await
-            .unwrap_or_else(|_| {
-                Err(Diagnostic::error(
-                    "server.internal",
-                    "slicing stopped unexpectedly",
-                ))
-            });
+    let outcome = tokio::task::spawn_blocking(move || {
+        slice(&models, &own, plate, &settings, &stop, &progress)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(Diagnostic::error(
+            "server.internal",
+            "slicing stopped unexpectedly",
+        ))
+    });
 
     let mut job = {
         let jobs = app.jobs();

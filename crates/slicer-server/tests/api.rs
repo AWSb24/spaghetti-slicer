@@ -286,6 +286,88 @@ async fn a_3mf_model_is_accepted() {
     assert_eq!(job["status"], "done", "{job}");
 }
 
+/// Slices a job to the end and returns its G-code.
+async fn sliced(router: &Router, fields: &[(&str, &[u8])]) -> String {
+    let (status, created) = create(router, fields).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+    let job = finished(router, created["id"].as_str().unwrap()).await;
+    assert_eq!(job["status"], "done", "{job}");
+    let request = Request::builder()
+        .uri(job["gcode_url"].as_str().unwrap())
+        .body(Body::empty())
+        .unwrap();
+    let (status, gcode) = send(router, request).await;
+    assert_eq!(status, StatusCode::OK);
+    String::from_utf8(gcode).unwrap()
+}
+
+#[tokio::test]
+async fn an_object_gets_settings_of_its_own() {
+    let router = App::new(Config::default()).router();
+    let stl = cube();
+    let two = [("model", &stl[..]), ("model", &stl[..])];
+    let plain = sliced(&router, &two).await;
+    let one_wall = sliced(
+        &router,
+        &[&two[..], &[("object_settings_2", b"wall_loops = 1")]].concat(),
+    )
+    .await;
+    assert_ne!(plain, one_wall);
+    // Several fields for one object are layered; the plate's own value
+    // prints as without settings of its own.
+    let fields = [
+        &two[..],
+        &[
+            ("object_settings_2", b"wall_loops = 1"),
+            ("object_settings_2", b"wall_loops = 2"),
+        ],
+    ]
+    .concat();
+    assert_eq!(plain, sliced(&router, &fields).await);
+}
+
+#[tokio::test]
+async fn object_settings_are_checked() {
+    let router = App::new(Config::default()).router();
+    let stl = cube();
+    let (status, body) = create(
+        &router,
+        &[
+            ("model", &stl),
+            ("object_settings_1", b"wall_loops = 1\nlayer_height = 0.1"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "settings.not_per_object");
+    assert_eq!(body["error"]["context"]["key"], "layer_height");
+    assert_eq!(body["error"]["context"]["field"], "object_settings_1");
+    assert!(
+        body["error"]["context"]["allowed"]
+            .as_str()
+            .unwrap()
+            .contains("wall_loops")
+    );
+
+    let (status, body) = create(
+        &router,
+        &[("model", &stl), ("object_settings_1", b"wall_loops = 0")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "settings.out_of_range");
+
+    for name in [
+        "object_settings_2",
+        "object_settings_0",
+        "object_settings_x",
+    ] {
+        let (status, body) = create(&router, &[("model", &stl), (name, b"wall_loops = 1")]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}");
+        assert_eq!(body["error"]["code"], "request.invalid", "{name}");
+    }
+}
+
 #[tokio::test]
 async fn errors_have_the_same_shape_as_the_command_line() {
     let router = App::new(Config::default()).router();
