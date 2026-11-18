@@ -164,7 +164,7 @@ pub fn step_from_code(code: u8) -> Option<Step> {
 }
 
 /// Every path kind, for reading them back.
-const KINDS: [PathKind; 11] = [
+const KINDS: [PathKind; 12] = [
     PathKind::Skirt,
     PathKind::Brim,
     PathKind::Support,
@@ -176,6 +176,7 @@ const KINDS: [PathKind; 11] = [
     PathKind::SparseInfill,
     PathKind::PrimeTower,
     PathKind::Ironing,
+    PathKind::OverhangWall,
 ];
 
 fn kind_code(kind: PathKind) -> u8 {
@@ -192,6 +193,7 @@ fn kind_code(kind: PathKind) -> u8 {
         PathKind::SparseInfill => 8,
         PathKind::PrimeTower => 9,
         PathKind::Ironing => 10,
+        PathKind::OverhangWall => 11,
     }
 }
 

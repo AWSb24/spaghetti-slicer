@@ -24,6 +24,9 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `fan_speed` | 100 | 0 to 100 | Part cooling fan speed in percent. |
 | `fan_off_layers` | 1 | 0 or more | Number of initial layers printed with the fan off. |
 | `bridge_fan_speed` | 100 | 0 to 100 | Part cooling fan speed in percent while printing bridges. |
+| `fan_layer_time` | 0 | 0 to 600 | Layers that take less than this many seconds get more fan than `fan_speed`, the more the shorter they are, up to `fan_max_speed` at `min_layer_time` (or at no time at all without it). 0 turns it off. |
+| `fan_max_speed` | 100 | 0 to 100 | Fan speed in percent for the shortest layers, see `fan_layer_time`. |
+| `overhang_fan_speed` | 100 | 0 to 100 | Fan speed in percent while printing overhanging walls, see `overhang_speed`. |
 | `min_layer_time` | 0 | 0 to 600 | Shortest time in seconds a layer may take, so that it can cool before the next one goes on top; smaller layers are printed slower. 0 turns it off. |
 | `min_print_speed` | 10 | 1 to 1000 | Slowest speed in mm/s that `min_layer_time` slows extrusion down to. |
 | `pressure_advance` | 0 | 0 to 2 | Pressure advance (linear advance) factor written at the start of the print: `M900 K` for Marlin, `SET_PRESSURE_ADVANCE` for Klipper. 0 leaves the printer's own value. |
@@ -67,6 +70,7 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `inner_wall_speed` | 60 | 1 to 1000 | Speed of inner walls. |
 | `infill_speed` | 80 | 1 to 1000 | Speed of solid and sparse infill. |
 | `bridge_speed` | 30 | 1 to 1000 | Speed of bridges: solid infill with nothing below it. |
+| `overhang_speed` | 0 | 0 to 1000 | Speed of walls where more than half the line hangs over the edge of the layer below; these parts of walls are printed as overhang walls with `overhang_fan_speed`. 0 turns it off: walls keep their speed. |
 | `ironing_speed` | 20 | 1 to 1000 | Speed of ironing. |
 | `bridge_flow` | 1 | 0.5 to 2 | Multiplier on the extruded amount of bridges, on top of `flow_ratio`. |
 | `first_layer_speed` | 25 | 1 to 1000 | Speed of all extrusion on the first layer. |

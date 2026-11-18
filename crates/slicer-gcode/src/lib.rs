@@ -150,6 +150,7 @@ fn label(kind: PathKind) -> &'static str {
         PathKind::SparseInfill => "Sparse infill",
         PathKind::PrimeTower => "Prime tower",
         PathKind::Ironing => "Ironing",
+        PathKind::OverhangWall => "Overhang wall",
     }
 }
 
@@ -579,14 +580,15 @@ impl<'a> Writer<'a> {
 }
 
 /// Writes one layer. Extrusion runs at `slow` times its speed (1 for full
-/// speed), see [`slowdown`].
+/// speed), see [`slowdown`]; `layer_fan` is the fan speed of the layer in
+/// percent, see [`layer_fan`].
 fn write_layer(
     w: &mut Writer,
     carry: &mut Carry,
     layer: &Layer,
     index: usize,
     context: &Context,
-    slow: f64,
+    (slow, layer_fan): (f64, f64),
 ) -> Result<(), GcodeError> {
     let settings = w.settings;
     let _ = writeln!(
@@ -602,11 +604,6 @@ fn write_layer(
             let _ = writeln!(w.out, "M140 S{}", settings.bed_temp);
         }
     }
-    let layer_fan = if index >= settings.fan_off_layers as usize {
-        settings.fan_speed
-    } else {
-        0.0
-    };
     if layer_fan != carry.fan {
         carry.fan = layer_fan;
         let _ = writeln!(w.out, "M106 S{:.0}", carry.fan * 2.55);
@@ -663,10 +660,10 @@ fn write_layer(
             carry.restore_z = false;
         }
         let bridge = path.kind == PathKind::Bridge;
-        let wanted = if bridge {
-            settings.bridge_fan_speed
-        } else {
-            layer_fan
+        let wanted = match path.kind {
+            PathKind::Bridge => settings.bridge_fan_speed,
+            PathKind::OverhangWall => settings.overhang_fan_speed,
+            _ => layer_fan,
         };
         if wanted != carry.fan {
             carry.fan = wanted;
@@ -717,12 +714,13 @@ fn write_layer(
 }
 
 /// The factor by which extrusion on `layer` slows down so that the layer
-/// takes at least `min_layer_time`; 1 if it takes that long anyway or the
-/// setting is off. The layer is tried out on copies of the writer: the
-/// time spent extruding is stretched to fill the gap, and as acceleration
-/// makes slower moves gain less than their speed says, the stretch is
-/// repeated a few times.
-// ponytail: up to four trial runs of the layer; `min_print_speed` can keep
+/// takes at least `min_layer_time`, 1 if it takes that long anyway or the
+/// setting is off, and the time in seconds the layer then takes (0 when
+/// neither `min_layer_time` nor `fan_layer_time` needs it). The layer is
+/// tried out on copies of the writer: the time spent extruding is
+/// stretched to fill the gap, and as acceleration makes slower moves gain
+/// less than their speed says, the stretch is repeated a few times.
+// ponytail: up to five trial runs of the layer; `min_print_speed` can keep
 // a layer shorter than asked.
 fn slowdown(
     w: &Writer,
@@ -730,17 +728,18 @@ fn slowdown(
     layer: &Layer,
     index: usize,
     context: &Context,
-) -> Result<f64, GcodeError> {
+) -> Result<(f64, f64), GcodeError> {
     let settings = w.settings;
     let goal = settings.min_layer_time;
-    if goal <= 0.0 {
-        return Ok(1.0);
+    if goal <= 0.0 && settings.fan_layer_time <= 0.0 {
+        return Ok((1.0, 0.0));
     }
     let mut slow = 1.0;
-    for _ in 0..4 {
+    for tries in 1.. {
         let mut trial = w.fork();
         let mut carry = carry;
-        write_layer(&mut trial, &mut carry, layer, index, context, slow)?;
+        let fan = settings.fan_speed;
+        write_layer(&mut trial, &mut carry, layer, index, context, (slow, fan))?;
         let times = move_times(&trial.moves, settings.acceleration, settings.jerk);
         let total: f64 = times.iter().sum();
         let extruding: f64 = trial
@@ -750,12 +749,29 @@ fn slowdown(
             .filter(|(m, _)| m.kind.is_some())
             .map(|(_, t)| t)
             .sum();
-        if total >= goal * 0.99 || extruding <= 0.0 {
-            break;
+        if total >= goal * 0.99 || extruding <= 0.0 || tries > 4 {
+            return Ok((slow, total));
         }
         slow *= extruding / (goal - (total - extruding));
     }
-    Ok(slow)
+    Ok((slow, 0.0))
+}
+
+/// Fan speed in percent of layer `index`, which takes `time` seconds: off
+/// for the first `fan_off_layers`, then `fan_speed`, and for layers shorter
+/// than `fan_layer_time` rising in proportion up to `fan_max_speed` at
+/// `min_layer_time`.
+fn layer_fan(settings: &Settings, index: usize, time: f64) -> f64 {
+    let limit = settings.fan_layer_time;
+    if index < settings.fan_off_layers as usize {
+        0.0
+    } else if limit <= 0.0 || time >= limit {
+        settings.fan_speed
+    } else {
+        let shortest = settings.min_layer_time.min(limit);
+        let t = ((limit - time) / (limit - shortest).max(1e-9)).clamp(0.0, 1.0);
+        settings.fan_speed + (settings.fan_max_speed - settings.fan_speed) * t
+    }
 }
 
 /// `speed` slowed by `slow`, but not below `min_print_speed` unless it was
@@ -792,6 +808,7 @@ pub fn path_speed(settings: &Settings, kind: PathKind, layer: usize) -> f64 {
     }
     match kind {
         PathKind::OuterWall => settings.outer_wall_speed,
+        PathKind::OverhangWall => settings.overhang_speed,
         PathKind::InnerWall | PathKind::GapFill => settings.inner_wall_speed,
         PathKind::SolidInfill
         | PathKind::SparseInfill
@@ -864,8 +881,9 @@ pub fn write_gcode_with_progress(
     };
     let mut carry = Carry::default();
     for (index, layer) in toolpaths.layers.iter().enumerate() {
-        let slow = slowdown(&w, carry, layer, index, &context)?;
-        write_layer(&mut w, &mut carry, layer, index, &context, slow)?;
+        let (slow, time) = slowdown(&w, carry, layer, index, &context)?;
+        let fan = layer_fan(settings, index, time);
+        write_layer(&mut w, &mut carry, layer, index, &context, (slow, fan))?;
         progress.advance();
     }
     w.retract();
@@ -1646,5 +1664,62 @@ SET_PRESSURE_ADVANCE ADVANCE=0.04
                 line: 1
             }
         );
+    }
+
+    #[test]
+    fn short_layers_get_more_fan() {
+        let fans = |output: &Output| -> Vec<f64> {
+            output
+                .gcode
+                .lines()
+                .filter(|l| l.starts_with("M106"))
+                .filter_map(|l| word(l, 'S'))
+                .collect()
+        };
+        let mesh = Mesh::cuboid(10.0, 10.0, 2.0);
+        let mut settings = Settings::default();
+        settings.fan_speed = 40.0;
+        assert_eq!(fans(&slice(&mesh, &settings)), [102.0]);
+        // Layers of a few seconds get nearly the full fan.
+        settings.fan_layer_time = 60.0;
+        let more = fans(&slice(&mesh, &settings));
+        assert!(more.iter().all(|&s| s > 102.0 && s < 255.0), "{more:?}");
+        // Layers slowed down to the minimum layer time get all of it.
+        settings.min_layer_time = 20.0;
+        settings.fan_layer_time = 30.0;
+        assert_eq!(fans(&slice(&mesh, &settings)), [255.0]);
+    }
+
+    #[test]
+    fn overhanging_walls_print_slowly_with_their_own_fan() {
+        let mut mesh = Mesh::cuboid(10.0, 10.0, 4.0);
+        let mut slab = Mesh::cuboid(20.0, 10.0, 2.0);
+        slab.translate([-5.0, 0.0, 4.0]);
+        mesh.merge(&slab);
+        let mut settings = Settings::default();
+        settings.fan_speed = 40.0;
+        settings.bridge_fan_speed = 40.0;
+        settings.overhang_speed = 15.0;
+        settings.overhang_fan_speed = 80.0;
+        let output = slice(&mesh, &settings);
+        let mut overhang = false;
+        let mut moves = 0;
+        for line in output.gcode.lines() {
+            if let Some(kind) = line.strip_prefix(";TYPE:") {
+                overhang = kind == "Overhang wall";
+            } else if overhang && line.starts_with("G1 X") && word(line, 'E').is_some() {
+                moves += 1;
+                if let Some(f) = word(line, 'F') {
+                    assert_eq!(f, 900.0, "{line}");
+                }
+            }
+        }
+        assert!(moves > 4, "{moves}");
+        let fans: Vec<&str> = output
+            .gcode
+            .lines()
+            .filter(|l| l.starts_with("M106"))
+            .collect();
+        assert!(fans.contains(&"M106 S204"), "{fans:?}");
     }
 }

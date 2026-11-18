@@ -119,6 +119,7 @@ pub fn path_color(kind: PathKind) -> [u8; 3] {
         PathKind::SparseInfill => [0xb0, 0x30, 0x29],
         PathKind::PrimeTower => [0xc1, 0xbe, 0x63],
         PathKind::Ironing => [0xff, 0x9e, 0xc7],
+        PathKind::OverhangWall => [0x1d, 0x9b, 0xf0],
     }
 }
 

@@ -146,6 +146,16 @@ pub struct Settings {
     pub fan_off_layers: u32,
     /// Part cooling fan speed in percent while printing bridges.
     pub bridge_fan_speed: f64,
+    /// Layers that take less than this many seconds get more fan than
+    /// `fan_speed`, the more the shorter they are, up to `fan_max_speed`
+    /// at `min_layer_time` (or at no time at all without it). 0 turns it
+    /// off.
+    pub fan_layer_time: f64,
+    /// Fan speed in percent for the shortest layers, see `fan_layer_time`.
+    pub fan_max_speed: f64,
+    /// Fan speed in percent while printing overhanging walls, see
+    /// `overhang_speed`.
+    pub overhang_fan_speed: f64,
     /// Shortest time in seconds a layer may take, so that it can cool
     /// before the next one goes on top; smaller layers are printed slower.
     /// 0 turns it off.
@@ -266,6 +276,10 @@ pub struct Settings {
     pub infill_speed: f64,
     /// Speed of bridges: solid infill with nothing below it.
     pub bridge_speed: f64,
+    /// Speed of walls where more than half the line hangs over the edge of
+    /// the layer below; these parts of walls are printed as overhang walls
+    /// with `overhang_fan_speed`. 0 turns it off: walls keep their speed.
+    pub overhang_speed: f64,
     /// Speed of ironing.
     pub ironing_speed: f64,
     /// Multiplier on the extruded amount of bridges, on top of `flow_ratio`.
@@ -327,6 +341,9 @@ impl Default for Settings {
             fan_speed: 100.0,
             fan_off_layers: 1,
             bridge_fan_speed: 100.0,
+            fan_layer_time: 0.0,
+            fan_max_speed: 100.0,
+            overhang_fan_speed: 100.0,
             min_layer_time: 0.0,
             min_print_speed: 10.0,
             pressure_advance: 0.0,
@@ -370,6 +387,7 @@ impl Default for Settings {
             inner_wall_speed: 60.0,
             infill_speed: 80.0,
             bridge_speed: 30.0,
+            overhang_speed: 0.0,
             ironing_speed: 20.0,
             bridge_flow: 1.0,
             first_layer_speed: 25.0,
@@ -692,6 +710,10 @@ impl Settings {
             ("bridge_speed", self.bridge_speed, 1.0, 1000.0),
             ("bridge_flow", self.bridge_flow, 0.5, 2.0),
             ("bridge_fan_speed", self.bridge_fan_speed, 0.0, 100.0),
+            ("fan_layer_time", self.fan_layer_time, 0.0, 600.0),
+            ("fan_max_speed", self.fan_max_speed, 0.0, 100.0),
+            ("overhang_fan_speed", self.overhang_fan_speed, 0.0, 100.0),
+            ("overhang_speed", self.overhang_speed, 0.0, 1000.0),
             ("first_layer_speed", self.first_layer_speed, 1.0, 1000.0),
             ("travel_speed", self.travel_speed, 1.0, 2000.0),
             ("acceleration", self.acceleration, 10.0, 100_000.0),

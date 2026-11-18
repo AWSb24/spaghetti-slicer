@@ -99,6 +99,10 @@ const FOLD_MARGIN: f64 = 0.01;
 /// polygon operations) that a full turn of arc loses.
 const ARC_SHORTFALL: f64 = 0.02;
 
+/// Walls are told apart into overhanging and supported parts by the
+/// middles of pieces at most this long, see [`split_overhangs`].
+const OVERHANG_STEP: f64 = 0.5;
+
 /// What a path is for. Determines speed and the label in the G-code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathKind {
@@ -126,6 +130,9 @@ pub enum PathKind {
     PrimeTower,
     /// A pass with very little material over a top surface to smooth it.
     Ironing,
+    /// Part of a wall where more than half the line hangs over the edge of
+    /// the layer below (see `Settings::overhang_speed`).
+    OverhangWall,
 }
 
 /// A continuous extrusion.
@@ -781,6 +788,18 @@ pub fn generate_plate_with_object_settings(
     if stopped() {
         return Err(FdmError::Cancelled);
     }
+    if settings.overhang_speed > 0.0 {
+        let split = parallel_map(layers.len(), |index| match index {
+            0 => None,
+            _ if layers[index].spiral => None,
+            _ => split_overhangs(&layers[index].paths, &slices[index], &slices[index - 1]),
+        });
+        for (layer, paths) in layers.iter_mut().zip(split) {
+            if let Some(paths) = paths {
+                layer.paths = paths;
+            }
+        }
+    }
     // Which travel moves stay over the part depends only on the finished
     // order of a layer, so all cores can work on it again.
     let inside = parallel_map(layers.len(), |index| {
@@ -1021,6 +1040,96 @@ fn combed(
         routes.push(route);
     }
     routes
+}
+
+/// The paths of a layer with the parts of walls whose line middle lies
+/// outside `below`, the layer below, turned into overhang walls; `None` if
+/// nothing changes. Where a wall changes between overhanging and supported
+/// it is cut into open pieces that follow on one another, starting where
+/// the wall started.
+// ponytail: every piece of an overhang becomes a path of its own however
+// short, and the fan follows each; merging short pieces into their
+// neighbours would calm it.
+fn split_overhangs(paths: &[Path], slice: &Shapes, below: &Shapes) -> Option<Vec<Path>> {
+    let hanging = polygon::difference(slice, below);
+    if hanging.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(paths.len());
+    let mut changed = false;
+    for path in paths {
+        let wall = matches!(path.kind, PathKind::OuterWall | PathKind::InnerWall);
+        if !wall || path.points.len() < 2 {
+            out.push(path.clone());
+            continue;
+        }
+        let mut corners = path.points.clone();
+        if path.closed {
+            corners.push(path.points[0]);
+        }
+        // Every piece: where it ends, whether that is a corner of the wall,
+        // and whether it hangs.
+        let mut pieces: Vec<(Point, bool, bool)> = Vec::new();
+        for pair in corners.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            let at = |f: f64| [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f];
+            let n = (distance(a, b) / OVERHANG_STEP).ceil().max(1.0) as usize;
+            for k in 1..=n {
+                let middle = at((k as f64 - 0.5) / n as f64);
+                pieces.push((
+                    at(k as f64 / n as f64),
+                    k == n,
+                    point_inside(&hanging, middle),
+                ));
+            }
+        }
+        let kind = |hangs: bool| {
+            if hangs {
+                PathKind::OverhangWall
+            } else {
+                path.kind
+            }
+        };
+        if pieces.iter().all(|p| !p.2) {
+            out.push(path.clone());
+            continue;
+        }
+        changed = true;
+        if pieces.iter().all(|p| p.2) {
+            out.push(Path {
+                kind: PathKind::OverhangWall,
+                ..path.clone()
+            });
+            continue;
+        }
+        let piece = |points: Vec<Point>, hangs: bool| Path {
+            kind: kind(hangs),
+            points,
+            closed: false,
+            travel_inside: false,
+            extruder: path.extruder,
+            width: path.width,
+            travel: Vec::new(),
+        };
+        let mut run = vec![corners[0]];
+        let mut hangs = pieces[0].2;
+        let mut last = corners[0];
+        for &(end, corner, piece_hangs) in &pieces {
+            if piece_hangs != hangs {
+                if run.last() != Some(&last) {
+                    run.push(last);
+                }
+                out.push(piece(std::mem::replace(&mut run, vec![last]), hangs));
+                hangs = piece_hangs;
+            }
+            if corner {
+                run.push(end);
+            }
+            last = end;
+        }
+        out.push(piece(run, hangs));
+    }
+    changed.then_some(out)
 }
 
 fn travels_inside(layer: &Layer, slice: &Shapes) -> Vec<bool> {
@@ -3587,5 +3696,90 @@ mod tests {
             solid_on_top > wanted - 1e-6 && solid_on_top < wanted + settings.max_layer_height,
             "{solid_on_top}"
         );
+    }
+
+    /// A 10 mm column 4 mm high carrying a slab 20 mm wide, 5 mm sticking
+    /// out on both sides.
+    fn mushroom() -> Mesh {
+        let mut mesh = Mesh::cuboid(10.0, 10.0, 4.0);
+        let mut slab = Mesh::cuboid(20.0, 10.0, 2.0);
+        slab.translate([-5.0, 0.0, 4.0]);
+        mesh.merge(&slab);
+        mesh
+    }
+
+    #[test]
+    fn walls_over_the_edge_become_overhang_walls() {
+        let mut settings = Settings::default();
+        let plain = generate(&mushroom(), &settings).unwrap();
+        settings.overhang_speed = 15.0;
+        let split = generate(&mushroom(), &settings).unwrap();
+        let has = |layer: &Layer| layer.paths.iter().any(|p| p.kind == PathKind::OverhangWall);
+        let first = split
+            .layers
+            .iter()
+            .position(|l| (l.z - 4.2).abs() < 1e-6)
+            .unwrap();
+        // Only the first layer of the slab hangs.
+        for (index, layer) in split.layers.iter().enumerate() {
+            assert_eq!(has(layer), index == first, "layer {index}");
+        }
+        assert!(!plain.layers.iter().any(has));
+        // The walls keep their length and stay connected.
+        let walls = |layer: &Layer| -> f64 {
+            [
+                PathKind::OuterWall,
+                PathKind::InnerWall,
+                PathKind::OverhangWall,
+            ]
+            .into_iter()
+            .map(|kind| extruded_length(layer, kind))
+            .sum()
+        };
+        let (before, after) = (&plain.layers[first], &split.layers[first]);
+        assert!((walls(before) - walls(after)).abs() < 1e-6);
+        // Pieces of a cut wall follow on one another and close the loop.
+        let mut chain: Option<(Point, Point)> = None;
+        let wall = |kind| {
+            matches!(
+                kind,
+                PathKind::OuterWall | PathKind::InnerWall | PathKind::OverhangWall
+            )
+        };
+        for path in after.paths.iter().filter(|p| !p.closed && wall(p.kind)) {
+            let (start, end) = (path.points[0], *path.points.last().unwrap());
+            chain = match chain {
+                Some((begin, last)) if last == start => Some((begin, end)),
+                Some((begin, last)) => {
+                    assert_eq!(begin, last, "an open wall");
+                    Some((start, end))
+                }
+                None => Some((start, end)),
+            };
+        }
+        let (begin, last) = chain.unwrap();
+        assert_eq!(begin, last);
+        // What hangs lies beside the column.
+        let column: Vec<f64> = split.layers[first - 1]
+            .paths
+            .iter()
+            .filter(|p| p.kind == PathKind::OuterWall)
+            .flat_map(|p| p.points.iter().map(|q| q[0]))
+            .collect();
+        let left = column.iter().copied().fold(f64::INFINITY, f64::min);
+        let right = column.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let mut hanging = 0.0;
+        for path in after
+            .paths
+            .iter()
+            .filter(|p| p.kind == PathKind::OverhangWall)
+        {
+            for pair in path.points.windows(2) {
+                let x = (pair[0][0] + pair[1][0]) / 2.0;
+                assert!(x < left + 0.5 || x > right - 0.5, "{x} in {left}..{right}");
+                hanging += distance(pair[0], pair[1]);
+            }
+        }
+        assert!(hanging > 20.0, "{hanging}");
     }
 }
