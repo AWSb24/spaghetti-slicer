@@ -117,6 +117,29 @@ pub fn apply_object_toml(own: &mut Settings, text: &str) -> Result<(), Diagnosti
     own.apply_toml(text).map_err(|e| e.diagnostic())
 }
 
+/// Layers settings by the names of Orca Slicer and Bambu Studio, as their
+/// project files store them for a single object, over `own`, the settings
+/// of that object. Only settings of [`OBJECT_SETTINGS`] are taken; those
+/// without a counterpart, with values that are not valid and those that
+/// cannot be set per object are returned by their Orca name with the
+/// reason.
+pub fn apply_object_orca(own: &mut Settings, values: &[(String, String)]) -> Vec<(String, String)> {
+    let mut trial = own.clone();
+    let pairs = values
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()));
+    let import = slicer_profiles::import_orca_values(pairs, &mut trial);
+    let mut skipped = import.skipped;
+    for (ours, value, orca) in import.taken {
+        if !OBJECT_SETTINGS.contains(&ours.as_str()) {
+            skipped.push((orca, format!("'{ours}' cannot be set per object")));
+        } else if let Err(error) = own.set(&ours, &value) {
+            skipped.push((orca, error.to_string()));
+        }
+    }
+    skipped
+}
+
 /// The different settings among `count` objects, the first of them those
 /// of the first object, and for every object the index of its settings.
 /// Object `i` has `own[i]` if given, otherwise the plate's. Speeds do not
@@ -502,6 +525,33 @@ mod tests {
         for key in OBJECT_SETTINGS {
             assert!(mixed.contains_key(*key), "{key}");
         }
+    }
+
+    #[test]
+    fn project_values_of_an_object_are_restricted_to_its_keys() {
+        let mut own = Settings::default();
+        let values: Vec<(String, String)> = [
+            ("sparse_infill_density", "35%"),
+            ("wall_loops", "5"),
+            ("layer_height", "0.1"),
+            ("support_type", "tree(auto)"),
+            ("top_shell_layers", "-3"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let skipped = apply_object_orca(&mut own, &values);
+        assert_eq!(own.infill_density, 35.0);
+        assert_eq!(own.wall_loops, 5);
+        assert_eq!(own.layer_height, Settings::default().layer_height);
+        let mut keys: Vec<&str> = skipped.iter().map(|(key, _)| key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["layer_height", "support_type", "top_shell_layers"]);
+        assert!(
+            skipped
+                .iter()
+                .any(|(key, reason)| key == "layer_height" && reason.contains("per object"))
+        );
     }
 
     #[test]

@@ -237,7 +237,10 @@ pub(crate) struct Part {
 }
 
 /// Reads the attributes of one element into `slots`, matched by local name.
-fn attributes<const N: usize>(element: &BytesStart<'_>, names: [&str; N]) -> [Option<String>; N] {
+pub(crate) fn attributes<const N: usize>(
+    element: &BytesStart<'_>,
+    names: [&str; N],
+) -> [Option<String>; N] {
     let mut slots = [const { None }; N];
     for attribute in element.attributes().flatten() {
         let local = attribute.key.local_name();
@@ -452,6 +455,16 @@ impl<'a> Package<'a> {
     /// Reads a part as text. Part names are case-insensitive and may be
     /// written with a leading slash.
     pub(crate) fn read(&mut self, name: &str) -> Result<Option<String>, ThreeMfError> {
+        self.read_limited(name, MAX_PART_BYTES)
+    }
+
+    /// Like [`Package::read`], but fails with [`ThreeMfError::TooLarge`]
+    /// for a part of more than `limit` bytes.
+    pub(crate) fn read_limited(
+        &mut self,
+        name: &str,
+        limit: u64,
+    ) -> Result<Option<String>, ThreeMfError> {
         let wanted = name.trim_start_matches('/');
         let Some(actual) = self
             .archive
@@ -467,10 +480,10 @@ impl<'a> Package<'a> {
             .by_name(&actual)
             .map_err(|e| ThreeMfError::Archive(e.to_string()))?;
         let mut bytes = Vec::new();
-        file.take(MAX_PART_BYTES + 1)
+        file.take(limit + 1)
             .read_to_end(&mut bytes)
             .map_err(|e| ThreeMfError::Archive(e.to_string()))?;
-        if bytes.len() as u64 > MAX_PART_BYTES {
+        if bytes.len() as u64 > limit {
             return Err(ThreeMfError::TooLarge);
         }
         String::from_utf8(bytes)
@@ -573,7 +586,7 @@ impl<'a> Package<'a> {
 }
 
 /// Name of the part in which Bambu Studio lists the objects of each plate.
-const PLATE_PART: &str = "Metadata/model_settings.config";
+pub(crate) const PLATE_PART: &str = "Metadata/model_settings.config";
 
 /// A build plate: its number and the identifiers of the objects on it.
 type Plate = (u32, Vec<u32>);
@@ -661,6 +674,29 @@ pub fn parse_3mf_plate(
     plate: Option<u32>,
     diagnostics: &mut Diagnostics,
 ) -> Result<Mesh, ThreeMfError> {
+    let mut objects = read_plate(bytes, plate, false, diagnostics)?;
+    Ok(objects.pop().map(|(_, mesh)| mesh).unwrap_or_default())
+}
+
+/// Like [`parse_3mf_plate`], but every build item becomes a mesh of its
+/// own, placed as the file positions it, together with the identifier of
+/// the object it places. Several items may place the same object.
+pub fn parse_3mf_plate_objects(
+    bytes: &[u8],
+    plate: Option<u32>,
+    diagnostics: &mut Diagnostics,
+) -> Result<Vec<(u32, Mesh)>, ThreeMfError> {
+    read_plate(bytes, plate, true, diagnostics)
+}
+
+/// Reads the build items of one plate: all into a single mesh (with the
+/// identifier 0), or with `split` each into its own.
+fn read_plate(
+    bytes: &[u8],
+    plate: Option<u32>,
+    split: bool,
+    diagnostics: &mut Diagnostics,
+) -> Result<Vec<(u32, Mesh)>, ThreeMfError> {
     let (mut package, root) = Package::open(bytes)?;
 
     let (plates, extruders) = package
@@ -699,6 +735,8 @@ pub fn parse_3mf_plate(
     };
 
     let mut mesh = Mesh::default();
+    let mut objects = Vec::new();
+    let mut total = 0;
     let mut skipped = 0;
     let items = package.parts.get(&root).map_or(0, |part| part.build.len());
     for index in 0..items {
@@ -716,8 +754,18 @@ pub fn parse_3mf_plate(
         let first = mesh.triangles.len();
         package.emit(&root, &item, &IDENTITY, 0, &mut skipped, &mut mesh)?;
         mesh.set_extruder(first, extruders.get(&item.object).copied().unwrap_or(0));
+        if split && !mesh.triangles.is_empty() {
+            total += mesh.triangles.len();
+            if total > MAX_TRIANGLES {
+                return Err(ThreeMfError::TooLarge);
+            }
+            objects.push((item.object, std::mem::take(&mut mesh)));
+        }
     }
-    if mesh.triangles.is_empty() {
+    if !split && !mesh.triangles.is_empty() {
+        objects.push((0, mesh));
+    }
+    if objects.is_empty() {
         return Err(ThreeMfError::NoTriangles);
     }
 
@@ -750,7 +798,7 @@ pub fn parse_3mf_plate(
             .with("objects", skipped),
         );
     }
-    Ok(mesh)
+    Ok(objects)
 }
 
 /// Returns whether the data starts like a ZIP archive, as every 3MF does.
@@ -1042,6 +1090,20 @@ mod tests {
         assert_eq!(mesh.extruders.len(), 12);
         assert_eq!(mesh.used_extruders(), [0, 1]);
         assert!(diagnostics.is_empty());
+
+        // Split into objects, the same triangles in the same places.
+        let objects = parse_3mf_plate_objects(&bytes, None, &mut diagnostics).unwrap();
+        let ids: Vec<u32> = objects.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, [1, 2, 3]);
+        let mut merged = Mesh::default();
+        for (_, object) in &objects {
+            assert_eq!(object.triangles.len(), 4);
+            merged.merge(object);
+        }
+        assert_eq!(merged.vertices, mesh.vertices);
+        assert_eq!(merged.triangles, mesh.triangles);
+        assert_eq!(objects[0].1.used_extruders(), [1]);
+        assert_eq!(objects[1].1.used_extruders(), [0]);
     }
 
     #[test]
