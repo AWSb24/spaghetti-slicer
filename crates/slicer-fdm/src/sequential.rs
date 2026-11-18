@@ -85,7 +85,10 @@ pub(crate) fn generate(
             layers.push(layer);
         }
     }
-    Ok(Toolpaths { layers })
+    Ok(Toolpaths {
+        layers,
+        object_settings: crate::objects::speed_table(objects.len(), own, settings),
+    })
 }
 
 /// The order to print the objects in: lowest first, so that the tallest

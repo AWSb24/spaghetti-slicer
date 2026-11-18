@@ -236,7 +236,14 @@ fn read_mesh(input: &mut Reader) -> Result<Mesh, Malformed> {
 }
 
 fn write_toolpaths(out: &mut Writer, toolpaths: &Toolpaths) {
-    let Toolpaths { layers } = toolpaths;
+    let Toolpaths {
+        layers,
+        object_settings,
+    } = toolpaths;
+    out.len(object_settings.len());
+    for settings in object_settings {
+        out.text(&settings.to_toml());
+    }
     out.len(layers.len());
     for layer in layers {
         let Layer {
@@ -256,6 +263,10 @@ fn write_toolpaths(out: &mut Writer, toolpaths: &Toolpaths) {
 }
 
 fn read_toolpaths(input: &mut Reader) -> Result<Toolpaths, Malformed> {
+    let object_settings = input.list(|input| {
+        let text = input.text()?;
+        Settings::from_toml(&text).map_err(|_| Malformed)
+    })?;
     let layers = input.list(|input| {
         Ok(Layer {
             z: input.f64()?,
@@ -264,7 +275,10 @@ fn read_toolpaths(input: &mut Reader) -> Result<Toolpaths, Malformed> {
             paths: input.list(read_path)?,
         })
     })?;
-    Ok(Toolpaths { layers })
+    Ok(Toolpaths {
+        layers,
+        object_settings,
+    })
 }
 
 fn write_path(out: &mut Writer, path: &Path) {

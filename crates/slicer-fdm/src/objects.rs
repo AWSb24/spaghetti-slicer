@@ -10,13 +10,16 @@ use crate::plate::{self, Placement};
 use crate::{DEGENERATE_HEIGHT, MAX_HOLE_EDGES};
 
 /// Process settings that an object on the plate may set for itself,
-/// overriding the plate's: walls, top and bottom shells, sparse infill and
-/// whether it gets supports. Everything else, among it the layer heights,
-/// line width, skirt, brim, the shape of supports, the seam, speeds and
-/// travel, stays the same for the whole plate.
+/// overriding the plate's: walls and their seam, top and bottom shells,
+/// sparse infill, whether it gets supports, and the speeds of its walls,
+/// infill, bridges, overhangs and ironing. Everything else, among it the
+/// layer heights, line width, skirt, brim, the shape and speed of
+/// supports, the first layer speed, travel and retraction, stays the same
+/// for the whole plate.
 pub const OBJECT_SETTINGS: &[&str] = &[
     "wall_loops",
     "wall_order",
+    "seam_position",
     "top_layers",
     "bottom_layers",
     "infill_density",
@@ -25,14 +28,39 @@ pub const OBJECT_SETTINGS: &[&str] = &[
     "infill_connect",
     "infill_overlap",
     "supports",
+    "outer_wall_speed",
+    "inner_wall_speed",
+    "infill_speed",
+    "bridge_speed",
+    "overhang_speed",
+    "overhang_speed_full",
+    "ironing_speed",
 ];
+
+/// `settings` with the speeds an object may set for itself taken from
+/// `speeds`. They change only how fast the G-code writer prints the lines
+/// of an object (and whether its overhanging walls are slowed down), not
+/// where the lines go.
+fn with_speeds(settings: &Settings, speeds: &Settings) -> Settings {
+    Settings {
+        outer_wall_speed: speeds.outer_wall_speed,
+        inner_wall_speed: speeds.inner_wall_speed,
+        infill_speed: speeds.infill_speed,
+        bridge_speed: speeds.bridge_speed,
+        overhang_speed: speeds.overhang_speed,
+        overhang_speed_full: speeds.overhang_speed_full,
+        ironing_speed: speeds.ironing_speed,
+        ..settings.clone()
+    }
+}
 
 /// The settings an object prints with: `plate` with the values of
 /// [`OBJECT_SETTINGS`] taken from `own`.
 pub fn object_settings(plate: &Settings, own: &Settings) -> Settings {
-    Settings {
+    let merged = Settings {
         wall_loops: own.wall_loops,
         wall_order: own.wall_order,
+        seam_position: own.seam_position,
         top_layers: own.top_layers,
         bottom_layers: own.bottom_layers,
         infill_density: own.infill_density,
@@ -42,7 +70,32 @@ pub fn object_settings(plate: &Settings, own: &Settings) -> Settings {
         infill_overlap: own.infill_overlap,
         supports: own.supports,
         ..plate.clone()
+    };
+    with_speeds(&merged, own)
+}
+
+/// The settings of every object (`own[i]` over `plate` for object `i`, the
+/// plate's without) for [`crate::Toolpaths::object_settings`]; empty if
+/// every object prints at the plate's speeds, and in vase mode, which
+/// leaves the settings of objects out.
+pub(crate) fn speed_table(
+    count: usize,
+    own: &[Option<Settings>],
+    plate: &Settings,
+) -> Vec<Settings> {
+    if plate.spiral_vase {
+        return Vec::new();
     }
+    let table: Vec<Settings> = (0..count)
+        .map(|index| match own.get(index) {
+            Some(Some(own)) => object_settings(plate, own),
+            _ => plate.clone(),
+        })
+        .collect();
+    if table.iter().all(|s| with_speeds(s, plate) == *s) {
+        return Vec::new();
+    }
+    table
 }
 
 /// Layers a settings file in TOML form over `own`, the settings of one
@@ -66,7 +119,10 @@ pub fn apply_object_toml(own: &mut Settings, text: &str) -> Result<(), Diagnosti
 
 /// The different settings among `count` objects, the first of them those
 /// of the first object, and for every object the index of its settings.
-/// Object `i` has `own[i]` if given, otherwise the plate's.
+/// Object `i` has `own[i]` if given, otherwise the plate's. Speeds do not
+/// count: every group has the plate's, and the G-code writer takes those
+/// of every object from [`speed_table`], so objects that differ only in
+/// speeds are laid out exactly as if they did not.
 pub(crate) fn groups(
     count: usize,
     own: &[Option<Settings>],
@@ -76,7 +132,7 @@ pub(crate) fn groups(
     let mut membership = Vec::with_capacity(count);
     for index in 0..count {
         let settings = match own.get(index) {
-            Some(Some(own)) => object_settings(plate, own),
+            Some(Some(own)) => with_speeds(&object_settings(plate, own), plate),
             _ => plate.clone(),
         };
         let group = match groups.iter().position(|g| *g == settings) {
@@ -198,7 +254,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     use slicer_core::Diagnostics;
-    use slicer_profiles::{InfillPattern, WallOrder};
+    use slicer_profiles::{InfillPattern, SeamPosition, WallOrder};
 
     use super::*;
     use crate::{Layer, PathKind, Progress, Toolpaths, generate_plate_with_object_settings};
@@ -350,6 +406,34 @@ mod tests {
     }
 
     #[test]
+    fn only_objects_with_an_overhang_speed_get_overhang_walls() {
+        let objects = [tee(20.0), tee(140.0)];
+        let slow = Settings {
+            overhang_speed: 15.0,
+            ..Settings::default()
+        };
+        let plain = Settings::default();
+        let overhangs = |toolpaths: &Toolpaths, left: bool| {
+            toolpaths
+                .layers
+                .iter()
+                .any(|layer| kinds(layer, left).contains(&PathKind::OverhangWall))
+        };
+        // The plate has none, the first object asks for them; then the
+        // other way round.
+        for (plate, own) in [(&plain, &slow), (&slow, &plain)] {
+            let (toolpaths, _) = slice(&objects, &[Some(own.clone()), None], plate);
+            assert_eq!(toolpaths.object_settings.len(), 2);
+            assert_eq!(overhangs(&toolpaths, true), own.overhang_speed > 0.0);
+            assert_eq!(overhangs(&toolpaths, false), plate.overhang_speed > 0.0);
+            // Speeds alone leave the layout as it was: the groups are the
+            // same, only the overhangs are split.
+            let (alone, _) = slice(&objects, &[], plate);
+            assert_eq!(toolpaths.layers.len(), alone.layers.len());
+        }
+    }
+
+    #[test]
     fn own_settings_and_several_extruders() {
         let settings = Settings {
             skirt_loops: 0,
@@ -383,6 +467,7 @@ mod tests {
         let own = Settings {
             wall_loops: 4,
             wall_order: WallOrder::OuterInner,
+            seam_position: SeamPosition::Corner,
             top_layers: 2,
             bottom_layers: 7,
             infill_density: 100.0,
@@ -391,8 +476,17 @@ mod tests {
             infill_connect: false,
             infill_overlap: 30.0,
             supports: true,
+            outer_wall_speed: 21.0,
+            inner_wall_speed: 22.0,
+            infill_speed: 23.0,
+            bridge_speed: 24.0,
+            overhang_speed: 25.0,
+            overhang_speed_full: 26.0,
+            ironing_speed: 27.0,
             layer_height: 0.1,
             brim_width: 5.0,
+            first_layer_speed: 10.0,
+            travel_speed: 100.0,
             ..Settings::default()
         };
         let mixed = object_settings(&plate, &own).values();
