@@ -8,8 +8,8 @@
 //! bounded angle. Here every layer moves each branch a bounded step towards
 //! its nearest neighbour, out of the way of the model of the next few
 //! layers and out of the model itself, and merges branches that touch.
-//! Branches start thin and thicken on the way down with their length and,
-//! gradually, with the area they carry.
+//! Branches start thin and thicken gradually on the way down with the area
+//! they carry.
 
 use slicer_core::polygon::{self, distance, sin_cos_degrees};
 use slicer_core::{Contour, Point, Shapes, parallel_map};
@@ -31,10 +31,6 @@ const ATTRACTION: f64 = 4.0;
 
 /// Radius of a branch that carries one point, in line widths.
 const TIP_RADIUS: f64 = 1.0;
-
-/// How much the radius of a branch grows per millimetre that it reaches
-/// down from its tip, so that long branches stand more firmly.
-const TAPER: f64 = 0.01;
 
 /// How fast a branch thickens to the radius its load asks for after two
 /// branches merged, per layer, as a share of the overhang a layer may have
@@ -68,9 +64,6 @@ struct Node {
     load: f64,
     /// Radius of the branch.
     radius: f64,
-    /// Length of the longest of the branches it carries, from its tip down
-    /// to here, in millimetres.
-    length: f64,
     /// Which branches of the layer above it continues.
     from: Vec<usize>,
 }
@@ -316,11 +309,9 @@ fn branches(
     let width = settings.line_width;
     let spacing = settings.support_spacing;
     let interface = settings.support_interface_layers as usize;
-    // The thickness a branch grows to: by the area it carries and by its
-    // length below the tip.
-    let target = |load: f64, length: f64| {
-        (TIP_RADIUS * width * (load / (spacing * spacing)).max(1.0).sqrt() + TAPER * length)
-            .min(MAX_RADIUS * width)
+    // The thickness a branch grows to, by the area it carries.
+    let target = |load: f64| {
+        (TIP_RADIUS * width * (load / (spacing * spacing)).max(1.0).sqrt()).min(MAX_RADIUS * width)
     };
 
     // Where the model is on every layer, and on it and the layers right
@@ -351,10 +342,9 @@ fn branches(
             let step = LEAN * reach;
             let mut grown = Vec::with_capacity(nodes.len());
             for (k, node) in nodes.iter().enumerate() {
-                let length = node.length + thickness;
                 let r = node
                     .radius
-                    .max(target(node.load, length).min(node.radius + GROWTH * reach));
+                    .max(target(node.load).min(node.radius + GROWTH * reach));
                 let mut neighbour: Option<(Point, f64)> = None;
                 for (m, other) in nodes.iter().enumerate() {
                     let d = distance(node.at, other.at);
@@ -394,7 +384,6 @@ fn branches(
                     at,
                     load: node.load,
                     radius: r,
-                    length,
                     from: vec![k],
                 });
             }
@@ -404,7 +393,7 @@ fn branches(
         // New branches start right under the dense interface.
         if let Some(above) = hanging.get(index + 2 + interface) {
             for (at, load) in contact_points(above, spacing) {
-                let radius = target(load, 0.0);
+                let radius = target(load);
                 if let Some(at) = outline
                     .escape(at, radius)
                     .filter(|&p| distance(at, p) <= 0.5 * spacing)
@@ -413,7 +402,6 @@ fn branches(
                         at,
                         load,
                         radius,
-                        length: 0.0,
                         from: Vec::new(),
                     });
                 }
@@ -435,10 +423,15 @@ fn branches(
                     ];
                     let b = nodes.remove(j);
                     let a = &mut nodes[i];
-                    a.at = at;
+                    // Between the two, the merged branch may reach into the
+                    // model; it moves out of it, or else stays where the
+                    // thicker one was.
+                    let thicker = if b.radius > a.radius { b.at } else { a.at };
                     a.load = load;
                     a.radius = a.radius.max(b.radius);
-                    a.length = a.length.max(b.length);
+                    a.at = outline
+                        .escape(at, a.radius + ESCAPE_MARGIN)
+                        .unwrap_or(thicker);
                     a.from.extend(b.from);
                     j = i + 1;
                 } else {
@@ -518,14 +511,14 @@ mod tests {
                 );
             }
         }
-        // Thin tips, thicker trunks; growing by length too.
-        let thinnest = |index: usize| {
+        // Thin tips, thicker trunks.
+        let thickest = |index: usize| {
             branches[index]
                 .iter()
                 .map(|n| n.radius)
-                .fold(f64::MAX, f64::min)
+                .fold(f64::MIN, f64::max)
         };
-        assert!(thinnest(46) < thinnest(0));
+        assert!(thickest(46) < thickest(0));
     }
 
     #[test]
@@ -552,8 +545,10 @@ mod tests {
             for node in &branches[index] {
                 let (inside, near) = outline.nearest(node.at);
                 assert!(!inside, "layer {index}: {:?}", node.at);
+                // Branches keep clear of the simplified outline, which may
+                // lie up to its resolution inside the exact one.
                 assert!(
-                    near.is_none_or(|(_, d)| d >= node.radius - 1e-9),
+                    near.is_none_or(|(_, d)| d >= node.radius - crate::SUPPORT_RESOLUTION),
                     "layer {index}"
                 );
             }
