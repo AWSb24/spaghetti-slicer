@@ -272,6 +272,7 @@ fn write_path(out: &mut Writer, path: &Path) {
         closed,
         travel_inside,
         extruder,
+        object,
         width,
         travel,
     } = path;
@@ -279,6 +280,7 @@ fn write_path(out: &mut Writer, path: &Path) {
     out.bool(*closed);
     out.bool(*travel_inside);
     out.u32(*extruder);
+    out.u32(*object);
     out.bool(width.is_some());
     out.f64(width.unwrap_or(0.0));
     for list in [points, travel] {
@@ -295,6 +297,7 @@ fn read_path(input: &mut Reader) -> Result<Path, Malformed> {
     let closed = input.bool()?;
     let travel_inside = input.bool()?;
     let extruder = input.u32()?;
+    let object = input.u32()?;
     let has_width = input.bool()?;
     let width = input.f64()?;
     let points = input.list(|input| Ok([input.f64()?, input.f64()?]))?;
@@ -305,6 +308,7 @@ fn read_path(input: &mut Reader) -> Result<Path, Malformed> {
         closed,
         travel_inside,
         extruder,
+        object,
         width: has_width.then_some(width),
         travel,
     })

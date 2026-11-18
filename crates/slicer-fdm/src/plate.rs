@@ -99,7 +99,7 @@ pub(crate) fn check(
 }
 
 /// Convex hull of a mesh seen from above.
-fn outline(mesh: &Mesh) -> Contour {
+pub(crate) fn outline(mesh: &Mesh) -> Contour {
     let points: Vec<Point> = mesh
         .triangles
         .iter()
@@ -112,7 +112,8 @@ fn outline(mesh: &Mesh) -> Contour {
 
 /// Places objects whose bounding boxes seen from above have the given sizes
 /// (X, Y in millimetres) side by side on the bed, and returns the smallest X
-/// and Y each one gets. They lie `gap` millimetres apart, plus room for the
+/// and Y each one gets. They lie `gap` millimetres apart, at least
+/// `extruder_clearance_radius` with `sequential_print`, plus room for the
 /// brim of both.
 ///
 /// Shelf packing ("next fit, decreasing height"; Coffman, Garey, Johnson and
@@ -126,7 +127,11 @@ fn outline(mesh: &Mesh) -> Contour {
 // polygons) is the upgrade.
 pub fn arrange(sizes: &[[f64; 2]], settings: &Settings, gap: f64) -> Vec<Point> {
     let bed = [settings.bed_size_x, settings.bed_size_y];
-    let gap = gap + 2.0 * settings.brim_width;
+    let gap = if settings.sequential_print {
+        gap.max(settings.extruder_clearance_radius)
+    } else {
+        gap
+    } + 2.0 * settings.brim_width;
     let mut order: Vec<usize> = (0..sizes.len()).collect();
     // Deepest first, then widest; the sort is stable, so equal objects keep
     // their order.

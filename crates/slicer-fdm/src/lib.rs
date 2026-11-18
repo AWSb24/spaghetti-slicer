@@ -6,6 +6,7 @@ mod infill;
 mod objects;
 mod plate;
 pub mod preview;
+mod sequential;
 mod tree;
 
 pub use objects::{OBJECT_SETTINGS, apply_object_toml, object_settings};
@@ -140,6 +141,9 @@ pub enum PathKind {
     OverhangWall,
 }
 
+/// [`Path::object`] of a path that belongs to no single object.
+pub const NO_OBJECT: u32 = u32::MAX;
+
 /// A continuous extrusion.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Path {
@@ -154,6 +158,12 @@ pub struct Path {
     pub travel_inside: bool,
     /// Extruder that prints the path, counted from 0.
     pub extruder: u32,
+    /// Object on the plate the path belongs to, counted from 0 in the order
+    /// the objects were given; [`NO_OBJECT`] for skirt, brim, supports and
+    /// the prime tower. On a plate of several objects printed together it
+    /// is only worked out with `Settings::label_objects` and is
+    /// [`NO_OBJECT`] for every path otherwise.
+    pub object: u32,
     /// Width of the extruded line in millimetres where it differs from the
     /// line width setting: lines along the middle of regions too narrow for
     /// a wall loop (up to two line widths wide).
@@ -197,7 +207,9 @@ pub struct Layer {
 /// The complete print, layer by layer from the bed up.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Toolpaths {
-    /// Layers from bottom to top.
+    /// Layers from bottom to top. With `Settings::sequential_print` the
+    /// layers of every object follow those of the object printed before;
+    /// a layer no higher than the one before it starts the next object.
     pub layers: Vec<Layer>,
 }
 
@@ -227,6 +239,26 @@ pub enum FdmError {
         /// Bed size in X and Y.
         bed: [f64; 2],
     },
+    /// With `Settings::sequential_print`, two objects stand closer together
+    /// than `extruder_clearance_radius`, so the print head would hit the one
+    /// printed first.
+    ObjectsTooClose {
+        /// Indices of the two objects in the list, counted from 0.
+        objects: [usize; 2],
+        /// The clearance asked for, in millimetres.
+        clearance: f64,
+    },
+    /// With `Settings::sequential_print`, an object that is not the last
+    /// one printed is taller than `gantry_height`, so the gantry would hit
+    /// it while the next one prints.
+    ObjectTooTall {
+        /// Index of the object in the list, counted from 0.
+        object: usize,
+        /// Height of the object in millimetres.
+        height: f64,
+        /// The gantry height, in millimetres.
+        gantry: f64,
+    },
 }
 
 impl fmt::Display for FdmError {
@@ -254,6 +286,24 @@ impl fmt::Display for FdmError {
                 bed[0],
                 bed[1]
             ),
+            Self::ObjectsTooClose {
+                objects: [a, b],
+                clearance,
+            } => write!(
+                f,
+                "objects {} and {} stand closer together than extruder_clearance_radius ({clearance:.1} mm); move them apart to print them one after the other",
+                a + 1,
+                b + 1
+            ),
+            Self::ObjectTooTall {
+                object,
+                height,
+                gantry,
+            } => write!(
+                f,
+                "object {} ({height:.1} mm) is taller than gantry_height ({gantry:.1} mm), and only the tallest object can be printed last; print the objects together or lower them",
+                object + 1
+            ),
         }
     }
 }
@@ -268,6 +318,8 @@ impl slicer_core::Diagnose for FdmError {
             Self::NothingToPrint => "slicing.nothing_to_print",
             Self::Cancelled => "slicing.cancelled",
             Self::OutsideBed { .. } => "slicing.outside_bed",
+            Self::ObjectsTooClose { .. } => "slicing.objects_too_close",
+            Self::ObjectTooTall { .. } => "slicing.object_too_tall",
         }
     }
 
@@ -288,6 +340,22 @@ impl slicer_core::Diagnose for FdmError {
                     format!("{:.3} {:.3} {:.3} {:.3}", f[0], f[1], f[2], f[3]),
                 ),
                 ("bed_size", format!("{:.3} x {:.3}", bed[0], bed[1])),
+            ],
+            Self::ObjectsTooClose {
+                objects: [a, b],
+                clearance,
+            } => vec![
+                ("objects", format!("{} {}", a + 1, b + 1)),
+                ("clearance", format!("{clearance:.3}")),
+            ],
+            Self::ObjectTooTall {
+                object,
+                height,
+                gantry,
+            } => vec![
+                ("object", (object + 1).to_string()),
+                ("height", format!("{height:.3}")),
+                ("gantry_height", format!("{gantry:.3}")),
             ],
             _ => Vec::new(),
         }
@@ -350,9 +418,9 @@ pub fn generate_with_progress(
 /// objects go; [`arrange`] finds positions for [`Placement::AsGiven`].
 /// Objects whose outlines overlap seen from above are reported and printed
 /// as one.
-// ponytail: the objects are printed together, layer by layer, with the
-// layer heights of the whole plate. Printing one object after the other
-// is the upgrade. Cutting the mesh counts as one
+// ponytail: printed together, the objects share the layer heights of the
+// whole plate (`sequential_print` prints one after the other). Cutting the
+// mesh counts as one
 // part of the progress; reporting from inside `slice_mesh_reporting` is
 // the upgrade there.
 pub fn generate_plate(
@@ -395,6 +463,10 @@ pub fn generate_plate_with_progress(
 /// speeds and travel are those of `settings` for the whole plate. Objects
 /// without own settings, or with values equal to the plate's, print
 /// exactly as with [`generate_plate_with_progress`].
+///
+/// With `Settings::sequential_print` and more than one object, every object
+/// is generated on its own and its layers follow those of the object before
+/// (see [`Toolpaths`]).
 pub fn generate_plate_with_object_settings(
     objects: &[Mesh],
     own: &[Option<Settings>],
@@ -404,6 +476,17 @@ pub fn generate_plate_with_object_settings(
     stop: &AtomicBool,
     progress: &Progress,
 ) -> Result<Toolpaths, FdmError> {
+    if settings.sequential_print && objects.len() > 1 {
+        return sequential::generate(
+            objects,
+            own,
+            placement,
+            settings,
+            diagnostics,
+            stop,
+            progress,
+        );
+    }
     let stopped = || stop.load(Ordering::Relaxed);
     // Vase mode prints one wall and nothing inside or on top, the same for
     // every object.
@@ -793,6 +876,14 @@ pub fn generate_plate_with_object_settings(
     if stopped() {
         return Err(FdmError::Cancelled);
     }
+    assign_objects(
+        &mut layers,
+        objects,
+        placement,
+        shift,
+        &cut_heights,
+        settings,
+    );
     if settings.overhang_speed > 0.0 {
         let split = parallel_map(layers.len(), |index| match index {
             0 => None,
@@ -878,6 +969,72 @@ pub fn generate_plate_with_object_settings(
         );
     }
     Ok(Toolpaths { layers })
+}
+
+/// Sets [`Path::object`] of every path that belongs to an object: with one
+/// object to it, with several and `label_objects` to the object whose part
+/// of the layer the path starts in (see [`objects::regions`]), trying the
+/// other points of the path if the first lies in none.
+// ponytail: objects whose outlines overlap are printed as one, and a path
+// running from one into the other belongs to the first one it starts in.
+fn assign_objects(
+    layers: &mut [Layer],
+    objects: &[Mesh],
+    placement: Placement,
+    shift: Option<[f64; 3]>,
+    cut_heights: &[f64],
+    settings: &Settings,
+) {
+    let own = |path: &Path| {
+        !matches!(
+            path.kind,
+            PathKind::Skirt | PathKind::Brim | PathKind::Support | PathKind::PrimeTower
+        )
+    };
+    if objects.len() == 1 {
+        for path in layers.iter_mut().flat_map(|l| &mut l.paths) {
+            if own(path) {
+                path.object = 0;
+            }
+        }
+        return;
+    }
+    if !settings.label_objects {
+        return;
+    }
+    let membership: Vec<usize> = (0..objects.len()).collect();
+    let regions = objects::regions(
+        objects,
+        placement,
+        &membership,
+        objects.len(),
+        shift,
+        cut_heights,
+    );
+    let found = parallel_map(layers.len(), |index| {
+        let object_of = |path: &Path| {
+            path.points
+                .iter()
+                .find_map(|&p| regions.iter().position(|r| point_inside(&r[index], p)))
+                .map_or(NO_OBJECT, |o| o as u32)
+        };
+        layers[index]
+            .paths
+            .iter()
+            .map(|path| {
+                if own(path) {
+                    object_of(path)
+                } else {
+                    NO_OBJECT
+                }
+            })
+            .collect::<Vec<u32>>()
+    });
+    for (layer, found) in layers.iter_mut().zip(found) {
+        for (path, object) in layer.paths.iter_mut().zip(found) {
+            path.object = object;
+        }
+    }
 }
 
 /// The triangles of `mesh` that `extruder` prints, with all vertices.
@@ -1119,6 +1276,7 @@ fn split_overhangs(paths: &[Path], slice: &Shapes, below: &Shapes) -> Option<Vec
             closed: false,
             travel_inside: false,
             extruder: path.extruder,
+            object: path.object,
             width: path.width,
             travel: Vec::new(),
         };
@@ -2145,6 +2303,7 @@ fn push_loops(
             closed: true,
             travel_inside: false,
             extruder: 0,
+            object: NO_OBJECT,
             width: None,
             travel: Vec::new(),
         };
@@ -2195,6 +2354,7 @@ fn push_lines<L: AsRef<[Point]>>(
                     closed: false,
                     travel_inside: false,
                     extruder: 0,
+                    object: NO_OBJECT,
                     width: None,
                     travel: Vec::new(),
                 });
@@ -2241,6 +2401,7 @@ fn push_centred(
             closed,
             travel_inside: false,
             extruder: 0,
+            object: NO_OBJECT,
             width: Some(width),
             travel: Vec::new(),
         });

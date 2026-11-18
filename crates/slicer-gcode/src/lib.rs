@@ -11,8 +11,8 @@ use std::fmt::{self, Write};
 
 use serde::Serialize;
 use slicer_core::Point;
-use slicer_core::polygon::distance;
-use slicer_fdm::{Layer, PathKind, Progress, Step, Toolpaths};
+use slicer_core::polygon::{convex_hull, distance};
+use slicer_fdm::{Layer, NO_OBJECT, PathKind, Progress, Step, Toolpaths};
 use slicer_profiles::{ExtrusionMode, Flavor, Settings};
 
 /// Summary of a generated print.
@@ -289,9 +289,18 @@ struct Writer<'a> {
     trail: Vec<Point>,
 }
 
+/// How far above everything printed so far the nozzle rises before it
+/// goes over to the next object of a sequential print, in millimetres.
+const OBJECT_CLEARANCE: f64 = 2.0;
+
 /// What the layers hand on to the next one besides the printer's state.
 #[derive(Debug, Clone, Copy, Default)]
 struct Carry {
+    /// Height of the highest layer printed so far.
+    top: f64,
+    /// A later object of a sequential print is being printed, after the
+    /// first layer of the first one.
+    later: bool,
     /// What the fan was last told, in percent.
     fan: f64,
     /// The extruder selected with `T<n>`, none before the first one.
@@ -725,7 +734,7 @@ fn write_layer(
         ";LAYER_CHANGE\n;Z:{:.3}\n;HEIGHT:{:.3}",
         layer.z, layer.height
     );
-    if index == 1 {
+    if index == 1 && !carry.later {
         if settings.nozzle_temp != settings.nozzle_temp_first_layer {
             let _ = writeln!(w.out, "M104 S{}", settings.nozzle_temp);
         }
@@ -747,6 +756,20 @@ fn write_layer(
     let spiral = layer.spiral
         && matches!(layer.paths.as_slice(), [only] if only.closed && only.kind == PathKind::OuterWall);
     let rise_from = w.nozzle_z.filter(|_| spiral);
+    // The first layer of the next object of a sequential print: up above
+    // everything printed so far, across to where the layer starts, and down.
+    if index == 0 && carry.top > 0.0 {
+        carry.later = true;
+        w.wipe_and_retract();
+        let safe = (carry.top + OBJECT_CLEARANCE)
+            .min(settings.max_print_height)
+            .max(carry.top);
+        w.move_z(safe);
+        if let Some(&start) = layer.paths.iter().find_map(|p| p.points.first()) {
+            w.travel(&[], start, true);
+        }
+    }
+    carry.top = carry.top.max(layer.z);
     match rise_from {
         Some(from) => w.z = from,
         None => {
@@ -758,6 +781,8 @@ fn write_layer(
     let filament_per_mm =
         settings.line_width * layer.height * settings.flow_ratio / context.filament_area;
     let mut current_kind = None;
+    // The object whose label is open.
+    let mut open = None;
     for path in &layer.paths {
         let Some(&first) = path.points.first() else {
             continue;
@@ -782,6 +807,16 @@ fn write_layer(
             }
             carry.selected = Some(next);
             w.select(next as usize);
+        }
+        let object = Some(path.object).filter(|&o| o != NO_OBJECT);
+        if settings.label_objects && object != open {
+            if let Some(o) = open {
+                end_label(&mut w.out, settings, o);
+            }
+            if let Some(o) = object {
+                start_label(&mut w.out, settings, o);
+            }
+            open = object;
         }
         w.travel(&path.travel, first, path.travel_inside);
         if carry.restore_z {
@@ -838,7 +873,83 @@ fn write_layer(
         }
         w.extrude_all(&points, filament_per_mm, speed, path.kind);
     }
+    if let Some(o) = open {
+        end_label(&mut w.out, settings, o);
+    }
     Ok(())
+}
+
+/// Name of object `object` (counted from 0) in the labels of the G-code.
+fn object_name(object: u32) -> String {
+    format!("object_{}", u64::from(object) + 1)
+}
+
+/// Starts the paths of `object` for the firmware to leave out on request.
+fn start_label(out: &mut String, settings: &Settings, object: u32) {
+    let _ = match settings.flavor {
+        Flavor::Klipper => writeln!(out, "EXCLUDE_OBJECT_START NAME={}", object_name(object)),
+        Flavor::Marlin => writeln!(out, "M486 S{object}"),
+    };
+}
+
+/// Ends the paths of `object` started with [`start_label`].
+fn end_label(out: &mut String, settings: &Settings, object: u32) {
+    let _ = match settings.flavor {
+        Flavor::Klipper => writeln!(out, "EXCLUDE_OBJECT_END NAME={}", object_name(object)),
+        Flavor::Marlin => writeln!(out, "M486 S-1"),
+    };
+}
+
+/// Announces the objects of the print to the firmware, for
+/// `label_objects`: for Klipper every object with the convex hull of its
+/// paths on the first layer it is printed on and the middle of that hull's
+/// bounding box, for Marlin how many objects there are.
+fn define_objects(out: &mut String, toolpaths: &Toolpaths, settings: &Settings) {
+    let mut first: BTreeMap<u32, Vec<Point>> = BTreeMap::new();
+    for layer in &toolpaths.layers {
+        let mut here: BTreeMap<u32, Vec<Point>> = BTreeMap::new();
+        for path in layer.paths.iter().filter(|p| p.object != NO_OBJECT) {
+            if !first.contains_key(&path.object) {
+                here.entry(path.object)
+                    .or_default()
+                    .extend_from_slice(&path.points);
+            }
+        }
+        first.extend(here);
+    }
+    match settings.flavor {
+        Flavor::Marlin => {
+            if let Some(&last) = first.keys().next_back() {
+                let _ = writeln!(out, "M486 T{}", u64::from(last) + 1);
+            }
+        }
+        Flavor::Klipper => {
+            for (object, points) in first {
+                let hull = convex_hull(&points);
+                let (lo, hi) = hull.iter().fold(
+                    ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]),
+                    |(lo, hi), p| {
+                        (
+                            [lo[0].min(p[0]), lo[1].min(p[1])],
+                            [hi[0].max(p[0]), hi[1].max(p[1])],
+                        )
+                    },
+                );
+                let polygon: Vec<String> = hull
+                    .iter()
+                    .map(|p| format!("[{:.3},{:.3}]", p[0], p[1]))
+                    .collect();
+                let _ = writeln!(
+                    out,
+                    "EXCLUDE_OBJECT_DEFINE NAME={} CENTER={:.3},{:.3} POLYGON=[{}]",
+                    object_name(object),
+                    (lo[0] + hi[0]) / 2.0,
+                    (lo[1] + hi[1]) / 2.0,
+                    polygon.join(",")
+                );
+            }
+        }
+    }
 }
 
 /// The factor by which extrusion on `layer` slows down so that the layer
@@ -1001,6 +1112,10 @@ pub fn write_gcode_with_progress(
         };
     }
 
+    if settings.label_objects {
+        define_objects(&mut w.out, toolpaths, settings);
+    }
+
     let context = Context {
         values: &values,
         filament_area,
@@ -1008,11 +1123,21 @@ pub fn write_gcode_with_progress(
         absolute,
     };
     let mut carry = Carry::default();
-    for (index, layer) in toolpaths.layers.iter().enumerate() {
+    // Layers are counted within their object: a layer no higher than the
+    // one before starts the next object of a sequential print, which gets
+    // the speed and fan of a first layer again.
+    let mut index = 0;
+    let mut below = f64::NEG_INFINITY;
+    for layer in &toolpaths.layers {
+        if layer.z <= below + 1e-9 {
+            index = 0;
+        }
+        below = layer.z;
         let (slow, time) = slowdown(&w, carry, layer, index, &context)?;
         let fan = layer_fan(settings, index, time);
         write_layer(&mut w, &mut carry, layer, index, &context, (slow, fan))?;
         progress.advance();
+        index += 1;
     }
     w.retract();
     w.out.push_str(&end);
@@ -1939,5 +2064,147 @@ SET_PRESSURE_ADVANCE ADVANCE=0.04
         };
         let (a, b) = (slice(&mesh, &plain), slice(&mesh, &arcs));
         assert_eq!(moves_only(&a.gcode), moves_only(&b.gcode));
+    }
+
+    /// The G-code of the cubes 10 x 10 mm and `heights` high, one beside
+    /// the other `gap` mm apart, centred on the bed together.
+    fn cubes(heights: &[f64], gap: f64, settings: &Settings) -> Output {
+        let objects: Vec<Mesh> = (heights.iter().enumerate())
+            .map(|(k, &h)| {
+                let mut mesh = Mesh::cuboid(10.0, 10.0, h);
+                mesh.translate([k as f64 * (10.0 + gap), 0.0, 0.0]);
+                mesh
+            })
+            .collect();
+        let toolpaths = slicer_fdm::generate_plate(
+            &objects,
+            slicer_fdm::Placement::Centre,
+            settings,
+            &mut slicer_core::Diagnostics::new(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        write_gcode(&toolpaths, settings).unwrap()
+    }
+
+    /// The lines of `gcode` without comments and object labels.
+    fn without_labels(gcode: &str) -> Vec<&str> {
+        gcode
+            .lines()
+            .filter(|l| !l.starts_with(';') && !l.starts_with("EXCLUDE_OBJECT"))
+            .filter(|l| !l.starts_with("M486"))
+            .collect()
+    }
+
+    #[test]
+    fn objects_are_labelled_for_the_firmware() {
+        let mut settings = Settings::default();
+        let plain = cubes(&[2.0, 2.0], 10.0, &settings).gcode;
+        assert!(!plain.contains("EXCLUDE_OBJECT") && !plain.contains("M486"));
+        settings.label_objects = true;
+        settings.flavor = Flavor::Klipper;
+        let klipper = cubes(&[2.0, 2.0], 10.0, &settings).gcode;
+        // The moves stay the same.
+        assert_eq!(without_labels(&klipper), without_labels(&plain));
+        let defined: Vec<&str> = (klipper.lines())
+            .filter(|l| l.starts_with("EXCLUDE_OBJECT_DEFINE"))
+            .collect();
+        assert_eq!(defined.len(), 2);
+        // The cubes are centred at X 100 and 120 (both 10 mm wide, 10 mm
+        // apart, centred on the 220 mm bed together); the outline of the
+        // first layer is that of the outer wall.
+        assert_eq!(
+            defined[0],
+            "EXCLUDE_OBJECT_DEFINE NAME=object_1 CENTER=100.000,110.000 POLYGON=[[95.225,105.225],[104.775,105.225],[104.775,114.775],[95.225,114.775]]"
+        );
+        assert!(defined[1].contains("NAME=object_2 CENTER=120.000,110.000"));
+        // On every layer both objects are started and ended in turn.
+        let layers: Vec<&str> = klipper.split(";LAYER_CHANGE").skip(1).collect();
+        assert_eq!(layers.len(), 10);
+        for layer in &layers {
+            let labels: Vec<&str> = (layer.lines())
+                .filter(|l| l.starts_with("EXCLUDE_OBJECT_"))
+                .collect();
+            assert!(
+                labels.len() >= 4 && labels.len().is_multiple_of(2),
+                "{labels:?}"
+            );
+            for pair in labels.chunks(2) {
+                let name = pair[0].strip_prefix("EXCLUDE_OBJECT_START ").unwrap();
+                assert_eq!(pair[1], format!("EXCLUDE_OBJECT_END {name}"));
+            }
+            for name in ["NAME=object_1", "NAME=object_2"] {
+                assert!(labels.contains(&format!("EXCLUDE_OBJECT_START {name}").as_str()));
+            }
+        }
+
+        settings.flavor = Flavor::Marlin;
+        let marlin = cubes(&[2.0, 2.0], 10.0, &settings).gcode;
+        assert_eq!(without_labels(&marlin), without_labels(&plain));
+        assert_eq!(marlin.matches("\nM486 T").count(), 1);
+        assert!(marlin.contains("\nM486 T2\n"));
+        for layer in marlin.split(";LAYER_CHANGE").skip(1) {
+            let labels: Vec<&str> = layer.lines().filter(|l| l.starts_with("M486")).collect();
+            for pair in labels.chunks(2) {
+                assert!(pair[0] == "M486 S0" || pair[0] == "M486 S1", "{pair:?}");
+                assert_eq!(pair[1], "M486 S-1");
+            }
+        }
+    }
+
+    #[test]
+    fn sequential_print_finishes_one_object_before_the_next() {
+        let mut settings = Settings {
+            sequential_print: true,
+            label_objects: true,
+            flavor: Flavor::Klipper,
+            ..Settings::default()
+        };
+        // The taller cube is given first and printed last.
+        let output = cubes(&[1.0, 0.6], 40.0, &settings);
+        let gcode = &output.gcode;
+        let heights: Vec<&str> = (gcode.lines())
+            .filter_map(|l| l.strip_prefix(";Z:"))
+            .collect();
+        assert_eq!(
+            heights,
+            [
+                "0.200", "0.400", "0.600", "0.200", "0.400", "0.600", "0.800", "1.000"
+            ]
+        );
+        assert_eq!(output.stats.layers, 8);
+        // Between the objects: up 2 mm above the first one, across, down.
+        let layers: Vec<&str> = gcode.split(";LAYER_CHANGE").collect();
+        let start: Vec<&str> = layers[4].lines().filter(|l| l.starts_with('G')).collect();
+        assert!(start[0].starts_with("G1 E-0.8"), "{start:?}");
+        assert!(start[1].starts_with("G1 Z2.600"), "{start:?}");
+        assert!(start[2].starts_with("G0 X"), "{start:?}");
+        assert!(start[3].starts_with("G1 Z0.200"), "{start:?}");
+        // All of the second cube first, then all of the first.
+        let objects = |layers: &[&str]| -> Vec<String> {
+            let mut names: Vec<String> = (layers.iter().flat_map(|l| l.lines()))
+                .filter_map(|l| l.strip_prefix("EXCLUDE_OBJECT_START "))
+                .map(str::to_owned)
+                .collect();
+            names.dedup();
+            names
+        };
+        assert_eq!(objects(&layers[1..4]), ["NAME=object_2"]);
+        assert_eq!(objects(&layers[4..]), ["NAME=object_1"]);
+        // The first layer of both is slow and without fan.
+        assert!(layers[4].contains(" F1500\n"), "{}", layers[4]);
+        assert!(layers[4].contains("\nM106 S0\n"), "{}", layers[4]);
+
+        // Filament as when printed together (skirt aside); the time adds the
+        // way between.
+        settings.skirt_loops = 0;
+        let one_by_one = cubes(&[1.0, 0.6], 40.0, &settings).stats;
+        settings.sequential_print = false;
+        let together = cubes(&[1.0, 0.6], 40.0, &settings).stats;
+        let ratio = one_by_one.filament_length_mm / together.filament_length_mm;
+        assert!((ratio - 1.0).abs() < 0.02, "{ratio}");
+        assert!(one_by_one.print_time_s > 0.0);
+        let sum: f64 = one_by_one.times.iter().map(|(_, t)| t).sum();
+        assert!((sum - one_by_one.print_time_s).abs() < 1e-6);
     }
 }

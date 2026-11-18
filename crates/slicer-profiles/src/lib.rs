@@ -127,6 +127,12 @@ pub struct Settings {
     /// With `arc_fitting`: how far any point of the original lines (and
     /// the middle of every line) may lie from the arc that replaces them.
     pub arc_tolerance: f64,
+    /// Whether the G-code names the objects on the plate, so that the
+    /// printer can leave one out while printing (Klipper's
+    /// `EXCLUDE_OBJECT_DEFINE`/`_START`/`_END`, Marlin's `M486`). The
+    /// objects are called `object_1`, `object_2` and so on, in the order
+    /// they were given.
+    pub label_objects: bool,
     /// Number of extruders (tools or filament slots) of the printer. With
     /// more than one, every object prints with the extruder it names (Bambu
     /// Studio projects) and the G-code changes tools with `T<n>`; with one,
@@ -274,6 +280,22 @@ pub struct Settings {
     pub prime_tower_x: f64,
     /// Y of the centre of the prime tower on the bed.
     pub prime_tower_y: f64,
+    /// Whether every object on the plate is printed completely, all its
+    /// layers, before the next one starts, lowest first; between objects
+    /// the nozzle rises above everything printed. The objects must stand
+    /// `extruder_clearance_radius` apart, and all but the last one printed
+    /// must be no taller than `gantry_height`. Every object gets its own
+    /// brim; the skirt goes round the first object only, and there is no
+    /// prime tower.
+    pub sequential_print: bool,
+    /// With `sequential_print`: radius around the nozzle that the print
+    /// head takes up below the height of the objects; objects must be at
+    /// least this far apart.
+    pub extruder_clearance_radius: f64,
+    /// With `sequential_print`: height of the lowest part of the gantry
+    /// (the X axis) above the tip of the nozzle; every object but the last
+    /// one printed must be lower.
+    pub gantry_height: f64,
 
     // Speeds
     /// Speed of the outermost wall.
@@ -340,6 +362,7 @@ impl Default for Settings {
             extrusion_mode: ExtrusionMode::Relative,
             arc_fitting: false,
             arc_tolerance: 0.01,
+            label_objects: false,
             extruder_count: 1,
             filament_diameter: 1.75,
             filament_density: 1.24,
@@ -393,6 +416,9 @@ impl Default for Settings {
             prime_tower_width: 15.0,
             prime_tower_x: 190.0,
             prime_tower_y: 190.0,
+            sequential_print: false,
+            extruder_clearance_radius: 35.0,
+            gantry_height: 20.0,
             outer_wall_speed: 40.0,
             inner_wall_speed: 60.0,
             infill_speed: 80.0,
@@ -767,6 +793,13 @@ impl Settings {
             ),
             ("wipe_distance", self.wipe_distance, 0.0, 20.0),
             ("arc_tolerance", self.arc_tolerance, 0.001, 0.5),
+            (
+                "extruder_clearance_radius",
+                self.extruder_clearance_radius,
+                0.0,
+                500.0,
+            ),
+            ("gantry_height", self.gantry_height, 0.0, 2000.0),
         ]
     }
 }

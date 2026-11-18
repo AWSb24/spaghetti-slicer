@@ -515,9 +515,11 @@ fn slice(
     )
     .map_err(|e| match (&e, inputs.len()) {
         // Name the file rather than its number.
-        (slicer_fdm::FdmError::OutsideBed { object, .. }, 2..) => {
-            in_file(&inputs[*object])(e.diagnostic())
-        }
+        (
+            slicer_fdm::FdmError::OutsideBed { object, .. }
+            | slicer_fdm::FdmError::ObjectTooTall { object, .. },
+            2..,
+        ) => in_file(&inputs[*object])(e.diagnostic()),
         _ => e.diagnostic(),
     })?;
     let result = slicer_gcode::write_gcode(&toolpaths, &settings).map_err(|e| e.diagnostic())?;
