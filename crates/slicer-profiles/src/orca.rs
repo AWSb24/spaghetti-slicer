@@ -90,6 +90,7 @@ const MAPPING: &[(&str, &str, Kind)] = &[
             ("honeycomb", "honeycomb"),
             ("cubic", "cubic"),
             ("concentric", "concentric"),
+            ("lightning", "lightning"),
         ]),
     ),
     (
@@ -349,10 +350,14 @@ mod tests {
         assert_eq!(process.taken.len(), 8);
 
         // Patterns without a counterpart leave the setting alone.
-        let other = r#"{ "sparse_infill_pattern": "lightning" }"#;
+        let other = r#"{ "sparse_infill_pattern": "crosshatch" }"#;
         let other = import_orca(other, &mut settings).unwrap();
         assert_eq!(skipped(&other), ["sparse_infill_pattern"]);
         assert_eq!(settings.infill_pattern, InfillPattern::Gyroid);
+        let lightning = r#"{ "sparse_infill_pattern": "lightning" }"#;
+        let lightning = import_orca(lightning, &mut settings).unwrap();
+        assert!(lightning.skipped.is_empty());
+        assert_eq!(settings.infill_pattern, InfillPattern::Lightning);
         let patterns = r#"{ "sparse_infill_pattern": "honeycomb",
             "top_surface_pattern": "monotonic", "bottom_surface_pattern": "concentric" }"#;
         let patterns = import_orca(patterns, &mut settings).unwrap();

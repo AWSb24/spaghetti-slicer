@@ -59,7 +59,7 @@ fn settings_reference_is_current() {
                 "technology" => "`fdm`".to_string(),
                 "flavor" => "`marlin`, `klipper`".to_string(),
                 "infill_pattern" => {
-                    "`rectilinear`, `grid`, `triangles`, `gyroid`, `honeycomb`, `cubic`, `concentric`"
+                    "`rectilinear`, `grid`, `triangles`, `gyroid`, `honeycomb`, `cubic`, `concentric`, `lightning`"
                         .to_string()
                 }
                 "top_surface_pattern" | "bottom_surface_pattern" => {
