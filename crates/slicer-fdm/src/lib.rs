@@ -1,6 +1,7 @@
 //! FDM toolpath generation: perimeters, infill, supports and path planning.
 
 mod adaptive;
+mod arrange;
 mod comb;
 mod infill;
 mod lightning;
@@ -10,8 +11,9 @@ pub mod preview;
 mod sequential;
 mod tree;
 
+pub use arrange::{Spot, arrange_outlines, arranges_outlines};
 pub use objects::{OBJECT_SETTINGS, apply_object_orca, apply_object_toml, object_settings};
-pub use plate::{ARRANGE_GAP, Placement, arrange, arrange_objects};
+pub use plate::{ARRANGE_GAP, Placement, arrange, arrange_objects, footprint};
 pub mod progress;
 
 pub use progress::{Progress, Step};

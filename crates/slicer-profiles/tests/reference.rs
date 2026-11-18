@@ -80,7 +80,9 @@ fn settings_reference_is_current() {
                 | "fuzzy_skin"
                 | "arc_fitting"
                 | "label_objects"
-                | "sequential_print" => "`true`, `false`".to_string(),
+                | "sequential_print"
+                | "arrange_outlines"
+                | "arrange_rotation" => "`true`, `false`".to_string(),
                 "start_gcode" | "end_gcode" | "toolchange_gcode" => {
                     "text with `{key}` placeholders".to_string()
                 }

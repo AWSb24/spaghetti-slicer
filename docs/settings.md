@@ -75,6 +75,8 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `sequential_print` | false | `true`, `false` | Whether every object on the plate is printed completely, all its layers, before the next one starts, lowest first; between objects the nozzle rises above everything printed. The objects must stand `extruder_clearance_radius` apart, and all but the last one printed must be no taller than `gantry_height`. Every object gets its own brim; the skirt goes round the first object only, and there is no prime tower. |
 | `extruder_clearance_radius` | 35 | 0 to 500 | With `sequential_print`: radius around the nozzle that the print head takes up below the height of the objects; objects must be at least this far apart. |
 | `gantry_height` | 20 | 0 to 2000 | With `sequential_print`: height of the lowest part of the gantry (the X axis) above the tip of the nozzle; every object but the last one printed must be lower. |
+| `arrange_outlines` | false | `true`, `false` | Whether arranging packs the objects by their convex outlines seen from above instead of their bounding rectangles, so round, slanted and triangular objects stand closer together. Off, arranging fills rows of rectangles as before. |
+| `arrange_rotation` | false | `true`, `false` | Whether arranging may also turn objects about Z in steps of 45° where that packs them closer; the slicer turns the models it arranges, the desktop app adds the turn to their rotation. Packs by outlines even without `arrange_outlines`. |
 | `outer_wall_speed` | 40 | 1 to 1000 | Speed of the outermost wall. |
 | `inner_wall_speed` | 60 | 1 to 1000 | Speed of inner walls. |
 | `infill_speed` | 80 | 1 to 1000 | Speed of solid and sparse infill. |

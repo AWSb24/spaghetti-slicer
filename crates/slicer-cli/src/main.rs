@@ -447,6 +447,19 @@ fn place(
         slicer_fdm::arrange_objects(meshes, settings, placing.gap);
         return slicer_fdm::Placement::AsGiven;
     }
+    if slicer_fdm::arranges_outlines(settings) {
+        // The outline of every file's objects together, arranged as one
+        // and turned together.
+        let mut points: Vec<Vec<[f64; 2]>> = vec![Vec::new(); files];
+        for (mesh, &file) in meshes.iter().zip(file) {
+            points[file].extend(slicer_fdm::footprint(mesh));
+        }
+        let spots = slicer_fdm::arrange_outlines(&points, settings, placing.gap);
+        for (mesh, &file) in meshes.iter_mut().zip(file) {
+            spots[file].apply(mesh);
+        }
+        return slicer_fdm::Placement::AsGiven;
+    }
     // The bounds of every file's objects together, arranged as one.
     let mut bounds: Vec<Option<([f64; 3], [f64; 3])>> = vec![None; files];
     for (mesh, &file) in meshes.iter().zip(file) {

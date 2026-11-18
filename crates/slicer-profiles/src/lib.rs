@@ -346,6 +346,16 @@ pub struct Settings {
     /// (the X axis) above the tip of the nozzle; every object but the last
     /// one printed must be lower.
     pub gantry_height: f64,
+    /// Whether arranging packs the objects by their convex outlines seen
+    /// from above instead of their bounding rectangles, so round, slanted
+    /// and triangular objects stand closer together. Off, arranging fills
+    /// rows of rectangles as before.
+    pub arrange_outlines: bool,
+    /// Whether arranging may also turn objects about Z in steps of 45° where
+    /// that packs them closer; the slicer turns the models it arranges, the
+    /// desktop app adds the turn to their rotation. Packs by outlines even
+    /// without `arrange_outlines`.
+    pub arrange_rotation: bool,
 
     // Speeds
     /// Speed of the outermost wall.
@@ -476,6 +486,8 @@ impl Default for Settings {
             sequential_print: false,
             extruder_clearance_radius: 35.0,
             gantry_height: 20.0,
+            arrange_outlines: false,
+            arrange_rotation: false,
             outer_wall_speed: 40.0,
             inner_wall_speed: 60.0,
             infill_speed: 80.0,
