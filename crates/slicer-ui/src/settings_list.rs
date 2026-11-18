@@ -47,7 +47,15 @@ pub const PROCESS_TABS: [ProcessTab; 5] = [
         "Strength",
         &[
             ("Walls", &["wall_loops"]),
-            ("Top/bottom shells", &["top_layers", "bottom_layers"]),
+            (
+                "Top/bottom shells",
+                &[
+                    "top_layers",
+                    "bottom_layers",
+                    "top_surface_pattern",
+                    "bottom_surface_pattern",
+                ],
+            ),
             (
                 "Sparse infill",
                 &[

@@ -1,9 +1,14 @@
-//! Sparse infill patterns that are more than one or two hatchings.
+//! Sparse infill patterns that are more than one or two hatchings, and the
+//! patterns of top and bottom surfaces.
+
+use std::collections::BTreeSet;
+use std::f64::consts::SQRT_2;
 
 use slicer_core::polygon::{self, HatchDirection, distance};
-use slicer_core::{Point, Shapes};
+use slicer_core::{Contour, Point, Shapes};
+use slicer_profiles::SurfacePattern;
 
-use crate::PATH_RESOLUTION;
+use crate::{CentreLine, PATH_RESOLUTION, PathKind, Work};
 
 /// Samples of the gyroid per period along X and Y: steps of 15 degrees.
 const GYROID_STEPS: i64 = 24;
@@ -368,6 +373,307 @@ fn trace_gyroid(area: &Shapes, spacing: f64, z: f64) -> Vec<Vec<Point>> {
     polygon::clip_polylines(area, &segments)
 }
 
+/// `area` turned by the angle with this sine and cosine about the origin.
+fn turned(area: &Shapes, sin: f64, cos: f64) -> Shapes {
+    area.iter()
+        .map(|shape| {
+            shape
+                .iter()
+                .map(|c| {
+                    c.iter()
+                        .map(|p| [p[0] * cos - p[1] * sin, p[0] * sin + p[1] * cos])
+                        .collect()
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Hexagons with as much line per area as straight lines `spacing` apart,
+/// clipped to `area`; the same on every layer, so they stack into
+/// hexagonal prisms. Zig-zag lines run along `angle` degrees; between two
+/// of them, short lines across join the corners where they come closest.
+/// Every edge of the hexagons is printed once: three edges meet in every
+/// corner, so the zig-zags cannot take them all. Lines shorter than
+/// `min_length` are dropped.
+pub(crate) fn honeycomb(
+    area: &Shapes,
+    spacing: f64,
+    angle: f64,
+    min_length: f64,
+) -> Vec<Vec<Point>> {
+    // A tiling by hexagons of side s has 2 / (sqrt(3) s) of edges per area,
+    // straight lines 1 / spacing. Half the width of a hexagon is then
+    // `spacing`, and zig-zags lie 1.5 s apart.
+    let side = 2.0 * spacing / 3.0_f64.sqrt();
+    let rise = 1.5 * side;
+    // Traced in a frame turned by `angle`, like the gyroid.
+    let (sin, cos) = polygon::sin_cos_degrees(angle);
+    let frame = turned(area, -sin, cos);
+    let mut points = frame.iter().flatten().flatten();
+    let Some(&first) = points.next() else {
+        return Vec::new();
+    };
+    let (min, max) = points.fold((first, first), |(lo, hi), p| {
+        (
+            [lo[0].min(p[0]), lo[1].min(p[1])],
+            [hi[0].max(p[0]), hi[1].max(p[1])],
+        )
+    });
+    // Corners on a grid anchored at the origin, so that every layer is the
+    // same wherever the area lies.
+    let (i0, i1) = (
+        (min[0] / spacing).floor() as i64 - 1,
+        (max[0] / spacing).ceil() as i64 + 1,
+    );
+    let (j0, j1) = (
+        (min[1] / rise).floor() as i64 - 1,
+        (max[1] / rise).ceil() as i64 + 1,
+    );
+    let mut lines = Vec::new();
+    for j in j0..=j1 {
+        // Zig-zag j has its low corners on y = 1.5 s j and its high ones
+        // half a side above, at every other multiple of `spacing`; from
+        // each high corner a line of one side goes up to a low corner of
+        // the next zig-zag.
+        let low = j as f64 * rise;
+        let high = |i: i64| (i - j).rem_euclid(2) == 0;
+        lines.push(
+            (i0..=i1)
+                .map(|i| {
+                    let y = if high(i) { low + 0.5 * side } else { low };
+                    [i as f64 * spacing, y]
+                })
+                .collect(),
+        );
+        for i in (i0..=i1).filter(|&i| high(i)) {
+            let x = i as f64 * spacing;
+            lines.push(vec![[x, low + 0.5 * side], [x, low + rise]]);
+        }
+    }
+    polygon::clip_polylines(&frame, &lines)
+        .into_iter()
+        .filter(|line| line.windows(2).map(|w| distance(w[0], w[1])).sum::<f64>() >= min_length)
+        .map(|line| {
+            line.iter()
+                .map(|p| [p[0] * cos - p[1] * sin, p[0] * sin + p[1] * cos])
+                .collect()
+        })
+        .collect()
+}
+
+/// Lines in three directions 60° apart, starting at `angle`, each set
+/// `spacing` apart, at height `z`: the cross-section of cubes standing on a
+/// corner. The faces of such cubes are tilted by acos(1 / sqrt(3)) from
+/// the horizontal, so every set moves sideways by z / sqrt(2) as the
+/// height goes up, across its lines and in its own direction; the cells
+/// change from layer to layer between triangles and hexagons.
+pub(crate) fn cubic(
+    area: &Shapes,
+    spacing: f64,
+    z: f64,
+    angle: f64,
+    min_length: f64,
+) -> Vec<Vec<[Point; 2]>> {
+    // A shift by whole spacings brings the lines back; what is left keeps
+    // the numbers small.
+    let travel = z / SQRT_2;
+    let shift = travel - spacing * (travel / spacing).floor();
+    (0..3)
+        .map(|k| {
+            let turn = angle + 120.0 * f64::from(k);
+            // Across the lines, 120° on from one set to the next, so that
+            // the three faces of a cube meet at right angles.
+            let (sin, cos) = polygon::sin_cos_degrees(turn + 90.0);
+            let by = [cos * shift, sin * shift];
+            let moved: Shapes = area
+                .iter()
+                .map(|shape| {
+                    shape
+                        .iter()
+                        .map(|c| c.iter().map(|p| [p[0] - by[0], p[1] - by[1]]).collect())
+                        .collect()
+                })
+                .collect();
+            polygon::hatch(&moved, spacing, HatchDirection::degrees(turn), min_length)
+                .into_iter()
+                .map(|line| line.map(|p| [p[0] + by[0], p[1] + by[1]]))
+                .collect()
+        })
+        .collect()
+}
+
+/// Loops following the outline of `area`, `spacing` apart. Sparse loops
+/// start half a spacing inside the outline, as hatch lines do, so they
+/// have as much line per area as straight lines `spacing` apart. `solid`
+/// loops start on the outline, like the ends of solid infill lines, and
+/// what they leave open between them and in the middle (up to a line
+/// `width` wide) gets lines of its own width along its middle, so that the
+/// surface has no holes.
+// ponytail: where the area is narrower than a line, a loop runs out and
+// back with its sides closer than a line and deposits up to twice the
+// material.
+pub(crate) fn concentric(
+    area: &Shapes,
+    spacing: f64,
+    width: f64,
+    solid: bool,
+) -> (Vec<Contour>, Vec<CentreLine>) {
+    let mut loops = Vec::new();
+    let mut missed = Vec::new();
+    let first = if solid { 0.0 } else { 0.5 * spacing };
+    // Every loop is offset from the area itself: offsets of offsets gather
+    // more and more points on their rounded corners.
+    let inset = |k: usize| first + k as f64 * spacing;
+    let mut shapes = polygon::offset(area, -first);
+    let mut k = 0;
+    while !shapes.is_empty() {
+        loops.extend(
+            shapes
+                .iter()
+                .flatten()
+                .map(|c| polygon::simplify(c, PATH_RESOLUTION)),
+        );
+        let inner = polygon::offset(area, -inset(k + 1));
+        if solid {
+            // A loop covers half a width to either side: what lies further
+            // inside and is not covered by the next loop is missed.
+            let reach = 0.5 * width;
+            let core = polygon::offset(area, -(inset(k) + reach));
+            // Growing a shape is slow; most of the time an estimate shows
+            // that nothing worth a line is missed, as for the walls.
+            let estimate = polygon::area(&core)
+                - crate::grown_area(&inner, reach)
+                - crate::corner_loss(&core, reach);
+            if estimate >= crate::MIN_THIN_WIDTH * width * width {
+                missed.extend(polygon::difference(&core, &polygon::offset(&inner, reach)));
+            }
+        }
+        shapes = inner;
+        k += 1;
+    }
+    let gaps = if missed.is_empty() {
+        Vec::new()
+    } else {
+        crate::centre_lines(missed, width).0
+    };
+    (loops, gaps)
+}
+
+/// Lines `spacing` apart along `angle` degrees, clipped to `area`, all
+/// pointing the same way and in the order to print them: a line comes only
+/// after every line beside it in the row before, and where possible right
+/// after one of them, so that every line is laid against
+/// the one before and the surface has no seams where lines were laid from
+/// both sides. Lines shorter than `min_length` are dropped.
+pub(crate) fn monotonic(
+    area: &Shapes,
+    spacing: f64,
+    angle: f64,
+    min_length: f64,
+) -> Vec<[Point; 2]> {
+    let (sin, cos) = polygon::sin_cos_degrees(angle);
+    let along = |p: Point| p[0] * cos + p[1] * sin;
+    // The number of the hatch line through `p`.
+    let row = |p: Point| ((p[1] * cos - p[0] * sin) / spacing - 0.5).round() as i64;
+    let mut lines: Vec<(i64, f64, f64, [Point; 2])> =
+        polygon::hatch(area, spacing, HatchDirection::degrees(angle), min_length)
+            .into_iter()
+            .map(|[a, b]| {
+                let line = if along(a) <= along(b) { [a, b] } else { [b, a] };
+                (row(line[0]), along(line[0]), along(line[1]), line)
+            })
+            .collect();
+    lines.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+
+    // Every line waits for the lines of the row before that lie beside it.
+    let n = lines.len();
+    let mut waits = vec![0_usize; n];
+    let mut frees: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut start = 0;
+    while start < n {
+        let row = lines[start].0;
+        let end = start + lines[start..].partition_point(|l| l.0 == row);
+        let next = end + lines[end..].partition_point(|l| l.0 == row + 1);
+        for a in start..end {
+            for b in end..next {
+                if lines[a].1 < lines[b].2 && lines[b].1 < lines[a].2 {
+                    waits[b] += 1;
+                    frees[a].push(b);
+                }
+            }
+        }
+        start = end;
+    }
+
+    // Lines are numbered by row and then by position along it, so the
+    // first one ready is the lowest.
+    let mut ready: BTreeSet<usize> = (0..n).filter(|&i| waits[i] == 0).collect();
+    let mut order = Vec::with_capacity(n);
+    let mut last: Option<usize> = None;
+    while let Some(pick) = last
+        .and_then(|l| frees[l].iter().copied().find(|b| ready.contains(b)))
+        .or_else(|| ready.first().copied())
+    {
+        ready.remove(&pick);
+        for &b in &frees[pick] {
+            waits[b] -= 1;
+            if waits[b] == 0 {
+                ready.insert(b);
+            }
+        }
+        order.push(lines[pick].3);
+        last = Some(pick);
+    }
+    order
+}
+
+/// Splits the solid infill of a layer into the surface that gets `pattern`
+/// and the rest, which keeps straight lines: the part with nothing `above`
+/// it, or all of it without anything above (the last layer, and the first
+/// one for its bottom surface). Returns the rest and the work for the
+/// surface. Strips of surface narrower than a line, along sloped sides,
+/// stay with the rest. The lines of the monotonic pattern run along
+/// `angle` degrees like those of the rest.
+pub(crate) fn surface(
+    solid: Shapes,
+    above: Option<&Shapes>,
+    pattern: SurfacePattern,
+    angle: f64,
+    width: f64,
+) -> (Shapes, Vec<Work>) {
+    if pattern == SurfacePattern::Rectilinear || solid.is_empty() {
+        return (solid, Vec::new());
+    }
+    let (surface, rest) = match above {
+        None => (solid, Vec::new()),
+        Some(above) => {
+            let top = polygon::difference(&solid, above);
+            let top = polygon::offset(&polygon::offset(&top, -0.5 * width), 0.5 * width);
+            // Loops run along the edge of the surface and cover half a
+            // line beyond it, where the line ends of the rest reach too.
+            let reach = if pattern == SurfacePattern::Concentric {
+                polygon::offset(&top, width)
+            } else {
+                top.clone()
+            };
+            (top, polygon::difference(&solid, &reach))
+        }
+    };
+    let kind = PathKind::SolidInfill;
+    let work = match pattern {
+        SurfacePattern::Concentric => {
+            let (loops, gaps) = concentric(&surface, width, width, true);
+            vec![Work::Loops(loops, kind, width), Work::Centred(gaps, kind)]
+        }
+        _ => vec![Work::Ordered(
+            monotonic(&surface, width, angle, 0.5 * width),
+            kind,
+        )],
+    };
+    (rest, work)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -501,5 +807,52 @@ mod tests {
         // Lines join in pairs at the wall only.
         assert!(joined >= lines.len() / 2 - 1, "{joined} of {}", lines.len());
         assert!(chains.len() <= lines.len() / 2 + 1, "{}", chains.len());
+    }
+
+    #[test]
+    fn honeycomb_has_as_much_line_as_straight_lines() {
+        let area = square(0.0, 60.0);
+        let lines = honeycomb(&area, 3.0, 30.0, 0.0);
+        assert_eq!(lines, honeycomb(&area, 3.0, 30.0, 0.0));
+        let ratio = length(&lines) / (60.0 * 60.0 / 3.0);
+        assert!((ratio - 1.0).abs() < 0.03, "{ratio}");
+        for p in lines.iter().flatten() {
+            assert!(p.iter().all(|v| (-1e-4..=60.0 + 1e-4).contains(v)), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn concentric_loops_are_a_spacing_apart() {
+        let (loops, gaps) = concentric(&square(0.0, 20.0), 2.0, 0.45, false);
+        assert!(gaps.is_empty());
+        // Squares 18, 14, 10, 6 and 2 mm wide.
+        assert_eq!(loops.len(), 5);
+        let total: f64 = loops.iter().map(|c| crate::line_length(c, true)).sum();
+        assert!((total - 200.0).abs() < 1e-6, "{total}");
+    }
+
+    #[test]
+    fn monotonic_lines_wait_for_the_lines_beside_them() {
+        // A square with a notch from below: two legs, one top.
+        let area = vec![vec![vec![
+            [0.0, 0.0],
+            [8.0, 0.0],
+            [8.0, 12.0],
+            [12.0, 12.0],
+            [12.0, 0.0],
+            [20.0, 0.0],
+            [20.0, 20.0],
+            [0.0, 20.0],
+        ]]];
+        let lines = monotonic(&area, 1.0, 0.0, 0.0);
+        assert_eq!(lines.len(), 2 * 12 + 8);
+        // Left to right; the left leg, then the right one, then the top.
+        assert!(lines.iter().all(|[a, b]| a[0] < b[0] && a[1] == b[1]));
+        let left = (0..12).map(|k| (0.0, k as f64 + 0.5));
+        let right = (0..12).map(|k| (12.0, k as f64 + 0.5));
+        let top = (12..20).map(|k| (0.0, k as f64 + 0.5));
+        let expected: Vec<(f64, f64)> = left.chain(right).chain(top).collect();
+        let starts: Vec<(f64, f64)> = lines.iter().map(|[a, _]| (a[0], a[1])).collect();
+        assert_eq!(starts, expected);
     }
 }

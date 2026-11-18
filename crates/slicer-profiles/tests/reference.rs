@@ -58,7 +58,13 @@ fn settings_reference_is_current() {
             None => match name.as_str() {
                 "technology" => "`fdm`".to_string(),
                 "flavor" => "`marlin`, `klipper`".to_string(),
-                "infill_pattern" => "`rectilinear`, `grid`, `triangles`, `gyroid`".to_string(),
+                "infill_pattern" => {
+                    "`rectilinear`, `grid`, `triangles`, `gyroid`, `honeycomb`, `cubic`, `concentric`"
+                        .to_string()
+                }
+                "top_surface_pattern" | "bottom_surface_pattern" => {
+                    "`rectilinear`, `monotonic`, `concentric`".to_string()
+                }
                 "wall_order" => "`inner_outer`, `outer_inner`".to_string(),
                 "seam_position" => "`rear`, `corner`, `nearest`".to_string(),
                 "support_style" => "`normal`, `tree`".to_string(),
