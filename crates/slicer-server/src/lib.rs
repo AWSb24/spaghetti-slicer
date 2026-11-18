@@ -258,6 +258,16 @@ impl Job {
         if let Some(gcode) = &self.gcode {
             std::fs::write(dir.join(format!("{id}.gcode")), gcode.as_bytes())?;
         }
+        if let Some(info) = &self.info {
+            for (extension, png) in [
+                ("png", &info.thumbnail),
+                ("small.png", &info.thumbnail_small),
+            ] {
+                if !png.is_empty() {
+                    std::fs::write(dir.join(format!("{id}.{extension}")), png)?;
+                }
+            }
+        }
         let age = self
             .finished_at
             .map_or(0.0, |at| at.elapsed().as_secs_f64());
@@ -307,6 +317,11 @@ impl Job {
                 filament_m: info["filament_m"].as_f64()?,
                 layers: usize::try_from(info["layers"].as_u64()?).ok()?,
                 nozzle_diameter: info["nozzle_diameter"].as_f64()?,
+                // Pictures are kept if they can be read; jobs of older
+                // versions have none.
+                thumbnail: std::fs::read(dir.join(format!("{id}.png"))).unwrap_or_default(),
+                thumbnail_small: std::fs::read(dir.join(format!("{id}.small.png")))
+                    .unwrap_or_default(),
             };
             (Some(Arc::new(gcode)), Some(info))
         } else {
@@ -372,7 +387,7 @@ fn load_jobs(dir: &std::path::Path, ttl: Duration) -> HashMap<Uuid, Job> {
 
 /// Deletes what [`Job::save`] wrote; missing files are no error.
 fn forget(dir: &std::path::Path, id: Uuid) {
-    for extension in ["json", "gcode", "json.tmp"] {
+    for extension in ["json", "gcode", "json.tmp", "png", "small.png"] {
         let _ = std::fs::remove_file(dir.join(format!("{id}.{extension}")));
     }
 }
@@ -820,12 +835,14 @@ struct JobInput {
 /// centred on the bed, several are arranged side by side; with
 /// `project_settings` a project file whose objects have settings of their
 /// own is split into them, as the command line tool does. Returns the
-/// G-code, the warnings and the nozzle diameter of the plate.
+/// G-code, the warnings and what the `.gcode.3mf` container says about the
+/// print, with the pictures of the plate. The G-code holds the pictures
+/// that the setting `thumbnails` asks for.
 fn slice(
     input: &JobInput,
     stop: &AtomicBool,
     progress: &Progress,
-) -> Result<(slicer_gcode::Output, Diagnostics, f64), Diagnostic> {
+) -> Result<(slicer_gcode::Output, Diagnostics, slicer_formats::PrintInfo), Diagnostic> {
     let mut warnings = Diagnostics::new();
     // Messages name the model by its number when there are several.
     let names: Vec<Option<load::Name>> = (1..=input.models.len())
@@ -861,9 +878,39 @@ fn slice(
         progress,
     )
     .map_err(|e| e.diagnostic())?;
-    let output = slicer_gcode::write_gcode_with_progress(&toolpaths, settings, progress)
+    let mut output = slicer_gcode::write_gcode_with_progress(&toolpaths, settings, progress)
         .map_err(|e| e.diagnostic())?;
-    Ok((output, warnings, settings.nozzle_diameter))
+    let thumbnail_error = |e: std::io::Error| {
+        Diagnostic::error(
+            "thumbnail.encode",
+            format!("the picture of the plate cannot be made: {e}"),
+        )
+    };
+    let meshes = &plate.objects.meshes;
+    slicer_gcode::thumbnails::add_thumbnails(&mut output.gcode, meshes, plate.placement, settings)
+        .map_err(thumbnail_error)?;
+    let [large, small] = [
+        slicer_formats::PLATE_THUMBNAIL_SIZE,
+        slicer_formats::PLATE_THUMBNAIL_SMALL_SIZE,
+    ];
+    let mut pictures = slicer_gcode::thumbnails::render_thumbnails(
+        meshes,
+        plate.placement,
+        &[[large, large], [small, small]],
+    )
+    .map_err(thumbnail_error)?
+    .into_iter()
+    .map(|picture| picture.png);
+    let info = slicer_formats::PrintInfo {
+        seconds: output.stats.print_time_s,
+        weight_g: output.stats.filament_weight_g,
+        filament_m: output.stats.filament_length_mm / 1000.0,
+        layers: output.stats.layers,
+        nozzle_diameter: settings.nozzle_diameter,
+        thumbnail: pictures.next().unwrap_or_default(),
+        thumbnail_small: pictures.next().unwrap_or_default(),
+    };
+    Ok((output, warnings, info))
 }
 
 async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Response {
@@ -1075,16 +1122,10 @@ async fn run_job(app: App, id: Uuid, input: JobInput) {
     };
     job.finished_at = Some(Instant::now());
     match outcome {
-        Ok((output, warnings, nozzle_diameter)) => {
+        Ok((output, warnings, info)) => {
             job.status = Status::Done;
             job.stats = Some(json!(output.stats));
-            job.info = Some(slicer_formats::PrintInfo {
-                seconds: output.stats.print_time_s,
-                weight_g: output.stats.filament_weight_g,
-                filament_m: output.stats.filament_length_mm / 1000.0,
-                layers: output.stats.layers,
-                nozzle_diameter,
-            });
+            job.info = Some(info);
             job.warnings = json!(warnings.as_slice());
             job.gcode = Some(Arc::new(output.gcode));
         }

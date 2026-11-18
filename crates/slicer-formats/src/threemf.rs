@@ -844,14 +844,29 @@ pub(crate) fn push_mesh(model: &mut String, mesh: &Mesh) {
 
 /// Packs named parts into a ZIP archive.
 pub fn write_package(parts: &[(&str, &str)]) -> Result<Vec<u8>, ThreeMfError> {
+    let parts: Vec<(&str, &[u8])> = parts
+        .iter()
+        .map(|&(name, content)| (name, content.as_bytes()))
+        .collect();
+    write_binary_package(&parts)
+}
+
+/// Packs named parts with any content into a ZIP archive. PNG images,
+/// compressed already, are stored as they are; everything else is
+/// compressed.
+pub fn write_binary_package(parts: &[(&str, &[u8])]) -> Result<Vec<u8>, ThreeMfError> {
     let archive = |e: zip::result::ZipError| ThreeMfError::Archive(e.to_string());
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     for (name, content) in parts {
+        let method = if name.ends_with(".png") {
+            zip::CompressionMethod::Stored
+        } else {
+            zip::CompressionMethod::Deflated
+        };
+        let options = zip::write::SimpleFileOptions::default().compression_method(method);
         writer.start_file(*name, options).map_err(archive)?;
         writer
-            .write_all(content.as_bytes())
+            .write_all(content)
             .map_err(|e| ThreeMfError::Archive(e.to_string()))?;
     }
     Ok(writer.finish().map_err(archive)?.into_inner())

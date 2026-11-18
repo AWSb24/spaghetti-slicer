@@ -218,6 +218,14 @@ fn io_error(code: &'static str, path: &Path, error: &std::io::Error) -> Diagnost
     Diagnostic::error(code, format!("{}: {error}", path.display())).with("path", path.display())
 }
 
+/// Why a picture of the plate could not be made.
+fn thumbnail_error(error: &std::io::Error) -> Diagnostic {
+    Diagnostic::error(
+        "thumbnail.encode",
+        format!("the picture of the plate cannot be made: {error}"),
+    )
+}
+
 fn main() -> ExitCode {
     match Cli::parse().command {
         Command::DefaultConfig => {
@@ -340,6 +348,13 @@ fn calibrate(
         slicer_gcode::write_gcode(&toolpaths, &settings).map_err(|e| e.diagnostic())?;
     let objects: Vec<(usize, &slicer_core::Mesh)> = meshes.iter().enumerate().collect();
     calibration.apply(&mut result, &objects, &settings);
+    slicer_gcode::thumbnails::add_thumbnails(
+        &mut result.gcode,
+        &meshes,
+        slicer_fdm::Placement::AsGiven,
+        &settings,
+    )
+    .map_err(|e| thumbnail_error(&e))?;
 
     let output =
         output.unwrap_or_else(|| PathBuf::from(format!("calibration-{}.gcode", kind.name())));
@@ -567,7 +582,15 @@ fn slice(
         },
         _ => e.diagnostic(),
     })?;
-    let result = slicer_gcode::write_gcode(&toolpaths, &settings).map_err(|e| e.diagnostic())?;
+    let mut result =
+        slicer_gcode::write_gcode(&toolpaths, &settings).map_err(|e| e.diagnostic())?;
+    slicer_gcode::thumbnails::add_thumbnails(
+        &mut result.gcode,
+        &objects.meshes,
+        placement,
+        &settings,
+    )
+    .map_err(|e| thumbnail_error(&e))?;
 
     let first = inputs.first().map_or_else(PathBuf::new, PathBuf::clone);
     let output = output.unwrap_or_else(|| first.with_extension("gcode"));
@@ -578,12 +601,26 @@ fn slice(
         .to_lowercase()
         .ends_with(".gcode.3mf");
     let content = if container {
+        let [large, small] = [
+            slicer_formats::PLATE_THUMBNAIL_SIZE,
+            slicer_formats::PLATE_THUMBNAIL_SMALL_SIZE,
+        ];
+        let mut pictures = slicer_gcode::thumbnails::render_thumbnails(
+            &objects.meshes,
+            placement,
+            &[[large, large], [small, small]],
+        )
+        .map_err(|e| thumbnail_error(&e))?
+        .into_iter()
+        .map(|picture| picture.png);
         let info = slicer_formats::PrintInfo {
             seconds: result.stats.print_time_s,
             weight_g: result.stats.filament_weight_g,
             filament_m: result.stats.filament_length_mm / 1000.0,
             layers: result.stats.layers,
             nozzle_diameter: settings.nozzle_diameter,
+            thumbnail: pictures.next().unwrap_or_default(),
+            thumbnail_small: pictures.next().unwrap_or_default(),
         };
         slicer_formats::write_gcode_3mf(&result.gcode, &info).map_err(|e| e.diagnostic())?
     } else {

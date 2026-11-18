@@ -2607,6 +2607,8 @@ dependencies = [
 name = "slicer-core"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
+ "flate2",
  "i_overlay",
  "serde",
 ]
