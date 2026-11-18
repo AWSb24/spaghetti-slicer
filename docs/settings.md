@@ -13,6 +13,8 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `nozzle_diameter` | 0.4 | 0.1 to 2 | Nozzle diameter. |
 | `flavor` | marlin | `marlin`, `klipper` | G-code dialect. |
 | `extrusion_mode` | relative | `relative`, `absolute` | Whether extrusion amounts in the G-code are relative or absolute. |
+| `arc_fitting` | false | `true`, `false` | Whether runs of short extrusion moves that lie on a circle are written as one arc (`G2` clockwise, `G3` counter-clockwise) instead of many straight `G1` lines: smaller files and smoother curves. Klipper needs `[gcode_arcs]` in `printer.cfg` for it. |
+| `arc_tolerance` | 0.01 | 0.001 to 0.5 | With `arc_fitting`: how far any point of the original lines (and the middle of every line) may lie from the arc that replaces them. |
 | `extruder_count` | 1 | 1 to 16 | Number of extruders (tools or filament slots) of the printer. With more than one, every object prints with the extruder it names (Bambu Studio projects) and the G-code changes tools with `T<n>`; with one, everything prints with the lowest extruder the objects name. |
 | `filament_diameter` | 1.75 | 1 to 3.5 | Filament diameter. |
 | `filament_density` | 1.24 | 0.1 to 20 | Filament density in g/cm³, used for the weight estimate. |

@@ -70,7 +70,8 @@ fn settings_reference_is_current() {
                 | "spiral_vase"
                 | "ironing"
                 | "avoid_crossing_walls"
-                | "fuzzy_skin" => "`true`, `false`".to_string(),
+                | "fuzzy_skin"
+                | "arc_fitting" => "`true`, `false`".to_string(),
                 "start_gcode" | "end_gcode" | "toolchange_gcode" => {
                     "text with `{key}` placeholders".to_string()
                 }

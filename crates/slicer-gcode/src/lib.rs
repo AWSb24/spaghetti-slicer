@@ -512,6 +512,76 @@ impl<'a> Writer<'a> {
         self.extend_trail(from, to);
     }
 
+    /// Extrudes along `points` from where the nozzle is. With
+    /// `arc_fitting`, runs of the points that lie on a circle become arcs,
+    /// see [`fit_arc`]; the filament, the time estimate and the wipe trail
+    /// stay those of the straight lines.
+    fn extrude_all(&mut self, points: &[Point], filament_per_mm: f64, speed: f64, kind: PathKind) {
+        let Some(start) = self.position.filter(|_| self.settings.arc_fitting) else {
+            for &point in points {
+                self.extrude(point, filament_per_mm, speed, kind);
+            }
+            return;
+        };
+        // The points the nozzle goes through; `extrude` skips shorter moves.
+        let mut run = vec![start];
+        for &point in points {
+            if run
+                .last()
+                .is_some_and(|&last| distance(last, point) >= 1e-4)
+            {
+                run.push(point);
+            }
+        }
+        let mut i = 0;
+        while i + 1 < run.len() {
+            // Grow the arc point by point for as long as it fits.
+            // ponytail: greedy and rechecks the whole run at every step,
+            // quadratic in the points of one arc.
+            let mut found = None;
+            let mut end = i + 3;
+            while end < run.len() {
+                match fit_arc(&run[i..=end], self.settings.arc_tolerance) {
+                    Some(arc) => found = Some((end, arc)),
+                    None => break,
+                }
+                end += 1;
+            }
+            let Some((end, (centre, clockwise))) = found else {
+                self.extrude(run[i + 1], filament_per_mm, speed, kind);
+                i += 1;
+                continue;
+            };
+            self.unretract();
+            let length: f64 = run[i..=end].windows(2).map(|p| distance(p[0], p[1])).sum();
+            let e = length * filament_per_mm;
+            let f = self.feed_word(speed);
+            let word = self.e_word(e);
+            let (from, to) = (run[i], run[end]);
+            // ponytail: I and J are taken from the exact start, not from the
+            // start as rounded in the G-code; the two differ by at most
+            // 0.0005 mm.
+            let _ = writeln!(
+                self.out,
+                "{} X{:.3} Y{:.3} I{:.3} J{:.3}{word}{f}",
+                if clockwise { "G2" } else { "G3" },
+                to[0],
+                to[1],
+                centre[0] - from[0],
+                centre[1] - from[1]
+            );
+            self.filament[self.tool] += e;
+            for pair in run[i..=end].windows(2) {
+                let d = distance(pair[0], pair[1]);
+                let direction = [(pair[1][0] - pair[0][0]) / d, (pair[1][1] - pair[0][1]) / d];
+                self.record(direction, d, speed, Some(kind));
+                self.extend_trail(pair[0], pair[1]);
+            }
+            self.position = Some(to);
+            i = end;
+        }
+    }
+
     /// Adds the move from `from` to `to` to the line printed last.
     // ponytail: only the last 64 points are kept; a wipe never needs more
     // than a few millimetres of the line.
@@ -577,6 +647,65 @@ impl<'a> Writer<'a> {
         self.position = Some(from);
         self.trail.clear();
     }
+}
+
+/// The circle through the first, middle and last of `points` if all the
+/// points and the middles of the lines between them lie within `tolerance`
+/// of it, the lines turn one way and go round its centre in that direction
+/// by less than a full turn; at least three lines and a radius above
+/// `tolerance` and at most 1000 mm. Returns the centre and whether the arc
+/// runs clockwise.
+fn fit_arc(points: &[Point], tolerance: f64) -> Option<(Point, bool)> {
+    if points.len() < 4 {
+        return None;
+    }
+    let first = points[0];
+    let sub = |p: Point, q: Point| [p[0] - q[0], p[1] - q[1]];
+    let cross = |a: Point, b: Point| a[0] * b[1] - a[1] * b[0];
+    let b = sub(points[points.len() / 2], first);
+    let c = sub(points[points.len() - 1], first);
+    let d = 2.0 * cross(b, c);
+    let (bb, cc) = (b[0] * b[0] + b[1] * b[1], c[0] * c[0] + c[1] * c[1]);
+    let u = [(c[1] * bb - b[1] * cc) / d, (b[0] * cc - c[0] * bb) / d];
+    let radius = (u[0] * u[0] + u[1] * u[1]).sqrt();
+    if !radius.is_finite() || radius > 1000.0 || radius <= tolerance {
+        return None;
+    }
+    let centre = [first[0] + u[0], first[1] + u[1]];
+    let side = d.signum();
+    let off = |p: Point| (distance(centre, p) - radius).abs() > tolerance;
+    // Angle round the centre from the first point in the direction of the
+    // arc, as a number from 0 to 4 that grows with the angle (a quarter turn
+    // per unit), so that no trigonometry is needed.
+    let start = sub(first, centre);
+    let turn = |p: Point| {
+        let v = sub(p, centre);
+        let (x, y) = (start[0] * v[0] + start[1] * v[1], side * cross(start, v));
+        match (x >= 0.0, y >= 0.0) {
+            (true, true) => y / (x + y),
+            (false, true) => 1.0 - x / (y - x),
+            (false, false) => 2.0 + y / (x + y),
+            (true, false) => 3.0 + x / (x - y),
+        }
+    };
+    let mut angle = 0.0;
+    for (k, pair) in points.windows(2).enumerate() {
+        let middle = [
+            (pair[0][0] + pair[1][0]) / 2.0,
+            (pair[0][1] + pair[1][1]) / 2.0,
+        ];
+        let next = turn(pair[1]);
+        if off(pair[1]) || off(middle) || next <= angle {
+            return None;
+        }
+        angle = next;
+        if let Some(&after) = points.get(k + 2)
+            && side * cross(sub(pair[1], pair[0]), sub(after, pair[1])) < 0.0
+        {
+            return None;
+        }
+    }
+    Some((centre, side < 0.0))
 }
 
 /// Writes one layer. Extrusion runs at `slow` times its speed (1 for full
@@ -703,12 +832,11 @@ fn write_layer(
             w.z = layer.z;
             continue;
         }
-        for &point in &path.points[1..] {
-            w.extrude(point, filament_per_mm, speed, path.kind);
-        }
+        let mut points = path.points[1..].to_vec();
         if path.closed {
-            w.extrude(first, filament_per_mm, speed, path.kind);
+            points.push(first);
         }
+        w.extrude_all(&points, filament_per_mm, speed, path.kind);
     }
     Ok(())
 }
@@ -1721,5 +1849,95 @@ SET_PRESSURE_ADVANCE ADVANCE=0.04
             .filter(|l| l.starts_with("M106"))
             .collect();
         assert!(fans.contains(&"M106 S204"), "{fans:?}");
+    }
+
+    /// The G-code without the settings dump at its end.
+    fn moves_only(gcode: &str) -> &str {
+        &gcode[..gcode.rfind("; settings").unwrap()]
+    }
+
+    #[test]
+    fn arcs_replace_the_lines_round_a_cylinder() {
+        let mesh = slicer_core::primitives::cylinder(10.0, 2.0, 128);
+        let plain = Settings::default();
+        let arcs = Settings {
+            arc_fitting: true,
+            ..plain.clone()
+        };
+        let (a, b) = (slice(&mesh, &plain), slice(&mesh, &arcs));
+        let count = |gcode: &str, prefix: &str| {
+            moves_only(gcode)
+                .lines()
+                .filter(|l| l.starts_with(prefix))
+                .count()
+        };
+        assert_eq!(count(&a.gcode, "G2 ") + count(&a.gcode, "G3 "), 0);
+        assert!(count(&b.gcode, "G2 ") + count(&b.gcode, "G3 ") > 0);
+        assert!(
+            count(&b.gcode, "G") < count(&a.gcode, "G"),
+            "{} {}",
+            count(&b.gcode, "G"),
+            count(&a.gcode, "G")
+        );
+        assert!((a.stats.filament_length_mm - b.stats.filament_length_mm).abs() < 1e-6);
+        assert!((a.stats.print_time_s - b.stats.print_time_s).abs() < 1e-6);
+
+        // Every other line stays as it was; every arc stands for three or
+        // more of the straight lines, ends where they end, and their points
+        // lie on its circle.
+        let tolerance = arcs.arc_tolerance + 0.002;
+        let mut straight = moves_only(&a.gcode).lines();
+        let mut at = [0.0, 0.0];
+        let mut checked = 0;
+        for line in moves_only(&b.gcode).lines() {
+            if !(line.starts_with("G2 ") || line.starts_with("G3 ")) {
+                assert_eq!(Some(line), straight.next());
+                if let (Some(x), Some(y)) = (word(line, 'X'), word(line, 'Y')) {
+                    at = [x, y];
+                }
+                continue;
+            }
+            // Round the cylinder counter-clockwise, as the walls go.
+            assert!(line.starts_with("G3 "), "{line}");
+            let centre = [
+                at[0] + word(line, 'I').unwrap(),
+                at[1] + word(line, 'J').unwrap(),
+            ];
+            let radius = distance(at, centre);
+            let end = [word(line, 'X').unwrap(), word(line, 'Y').unwrap()];
+            let mut replaced = 0;
+            loop {
+                let original = straight.next().unwrap();
+                assert!(original.starts_with("G1 X"), "{line} for {original}");
+                let p = [word(original, 'X').unwrap(), word(original, 'Y').unwrap()];
+                let off = (distance(p, centre) - radius).abs();
+                assert!(off <= tolerance, "{line} for {original}: {off}");
+                replaced += 1;
+                if p == end {
+                    break;
+                }
+            }
+            assert!(replaced >= 3, "{line}");
+            at = end;
+            checked += 1;
+        }
+        assert_eq!(straight.next(), None);
+        assert!(checked > 0);
+    }
+
+    #[test]
+    fn straight_walls_get_no_arcs() {
+        let mesh = Mesh::cuboid(20.0, 20.0, 3.0);
+        // The skirt has round corners.
+        let plain = Settings {
+            skirt_loops: 0,
+            ..Settings::default()
+        };
+        let arcs = Settings {
+            arc_fitting: true,
+            ..plain.clone()
+        };
+        let (a, b) = (slice(&mesh, &plain), slice(&mesh, &arcs));
+        assert_eq!(moves_only(&a.gcode), moves_only(&b.gcode));
     }
 }
