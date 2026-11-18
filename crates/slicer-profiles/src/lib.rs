@@ -376,6 +376,9 @@ pub struct Settings {
     pub overhang_speed_full: f64,
     /// Speed of ironing.
     pub ironing_speed: f64,
+    /// Speed of supports, their dense interface under the surface they
+    /// carry included; 0 prints them at `infill_speed`.
+    pub support_speed: f64,
     /// Multiplier on the extruded amount of bridges, on top of `flow_ratio`.
     pub bridge_flow: f64,
     /// Speed of all extrusion on the first layer.
@@ -495,6 +498,7 @@ impl Default for Settings {
             overhang_speed: 0.0,
             overhang_speed_full: 0.0,
             ironing_speed: 20.0,
+            support_speed: 0.0,
             bridge_flow: 1.0,
             first_layer_speed: 25.0,
             travel_speed: 150.0,
@@ -855,6 +859,7 @@ impl Settings {
             ("ironing_flow", self.ironing_flow, 0.0, 100.0),
             ("ironing_spacing", self.ironing_spacing, 0.01, 2.0),
             ("ironing_speed", self.ironing_speed, 1.0, 1000.0),
+            ("support_speed", self.support_speed, 0.0, 1000.0),
             ("fuzzy_skin_thickness", self.fuzzy_skin_thickness, 0.0, 2.0),
             (
                 "fuzzy_skin_point_distance",

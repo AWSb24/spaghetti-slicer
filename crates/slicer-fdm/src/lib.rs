@@ -168,9 +168,9 @@ pub struct Path {
     /// Object on the plate the path belongs to, counted from 0 in the order
     /// the objects were given; [`NO_OBJECT`] for skirt, brim, supports and
     /// the prime tower. On a plate of several objects printed together it
-    /// is only worked out with `Settings::label_objects` or speeds of
-    /// objects ([`Toolpaths::object_settings`]) and is [`NO_OBJECT`] for
-    /// every path otherwise.
+    /// is only worked out with `Settings::label_objects` or settings of
+    /// objects for the G-code writer ([`Toolpaths::object_settings`]) and
+    /// is [`NO_OBJECT`] for every path otherwise.
     pub object: u32,
     /// Width of the extruded line in millimetres where it differs from the
     /// line width setting: lines along the middle of regions too narrow for
@@ -220,9 +220,10 @@ pub struct Toolpaths {
     /// a layer no higher than the one before it starts the next object.
     pub layers: Vec<Layer>,
     /// The settings of every object on the plate, counted like
-    /// [`Path::object`], where an object prints at speeds of its own
-    /// (see [`OBJECT_SETTINGS`]); empty if every object prints at the
-    /// plate's speeds. Every path of an object then has its object set.
+    /// [`Path::object`], where an object prints with speeds, fan, flow
+    /// ratio or retraction of its own (see [`OBJECT_SETTINGS`]); empty if
+    /// every object prints with the plate's. Every path of an object then
+    /// has its object set.
     pub object_settings: Vec<Settings>,
 }
 
