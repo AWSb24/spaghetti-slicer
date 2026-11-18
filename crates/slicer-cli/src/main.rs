@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use slicer_core::{Diagnose, Diagnostic, Diagnostics};
+use slicer_fdm::load;
 use slicer_profiles::Settings;
 use slicer_send::Target;
 
@@ -206,6 +207,11 @@ fn in_file(path: &Path) -> impl Fn(Diagnostic) -> Diagnostic + '_ {
     }
 }
 
+/// How messages name the file at `path`, as [`in_file`] does.
+fn file_name(path: &Path) -> load::Name {
+    load::Name::new(path.display().to_string(), "path", path.display())
+}
+
 /// An input/output failure of the command line tool itself.
 fn io_error(code: &'static str, path: &Path, error: &std::io::Error) -> Diagnostic {
     Diagnostic::error(code, format!("{}: {error}", path.display())).with("path", path.display())
@@ -239,7 +245,7 @@ fn main() -> ExitCode {
             printer,
             json,
         } => {
-            let placement = Placing {
+            let placement = load::Placing {
                 keep_positions,
                 gap,
             };
@@ -419,70 +425,15 @@ fn split_override(item: &str) -> Result<(&str, &str), Diagnostic> {
     Ok((key.trim(), value.trim()))
 }
 
-/// How the command line puts the objects on the bed.
-#[derive(Clone, Copy)]
-struct Placing {
-    keep_positions: bool,
-    gap: f64,
-}
-
-/// Puts the objects on the bed: as the files place them, centred (one
-/// model file) or arranged side by side (several). `file` names the model
-/// file of every object; the objects of one file keep their places
-/// relative to each other.
-fn place(
-    meshes: &mut [slicer_core::Mesh],
-    file: &[usize],
-    files: usize,
-    placing: Placing,
-    settings: &Settings,
-) -> slicer_fdm::Placement {
-    if placing.keep_positions {
-        return slicer_fdm::Placement::AsGiven;
-    }
-    if files < 2 {
-        return slicer_fdm::Placement::Centre;
-    }
-    if meshes.len() == files {
-        slicer_fdm::arrange_objects(meshes, settings, placing.gap);
-        return slicer_fdm::Placement::AsGiven;
-    }
-    // The bounds of every file's objects together, arranged as one.
-    let mut bounds: Vec<Option<([f64; 3], [f64; 3])>> = vec![None; files];
-    for (mesh, &file) in meshes.iter().zip(file) {
-        if let Some((lo, hi)) = mesh.bounds() {
-            bounds[file] = Some(match bounds[file] {
-                Some((a, b)) => (
-                    [0, 1, 2].map(|i| a[i].min(lo[i])),
-                    [0, 1, 2].map(|i| b[i].max(hi[i])),
-                ),
-                None => (lo, hi),
-            });
-        }
-    }
-    let sizes: Vec<[f64; 2]> = bounds
-        .iter()
-        .map(|b| b.map_or([0.0, 0.0], |(lo, hi)| [hi[0] - lo[0], hi[1] - lo[1]]))
-        .collect();
-    let corners = slicer_fdm::arrange(&sizes, settings, placing.gap);
-    for (mesh, &file) in meshes.iter_mut().zip(file) {
-        if let Some((lo, _)) = bounds[file] {
-            let corner = corners[file];
-            mesh.translate([corner[0] - lo[0], corner[1] - lo[1], 0.0]);
-        }
-    }
-    slicer_fdm::Placement::AsGiven
-}
-
 /// The settings files of every one of `count` model files, from the
-/// `--object N:FILE` arguments in order, with their paths. Every file is
-/// checked by layering it over `settings`.
+/// `--object N:FILE` arguments in order, named by their paths. Every file
+/// is checked by layering it over `settings`.
 fn read_object_files(
     count: usize,
     objects: &[String],
     settings: &Settings,
-) -> Result<Vec<Vec<(PathBuf, String)>>, Diagnostic> {
-    let mut own: Vec<Vec<(PathBuf, String)>> = vec![Vec::new(); count];
+) -> Result<Vec<Vec<load::ObjectLayer>>, Diagnostic> {
+    let mut own: Vec<Vec<load::ObjectLayer>> = vec![Vec::new(); count];
     for item in objects {
         let invalid = || {
             Diagnostic::error(
@@ -502,7 +453,10 @@ fn read_object_files(
         let path = Path::new(path);
         let text = fs::read_to_string(path).map_err(|e| io_error("io.read", path, &e))?;
         slicer_fdm::apply_object_toml(&mut settings.clone(), &text).map_err(in_file(path))?;
-        slot.push((path.to_path_buf(), text));
+        slot.push(load::ObjectLayer {
+            text,
+            name: file_name(path),
+        });
     }
     Ok(own)
 }
@@ -538,213 +492,29 @@ struct SettingsArgs<'a> {
     project: bool,
 }
 
-/// Largest number of setting names a warning lists in its message; the
-/// `keys` field of the warning holds them all.
-const LISTED_KEYS: usize = 12;
-
-/// Up to [`LISTED_KEYS`] of `keys`, separated by commas, and how many more
-/// there are.
-fn listed(keys: &[&str]) -> String {
-    let mut text = keys
-        .iter()
-        .take(LISTED_KEYS)
-        .copied()
-        .collect::<Vec<_>>()
-        .join(", ");
-    if keys.len() > LISTED_KEYS {
-        text.push_str(&format!(" and {} more", keys.len() - LISTED_KEYS));
-    }
-    text
-}
-
-/// Layers the settings of the whole project stored in a project file of
-/// Orca Slicer or Bambu Studio over `base`. Returns what the file stores,
-/// `None` if it is not a 3MF file.
-fn read_project_base(
-    input: &Path,
-    bytes: &[u8],
-    base: &mut Settings,
-    warnings: &mut Diagnostics,
-) -> Result<Option<slicer_formats::ProjectSettings>, Diagnostic> {
-    if !slicer_formats::looks_like_3mf(bytes) {
-        return Ok(None);
-    }
-    let stored =
-        slicer_formats::read_project_settings(bytes).map_err(|e| in_file(input)(e.diagnostic()))?;
-    if stored.is_empty() {
-        warnings.push(
-            Diagnostic::warning(
-                "project.no_settings",
-                format!(
-                    "{}: the file stores no settings of Orca Slicer or Bambu Studio",
-                    input.display()
-                ),
-            )
-            .with("path", input.display()),
-        );
-    }
-    if let Some(config) = &stored.config {
-        let import = slicer_profiles::import_orca(config, base)
-            .map_err(|e| in_file(input)(e.diagnostic()))?;
-        if !import.skipped.is_empty() {
-            let keys: Vec<&str> = import.skipped.iter().map(|(k, _)| k.as_str()).collect();
-            warnings.push(
-                Diagnostic::warning(
-                    "project.settings_skipped",
-                    format!(
-                        "{}: {} of the project's settings have no counterpart and were left out ({} taken): {}",
-                        input.display(),
-                        keys.len(),
-                        import.taken.len(),
-                        listed(&keys)
-                    ),
-                )
-                .with("path", input.display())
-                .with("taken", import.taken.len())
-                .with("skipped", keys.len())
-                .with("keys", keys.join(" ")),
-            );
-        }
-    }
-    Ok(Some(stored))
-}
-
-/// The settings of one object of a project file over `settings`, the
-/// plate's; `None` if they change nothing. Settings that are not taken
-/// are reported.
-fn project_object(
-    input: &Path,
-    object: &slicer_formats::ObjectSettings,
-    settings: &Settings,
-    warnings: &mut Diagnostics,
-) -> Option<Settings> {
-    let name = match &object.name {
-        Some(name) => format!("object '{name}' (id {})", object.id),
-        None => format!("object {}", object.id),
-    };
-    let mut own = settings.clone();
-    let skipped = slicer_fdm::apply_object_orca(&mut own, &object.values);
-    if !skipped.is_empty() {
-        let keys: Vec<&str> = skipped.iter().map(|(k, _)| k.as_str()).collect();
-        let reasons: Vec<String> = skipped
-            .iter()
-            .take(LISTED_KEYS)
-            .map(|(key, reason)| format!("{key} ({reason})"))
-            .collect();
-        let more = if keys.len() > LISTED_KEYS {
-            ", ..."
-        } else {
-            ""
-        };
-        warnings.push(
-            Diagnostic::warning(
-                "project.object_settings_skipped",
-                format!(
-                    "{}: {name}: {} setting(s) were left out: {}{more}",
-                    input.display(),
-                    keys.len(),
-                    reasons.join(", "),
-                ),
-            )
-            .with("path", input.display())
-            .with("object", object.id)
-            .with("keys", keys.join(" ")),
-        );
-    }
-    if !object.part_keys.is_empty() {
-        let keys: Vec<&str> = object.part_keys.iter().map(String::as_str).collect();
-        warnings.push(
-            Diagnostic::warning(
-                "project.part_settings_skipped",
-                format!(
-                    "{}: {name}: settings of its parts and modifiers are not read: {}",
-                    input.display(),
-                    listed(&keys)
-                ),
-            )
-            .with("path", input.display())
-            .with("object", object.id)
-            .with("keys", keys.join(" ")),
-        );
-    }
-    (own != *settings).then_some(own)
-}
-
-/// A mesh to slice with its settings of its own, if any.
-type Object = (slicer_core::Mesh, Option<Settings>);
-
-/// Reads model file `input` as one object, or, if `stored` gives settings
-/// of their own to objects on the plate (over `settings`, the plate's), as
-/// one object per build item, each with the settings of its object.
-fn read_objects(
-    input: &Path,
-    bytes: &[u8],
-    stored: Option<&slicer_formats::ProjectSettings>,
-    settings: &Settings,
-    plate: Option<u32>,
-    warnings: &mut Diagnostics,
-) -> Result<Vec<Object>, Diagnostic> {
-    if let Some(stored) = stored.filter(|stored| !stored.objects.is_empty()) {
-        let mut found = Diagnostics::new();
-        let objects = slicer_formats::parse_3mf_plate_objects(bytes, plate, &mut found)
-            .map_err(|e| in_file(input)(e.diagnostic()))?;
-        // The settings of every object on the plate, once per object.
-        let mut by_id: Vec<(u32, Option<Settings>)> = Vec::new();
-        for (id, _) in &objects {
-            if by_id.iter().all(|(known, _)| known != id) {
-                let own = stored
-                    .object(*id)
-                    .and_then(|object| project_object(input, object, settings, &mut found));
-                by_id.push((*id, own));
-            }
-        }
-        // Without settings of their own the objects are read as one, as
-        // without the project's settings.
-        if by_id.iter().any(|(_, own)| own.is_some()) {
-            for warning in found.as_slice() {
-                warnings.push(warning.clone());
-            }
-            return Ok(objects
-                .into_iter()
-                .map(|(id, mesh)| {
-                    let own = by_id
-                        .iter()
-                        .find(|(known, _)| *known == id)
-                        .and_then(|(_, own)| own.clone());
-                    (mesh, own)
-                })
-                .collect());
-        }
-        // Only what was found about the settings counts, the rest is
-        // found again below.
-        for warning in found.as_slice() {
-            if warning.code.starts_with("project.") {
-                warnings.push(warning.clone());
-            }
-        }
-    }
-    let mesh = slicer_formats::parse_model(bytes, plate, warnings).map_err(in_file(input))?;
-    Ok(vec![(mesh, None)])
-}
-
 fn slice(
     inputs: &[PathBuf],
     output: Option<PathBuf>,
-    placing: Placing,
+    placing: load::Placing,
     args: &SettingsArgs,
     plate: Option<u32>,
     svg: Option<PathBuf>,
     printer: Option<(Target, bool)>,
 ) -> Result<serde_json::Value, Diagnostic> {
     let mut warnings = Diagnostics::new();
+    let names: Vec<load::Name> = inputs.iter().map(|input| file_name(input)).collect();
     let mut files = Vec::new();
     let mut base = Settings::default();
     let mut stored = Vec::new();
     if args.project {
         // The project files come first: their settings are the base.
-        for input in inputs {
+        for (input, name) in inputs.iter().zip(&names) {
             let bytes = fs::read(input).map_err(|e| io_error("io.read", input, &e))?;
-            stored.push(read_project_base(input, &bytes, &mut base, &mut warnings)?);
+            let model = load::Model {
+                bytes: &bytes,
+                name: Some(name),
+            };
+            stored.push(load::project_base(model, &mut base, &mut warnings)?);
             files.push(bytes);
         }
     }
@@ -756,30 +526,28 @@ fn slice(
         }
     }
 
-    let mut meshes = Vec::new();
-    let mut own = Vec::new();
-    // The model file of every object.
-    let mut owner = Vec::new();
-    for (index, (input, bytes)) in inputs.iter().zip(&files).enumerate() {
-        let stored = stored.get(index).and_then(Option::as_ref);
-        for (mesh, mut of_object) in
-            read_objects(input, bytes, stored, &settings, plate, &mut warnings)?
-        {
-            // --object files go over every object of their model file.
-            for (path, text) in &object_files[index] {
-                let object = of_object.get_or_insert_with(|| settings.clone());
-                slicer_fdm::apply_object_toml(object, text).map_err(in_file(path))?;
-            }
-            meshes.push(mesh);
-            own.push(of_object);
-            owner.push(index);
-        }
-    }
-    let placement = place(&mut meshes, &owner, inputs.len(), placing, &settings);
+    let models: Vec<load::Model> = files
+        .iter()
+        .zip(&names)
+        .map(|(bytes, name)| load::Model {
+            bytes,
+            name: Some(name),
+        })
+        .collect();
+    // --object files go over every object of their model file.
+    let mut objects = load::Objects::read(
+        &models,
+        &stored,
+        &settings,
+        &object_files,
+        plate,
+        &mut warnings,
+    )?;
+    let placement = objects.place(inputs.len(), placing, &settings);
     let stop = std::sync::atomic::AtomicBool::new(false);
     let toolpaths = slicer_fdm::generate_plate_with_object_settings(
-        &meshes,
-        &own,
+        &objects.meshes,
+        &objects.settings,
         placement,
         &settings,
         &mut warnings,
@@ -792,7 +560,7 @@ fn slice(
             slicer_fdm::FdmError::OutsideBed { object, .. }
             | slicer_fdm::FdmError::ObjectTooTall { object, .. },
             2..,
-        ) => match owner.get(*object) {
+        ) => match objects.model.get(*object) {
             Some(&file) => in_file(&inputs[file])(e.diagnostic()),
             None => e.diagnostic(),
         },

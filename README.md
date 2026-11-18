@@ -66,7 +66,7 @@ Project files (3MF) of Orca Slicer and Bambu Studio store their print settings: 
 cargo run --release -p slicer-cli -- slice project.3mf --project-settings -c my-printer.toml -s nozzle_temp=215
 ```
 
-The layers, from bottom to top: the defaults, the project's settings (of several project files in the order given), the `-c` files, the `--set` overrides. On a single object its settings from the project go over the plate's, and `--object` files over those; so `--set infill_density=30` does not change an object to which the project gives an infill of its own. Of the settings of an object only those that an object can have here are taken (see [several models](#several-models-on-one-plate) below); an object with settings of its own is sliced as an object of its own, so the project file then counts as several objects that keep their places relative to each other, and `--object N:FILE` applies to all objects of the N-th file. Of values per filament or extruder the first is taken. Everything that is left out is reported as a warning with the setting names in `keys`: `project.settings_skipped` for the project (project files saved by Bambu Studio hold 440 to 500 settings, of which about 40 are taken), `project.object_settings_skipped` per object, `project.part_settings_skipped` for settings of parts and modifiers, which are not read; a 3MF without such settings gives `project.no_settings`. Without the option the stored settings are ignored and the G-code stays the same. The server and the desktop app do not read them yet.
+The layers, from bottom to top: the defaults, the project's settings (of several project files in the order given), the `-c` files, the `--set` overrides. On a single object its settings from the project go over the plate's, and `--object` files over those; so `--set infill_density=30` does not change an object to which the project gives an infill of its own. Of the settings of an object only those that an object can have here are taken (see [several models](#several-models-on-one-plate) below); an object with settings of its own is sliced as an object of its own, so the project file then counts as several objects that keep their places relative to each other, and `--object N:FILE` applies to all objects of the N-th file. Of values per filament or extruder the first is taken. Everything that is left out is reported as a warning with the setting names in `keys`: `project.settings_skipped` for the project (project files saved by Bambu Studio hold 440 to 500 settings, of which about 40 are taken), `project.object_settings_skipped` per object, `project.part_settings_skipped` for settings of parts and modifiers, which are not read; a 3MF without such settings gives `project.no_settings`. Without the option the stored settings are ignored and the G-code stays the same. The server does the same with the form field `project_settings=true` (see [Server](#server)); the desktop app does not read them yet.
 
 Thinner layers where the surface is shallow, thicker ones on steep walls (top and bottom shells then keep their thickness, `top_layers`/`bottom_layers` × `layer_height`):
 
@@ -210,11 +210,17 @@ Several `model` fields put several objects on the plate, arranged side by side a
 curl -F model=@a.stl -F model=@b.stl -F object_settings_2=@strong.toml localhost:8080/v1/jobs
 ```
 
+The field `project_settings=true` uses the print settings stored in project files of Orca Slicer and Bambu Studio, as `--project-settings` does on the command line: the project's settings below the `settings` and `set` fields, the settings the project gives single objects over the plate's and below `object_settings_<n>`, and a project whose objects have settings of their own is sliced as those objects. What is left out appears in the job's `warnings` (`project.settings_skipped`, `project.object_settings_skipped`, `project.part_settings_skipped`, `project.no_settings`); with several models their messages start with `model <n>:`. Without the field the stored settings are ignored:
+
+```bash
+curl -F model=@project.3mf -F project_settings=true -F set=nozzle_temp=215 localhost:8080/v1/jobs
+```
+
 | Request | Purpose |
 |---|---|
 | `GET /health` | Liveness check, never needs a token |
 | `GET /openapi.json` | Description of this API (OpenAPI 3.1), never needs a token |
-| `POST /v1/jobs` | Create a job (multipart fields `model`, `settings`, `set`, `plate`, `object_settings_<n>`; several `settings` files are layered in order); answers `202` at once |
+| `POST /v1/jobs` | Create a job (multipart fields `model`, `settings`, `set`, `plate`, `project_settings`, `object_settings_<n>`; several `settings` files are layered in order); answers `202` at once |
 | `GET /v1/jobs/{id}` | Status (`queued`, `running`, `done`, `failed`, `cancelled`), statistics, warnings or the error |
 | `GET /v1/jobs/{id}/gcode` | The G-code of a finished job |
 | `POST /v1/jobs/{id}/send` | Upload the G-code of a finished job to a printer configured on the server; JSON body `{"printer": NAME, "start": false}`; 502 if the printer fails |
