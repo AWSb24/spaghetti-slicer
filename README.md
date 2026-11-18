@@ -79,6 +79,8 @@ More print options, all off by default (see `docs/settings.md`):
 - `arc_fitting = true` writes runs of short lines that lie on a circle within `arc_tolerance` (0.01 mm) as one `G2`/`G3` arc; the G-code of Benchy shrinks from 2.49 to 1.66 MB. Klipper needs `[gcode_arcs]` in `printer.cfg`.
 - `fan_layer_time = 30` turns the fan up on layers that take less than 30 seconds, the shorter the more, up to `fan_max_speed` at `min_layer_time`.
 - `overhang_speed = 15` prints the parts of walls where more than half the line hangs over the layer below at 15 mm/s and with `overhang_fan_speed`; they show as "Overhang wall" in the G-code and the preview.
+- `label_objects = true` names every object in the G-code (`object_1`, `object_2`, …), so that the printer can leave one out mid-print: Klipper gets `EXCLUDE_OBJECT_DEFINE` with the outline of each object's first layer and `EXCLUDE_OBJECT_START`/`_END` around its lines on every layer (needs `[exclude_object]` in `printer.cfg`), Marlin `M486 T`, `M486 S<n>` and `M486 S-1`.
+- `sequential_print = true` prints every object completely before the next one, lowest first; in between the nozzle rises 2 mm above everything printed so far. Objects must stand `extruder_clearance_radius` (35 mm) apart and all but the tallest must be lower than `gantry_height` (20 mm), otherwise slicing stops with `slicing.objects_too_close` or `slicing.object_too_tall`; arranging keeps that distance. Every object gets its own brim, the skirt goes round the first one only, and there is no prime tower.
 
 None of them has been tried on a printer yet.
 

@@ -15,6 +15,7 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `extrusion_mode` | relative | `relative`, `absolute` | Whether extrusion amounts in the G-code are relative or absolute. |
 | `arc_fitting` | false | `true`, `false` | Whether runs of short extrusion moves that lie on a circle are written as one arc (`G2` clockwise, `G3` counter-clockwise) instead of many straight `G1` lines: smaller files and smoother curves. Klipper needs `[gcode_arcs]` in `printer.cfg` for it. |
 | `arc_tolerance` | 0.01 | 0.001 to 0.5 | With `arc_fitting`: how far any point of the original lines (and the middle of every line) may lie from the arc that replaces them. |
+| `label_objects` | false | `true`, `false` | Whether the G-code names the objects on the plate, so that the printer can leave one out while printing (Klipper's `EXCLUDE_OBJECT_DEFINE`/`_START`/`_END`, Marlin's `M486`). The objects are called `object_1`, `object_2` and so on, in the order they were given. |
 | `extruder_count` | 1 | 1 to 16 | Number of extruders (tools or filament slots) of the printer. With more than one, every object prints with the extruder it names (Bambu Studio projects) and the G-code changes tools with `T<n>`; with one, everything prints with the lowest extruder the objects name. |
 | `filament_diameter` | 1.75 | 1 to 3.5 | Filament diameter. |
 | `filament_density` | 1.24 | 0.1 to 20 | Filament density in g/cm³, used for the weight estimate. |
@@ -68,6 +69,9 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `prime_tower_width` | 15 | 0 to 100 | Side of the square tower that every tool change primes the new extruder into, on every layer up to the last tool change; 0 disables it. Only used with more than one extruder. |
 | `prime_tower_x` | 190 | 0 to 2000 * | X of the centre of the prime tower on the bed. |
 | `prime_tower_y` | 190 | 0 to 2000 * | Y of the centre of the prime tower on the bed. |
+| `sequential_print` | false | `true`, `false` | Whether every object on the plate is printed completely, all its layers, before the next one starts, lowest first; between objects the nozzle rises above everything printed. The objects must stand `extruder_clearance_radius` apart, and all but the last one printed must be no taller than `gantry_height`. Every object gets its own brim; the skirt goes round the first object only, and there is no prime tower. |
+| `extruder_clearance_radius` | 35 | 0 to 500 | With `sequential_print`: radius around the nozzle that the print head takes up below the height of the objects; objects must be at least this far apart. |
+| `gantry_height` | 20 | 0 to 2000 | With `sequential_print`: height of the lowest part of the gantry (the X axis) above the tip of the nozzle; every object but the last one printed must be lower. |
 | `outer_wall_speed` | 40 | 1 to 1000 | Speed of the outermost wall. |
 | `inner_wall_speed` | 60 | 1 to 1000 | Speed of inner walls. |
 | `infill_speed` | 80 | 1 to 1000 | Speed of solid and sparse infill. |

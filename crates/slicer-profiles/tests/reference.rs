@@ -71,7 +71,9 @@ fn settings_reference_is_current() {
                 | "ironing"
                 | "avoid_crossing_walls"
                 | "fuzzy_skin"
-                | "arc_fitting" => "`true`, `false`".to_string(),
+                | "arc_fitting"
+                | "label_objects"
+                | "sequential_print" => "`true`, `false`".to_string(),
                 "start_gcode" | "end_gcode" | "toolchange_gcode" => {
                     "text with `{key}` placeholders".to_string()
                 }
