@@ -9,6 +9,9 @@
 //!   length each.
 //! - Flow test: small flat blocks next to each other, each printed with its
 //!   own share of the flow ratio.
+//! - Pressure advance tower: a hollow tower whose pressure advance factor
+//!   changes in bands of height (`M900 K` for Marlin,
+//!   `SET_PRESSURE_ADVANCE` for Klipper at the first layer of each band).
 //!
 //! The models are sliced like any others. [`Calibration::apply`] then
 //! changes the written G-code: it puts the temperature command after the
@@ -21,7 +24,7 @@
 use std::fmt;
 
 use slicer_core::{Diagnose, Mesh, Point};
-use slicer_profiles::Settings;
+use slicer_profiles::{Flavor, Settings};
 
 use crate::Output;
 
@@ -41,6 +44,10 @@ const RETRACTION_GAP: f64 = 30.0;
 /// Width, depth and height of one flow block, in mm.
 const FLOW_BLOCK: [f64; 3] = [20.0, 20.0, 3.0];
 
+/// Width, depth and height of one band of the pressure advance tower, in
+/// mm. The tower is hollow, so that its walls print without pauses.
+const PRESSURE_BAND: [f64; 3] = [30.0, 30.0, 4.0];
+
 /// Depth of the groove that marks where a block of a tower ends, in mm. The
 /// groove is as high as it is deep: a flat ledge below, a 45° slope above,
 /// so it prints without supports.
@@ -55,11 +62,18 @@ pub enum Kind {
     Retraction,
     /// Flat blocks, each with its own flow.
     Flow,
+    /// A hollow tower with a pressure advance factor per band of height.
+    PressureAdvance,
 }
 
 impl Kind {
     /// All kinds, in menu order.
-    pub const ALL: [Kind; 3] = [Kind::Temperature, Kind::Retraction, Kind::Flow];
+    pub const ALL: [Kind; 4] = [
+        Kind::Temperature,
+        Kind::Retraction,
+        Kind::Flow,
+        Kind::PressureAdvance,
+    ];
 
     /// Name on the command line.
     pub fn name(self) -> &'static str {
@@ -67,6 +81,7 @@ impl Kind {
             Kind::Temperature => "temperature",
             Kind::Retraction => "retraction",
             Kind::Flow => "flow",
+            Kind::PressureAdvance => "pressure-advance",
         }
     }
 
@@ -81,22 +96,27 @@ impl Kind {
             Kind::Temperature => "Temperature tower",
             Kind::Retraction => "Retraction test",
             Kind::Flow => "Flow rate test",
+            Kind::PressureAdvance => "Pressure advance tower",
         }
     }
 
-    /// Unit of the values: °C, mm, or % of the flow ratio.
+    /// Unit of the values: °C, mm, % of the flow ratio, or none for the
+    /// pressure advance factor.
     pub fn unit(self) -> &'static str {
         match self {
             Kind::Temperature => "°C",
             Kind::Retraction => "mm",
             Kind::Flow => "%",
+            Kind::PressureAdvance => "",
         }
     }
 
     /// Start, end and step that suit `settings`: temperatures 15 °C around
     /// the nozzle temperature in steps of 5, retraction lengths for a
     /// direct drive or a Bowden extruder (told apart by the retraction
-    /// length in use), flow from -10 % to +10 % in steps of 5.
+    /// length in use), flow from -10 % to +10 % in steps of 5, pressure
+    /// advance from 0 up to a value that suits a direct drive or a Bowden
+    /// extruder (told apart the same way).
     pub fn default_range(self, settings: &Settings) -> [f64; 3] {
         match self {
             Kind::Temperature => {
@@ -106,6 +126,8 @@ impl Kind {
             Kind::Retraction if settings.retraction_length <= 2.0 => [0.2, 2.0, 0.2],
             Kind::Retraction => [1.0, 6.0, 0.5],
             Kind::Flow => [-10.0, 10.0, 5.0],
+            Kind::PressureAdvance if settings.retraction_length <= 2.0 => [0.0, 0.08, 0.005],
+            Kind::PressureAdvance => [0.0, 0.8, 0.05],
         }
     }
 
@@ -115,6 +137,7 @@ impl Kind {
             Kind::Temperature => (100.0, 450.0),
             Kind::Retraction => (0.0, 20.0),
             Kind::Flow => (-50.0, 100.0),
+            Kind::PressureAdvance => (0.0, 2.0),
         }
     }
 }
@@ -202,6 +225,7 @@ impl Calibration {
     pub fn value_text(&self, value: f64) -> String {
         match self.kind {
             Kind::Flow => format!("{value:+} %"),
+            Kind::PressureAdvance => format!("K {value}"),
             kind => format!("{value} {}", kind.unit()),
         }
     }
@@ -224,6 +248,10 @@ impl Calibration {
             ),
             Kind::Flow => format!(
                 "{count} blocks, flow {first} to {last} of the flow ratio, left to right from the front row"
+            ),
+            Kind::PressureAdvance => format!(
+                "a hollow tower in {count} bands of {} mm, {first} at the bottom to {last} at the top",
+                PRESSURE_BAND[2]
             ),
         }
     }
@@ -256,6 +284,13 @@ impl Calibration {
                     )
                 })
                 .collect(),
+            Kind::PressureAdvance => {
+                let [x, y, z] = PRESSURE_BAND;
+                vec![(
+                    Kind::PressureAdvance.title().to_owned(),
+                    Mesh::cuboid(x, y, z * count as f64),
+                )]
+            }
         }
     }
 
@@ -284,8 +319,10 @@ impl Calibration {
 
     /// `settings` as the print needs them: the temperature tower starts at
     /// its first temperature on every layer up to the first block change,
-    /// and the retraction test slices with its longest length, which
-    /// [`Calibration::apply`] then shortens band by band.
+    /// the retraction test slices with its longest length, which
+    /// [`Calibration::apply`] then shortens band by band, and the pressure
+    /// advance tower is hollow (no infill, no top) and leaves pressure
+    /// advance to [`Calibration::apply`].
     pub fn settings(&self, settings: &Settings) -> Settings {
         let mut settings = settings.clone();
         match self.kind {
@@ -299,6 +336,11 @@ impl Calibration {
                 settings.retraction_length = self.values.iter().copied().fold(0.0, f64::max);
             }
             Kind::Flow => {}
+            Kind::PressureAdvance => {
+                settings.infill_density = 0.0;
+                settings.top_layers = 0;
+                settings.pressure_advance = 0.0;
+            }
         }
         settings
     }
@@ -311,7 +353,8 @@ impl Calibration {
     /// Towers are split into equal bands from the bed to the top of the
     /// highest object; a layer belongs to the band its middle lies in. The
     /// temperature tower gets `M104` at the first layer of every block after
-    /// the first. The retraction test changes the length of every
+    /// the first, the pressure advance tower its factor at the first layer
+    /// of every band. The retraction test changes the length of every
     /// retraction (and the push back after it) to that of its band. The
     /// flow test scales every extrusion that starts and ends inside a flow
     /// block, and the filament figures of the statistics and the header
@@ -342,6 +385,7 @@ impl Calibration {
         let mut editor = Editor {
             calibration: self,
             retraction_length: settings.retraction_length,
+            flavor: settings.flavor,
             top,
             regions,
             absolute_e: false,
@@ -387,6 +431,7 @@ impl Calibration {
             Kind::Temperature => format!("nozzle temperature {value}"),
             Kind::Retraction => format!("retraction {value} mm"),
             Kind::Flow => format!("flow {value:+} %"),
+            Kind::PressureAdvance => format!("pressure advance {value}"),
         }
     }
 }
@@ -409,6 +454,8 @@ struct Editor<'a> {
     calibration: &'a Calibration,
     /// Length of the retractions the writer made.
     retraction_length: f64,
+    /// Firmware, for the pressure advance command.
+    flavor: Flavor,
     /// Top of the highest test model.
     top: f64,
     regions: Vec<Region>,
@@ -483,6 +530,7 @@ impl Editor<'_> {
                 Kind::Temperature => "nozzle temperatures from the bottom up",
                 Kind::Retraction => "retraction lengths in mm from the bottom up",
                 Kind::Flow => "flow in % per block",
+                Kind::PressureAdvance => "pressure advance from the bottom up",
             };
             out.push_str(&format!(
                 "; calibration: {}, {what}: {}\n",
@@ -573,8 +621,13 @@ impl Editor<'_> {
             self.calibration.comment_text(value)
         ));
         // The start G-code has heated the nozzle for the first band.
-        if self.calibration.kind == Kind::Temperature && !first {
-            out.push_str(&format!("M104 S{value}\n"));
+        match self.calibration.kind {
+            Kind::Temperature if !first => out.push_str(&format!("M104 S{value}\n")),
+            Kind::PressureAdvance => out.push_str(&match self.flavor {
+                Flavor::Marlin => format!("M900 K{value}\n"),
+                Flavor::Klipper => format!("SET_PRESSURE_ADVANCE ADVANCE={value}\n"),
+            }),
+            _ => {}
         }
     }
 
@@ -603,7 +656,7 @@ impl Editor<'_> {
     /// The filament amount a move of `amount` gets in the calibration print.
     fn changed_amount(&mut self, amount: f64, moves: bool, path: Option<(Point, Point)>) -> f64 {
         match self.calibration.kind {
-            Kind::Temperature => amount,
+            Kind::Temperature | Kind::PressureAdvance => amount,
             Kind::Retraction => {
                 let retraction = (amount.abs() - self.retraction_length).abs() < 1e-4;
                 if moves || !retraction {
@@ -744,6 +797,10 @@ mod tests {
         }
         assert_eq!(Kind::from_name("flow"), Some(Kind::Flow));
         assert_eq!(Kind::from_name("pressure"), None);
+        assert_eq!(
+            Kind::from_name("pressure-advance"),
+            Some(Kind::PressureAdvance)
+        );
         let settings = Settings::default();
         for kind in Kind::ALL {
             let [start, end, step] = kind.default_range(&settings);
@@ -833,6 +890,71 @@ mod tests {
             .collect();
         assert_eq!(removed, plain.gcode);
         assert_eq!(changed.stats, plain.stats);
+    }
+
+    #[test]
+    fn pressure_advance_tower_sets_the_factor_per_band() {
+        for (flavor, command) in [
+            (Flavor::Marlin, "M900 K"),
+            (Flavor::Klipper, "SET_PRESSURE_ADVANCE ADVANCE="),
+        ] {
+            let calibration = Calibration::new(Kind::PressureAdvance, 0.0, 0.04, 0.02).unwrap();
+            let mut base = Settings::default();
+            base.flavor = flavor;
+            // The tower's own values replace the one of the settings.
+            base.pressure_advance = 0.5;
+            let (plain, changed) = print(&calibration, &base);
+            assert!(!plain.gcode.contains(command));
+            // 3 bands of 4 mm with 0.2 mm layers: bands start at layers 0,
+            // 20 and 40.
+            let layers: Vec<&str> = changed.gcode.split(";LAYER_CHANGE").collect();
+            assert_eq!(layers.len(), 61);
+            let with = |text: String| -> Vec<usize> {
+                (1..layers.len())
+                    .filter(|&i| layers[i].contains(&text))
+                    .map(|i| i - 1)
+                    .collect()
+            };
+            assert_eq!(
+                with(format!(
+                    "
+{command}0
+"
+                )),
+                [0]
+            );
+            assert_eq!(
+                with(format!(
+                    "
+{command}0.02
+"
+                )),
+                [20]
+            );
+            assert_eq!(
+                with(format!(
+                    "
+{command}0.04
+"
+                )),
+                [40]
+            );
+            // Hollow: walls and the bottom only.
+            assert!(!changed.gcode.contains(";TYPE:Sparse infill"));
+            let removed: String = changed
+                .gcode
+                .lines()
+                .filter(|l| !l.starts_with("; calibration") && !l.starts_with(command))
+                .map(|l| {
+                    format!(
+                        "{l}
+"
+                    )
+                })
+                .collect();
+            assert_eq!(removed, plain.gcode);
+            assert_eq!(changed.stats, plain.stats);
+        }
     }
 
     /// Retraction lengths as written, per band (retractions only).

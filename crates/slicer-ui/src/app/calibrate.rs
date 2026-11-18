@@ -36,6 +36,11 @@ fn help(kind: Kind) -> &'static str {
             "Flat blocks side by side, each with its own share of the flow ratio. Pick the \
              block with the smoothest top and multiply the flow ratio by 1 + its percentage / 100."
         }
+        Kind::PressureAdvance => {
+            "A hollow tower; the pressure advance factor changes every 4 mm of height, the \
+             start value at the bottom. Use the factor of the band whose corners are sharpest, \
+             without bulges or gaps."
+        }
     }
 }
 
@@ -58,7 +63,11 @@ impl App {
             return;
         };
         let (mut open, mut put, mut cancel) = (true, false, false);
-        let speed = if kind == Kind::Retraction { 0.05 } else { 1.0 };
+        let speed = match kind {
+            Kind::Retraction => 0.05,
+            Kind::PressureAdvance => 0.001,
+            _ => 1.0,
+        };
         let checked = egui::Window::new(kind.title())
             .open(&mut open)
             .collapsible(false)

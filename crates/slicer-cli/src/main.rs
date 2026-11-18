@@ -108,14 +108,16 @@ enum Command {
     /// temperature: a tower of blocks, one per nozzle temperature (M104 at
     /// the first layer of each block). retraction: two towers whose
     /// retraction length changes per band of height. flow: flat blocks side
-    /// by side, each with its own share of the flow ratio. Start, end and
-    /// step default to values that suit the settings.
+    /// by side, each with its own share of the flow ratio.
+    /// pressure-advance: a hollow tower whose pressure advance factor
+    /// changes every 4 mm of height. Start, end and step default to values
+    /// that suit the settings.
     Calibrate {
-        /// Kind of print: temperature, retraction or flow
+        /// Kind of print: temperature, retraction, flow or pressure-advance
         #[arg(value_parser = parse_calibration_kind)]
         kind: slicer_gcode::calibration::Kind,
-        /// First value: °C, mm, or % of the flow ratio (bottom block or
-        /// first flow block)
+        /// First value: °C, mm, % of the flow ratio, or the pressure advance
+        /// factor (bottom block or first flow block)
         #[arg(long, allow_hyphen_values = true)]
         start: Option<f64>,
         /// Last value
@@ -282,7 +284,7 @@ fn main() -> ExitCode {
 /// Reads the kind of a calibration print from the command line.
 fn parse_calibration_kind(name: &str) -> Result<slicer_gcode::calibration::Kind, String> {
     slicer_gcode::calibration::Kind::from_name(name)
-        .ok_or_else(|| "expected temperature, retraction or flow".to_owned())
+        .ok_or_else(|| "expected temperature, retraction, flow or pressure-advance".to_owned())
 }
 
 /// Builds the test models of a calibration print, slices them and writes
