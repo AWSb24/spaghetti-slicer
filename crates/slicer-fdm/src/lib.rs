@@ -1068,6 +1068,13 @@ fn push_work(piece: Work, settings: &Settings, position: &mut Point, paths: &mut
             push_lines(lines, kind, join_distance, position, paths);
         }
         Work::Centred(lines, kind) => push_centred(lines, kind, position, paths),
+        Work::Ordered(lines, kind) => {
+            for line in lines {
+                // Starting where the line starts makes it the nearest end.
+                *position = line[0];
+                push_lines(vec![line], kind, 0.0, position, paths);
+            }
+        }
     }
 }
 
@@ -1431,6 +1438,9 @@ enum Work {
     Polylines(Vec<Vec<Point>>, PathKind, f64),
     /// Lines along the middle of narrow regions, and their kind.
     Centred(Vec<CentreLine>, PathKind),
+    /// Line segments printed in the given order and direction, each a path
+    /// of its own, and their kind.
+    Ordered(Vec<[Point; 2]>, PathKind),
 }
 
 /// A line along the middle of a region too narrow for a wall: its points,
@@ -1659,10 +1669,19 @@ fn region_work(
     } else {
         (solid, sparse)
     };
+    // The bottom surface on the bed and the top surfaces may have a pattern
+    // of their own.
+    let (pattern, above) = match index {
+        0 => (settings.bottom_surface_pattern, None),
+        _ => (settings.top_surface_pattern, model.get(index + 1)),
+    };
+    let angle = settings.infill_angle + turn;
+    let (solid, surface) = infill::surface(solid, above, pattern, angle, width);
     let solid_lines = polygon::hatch(&solid, width, direction, min_length);
     // Joined by straight links; following the boundary instead (as sparse
     // rectilinear infill does) saves a few travels but adds many points.
     work.push(Work::Lines(solid_lines, PathKind::SolidInfill, 2.0 * width));
+    work.extend(surface);
 
     let density = settings.infill_density / 100.0;
     if density > 0.0 {
@@ -1709,6 +1728,24 @@ fn region_work(
                     let angle = settings.infill_angle;
                     let lines = infill::gyroid(&sparse, width / density, z, angle, min_length);
                     work.push(Work::Polylines(lines, PathKind::SparseInfill, 0.0));
+                }
+                InfillPattern::Honeycomb => {
+                    let angle = settings.infill_angle;
+                    let lines = infill::honeycomb(&sparse, width / density, angle, min_length);
+                    work.push(Work::Polylines(lines, PathKind::SparseInfill, 0.0));
+                }
+                InfillPattern::Cubic => {
+                    // Three directions share the material, like triangles.
+                    let z = settings.first_layer_height + index as f64 * settings.layer_height;
+                    let spacing = 3.0 * width / density;
+                    let angle = settings.infill_angle;
+                    for lines in infill::cubic(&sparse, spacing, z, angle, min_length) {
+                        work.push(Work::Lines(lines, PathKind::SparseInfill, 0.0));
+                    }
+                }
+                InfillPattern::Concentric => {
+                    let (loops, _) = infill::concentric(&sparse, width / density, width, false);
+                    work.push(Work::Loops(loops, PathKind::SparseInfill, width));
                 }
             }
         }
@@ -2412,6 +2449,7 @@ fn push_centred(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::field_reassign_with_default)]
     use super::*;
+    use slicer_profiles::SurfacePattern;
 
     fn extruded_length(layer: &Layer, kind: PathKind) -> f64 {
         layer
@@ -2875,11 +2913,14 @@ mod tests {
         assert!(sparse.iter().all(|p| p.points.len() == 2));
     }
 
-    const PATTERNS: [InfillPattern; 4] = [
+    const PATTERNS: [InfillPattern; 7] = [
         InfillPattern::Rectilinear,
         InfillPattern::Grid,
         InfillPattern::Triangles,
         InfillPattern::Gyroid,
+        InfillPattern::Honeycomb,
+        InfillPattern::Cubic,
+        InfillPattern::Concentric,
     ];
 
     #[test]
@@ -3021,6 +3062,196 @@ mod tests {
         settings.infill_pattern = InfillPattern::Gyroid;
         let toolpaths = generate(&mesh, &settings).unwrap();
         assert_ne!(sparse(&toolpaths.layers[10]), sparse(&toolpaths.layers[11]));
+    }
+
+    #[test]
+    fn sparse_infill_grows_with_the_density() {
+        let mesh = Mesh::cuboid(30.0, 30.0, 10.0);
+        let length = |pattern, density| -> f64 {
+            let mut settings = Settings::default();
+            settings.infill_pattern = pattern;
+            settings.infill_density = density;
+            let toolpaths = generate(&mesh, &settings).unwrap();
+            toolpaths
+                .layers
+                .iter()
+                .map(|layer| extruded_length(layer, PathKind::SparseInfill))
+                .sum()
+        };
+        for pattern in PATTERNS {
+            let (thin, dense) = (length(pattern, 10.0), length(pattern, 30.0));
+            let ratio = dense / thin;
+            assert!(
+                (ratio - 3.0).abs() < 0.45,
+                "{pattern:?}: {thin} and {dense}"
+            );
+        }
+    }
+
+    #[test]
+    fn cubic_moves_with_height_and_honeycomb_repeats() {
+        let mut settings = Settings::default();
+        settings.skirt_loops = 0;
+        let mesh = Mesh::cuboid(30.0, 30.0, 6.0);
+        let sparse = |toolpaths: &Toolpaths, index: usize| -> Vec<Vec<Point>> {
+            toolpaths.layers[index]
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::SparseInfill)
+                .map(|p| p.points.clone())
+                .collect()
+        };
+        settings.infill_pattern = InfillPattern::Honeycomb;
+        let toolpaths = generate(&mesh, &settings).unwrap();
+        assert_eq!(sparse(&toolpaths, 10), sparse(&toolpaths, 11));
+        // The edges of the hexagons are one side long, those cut by the
+        // boundary shorter.
+        let spacing = settings.line_width / (settings.infill_density / 100.0);
+        let side = 2.0 * spacing / 3.0_f64.sqrt();
+        let edges: Vec<f64> = sparse(&toolpaths, 10)
+            .iter()
+            .flat_map(|line| line.windows(2).map(|w| distance(w[0], w[1])))
+            .collect();
+        assert!(edges.iter().all(|&e| e < side + 1e-3), "{edges:?}");
+        let whole = edges.iter().filter(|&&e| (e - side).abs() < 1e-3).count();
+        assert!(whole > edges.len() / 2, "{whole} of {}", edges.len());
+
+        settings.infill_pattern = InfillPattern::Cubic;
+        let toolpaths = generate(&mesh, &settings).unwrap();
+        assert_ne!(sparse(&toolpaths, 10), sparse(&toolpaths, 11));
+        // Three directions 60 degrees apart on every layer.
+        let mut directions: Vec<i64> = sparse(&toolpaths, 10)
+            .iter()
+            .flat_map(|line| line.windows(2).map(|w| [w[0], w[1]]).collect::<Vec<_>>())
+            .filter(|s| distance(s[0], s[1]) > 2.0)
+            .map(|s| {
+                let deg = (s[1][1] - s[0][1]).atan2(s[1][0] - s[0][0]).to_degrees();
+                deg.rem_euclid(180.0).round() as i64 % 180
+            })
+            .collect();
+        directions.sort_unstable();
+        directions.dedup();
+        assert_eq!(directions, [45, 105, 165]);
+    }
+
+    /// The solid infill of the top layer of a frame with the given top
+    /// surface pattern, the settings, and a test whether a point lies in
+    /// the fill area.
+    fn top_surface(pattern: SurfacePattern) -> (Vec<Path>, Settings, impl Fn(Point) -> bool) {
+        let mut settings = Settings::default();
+        settings.top_surface_pattern = pattern;
+        let toolpaths = generate(&frame(30.0, 10.0, 4.0), &settings).unwrap();
+        let top: Vec<Path> = toolpaths.layers[19]
+            .paths
+            .iter()
+            .filter(|p| p.kind == PathKind::SolidInfill)
+            .cloned()
+            .collect();
+        let walls = f64::from(settings.wall_loops);
+        let inset = (walls + 0.5 - settings.infill_overlap / 100.0) * settings.line_width;
+        let inside = move |p: Point| {
+            let outer = (p[0] - 110.0).abs().max((p[1] - 110.0).abs());
+            let gap = |v: f64| ((v - 110.0).abs() - 5.0).max(0.0);
+            outer <= 15.0 - inset + 0.005
+                && distance([gap(p[0]), gap(p[1])], [0.0, 0.0]) >= inset - 0.005
+        };
+        (top, settings, inside)
+    }
+
+    #[test]
+    fn monotonic_surfaces_lay_every_line_beside_the_last() {
+        let (top, settings, inside) = top_surface(SurfacePattern::Monotonic);
+        let width = settings.line_width;
+        assert!(top.len() > 30, "{}", top.len());
+        // Layer 19 runs across the infill angle, at 135 degrees.
+        let (sin, cos) = (0.5_f64.sqrt(), -(0.5_f64.sqrt()));
+        let along = |p: Point| p[0] * cos + p[1] * sin;
+        let row = |p: Point| ((p[1] * cos - p[0] * sin) / width - 0.5).round() as i64;
+        let lines: Vec<(i64, f64, f64)> = top
+            .iter()
+            .map(|path| {
+                assert_eq!(path.points.len(), 2);
+                let [a, b] = [path.points[0], path.points[1]];
+                assert!(inside(a) && inside(b), "{a:?} {b:?}");
+                // All in the same direction.
+                assert!(along(b) > along(a), "{a:?} {b:?}");
+                assert_eq!(row(a), row(b));
+                (row(a), along(a), along(b))
+            })
+            .collect();
+        let beside =
+            |a: &(i64, f64, f64), b: &(i64, f64, f64)| b.0 == a.0 + 1 && a.1 < b.2 && b.1 < a.2;
+        // No line comes before one beside it in the row before.
+        for (i, later) in lines.iter().enumerate() {
+            for earlier in &lines[..i] {
+                assert!(!beside(later, earlier), "{earlier:?} before {later:?}");
+            }
+        }
+        // Nearly always one row on from the line before; the two sides of
+        // the hole are filled one after the other.
+        let jumps = lines.windows(2).filter(|w| !beside(&w[0], &w[1])).count();
+        assert!(jumps <= 4, "{jumps} jumps among {} lines", lines.len());
+        // The same lines as rectilinear, only in another order; there the
+        // links between lines (not along them) come on top.
+        let (rectilinear, ..) = top_surface(SurfacePattern::Rectilinear);
+        let total = |paths: &[Path]| -> f64 {
+            paths
+                .iter()
+                .flat_map(|p| p.points.windows(2))
+                .filter(|w| ((w[1][0] - w[0][0]) * sin - (w[1][1] - w[0][1]) * cos).abs() < 1e-6)
+                .map(|w| distance(w[0], w[1]))
+                .sum()
+        };
+        let ratio = total(&top) / total(&rectilinear);
+        assert!((ratio - 1.0).abs() < 1e-9, "{ratio}");
+    }
+
+    #[test]
+    fn concentric_surfaces_are_closed_loops_inside() {
+        let (top, _, inside) = top_surface(SurfacePattern::Concentric);
+        let loops = top.iter().filter(|p| p.closed).count();
+        // Around the outside and around the hole, about nine times each.
+        assert!(loops >= 14, "{loops}");
+        for path in &top {
+            for p in &path.points {
+                assert!(inside(*p), "{p:?}");
+            }
+        }
+        let (rectilinear, ..) = top_surface(SurfacePattern::Rectilinear);
+        let total = |paths: &[Path]| paths.iter().map(Path::length).sum::<f64>();
+        let ratio = total(&top) / total(&rectilinear);
+        assert!((ratio - 1.0).abs() < 0.1, "{ratio}");
+    }
+
+    #[test]
+    fn surface_patterns_leave_other_solid_infill_alone() {
+        // A step: the top of the lower part around the tower gets the
+        // pattern; under the tower the lines stay.
+        let mut settings = Settings::default();
+        settings.skirt_loops = 0;
+        let mut mesh = Mesh::cuboid(30.0, 30.0, 4.0);
+        let mut tower = Mesh::cuboid(10.0, 10.0, 4.0);
+        tower.translate([10.0, 10.0, 4.0]);
+        mesh.merge(&tower);
+        let plain = generate(&mesh, &settings).unwrap();
+        settings.top_surface_pattern = SurfacePattern::Concentric;
+        settings.bottom_surface_pattern = SurfacePattern::Monotonic;
+        let patterned = generate(&mesh, &settings).unwrap();
+        let closed = |toolpaths: &Toolpaths, index: usize| {
+            toolpaths.layers[index]
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::SolidInfill && p.closed)
+                .count()
+        };
+        // Layer 19 is the top of the step.
+        assert!(closed(&patterned, 19) > 5);
+        assert_eq!(closed(&plain, 19), 0);
+        assert!(closed(&patterned, 39) > 5);
+        // Solid infill below the top surfaces stays as it was.
+        assert_eq!(plain.layers[17], patterned.layers[17]);
+        assert_eq!(plain.layers[30], patterned.layers[30]);
+        assert_ne!(plain.layers[0], patterned.layers[0]);
     }
 
     #[test]

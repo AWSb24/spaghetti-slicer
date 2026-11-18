@@ -87,7 +87,20 @@ const MAPPING: &[(&str, &str, Kind)] = &[
             ("grid", "grid"),
             ("triangles", "triangles"),
             ("gyroid", "gyroid"),
+            ("honeycomb", "honeycomb"),
+            ("cubic", "cubic"),
+            ("concentric", "concentric"),
         ]),
+    ),
+    (
+        "top_surface_pattern",
+        "top_surface_pattern",
+        Kind::Choice(&[("monotonic", "monotonic"), ("concentric", "concentric")]),
+    ),
+    (
+        "bottom_surface_pattern",
+        "bottom_surface_pattern",
+        Kind::Choice(&[("monotonic", "monotonic"), ("concentric", "concentric")]),
     ),
     ("infill_direction", "infill_angle", Kind::Angle),
     ("infill_wall_overlap", "infill_overlap", Kind::Percent),
@@ -273,7 +286,7 @@ pub fn import_orca(json: &str, settings: &mut Settings) -> Result<OrcaImport, Se
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use crate::{InfillPattern, SeamPosition};
+    use crate::{InfillPattern, SeamPosition, SurfacePattern};
 
     #[test]
     fn profiles_are_translated_and_the_rest_reported() {
@@ -336,10 +349,17 @@ mod tests {
         assert_eq!(process.taken.len(), 8);
 
         // Patterns without a counterpart leave the setting alone.
-        let other = r#"{ "sparse_infill_pattern": "honeycomb" }"#;
+        let other = r#"{ "sparse_infill_pattern": "lightning" }"#;
         let other = import_orca(other, &mut settings).unwrap();
         assert_eq!(skipped(&other), ["sparse_infill_pattern"]);
         assert_eq!(settings.infill_pattern, InfillPattern::Gyroid);
+        let patterns = r#"{ "sparse_infill_pattern": "honeycomb",
+            "top_surface_pattern": "monotonic", "bottom_surface_pattern": "concentric" }"#;
+        let patterns = import_orca(patterns, &mut settings).unwrap();
+        assert!(patterns.skipped.is_empty());
+        assert_eq!(settings.infill_pattern, InfillPattern::Honeycomb);
+        assert_eq!(settings.top_surface_pattern, SurfacePattern::Monotonic);
+        assert_eq!(settings.bottom_surface_pattern, SurfacePattern::Concentric);
     }
 
     #[test]

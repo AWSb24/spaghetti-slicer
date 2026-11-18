@@ -40,6 +40,29 @@ pub enum InfillPattern {
     /// Wavy lines from the cross-section of a gyroid surface; the waves turn
     /// with the height.
     Gyroid,
+    /// Hexagons, the same on every layer, so they stack into hexagonal
+    /// prisms: zig-zag lines across the area and short lines joining them.
+    Honeycomb,
+    /// Lines in three directions 60° apart that move sideways with the
+    /// height, so they form cubes standing on a corner; strong in every
+    /// direction.
+    Cubic,
+    /// Loops following the outline of the area, one inside the other.
+    Concentric,
+}
+
+/// Pattern of the solid infill of a top or bottom surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SurfacePattern {
+    /// Parallel lines, printed back and forth in the order that keeps
+    /// travel short.
+    Rectilinear,
+    /// Parallel lines all printed in the same direction, each one next to
+    /// the one before, for an even sheen without criss-cross marks.
+    Monotonic,
+    /// Loops following the outline of the surface, one inside the other.
+    Concentric,
 }
 
 /// Order in which the walls of a layer are printed.
@@ -223,6 +246,13 @@ pub struct Settings {
     pub top_layers: u32,
     /// Number of solid layers at the bottom.
     pub bottom_layers: u32,
+    /// Pattern of the solid infill of top surfaces: the parts of a layer
+    /// with nothing above them. Other solid infill and bridges keep
+    /// rectilinear lines.
+    pub top_surface_pattern: SurfacePattern,
+    /// Pattern of the solid infill of the first layer, the bottom surface
+    /// on the bed.
+    pub bottom_surface_pattern: SurfacePattern,
     /// Vase mode: above the solid bottom layers, the outer wall alone is
     /// printed as one line rising continuously, without seams, infill or
     /// top layers. One wall loop, no supports.
@@ -232,8 +262,9 @@ pub struct Settings {
     /// Sparse infill pattern.
     pub infill_pattern: InfillPattern,
     /// Direction of the infill lines in degrees from the X axis; every
-    /// other layer is turned by 90 degrees. Triangles and the gyroid keep
-    /// it on every layer.
+    /// other layer is turned by 90 degrees. Triangles, the gyroid,
+    /// honeycomb and cubic keep it on every layer; concentric loops have no
+    /// direction.
     pub infill_angle: f64,
     /// Whether the lines of rectilinear sparse infill are joined into
     /// zig-zags along the walls. Saves travel moves and retractions but
@@ -395,6 +426,8 @@ impl Default for Settings {
             fuzzy_skin_point_distance: 0.8,
             top_layers: 5,
             bottom_layers: 4,
+            top_surface_pattern: SurfacePattern::Rectilinear,
+            bottom_surface_pattern: SurfacePattern::Rectilinear,
             spiral_vase: false,
             infill_density: 15.0,
             infill_pattern: InfillPattern::Grid,

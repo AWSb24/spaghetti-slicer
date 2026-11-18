@@ -4,7 +4,7 @@ A 3D printing slicer written entirely in Rust, for desktop and server use.
 
 **Status: early prototype. The G-code has never been run on a printer. Do not print it unattended.**
 
-What works: STL and 3MF import (geometry only, one plate of a Bambu Studio project), closing small holes in a mesh, slicing, walls, solid top/bottom layers, sparse infill (rectilinear, grid, triangles, gyroid), optional adaptive layer height, thin walls and gap fill with lines of their own width, several objects on one plate, several extruders with tool changes and a prime tower, tree supports, skirt, brim, retraction, G-code for Marlin and Klipper, layered settings files with a set of [profiles](profiles/README.md), time and material estimates, per-layer SVG preview, sending to Klipper (Moonraker) and OctoPrint, an HTTP server with a job API, a container image, a desktop app that also runs in the browser, and a first resin (MSLA) pipeline.
+What works: STL and 3MF import (geometry only, one plate of a Bambu Studio project), closing small holes in a mesh, slicing, walls, solid top/bottom layers, sparse infill (rectilinear, grid, triangles, gyroid, honeycomb, cubic, concentric), optional adaptive layer height, thin walls and gap fill with lines of their own width, several objects on one plate, several extruders with tool changes and a prime tower, tree supports, skirt, brim, retraction, G-code for Marlin and Klipper, layered settings files with a set of [profiles](profiles/README.md), time and material estimates, per-layer SVG preview, sending to Klipper (Moonraker) and OctoPrint, an HTTP server with a job API, a container image, a desktop app that also runs in the browser, and a first resin (MSLA) pipeline.
 
 ## Known limitations
 
@@ -72,6 +72,7 @@ More print options, all off by default (see `docs/settings.md`):
 - `pressure_advance = 0.04` writes `M900 K0.04` (Marlin) or `SET_PRESSURE_ADVANCE ADVANCE=0.04` (Klipper) at the start.
 - `elephant_foot_compensation = 0.15` prints the first layer that much smaller all round.
 - `spiral_vase = true` prints the outer wall alone above the solid bottom, as one line rising continuously, without seams.
+- `top_surface_pattern = "monotonic"` prints the lines of top surfaces all in the same direction, each beside the one before, for an even sheen; `"concentric"` prints loops following the outline instead. `bottom_surface_pattern` does the same for the first layer. Other solid infill and bridges keep their lines.
 - `ironing = true` passes over every top surface once more with 10 % of the material (`ironing_flow`), lines `ironing_spacing` apart at `ironing_speed`.
 - `avoid_crossing_walls = true` sends travel moves round holes and notches inside the part instead of over open air, which also saves their retraction.
 - `fuzzy_skin = true` gives the outer wall a rough texture: its points are moved in and out at random by up to half of `fuzzy_skin_thickness`, one every `fuzzy_skin_point_distance`, the same on every run. The first layer stays smooth.
