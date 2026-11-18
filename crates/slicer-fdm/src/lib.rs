@@ -103,6 +103,11 @@ const ARC_SHORTFALL: f64 = 0.02;
 /// middles of pieces at most this long, see [`split_overhangs`].
 const OVERHANG_STEP: f64 = 0.5;
 
+/// Overhangs along a wall shorter than this many millimetres print as
+/// ordinary wall, and supported stretches this short between two
+/// overhangs as overhang, so speed and fan do not switch back and forth.
+const MIN_OVERHANG_RUN: f64 = 1.0;
+
 /// What a path is for. Determines speed and the label in the G-code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathKind {
@@ -1046,10 +1051,8 @@ fn combed(
 /// outside `below`, the layer below, turned into overhang walls; `None` if
 /// nothing changes. Where a wall changes between overhanging and supported
 /// it is cut into open pieces that follow on one another, starting where
-/// the wall started.
-// ponytail: every piece of an overhang becomes a path of its own however
-// short, and the fan follows each; merging short pieces into their
-// neighbours would calm it.
+/// the wall started. Short changes are evened out, see
+/// [`MIN_OVERHANG_RUN`].
 fn split_overhangs(paths: &[Path], slice: &Shapes, below: &Shapes) -> Option<Vec<Path>> {
     let hanging = polygon::difference(slice, below);
     if hanging.is_empty() {
@@ -1070,10 +1073,12 @@ fn split_overhangs(paths: &[Path], slice: &Shapes, below: &Shapes) -> Option<Vec
         // Every piece: where it ends, whether that is a corner of the wall,
         // and whether it hangs.
         let mut pieces: Vec<(Point, bool, bool)> = Vec::new();
+        let mut lengths = Vec::new();
         for pair in corners.windows(2) {
             let (a, b) = (pair[0], pair[1]);
             let at = |f: f64| [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f];
             let n = (distance(a, b) / OVERHANG_STEP).ceil().max(1.0) as usize;
+            lengths.extend(std::iter::repeat_n(distance(a, b) / n as f64, n));
             for k in 1..=n {
                 let middle = at((k as f64 - 0.5) / n as f64);
                 pieces.push((
@@ -1082,6 +1087,12 @@ fn split_overhangs(paths: &[Path], slice: &Shapes, below: &Shapes) -> Option<Vec
                     point_inside(&hanging, middle),
                 ));
             }
+        }
+        let mut flags: Vec<bool> = pieces.iter().map(|p| p.2).collect();
+        even_out(&mut flags, &lengths, false);
+        even_out(&mut flags, &lengths, true);
+        for (piece, hangs) in pieces.iter_mut().zip(flags) {
+            piece.2 = hangs;
         }
         let kind = |hangs: bool| {
             if hangs {
@@ -1130,6 +1141,26 @@ fn split_overhangs(paths: &[Path], slice: &Shapes, below: &Shapes) -> Option<Vec
         out.push(piece(run, hangs));
     }
     changed.then_some(out)
+}
+
+/// Flips runs of `flags` that are shorter than [`MIN_OVERHANG_RUN`] (piece
+/// `i` is `lengths[i]` long): runs of `false` between two runs of `true` if
+/// `hangs` is false, otherwise runs of `true` anywhere.
+// ponytail: the ends of a closed wall are evened out as if it were open, so
+// an overhang across the seam counts as two shorter ones.
+fn even_out(flags: &mut [bool], lengths: &[f64], hangs: bool) {
+    let mut start = 0;
+    while start < flags.len() {
+        let end = (start..flags.len())
+            .find(|&i| flags[i] != flags[start])
+            .unwrap_or(flags.len());
+        let short = lengths[start..end].iter().sum::<f64>() < MIN_OVERHANG_RUN;
+        let between = start > 0 && end < flags.len();
+        if flags[start] == hangs && short && (hangs || between) {
+            flags[start..end].fill(!hangs);
+        }
+        start = end;
+    }
 }
 
 fn travels_inside(layer: &Layer, slice: &Shapes) -> Vec<bool> {
@@ -3781,5 +3812,29 @@ mod tests {
             }
         }
         assert!(hanging > 20.0, "{hanging}");
+    }
+
+    #[test]
+    fn short_overhangs_and_gaps_are_evened_out() {
+        let lengths = [0.5; 12];
+        // A gap of one piece between overhangs is filled ...
+        let mut flags = [
+            false, true, true, false, true, true, false, false, false, true, false, false,
+        ];
+        even_out(&mut flags, &lengths, false);
+        assert_eq!(
+            flags,
+            [
+                false, true, true, true, true, true, false, false, false, true, false, false
+            ]
+        );
+        // ... and an overhang of one piece dropped.
+        even_out(&mut flags, &lengths, true);
+        assert_eq!(
+            flags,
+            [
+                false, true, true, true, true, true, false, false, false, false, false, false
+            ]
+        );
     }
 }
