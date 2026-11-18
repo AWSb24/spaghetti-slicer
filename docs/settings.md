@@ -57,6 +57,7 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `infill_connect` | true | `true`, `false` | Whether the lines of rectilinear sparse infill are joined into zig-zags along the walls. Saves travel moves and retractions but uses more material (on small areas up to a third more infill). Along solid infill and bridges the lines stay apart. |
 | `infill_overlap` | 15 | 0 to 50 | How far infill reaches into the innermost wall, in percent of the line width. |
 | `ironing` | false | `true`, `false` | Whether top surfaces are ironed: the hot nozzle passes over them once more with very little material to smooth them. |
+| `ironing_type` | all | `top`, `all` | Which top surfaces are ironed: only the topmost one of every part (`top`) or every one (`all`). |
 | `ironing_flow` | 10 | 0 to 100 | Material extruded while ironing, in percent of a normal line. |
 | `ironing_spacing` | 0.1 | 0.01 to 2 | Distance between the lines of ironing. |
 | `skirt_loops` | 2 | 0 to 20 | Number of skirt loops around the first layer. |
@@ -79,6 +80,7 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `infill_speed` | 80 | 1 to 1000 | Speed of solid and sparse infill. |
 | `bridge_speed` | 30 | 1 to 1000 | Speed of bridges: solid infill with nothing below it. |
 | `overhang_speed` | 0 | 0 to 1000 | Speed of walls where more than half the line hangs over the edge of the layer below; these parts of walls are printed as overhang walls with `overhang_fan_speed`. 0 turns it off: walls keep their speed. |
+| `overhang_speed_full` | 0 | 0 to 1000 | Speed of walls that hang free entirely, the middle of the line more than half a line width beyond the edge of the layer below; only with `overhang_speed`. 0 turns it off: they print at `overhang_speed`. |
 | `ironing_speed` | 20 | 1 to 1000 | Speed of ironing. |
 | `bridge_flow` | 1 | 0.5 to 2 | Multiplier on the extruded amount of bridges, on top of `flow_ratio`. |
 | `first_layer_speed` | 25 | 1 to 1000 | Speed of all extrusion on the first layer. |

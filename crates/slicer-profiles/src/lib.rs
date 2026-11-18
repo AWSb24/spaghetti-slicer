@@ -103,6 +103,17 @@ pub enum SupportStyle {
     Tree,
 }
 
+/// Which top surfaces are ironed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IroningType {
+    /// Only the topmost surface of every part: the top of its last layer,
+    /// with nothing of that part above it.
+    Top,
+    /// Every top surface.
+    All,
+}
+
 /// The kind of printer settings are meant for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -276,6 +287,9 @@ pub struct Settings {
     /// Whether top surfaces are ironed: the hot nozzle passes over them
     /// once more with very little material to smooth them.
     pub ironing: bool,
+    /// Which top surfaces are ironed: only the topmost one of every part
+    /// (`top`) or every one (`all`).
+    pub ironing_type: IroningType,
     /// Material extruded while ironing, in percent of a normal line.
     pub ironing_flow: f64,
     /// Distance between the lines of ironing.
@@ -341,6 +355,10 @@ pub struct Settings {
     /// the layer below; these parts of walls are printed as overhang walls
     /// with `overhang_fan_speed`. 0 turns it off: walls keep their speed.
     pub overhang_speed: f64,
+    /// Speed of walls that hang free entirely, the middle of the line more
+    /// than half a line width beyond the edge of the layer below; only with
+    /// `overhang_speed`. 0 turns it off: they print at `overhang_speed`.
+    pub overhang_speed_full: f64,
     /// Speed of ironing.
     pub ironing_speed: f64,
     /// Multiplier on the extruded amount of bridges, on top of `flow_ratio`.
@@ -435,6 +453,7 @@ impl Default for Settings {
             infill_connect: true,
             infill_overlap: 15.0,
             ironing: false,
+            ironing_type: IroningType::All,
             ironing_flow: 10.0,
             ironing_spacing: 0.1,
             skirt_loops: 2,
@@ -457,6 +476,7 @@ impl Default for Settings {
             infill_speed: 80.0,
             bridge_speed: 30.0,
             overhang_speed: 0.0,
+            overhang_speed_full: 0.0,
             ironing_speed: 20.0,
             bridge_flow: 1.0,
             first_layer_speed: 25.0,
@@ -792,6 +812,7 @@ impl Settings {
             ("fan_max_speed", self.fan_max_speed, 0.0, 100.0),
             ("overhang_fan_speed", self.overhang_fan_speed, 0.0, 100.0),
             ("overhang_speed", self.overhang_speed, 0.0, 1000.0),
+            ("overhang_speed_full", self.overhang_speed_full, 0.0, 1000.0),
             ("first_layer_speed", self.first_layer_speed, 1.0, 1000.0),
             ("travel_speed", self.travel_speed, 1.0, 2000.0),
             ("acceleration", self.acceleration, 10.0, 100_000.0),

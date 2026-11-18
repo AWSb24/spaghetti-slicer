@@ -139,6 +139,9 @@ pub enum PathKind {
     /// Part of a wall where more than half the line hangs over the edge of
     /// the layer below (see `Settings::overhang_speed`).
     OverhangWall,
+    /// Part of a wall that hangs over the edge of the layer below entirely
+    /// (see `Settings::overhang_speed_full`).
+    OverhangWallFull,
 }
 
 /// [`Path::object`] of a path that belongs to no single object.
@@ -885,10 +888,19 @@ pub fn generate_plate_with_object_settings(
         settings,
     );
     if settings.overhang_speed > 0.0 {
+        let free = match settings.overhang_speed_full {
+            speed if speed > 0.0 => 0.5 * settings.line_width,
+            _ => 0.0,
+        };
         let split = parallel_map(layers.len(), |index| match index {
             0 => None,
             _ if layers[index].spiral => None,
-            _ => split_overhangs(&layers[index].paths, &slices[index], &slices[index - 1]),
+            _ => split_overhangs(
+                &layers[index].paths,
+                &slices[index],
+                &slices[index - 1],
+                free,
+            ),
         });
         for (layer, paths) in layers.iter_mut().zip(split) {
             if let Some(paths) = paths {
@@ -1216,12 +1228,15 @@ fn combed(
 /// nothing changes. Where a wall changes between overhanging and supported
 /// it is cut into open pieces that follow on one another, starting where
 /// the wall started. Short changes are evened out, see
-/// [`MIN_OVERHANG_RUN`].
-fn split_overhangs(paths: &[Path], slice: &Shapes, below: &Shapes) -> Option<Vec<Path>> {
+/// [`MIN_OVERHANG_RUN`]. With a `free` distance above 0, the parts whose
+/// line middle lies farther than that outside `below` become overhang
+/// walls that hang free entirely.
+fn split_overhangs(paths: &[Path], slice: &Shapes, below: &Shapes, free: f64) -> Option<Vec<Path>> {
     let hanging = polygon::difference(slice, below);
     if hanging.is_empty() {
         return None;
     }
+    let free = (free > 0.0).then(|| polygon::difference(slice, &polygon::offset(below, free)));
     let mut out = Vec::with_capacity(paths.len());
     let mut changed = false;
     for path in paths {
@@ -1238,6 +1253,7 @@ fn split_overhangs(paths: &[Path], slice: &Shapes, below: &Shapes) -> Option<Vec
         // and whether it hangs.
         let mut pieces: Vec<(Point, bool, bool)> = Vec::new();
         let mut lengths = Vec::new();
+        let mut middles = Vec::new();
         for pair in corners.windows(2) {
             let (a, b) = (pair[0], pair[1]);
             let at = |f: f64| [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f];
@@ -1245,6 +1261,7 @@ fn split_overhangs(paths: &[Path], slice: &Shapes, below: &Shapes) -> Option<Vec
             lengths.extend(std::iter::repeat_n(distance(a, b) / n as f64, n));
             for k in 1..=n {
                 let middle = at((k as f64 - 0.5) / n as f64);
+                middles.push(middle);
                 pieces.push((
                     at(k as f64 / n as f64),
                     k == n,
@@ -1255,30 +1272,47 @@ fn split_overhangs(paths: &[Path], slice: &Shapes, below: &Shapes) -> Option<Vec
         let mut flags: Vec<bool> = pieces.iter().map(|p| p.2).collect();
         even_out(&mut flags, &lengths, false);
         even_out(&mut flags, &lengths, true);
-        for (piece, hangs) in pieces.iter_mut().zip(flags) {
-            piece.2 = hangs;
-        }
-        let kind = |hangs: bool| {
-            if hangs {
-                PathKind::OverhangWall
-            } else {
-                path.kind
+        // Of what hangs, what hangs free entirely: short stretches of it
+        // hang only partly, short stretches that hang partly next to it
+        // hang free.
+        let mut whole = vec![false; flags.len()];
+        if let Some(free) = &free {
+            whole = middles.iter().map(|&m| point_inside(free, m)).collect();
+            for (w, &hangs) in whole.iter_mut().zip(&flags) {
+                *w &= hangs;
             }
-        };
-        if pieces.iter().all(|p| !p.2) {
+            even_out(&mut whole, &lengths, true);
+            for (w, &hangs) in whole.iter_mut().zip(&flags) {
+                *w |= !hangs;
+            }
+            even_out(&mut whole, &lengths, false);
+            for (w, &hangs) in whole.iter_mut().zip(&flags) {
+                *w &= hangs;
+            }
+        }
+        let kinds: Vec<PathKind> = flags
+            .iter()
+            .zip(&whole)
+            .map(|(&hangs, &whole)| match (hangs, whole) {
+                (_, true) => PathKind::OverhangWallFull,
+                (true, false) => PathKind::OverhangWall,
+                (false, false) => path.kind,
+            })
+            .collect();
+        if kinds.iter().all(|&k| k == path.kind) {
             out.push(path.clone());
             continue;
         }
         changed = true;
-        if pieces.iter().all(|p| p.2) {
+        if kinds.iter().all(|&k| k == kinds[0]) {
             out.push(Path {
-                kind: PathKind::OverhangWall,
+                kind: kinds[0],
                 ..path.clone()
             });
             continue;
         }
-        let piece = |points: Vec<Point>, hangs: bool| Path {
-            kind: kind(hangs),
+        let piece = |points: Vec<Point>, kind: PathKind| Path {
+            kind,
             points,
             closed: false,
             travel_inside: false,
@@ -1288,22 +1322,22 @@ fn split_overhangs(paths: &[Path], slice: &Shapes, below: &Shapes) -> Option<Vec
             travel: Vec::new(),
         };
         let mut run = vec![corners[0]];
-        let mut hangs = pieces[0].2;
+        let mut kind = kinds[0];
         let mut last = corners[0];
-        for &(end, corner, piece_hangs) in &pieces {
-            if piece_hangs != hangs {
+        for (&(end, corner, _), &piece_kind) in pieces.iter().zip(&kinds) {
+            if piece_kind != kind {
                 if run.last() != Some(&last) {
                     run.push(last);
                 }
-                out.push(piece(std::mem::replace(&mut run, vec![last]), hangs));
-                hangs = piece_hangs;
+                out.push(piece(std::mem::replace(&mut run, vec![last]), kind));
+                kind = piece_kind;
             }
             if corner {
                 run.push(end);
             }
             last = end;
         }
-        out.push(piece(run, hangs));
+        out.push(piece(run, kind));
     }
     changed.then_some(out)
 }
@@ -1756,6 +1790,19 @@ fn region_work(
         let top = match model.get(index + 1) {
             Some(above) => polygon::difference(&fill_area, above),
             None => fill_area.clone(),
+        };
+        // Only the topmost surface: the parts of the model that end on
+        // this layer, with nothing of them on the layer above.
+        let top = match (settings.ironing_type, model.get(index + 1)) {
+            (slicer_profiles::IroningType::Top, Some(above)) => {
+                let ending: Shapes = model[index]
+                    .iter()
+                    .filter(|&part| polygon::intersection(&vec![part.clone()], above).is_empty())
+                    .cloned()
+                    .collect();
+                polygon::intersection(&top, &ending)
+            }
+            _ => top,
         };
         let top = polygon::clean(top, width * width, 0.0);
         if !top.is_empty() {
@@ -4204,6 +4251,71 @@ mod tests {
             }
         }
         assert!(hanging > 20.0, "{hanging}");
+    }
+
+    #[test]
+    fn walls_hanging_free_entirely_get_their_own_kind() {
+        let length = |toolpaths: &Toolpaths, kind: PathKind| -> f64 {
+            toolpaths
+                .layers
+                .iter()
+                .map(|layer| extruded_length(layer, kind))
+                .sum()
+        };
+        let mut settings = Settings::default();
+        settings.overhang_speed = 15.0;
+        let partly = generate(&mushroom(), &settings).unwrap();
+        settings.overhang_speed_full = 5.0;
+        let split = generate(&mushroom(), &settings).unwrap();
+        // The slab sticks out 5 mm: what hangs there hangs free entirely,
+        // including the bit where the line only starts to hang (evened
+        // out), and the same walls hang as before.
+        let before = length(&partly, PathKind::OverhangWall);
+        let full = length(&split, PathKind::OverhangWallFull);
+        assert!(full > 20.0, "{full}");
+        assert_eq!(length(&split, PathKind::OverhangWall), 0.0);
+        assert!((full - before).abs() < 1e-6, "{full} {before}");
+
+        // A slab only 0.4 mm wider on one side: the outer wall hangs by
+        // less than half a line width more than half its width, so partly.
+        let mut lip = Mesh::cuboid(10.0, 10.0, 4.0);
+        let mut slab = Mesh::cuboid(10.4, 10.0, 2.0);
+        slab.translate([-0.4, 0.0, 4.0]);
+        lip.merge(&slab);
+        let split = generate(&lip, &settings).unwrap();
+        assert!(length(&split, PathKind::OverhangWall) > 5.0);
+        assert_eq!(length(&split, PathKind::OverhangWallFull), 0.0);
+    }
+
+    #[test]
+    fn ironing_can_be_limited_to_the_topmost_surface() {
+        // Steps: a block 5 mm high beside one 10 mm high.
+        let mut steps = Mesh::cuboid(10.0, 10.0, 5.0);
+        let mut tower = Mesh::cuboid(10.0, 10.0, 10.0);
+        tower.translate([10.0, 0.0, 0.0]);
+        steps.merge(&tower);
+        let ironed = |toolpaths: &Toolpaths| -> Vec<f64> {
+            toolpaths
+                .layers
+                .iter()
+                .filter(|layer| extruded_length(layer, PathKind::Ironing) > 0.0)
+                .map(|layer| layer.z)
+                .collect()
+        };
+        let mut settings = Settings::default();
+        settings.ironing = true;
+        let all = ironed(&generate(&steps, &settings).unwrap());
+        assert_eq!(all.len(), 2, "{all:?}");
+        assert!((all[0] - 5.0).abs() < 1e-6 && (all[1] - 10.0).abs() < 1e-6);
+        settings.ironing_type = slicer_profiles::IroningType::Top;
+        let top = ironed(&generate(&steps, &settings).unwrap());
+        assert_eq!(top, [all[1]]);
+        // Two separate parts each have their topmost surface.
+        let mut apart = Mesh::cuboid(10.0, 10.0, 5.0);
+        let mut tower = Mesh::cuboid(10.0, 10.0, 10.0);
+        tower.translate([15.0, 0.0, 0.0]);
+        apart.merge(&tower);
+        assert_eq!(ironed(&generate(&apart, &settings).unwrap()), all);
     }
 
     #[test]

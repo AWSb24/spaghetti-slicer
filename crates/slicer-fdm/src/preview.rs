@@ -19,6 +19,7 @@ pub fn color(kind: PathKind) -> &'static str {
         PathKind::PrimeTower => "#9d8df1",
         PathKind::Ironing => "#ff9ec7",
         PathKind::OverhangWall => "#1d9bf0",
+        PathKind::OverhangWallFull => "#0b5394",
     }
 }
 
