@@ -84,6 +84,7 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `overhang_speed` | 0 | 0 to 1000 | Speed of walls where more than half the line hangs over the edge of the layer below; these parts of walls are printed as overhang walls with `overhang_fan_speed`. 0 turns it off: walls keep their speed. |
 | `overhang_speed_full` | 0 | 0 to 1000 | Speed of walls that hang free entirely, the middle of the line more than half a line width beyond the edge of the layer below; only with `overhang_speed`. 0 turns it off: they print at `overhang_speed`. |
 | `ironing_speed` | 20 | 1 to 1000 | Speed of ironing. |
+| `support_speed` | 0 | 0 to 1000 | Speed of supports, their dense interface under the surface they carry included; 0 prints them at `infill_speed`. |
 | `bridge_flow` | 1 | 0.5 to 2 | Multiplier on the extruded amount of bridges, on top of `flow_ratio`. |
 | `first_layer_speed` | 25 | 1 to 1000 | Speed of all extrusion on the first layer. |
 | `travel_speed` | 150 | 1 to 2000 | Speed of moves without extrusion. |

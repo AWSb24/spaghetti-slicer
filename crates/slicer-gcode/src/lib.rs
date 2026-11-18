@@ -274,8 +274,11 @@ struct Writer<'a> {
     /// Slot of the selected extruder in `retracted` and `filament`: its
     /// number with several extruders, otherwise 0.
     tool: usize,
-    /// Per extruder: whether its filament is pulled back.
-    retracted: Vec<bool>,
+    /// How the next retraction, wipe and Z hop go: as the settings of the
+    /// path printed last say.
+    retraction: Retraction,
+    /// Per extruder: how its filament was pulled back, if it is.
+    retracted: Vec<Option<Retraction>>,
     /// Per extruder: filament pushed through so far, in millimetres.
     filament: Vec<f64>,
     /// Filament extruded since the last `G92 E0`; only used for absolute
@@ -287,6 +290,33 @@ struct Writer<'a> {
     nozzle_z: Option<f64>,
     /// The points of the line printed last, up to the nozzle, for wiping.
     trail: Vec<Point>,
+}
+
+/// How the filament is pulled back before a travel: the retraction, wipe
+/// and Z hop of one set of settings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Retraction {
+    /// Filament pulled back, in millimetres; 0 for none.
+    length: f64,
+    /// Speed of pulling back and pushing forward again, in mm/s.
+    speed: f64,
+    /// Lift of the nozzle during the travel, in millimetres.
+    z_hop: f64,
+    /// Way back along the line printed last while retracting, in
+    /// millimetres.
+    wipe: f64,
+}
+
+impl Retraction {
+    /// The retraction of `settings`.
+    fn of(settings: &Settings) -> Self {
+        Self {
+            length: settings.retraction_length,
+            speed: settings.retraction_speed,
+            z_hop: settings.z_hop,
+            wipe: settings.wipe_distance,
+        }
+    }
 }
 
 /// How far above everything printed so far the nozzle rises before it
@@ -331,6 +361,7 @@ impl<'a> Writer<'a> {
             z: self.z,
             feed: self.feed,
             tool: self.tool,
+            retraction: self.retraction,
             retracted: self.retracted.clone(),
             filament: self.filament.clone(),
             e: self.e,
@@ -362,27 +393,28 @@ impl<'a> Writer<'a> {
         }
     }
 
+    /// Pulls the filament back as `retraction` says, unless it is already.
     fn retract(&mut self) {
-        let length = self.settings.retraction_length;
-        if length > 0.0 && !self.retracted[self.tool] {
-            let f = self.feed_word(self.settings.retraction_speed);
-            let e = self.e_word(-length);
+        let r = self.retraction;
+        if r.length > 0.0 && self.retracted[self.tool].is_none() {
+            let f = self.feed_word(r.speed);
+            let e = self.e_word(-r.length);
             let _ = writeln!(self.out, "G1{e}{f}");
-            self.retracted[self.tool] = true;
-            self.filament[self.tool] -= length;
-            self.record([0.0, 0.0], length, self.settings.retraction_speed, None);
+            self.retracted[self.tool] = Some(r);
+            self.filament[self.tool] -= r.length;
+            self.record([0.0, 0.0], r.length, r.speed, None);
         }
     }
 
+    /// Pushes the filament forward again by as much and as fast as it was
+    /// pulled back, whatever the settings of the next path say.
     fn unretract(&mut self) {
-        if self.retracted[self.tool] {
-            let length = self.settings.retraction_length;
-            let f = self.feed_word(self.settings.retraction_speed);
-            let e = self.e_word(length);
+        if let Some(r) = self.retracted[self.tool].take() {
+            let f = self.feed_word(r.speed);
+            let e = self.e_word(r.length);
             let _ = writeln!(self.out, "G1{e}{f}");
-            self.retracted[self.tool] = false;
-            self.filament[self.tool] += length;
-            self.record([0.0, 0.0], length, self.settings.retraction_speed, None);
+            self.filament[self.tool] += r.length;
+            self.record([0.0, 0.0], r.length, r.speed, None);
         }
     }
 
@@ -391,7 +423,7 @@ impl<'a> Writer<'a> {
     /// stays retracted until it extrudes.
     fn select(&mut self, tool: usize) {
         if tool >= self.retracted.len() {
-            self.retracted.resize(tool + 1, false);
+            self.retracted.resize(tool + 1, None);
             self.filament.resize(tool + 1, 0.0);
         }
         self.tool = tool;
@@ -439,7 +471,7 @@ impl<'a> Writer<'a> {
         }
         let long =
             self.position.is_some() && !inside && length >= self.settings.retraction_min_travel;
-        let hop = long && self.settings.z_hop > 0.0 && self.settings.retraction_length > 0.0;
+        let hop = long && self.retraction.z_hop > 0.0 && self.retraction.length > 0.0;
         if long {
             self.wipe_and_retract();
         }
@@ -451,7 +483,7 @@ impl<'a> Writer<'a> {
             .filter(|_| length > 0.0)
             .map(|from| [(to[0] - from[0]) / length, (to[1] - from[1]) / length]);
         if hop {
-            self.move_z(self.z + self.settings.z_hop);
+            self.move_z(self.z + self.retraction.z_hop);
         }
         let f = self.feed_word(self.settings.travel_speed);
         let _ = writeln!(self.out, "G0 X{:.3} Y{:.3}{f}", to[0], to[1]);
@@ -612,12 +644,13 @@ impl<'a> Writer<'a> {
     /// `wipe_distance`, the filament pulled back in proportion to the way;
     /// a plain retraction without that setting or without a line.
     fn wipe_and_retract(&mut self) {
-        let length = self.settings.retraction_length;
-        let wipe = self.settings.wipe_distance;
+        let length = self.retraction.length;
+        let wipe = self.retraction.wipe;
         let Some(start) = self.position else {
             return self.retract();
         };
-        if wipe <= 0.0 || length <= 0.0 || self.retracted[self.tool] || self.trail.len() < 2 {
+        let pulled = self.retracted[self.tool].is_some();
+        if wipe <= 0.0 || length <= 0.0 || pulled || self.trail.len() < 2 {
             return self.retract();
         }
         let mut legs = Vec::new();
@@ -654,7 +687,7 @@ impl<'a> Writer<'a> {
             self.record(direction, d, speed, None);
             from = to;
         }
-        self.retracted[self.tool] = true;
+        self.retracted[self.tool] = Some(self.retraction);
         self.filament[self.tool] -= length;
         self.position = Some(from);
         self.trail.clear();
@@ -721,17 +754,26 @@ fn fit_arc(points: &[Point], tolerance: f64) -> Option<(Point, bool)> {
 }
 
 /// Writes one layer. Extrusion runs at `slow` times its speed (1 for full
-/// speed), see [`slowdown`]; `layer_fan` is the fan speed of the layer in
-/// percent, see [`layer_fan`].
+/// speed), see [`slowdown`]; the layer takes `time` seconds, from which
+/// the fan of every path follows with the settings of its object, see
+/// [`layer_fan`].
 fn write_layer(
     w: &mut Writer,
     carry: &mut Carry,
     layer: &Layer,
     index: usize,
     context: &Context,
-    (slow, layer_fan): (f64, f64),
+    (slow, time): (f64, f64),
 ) -> Result<(), GcodeError> {
     let settings = w.settings;
+    // The fan is set at the start of the layer as the first path wants it
+    // (bridges and overhangs aside).
+    let first = layer
+        .paths
+        .iter()
+        .find(|p| !p.points.is_empty())
+        .map_or(settings, |p| context.toolpaths.settings_of(p, settings));
+    let start_fan = layer_fan(first, index, time);
     let _ = writeln!(
         w.out,
         ";LAYER_CHANGE\n;Z:{:.3}\n;HEIGHT:{:.3}",
@@ -745,8 +787,8 @@ fn write_layer(
             let _ = writeln!(w.out, "M140 S{}", settings.bed_temp);
         }
     }
-    if layer_fan != carry.fan {
-        carry.fan = layer_fan;
+    if start_fan != carry.fan {
+        carry.fan = start_fan;
         let _ = writeln!(w.out, "M106 S{:.0}", carry.fan * 2.55);
     }
     if context.absolute {
@@ -781,8 +823,6 @@ fn write_layer(
         }
     }
 
-    let filament_per_mm =
-        settings.line_width * layer.height * settings.flow_ratio / context.filament_area;
     let mut current_kind = None;
     // The object whose label is open.
     let mut open = None;
@@ -826,16 +866,23 @@ fn write_layer(
             w.move_z(layer.z);
             carry.restore_z = false;
         }
+        // Paths of an object print with its fan, flow, speeds and
+        // retraction, all others with the plate's; the travel after a path
+        // retracts as its object says.
+        let own = context.toolpaths.settings_of(path, settings);
+        w.retraction = Retraction::of(own);
         let bridge = path.kind == PathKind::Bridge;
         let wanted = match path.kind {
-            PathKind::Bridge => settings.bridge_fan_speed,
-            PathKind::OverhangWall | PathKind::OverhangWallFull => settings.overhang_fan_speed,
-            _ => layer_fan,
+            PathKind::Bridge => own.bridge_fan_speed,
+            PathKind::OverhangWall | PathKind::OverhangWallFull => own.overhang_fan_speed,
+            _ => layer_fan(own, index, time),
         };
         if wanted != carry.fan {
             carry.fan = wanted;
             let _ = writeln!(w.out, "M106 S{:.0}", carry.fan * 2.55);
         }
+        let filament_per_mm =
+            settings.line_width * layer.height * own.flow_ratio / context.filament_area;
         let filament_per_mm = if bridge {
             filament_per_mm * settings.bridge_flow
         } else {
@@ -855,9 +902,7 @@ fn write_layer(
             current_kind = Some(path.kind);
             let _ = writeln!(w.out, ";TYPE:{}", label(path.kind));
         }
-        // Paths of an object print at its speeds, all others at the
-        // plate's; `slow` stretches them all alike.
-        let own = context.toolpaths.settings_of(path, settings);
+        // `slow` stretches the speeds of all paths alike.
         let speed = slowed(path_speed(own, path.kind, index), slow, settings);
         if let Some(from) = rise_from {
             // Z climbs in proportion to the length gone round.
@@ -976,15 +1021,18 @@ fn slowdown(
 ) -> Result<(f64, f64), GcodeError> {
     let settings = w.settings;
     let goal = settings.min_layer_time;
-    if goal <= 0.0 && settings.fan_layer_time <= 0.0 {
+    let fan_by_time = std::iter::once(settings)
+        .chain(&context.toolpaths.object_settings)
+        .any(|s| s.fan_layer_time > 0.0);
+    if goal <= 0.0 && !fan_by_time {
         return Ok((1.0, 0.0));
     }
     let mut slow = 1.0;
     for tries in 1.. {
         let mut trial = w.fork();
         let mut carry = carry;
-        let fan = settings.fan_speed;
-        write_layer(&mut trial, &mut carry, layer, index, context, (slow, fan))?;
+        // The fan takes no time; any layer time will do.
+        write_layer(&mut trial, &mut carry, layer, index, context, (slow, 0.0))?;
         let times = move_times(&trial.moves, settings.acceleration, settings.jerk);
         let total: f64 = times.iter().sum();
         let extruding: f64 = trial
@@ -1042,11 +1090,16 @@ fn slowed(speed: f64, slow: f64, settings: &Settings) -> f64 {
 /// follows, then `T<n>`, the travel to the next path and the move back to
 /// the height of the layer (the custom G-code may have moved the nozzle).
 ///
-/// The paths of objects with speeds of their own
-/// ([`Toolpaths::object_settings`]) print at those; everything else, and
-/// every path on the first layer, at the speeds of `settings`.
-// ponytail: only the speeds of lines come from the objects; fan, flow,
-// retraction and the slowdown for `min_layer_time` stay the plate's.
+/// The paths of objects with settings of their own
+/// ([`Toolpaths::object_settings`]) print with their speeds (except on the
+/// first layer), fan (`M106` only where the value changes) and flow ratio,
+/// and the travel after one of their paths retracts, wipes and lifts as
+/// its object says; the filament then goes forward again by as much and
+/// as fast as it was pulled back. Everything else prints with `settings`.
+// ponytail: the slowdown for `min_layer_time`, the shortest travel that
+// retracts, bridge and ironing flow and the speed of travel and wipe stay
+// the plate's; `fan_layer_time` of an object goes by the time of the whole
+// layer, not of the object's part of it.
 pub fn write_gcode(toolpaths: &Toolpaths, settings: &Settings) -> Result<Output, GcodeError> {
     write_gcode_with_progress(toolpaths, settings, &Progress::new())
 }
@@ -1065,6 +1118,9 @@ pub fn path_speed(settings: &Settings, kind: PathKind, layer: usize) -> f64 {
         }
         PathKind::OverhangWallFull => settings.overhang_speed,
         PathKind::InnerWall | PathKind::GapFill => settings.inner_wall_speed,
+        PathKind::Support if settings.support_speed > 0.0 => settings.support_speed,
+        // ponytail: the dense interface of supports prints as support, so it
+        // has no speed of its own.
         PathKind::SolidInfill
         | PathKind::SparseInfill
         | PathKind::Support
@@ -1102,7 +1158,8 @@ pub fn write_gcode_with_progress(
         z: 0.0,
         feed: 0.0,
         tool: 0,
-        retracted: vec![false],
+        retraction: Retraction::of(settings),
+        retracted: vec![None],
         filament: vec![0.0],
         e: 0.0,
         moves: Vec::new(),
@@ -1151,8 +1208,7 @@ pub fn write_gcode_with_progress(
         }
         below = layer.z;
         let (slow, time) = slowdown(&w, carry, layer, index, &context)?;
-        let fan = layer_fan(settings, index, time);
-        write_layer(&mut w, &mut carry, layer, index, &context, (slow, fan))?;
+        write_layer(&mut w, &mut carry, layer, index, &context, (slow, time))?;
         progress.advance();
         index += 1;
     }
@@ -1164,14 +1220,7 @@ pub fn write_gcode_with_progress(
         .filament
         .iter()
         .zip(&w.retracted)
-        .map(|(&filament, &retracted)| {
-            filament
-                + if retracted {
-                    settings.retraction_length
-                } else {
-                    0.0
-                }
-        })
+        .map(|(&filament, retracted)| filament + retracted.map_or(0.0, |r| r.length))
         .collect();
     let times = move_times(&w.moves, settings.acceleration, settings.jerk);
     let volume = |length: f64| length * filament_area / 1000.0;
@@ -2393,5 +2442,236 @@ SET_PRESSURE_ADVANCE ADVANCE=0.04
                 .collect()
         };
         assert_eq!(moves(&fast), moves(&plain));
+    }
+
+    /// The extruding moves of `gcode` (not the filament pushed back after
+    /// a retraction): line type, X they end at and filament.
+    fn extrusions(gcode: &str) -> Vec<(String, f64, f64)> {
+        let (mut kind, mut x) = ("", 0.0);
+        let mut moves = Vec::new();
+        for line in gcode.lines() {
+            if let Some(name) = line.strip_prefix(";TYPE:") {
+                kind = name;
+            }
+            if let Some(at) = word(line, 'X') {
+                x = at;
+            }
+            let moving = word(line, 'X').is_some() || word(line, 'Y').is_some();
+            if let Some(e) = word(line, 'E').filter(|&e| moving && e > 0.0) {
+                moves.push((kind.to_owned(), x, e));
+            }
+        }
+        moves
+    }
+
+    #[test]
+    fn objects_have_their_own_fan_flow_and_retraction() {
+        let objects = [house(20.0), house(140.0)];
+        let settings = Settings {
+            min_layer_time: 0.0,
+            fan_layer_time: 0.0,
+            ..Settings::default()
+        };
+        let own = Settings {
+            fan_speed: 30.0,
+            flow_ratio: 0.9,
+            retraction_length: 2.0,
+            z_hop: 0.4,
+            ..settings.clone()
+        };
+        let plain = write_gcode(&plate(&objects, &[], &settings), &settings).unwrap();
+        let toolpaths = plate(&objects, &[None, Some(own.clone())], &settings);
+        let output = write_gcode(&toolpaths, &settings).unwrap();
+
+        // Walking through the G-code: the fan, the line type, the layer,
+        // and whether the line printed last belongs to the second house.
+        let quiet = format!("M106 S{:.0}", own.fan_speed * 2.55);
+        let full = format!("M106 S{:.0}", settings.fan_speed * 2.55);
+        let (mut fan, mut kind, mut x, mut z) = (String::new(), "", 0.0, 0.0);
+        let (mut second, mut pulled) = (false, 0.0);
+        let (mut hops, mut retractions, mut fans) = (0, [0, 0], [0, 0]);
+        for line in output.gcode.lines() {
+            if line.starts_with("M106") {
+                assert_ne!(line, fan, "the fan is set twice");
+                fan = line.to_owned();
+            }
+            if let Some(name) = line.strip_prefix(";TYPE:") {
+                kind = name;
+            }
+            if let Some(height) = line.strip_prefix(";Z:") {
+                z = height.parse().unwrap();
+            }
+            if let Some(at) = word(line, 'X') {
+                x = at;
+            }
+            let moving = word(line, 'X').is_some() || word(line, 'Y').is_some();
+            let e = word(line, 'E');
+            if moving && e.is_some_and(|e| e > 0.0) {
+                second = x >= 100.0 && kind != "Skirt";
+                let plain_fan = !["Skirt", "Bridge", "Overhang wall"].contains(&kind);
+                if z > settings.first_layer_height + 1e-6 && plain_fan {
+                    assert_eq!(fan, if second { &*quiet } else { &*full }, "{line}");
+                    fans[usize::from(second)] += 1;
+                }
+            }
+            // Every retraction is that of the house printed last, and the
+            // filament goes forward again by as much.
+            if let Some(e) = e.filter(|_| !moving) {
+                if e < 0.0 {
+                    let length = (if second { &own } else { &settings }).retraction_length;
+                    assert!((e + length).abs() < 1e-9, "{line}");
+                    pulled = length;
+                    retractions[usize::from(second)] += 1;
+                } else {
+                    assert!((e - pulled).abs() < 1e-9, "{line}");
+                }
+            }
+            // Only the second house lifts the nozzle (the end G-code goes
+            // up 10 mm).
+            let lift = word(line, 'Z').map_or(0.0, |h| h - z);
+            if line.starts_with("G1 Z") && lift > 1e-6 && lift < 1.0 {
+                assert!(second, "{line}");
+                assert!((lift - own.z_hop).abs() < 1e-6, "{line}");
+                hops += 1;
+            }
+        }
+        assert!(fans[0] > 100 && fans[1] > 100, "{fans:?}");
+        assert!(retractions[0] > 5 && retractions[1] > 5, "{retractions:?}");
+        assert!(hops > 5, "{hops}");
+
+        // The lines are the same, the second house's with 0.9 times the
+        // filament.
+        let (before, after) = (extrusions(&plain.gcode), extrusions(&output.gcode));
+        assert_eq!(before.len(), after.len());
+        let mut less = 0.0;
+        for ((kind, x, e), (kind_now, x_now, e_now)) in before.iter().zip(&after) {
+            assert_eq!((kind, x), (kind_now, x_now));
+            if *x >= 100.0 && kind != "Skirt" {
+                assert!((e_now - 0.9 * e).abs() < 2e-5, "{e} {e_now}");
+                less += 0.1 * e;
+            } else {
+                assert_eq!(e, e_now);
+            }
+        }
+        assert!(less > 10.0, "{less}");
+        // The statistics count the filament as extruded.
+        let saved = plain.stats.filament_length_mm - output.stats.filament_length_mm;
+        assert!((saved - less).abs() < 0.05, "{saved} {less}");
+        let ratio = output.stats.filament_weight_g / output.stats.filament_length_mm;
+        assert!(
+            (ratio - plain.stats.filament_weight_g / plain.stats.filament_length_mm).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn objects_with_their_own_fan_by_layer_time() {
+        // The second house turns its fan on later and by layer time.
+        let objects = [house(20.0), house(140.0)];
+        let settings = Settings {
+            min_layer_time: 0.0,
+            fan_layer_time: 0.0,
+            fan_speed: 40.0,
+            ..Settings::default()
+        };
+        let own = Settings {
+            fan_off_layers: 3,
+            fan_layer_time: 600.0,
+            fan_max_speed: 90.0,
+            ..settings.clone()
+        };
+        let toolpaths = plate(&objects, &[None, Some(own)], &settings);
+        let gcode = write_gcode(&toolpaths, &settings).unwrap().gcode;
+        let (mut fan, mut layer, mut kind, mut x) = (0.0, 0, "", 0.0);
+        let mut seen = Vec::new();
+        for line in gcode.lines() {
+            if let Some(s) = line.strip_prefix("M106 S") {
+                fan = s.parse().unwrap();
+            }
+            if line.starts_with(";LAYER_CHANGE") {
+                layer += 1;
+            }
+            if let Some(name) = line.strip_prefix(";TYPE:") {
+                kind = name;
+            }
+            if let Some(at) = word(line, 'X') {
+                x = at;
+            }
+            let moving = word(line, 'X').is_some() || word(line, 'Y').is_some();
+            let extruding = moving && word(line, 'E').is_some_and(|e| e > 0.0);
+            if extruding && !["Skirt", "Bridge", "Overhang wall"].contains(&kind) {
+                seen.push((layer, x >= 100.0, fan));
+            }
+        }
+        for &(layer, second, fan) in &seen {
+            if (second && layer <= 3) || (!second && layer <= 1) {
+                assert_eq!(fan, 0.0, "layer {layer}");
+            } else if second {
+                // Every layer takes far less than 600 s: close to the most.
+                assert!(
+                    fan > 40.0 * 2.55 && fan <= 90.0 * 2.55,
+                    "layer {layer}: {fan}"
+                );
+            } else {
+                assert_eq!(fan, (40.0f64 * 2.55).round(), "layer {layer}");
+            }
+        }
+        assert!(seen.iter().any(|s| s.1 && s.0 > 3));
+    }
+
+    #[test]
+    fn support_speed_changes_only_the_feed_of_supports() {
+        let mut mesh = Mesh::cuboid(10.0, 10.0, 12.0);
+        mesh.translate([105.0, 105.0, 0.0]);
+        let mut top = Mesh::cuboid(30.0, 10.0, 2.0);
+        top.translate([95.0, 105.0, 10.0]);
+        mesh.merge(&top);
+        let settings = Settings {
+            supports: true,
+            min_layer_time: 0.0,
+            ..Settings::default()
+        };
+        let slow = Settings {
+            support_speed: 33.0,
+            ..settings.clone()
+        };
+        // Every move: line type, layer above the first, feed rate in effect
+        // and the line without it.
+        let moves = |gcode: &str| -> Vec<(String, bool, f64, String)> {
+            let (mut kind, mut above, mut feed) = ("", false, 0.0);
+            let mut moves = Vec::new();
+            for line in gcode.lines() {
+                if let Some(name) = line.strip_prefix(";TYPE:") {
+                    kind = name;
+                }
+                if let Some(z) = line.strip_prefix(";Z:") {
+                    above = z.parse::<f64>().unwrap() > settings.first_layer_height + 1e-6;
+                }
+                if let Some(f) = word(line, 'F') {
+                    feed = f;
+                }
+                if line.starts_with("G0") || line.starts_with("G1") {
+                    let words = line.split_whitespace().filter(|w| !w.starts_with('F'));
+                    let text = words.collect::<Vec<_>>().join(" ");
+                    moves.push((kind.to_owned(), above, feed, text));
+                }
+            }
+            moves
+        };
+        let before = moves(&slice(&mesh, &settings).gcode);
+        let after = moves(&slice(&mesh, &slow).gcode);
+        assert_eq!(before.len(), after.len());
+        let mut supports = 0;
+        for (b, a) in before.iter().zip(&after) {
+            assert_eq!((&b.0, b.1, &b.3), (&a.0, a.1, &a.3));
+            let extruding = a.3.starts_with("G1 X") && word(&a.3, 'E').is_some_and(|e| e > 0.0);
+            if a.0 == "Support" && a.1 && extruding {
+                assert_eq!(b.2, settings.infill_speed * 60.0);
+                assert_eq!(a.2, slow.support_speed * 60.0);
+                supports += 1;
+            } else {
+                assert_eq!(a.2, b.2, "{}", a.3);
+            }
+        }
+        assert!(supports > 100, "{supports}");
     }
 }

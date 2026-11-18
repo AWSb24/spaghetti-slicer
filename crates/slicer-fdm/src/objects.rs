@@ -11,11 +11,13 @@ use crate::{DEGENERATE_HEIGHT, MAX_HOLE_EDGES};
 
 /// Process settings that an object on the plate may set for itself,
 /// overriding the plate's: walls and their seam, top and bottom shells,
-/// sparse infill, whether it gets supports, and the speeds of its walls,
-/// infill, bridges, overhangs and ironing. Everything else, among it the
-/// layer heights, line width, skirt, brim, the shape and speed of
-/// supports, the first layer speed, travel and retraction, stays the same
-/// for the whole plate.
+/// sparse infill, whether it gets supports, the speeds of its walls,
+/// infill, bridges, overhangs and ironing, its fan, flow ratio, and the
+/// retraction, wipe and Z hop after its lines. Everything else, among it
+/// the layer heights, line width, skirt, brim, the shape and speed of
+/// supports, the first layer speed, travel, the shortest travel that
+/// retracts and the minimum layer time, stays the same for the whole
+/// plate.
 pub const OBJECT_SETTINGS: &[&str] = &[
     "wall_loops",
     "wall_order",
@@ -35,21 +37,44 @@ pub const OBJECT_SETTINGS: &[&str] = &[
     "overhang_speed",
     "overhang_speed_full",
     "ironing_speed",
+    "fan_speed",
+    "bridge_fan_speed",
+    "overhang_fan_speed",
+    "fan_off_layers",
+    "fan_layer_time",
+    "fan_max_speed",
+    "flow_ratio",
+    "retraction_length",
+    "retraction_speed",
+    "z_hop",
+    "wipe_distance",
 ];
 
-/// `settings` with the speeds an object may set for itself taken from
-/// `speeds`. They change only how fast the G-code writer prints the lines
-/// of an object (and whether its overhanging walls are slowed down), not
-/// where the lines go.
-fn with_speeds(settings: &Settings, speeds: &Settings) -> Settings {
+/// `settings` with the values an object may set for itself that only the
+/// G-code writer uses taken from `values`: speeds, fan, flow ratio and
+/// retraction. They change how the writer prints the lines of an object
+/// (and whether its overhanging walls are slowed down), not where the
+/// lines go.
+fn with_writer_values(settings: &Settings, values: &Settings) -> Settings {
     Settings {
-        outer_wall_speed: speeds.outer_wall_speed,
-        inner_wall_speed: speeds.inner_wall_speed,
-        infill_speed: speeds.infill_speed,
-        bridge_speed: speeds.bridge_speed,
-        overhang_speed: speeds.overhang_speed,
-        overhang_speed_full: speeds.overhang_speed_full,
-        ironing_speed: speeds.ironing_speed,
+        outer_wall_speed: values.outer_wall_speed,
+        inner_wall_speed: values.inner_wall_speed,
+        infill_speed: values.infill_speed,
+        bridge_speed: values.bridge_speed,
+        overhang_speed: values.overhang_speed,
+        overhang_speed_full: values.overhang_speed_full,
+        ironing_speed: values.ironing_speed,
+        fan_speed: values.fan_speed,
+        bridge_fan_speed: values.bridge_fan_speed,
+        overhang_fan_speed: values.overhang_fan_speed,
+        fan_off_layers: values.fan_off_layers,
+        fan_layer_time: values.fan_layer_time,
+        fan_max_speed: values.fan_max_speed,
+        flow_ratio: values.flow_ratio,
+        retraction_length: values.retraction_length,
+        retraction_speed: values.retraction_speed,
+        z_hop: values.z_hop,
+        wipe_distance: values.wipe_distance,
         ..settings.clone()
     }
 }
@@ -71,13 +96,13 @@ pub fn object_settings(plate: &Settings, own: &Settings) -> Settings {
         supports: own.supports,
         ..plate.clone()
     };
-    with_speeds(&merged, own)
+    with_writer_values(&merged, own)
 }
 
 /// The settings of every object (`own[i]` over `plate` for object `i`, the
 /// plate's without) for [`crate::Toolpaths::object_settings`]; empty if
-/// every object prints at the plate's speeds, and in vase mode, which
-/// leaves the settings of objects out.
+/// every object prints with the plate's speeds, fan, flow and retraction,
+/// and in vase mode, which leaves the settings of objects out.
 pub(crate) fn speed_table(
     count: usize,
     own: &[Option<Settings>],
@@ -92,7 +117,7 @@ pub(crate) fn speed_table(
             _ => plate.clone(),
         })
         .collect();
-    if table.iter().all(|s| with_speeds(s, plate) == *s) {
+    if table.iter().all(|s| with_writer_values(s, plate) == *s) {
         return Vec::new();
     }
     table
@@ -142,10 +167,11 @@ pub fn apply_object_orca(own: &mut Settings, values: &[(String, String)]) -> Vec
 
 /// The different settings among `count` objects, the first of them those
 /// of the first object, and for every object the index of its settings.
-/// Object `i` has `own[i]` if given, otherwise the plate's. Speeds do not
-/// count: every group has the plate's, and the G-code writer takes those
-/// of every object from [`speed_table`], so objects that differ only in
-/// speeds are laid out exactly as if they did not.
+/// Object `i` has `own[i]` if given, otherwise the plate's. Speeds, fan,
+/// flow and retraction do not count: every group has the plate's, and the
+/// G-code writer takes those of every object from [`speed_table`], so
+/// objects that differ only in them are laid out exactly as if they did
+/// not.
 pub(crate) fn groups(
     count: usize,
     own: &[Option<Settings>],
@@ -155,7 +181,7 @@ pub(crate) fn groups(
     let mut membership = Vec::with_capacity(count);
     for index in 0..count {
         let settings = match own.get(index) {
-            Some(Some(own)) => with_speeds(&object_settings(plate, own), plate),
+            Some(Some(own)) => with_writer_values(&object_settings(plate, own), plate),
             _ => plate.clone(),
         };
         let group = match groups.iter().position(|g| *g == settings) {
@@ -506,6 +532,17 @@ mod tests {
             overhang_speed: 25.0,
             overhang_speed_full: 26.0,
             ironing_speed: 27.0,
+            fan_speed: 30.0,
+            bridge_fan_speed: 40.0,
+            overhang_fan_speed: 50.0,
+            fan_off_layers: 3,
+            fan_layer_time: 12.0,
+            fan_max_speed: 60.0,
+            flow_ratio: 0.9,
+            retraction_length: 2.0,
+            retraction_speed: 25.0,
+            z_hop: 0.4,
+            wipe_distance: 1.5,
             layer_height: 0.1,
             brim_width: 5.0,
             first_layer_speed: 10.0,
@@ -536,6 +573,9 @@ mod tests {
             ("layer_height", "0.1"),
             ("support_type", "tree(auto)"),
             ("top_shell_layers", "-3"),
+            ("fan_max_speed", "40"),
+            ("filament_flow_ratio", "0.95"),
+            ("filament_retraction_length", "1.5"),
         ]
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -543,6 +583,10 @@ mod tests {
         let skipped = apply_object_orca(&mut own, &values);
         assert_eq!(own.infill_density, 35.0);
         assert_eq!(own.wall_loops, 5);
+        // Fan, flow and retraction of the filament are taken per object too.
+        assert_eq!(own.fan_speed, 40.0);
+        assert_eq!(own.flow_ratio, 0.95);
+        assert_eq!(own.retraction_length, 1.5);
         assert_eq!(own.layer_height, Settings::default().layer_height);
         let mut keys: Vec<&str> = skipped.iter().map(|(key, _)| key.as_str()).collect();
         keys.sort_unstable();
