@@ -118,8 +118,9 @@ enum Command {
     /// retraction length changes per band of height. flow: flat blocks side
     /// by side, each with its own share of the flow ratio.
     /// pressure-advance: a hollow tower whose pressure advance factor
-    /// changes every 4 mm of height. Start, end and step default to values
-    /// that suit the settings.
+    /// changes every 4 mm of height. Each value is lettered on the model in
+    /// raised digits. Start, end and step default to values that suit the
+    /// settings.
     Calibrate {
         /// Kind of print: temperature, retraction, flow or pressure-advance
         #[arg(value_parser = parse_calibration_kind)]

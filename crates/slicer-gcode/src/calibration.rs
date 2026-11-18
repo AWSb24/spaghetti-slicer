@@ -13,6 +13,15 @@
 //!   changes in bands of height (`M900 K` for Marlin,
 //!   `SET_PRESSURE_ADVANCE` for Klipper at the first layer of each band).
 //!
+//! Every value is lettered on the model where it applies, in raised
+//! digits of a small font of bars ([`text`]): on the front of each block
+//! of the temperature tower, on a tab beside each retraction tower (odd
+//! bands on the left one, even bands on the right one, counted from 1),
+//! on top of each flow block near its front edge, and on the pressure
+//! advance tower alternately on its front and its right side. The
+//! lettering stays within the height of a tower, so the bands stay where
+//! they are.
+//!
 //! The models are sliced like any others. [`Calibration::apply`] then
 //! changes the written G-code: it puts the temperature command after the
 //! layer change comments and scales the filament amounts of retractions, or
@@ -27,6 +36,10 @@ use slicer_core::{Diagnose, Mesh, Point};
 use slicer_profiles::{Flavor, Settings};
 
 use crate::Output;
+
+mod text;
+
+use text::{Face, Style};
 
 /// Most values one calibration print steps through.
 pub const MAX_STEPS: usize = 20;
@@ -52,6 +65,65 @@ const PRESSURE_BAND: [f64; 3] = [30.0, 30.0, 4.0];
 /// groove is as high as it is deep: a flat ledge below, a 45° slope above,
 /// so it prints without supports.
 const GROOVE: f64 = 1.0;
+
+/// Lettering on the front of the temperature tower and on the tabs of the
+/// retraction towers, in mm. The bars are at least two line widths wide,
+/// and stand out little enough that their sloped undersides print.
+const TOWER_TEXT: Style = Style {
+    height: 6.0,
+    width: 3.6,
+    upright: 1.0,
+    cross: 1.0,
+    spacing: 1.2,
+    raise: 0.6,
+};
+
+/// Lettering on the pressure advance tower, whose bands are only 4 mm
+/// high: smaller, with thinner crossing bars (on an upright face they are
+/// a few layers each, not lines side by side).
+const PRESSURE_TEXT: Style = Style {
+    height: 5.0,
+    width: 3.4,
+    upright: 1.0,
+    cross: 0.8,
+    spacing: 1.2,
+    raise: 0.6,
+};
+
+/// Lettering on top of the flow blocks.
+const FLOW_TEXT: Style = Style {
+    height: 5.0,
+    width: 3.4,
+    upright: 1.0,
+    cross: 1.0,
+    spacing: 1.2,
+    raise: 0.6,
+};
+
+/// Space between lettering and the bed, the top of a tower or the sides
+/// of the face it is on, in mm.
+const LABEL_MARGIN: f64 = 1.0;
+
+/// Distance of the lettering on a flow block from its front edge, in mm.
+const FLOW_TEXT_FRONT: f64 = 2.0;
+
+/// Depth of the tab beside a retraction tower that carries the lettering,
+/// in mm.
+const TAB_DEPTH: f64 = 2.0;
+
+/// How far a tab reaches into its tower, in mm: more than a groove is
+/// deep.
+const TAB_OVERLAP: f64 = 1.5;
+
+/// The front face of a model at `centre`: read along X, out towards -Y.
+fn front(centre: [f64; 3]) -> Face {
+    Face {
+        centre,
+        across: [1.0, 0.0, 0.0],
+        up: [0.0, 0.0, 1.0],
+        out: [0.0, -1.0, 0.0],
+    }
+}
 
 /// The kind of calibration print.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +232,16 @@ impl Diagnose for CalibrationError {
     }
 }
 
+/// A value lettered on a test model.
+#[derive(Debug, Clone, PartialEq)]
+struct Label {
+    /// Index of the model in [`Calibration::models`].
+    model: usize,
+    text: String,
+    style: Style,
+    face: Face,
+}
+
 /// A calibration print: its kind and the values it steps through, from the
 /// bottom up (towers) or one per block (flow).
 #[derive(Debug, Clone, PartialEq)]
@@ -256,11 +338,13 @@ impl Calibration {
         }
     }
 
-    /// The test models with their names, each with one corner at the
-    /// origin. For the flow test, model `i` prints with value `i`.
+    /// The test models with their names, standing on the bed (Z = 0)
+    /// with the body of the first one at the origin; lettering and the
+    /// tabs of the retraction towers may reach to negative X and Y. For
+    /// the flow test, model `i` prints with value `i`.
     pub fn models(&self) -> Vec<(String, Mesh)> {
         let count = self.values.len();
-        match self.kind {
+        let mut models: Vec<(String, Mesh)> = match self.kind {
             Kind::Temperature => vec![(
                 Kind::Temperature.title().to_owned(),
                 stacked_blocks(count, TOWER_BLOCK),
@@ -290,6 +374,136 @@ impl Calibration {
                     Kind::PressureAdvance.title().to_owned(),
                     Mesh::cuboid(x, y, z * count as f64),
                 )]
+            }
+        };
+        if self.kind == Kind::Retraction {
+            // A tab on the outer side of each tower that gets lettering.
+            let [width, _, height] = RETRACTION_BAND;
+            let tab = self.tab_width();
+            for (i, (_, mesh)) in models.iter_mut().enumerate().take(count) {
+                let mut piece = Mesh::cuboid(tab + TAB_OVERLAP, TAB_DEPTH, height * count as f64);
+                let x = if i == 0 { -tab } else { width - TAB_OVERLAP };
+                piece.translate([x, 0.0, 0.0]);
+                mesh.merge(&piece);
+            }
+        }
+        for label in self.labels() {
+            if let Some((_, mesh)) = models.get_mut(label.model) {
+                mesh.merge(&text::raised(&label.text, &label.style, &label.face));
+            }
+        }
+        models
+    }
+
+    /// A value as lettered on the model: the number alone, the flow with
+    /// its sign.
+    fn label_text(&self, value: f64) -> String {
+        match self.kind {
+            Kind::Flow => format!("{value:+}"),
+            _ => value.to_string(),
+        }
+    }
+
+    /// Width of the tabs beside the retraction towers: the widest value
+    /// and a margin on either side.
+    fn tab_width(&self) -> f64 {
+        let widest = (self.values.iter())
+            .map(|&value| text::width(&self.label_text(value), &TOWER_TEXT))
+            .fold(0.0, f64::max);
+        widest + 2.0 * LABEL_MARGIN
+    }
+
+    /// Where each value is lettered, in the coordinates of
+    /// [`Calibration::models`].
+    fn labels(&self) -> Vec<Label> {
+        let count = self.values.len() as f64;
+        let texts = (self.values.iter())
+            .map(|&value| self.label_text(value))
+            .enumerate();
+        // Height of the middle of the lettering for band `band` of a tower
+        // in bands of `pitch`: the middle of the band below its groove,
+        // but with the whole lettering above the bed and below the top.
+        let level = |band: usize, pitch: f64, groove: f64, style: &Style| {
+            let half = style.height / 2.0 + LABEL_MARGIN;
+            let middle = band as f64 * pitch + (pitch - groove) / 2.0;
+            middle.max(half).min(count * pitch - half)
+        };
+        let room = |width: f64| width - 2.0 * LABEL_MARGIN;
+        match self.kind {
+            Kind::Temperature => {
+                let [width, _, height] = TOWER_BLOCK;
+                texts
+                    .map(|(band, text)| Label {
+                        model: 0,
+                        style: TOWER_TEXT.fitting(&text, room(width)),
+                        face: front([width / 2.0, 0.0, level(band, height, GROOVE, &TOWER_TEXT)]),
+                        text,
+                    })
+                    .collect()
+            }
+            Kind::Retraction => {
+                let [width, _, height] = RETRACTION_BAND;
+                let tab = self.tab_width();
+                texts
+                    .map(|(band, text)| {
+                        let x = if band % 2 == 0 {
+                            -tab / 2.0
+                        } else {
+                            width + tab / 2.0
+                        };
+                        let z = level(band, height, GROOVE, &TOWER_TEXT);
+                        Label {
+                            model: band % 2,
+                            style: TOWER_TEXT,
+                            face: front([x, 0.0, z]),
+                            text,
+                        }
+                    })
+                    .collect()
+            }
+            Kind::Flow => {
+                let [width, _, height] = FLOW_BLOCK;
+                texts
+                    .map(|(block, text)| {
+                        let style = FLOW_TEXT.fitting(&text, room(width));
+                        let y = FLOW_TEXT_FRONT + style.height / 2.0;
+                        Label {
+                            model: block,
+                            style,
+                            face: Face {
+                                centre: [width / 2.0, y, height],
+                                across: [1.0, 0.0, 0.0],
+                                up: [0.0, 1.0, 0.0],
+                                out: [0.0, 0.0, 1.0],
+                            },
+                            text,
+                        }
+                    })
+                    .collect()
+            }
+            Kind::PressureAdvance => {
+                let [width, depth, height] = PRESSURE_BAND;
+                texts
+                    .map(|(band, text)| {
+                        let z = level(band, height, 0.0, &PRESSURE_TEXT);
+                        let face = if band % 2 == 0 {
+                            front([width / 2.0, 0.0, z])
+                        } else {
+                            Face {
+                                centre: [width, depth / 2.0, z],
+                                across: [0.0, 1.0, 0.0],
+                                up: [0.0, 0.0, 1.0],
+                                out: [1.0, 0.0, 0.0],
+                            }
+                        };
+                        Label {
+                            model: 0,
+                            style: PRESSURE_TEXT.fitting(&text, room(width.min(depth))),
+                            face,
+                            text,
+                        }
+                    })
+                    .collect()
             }
         }
     }
@@ -838,15 +1052,17 @@ mod tests {
 
         let retraction = Calibration::new(Kind::Retraction, 0.5, 1.5, 0.5).unwrap();
         let placed = retraction.placed_models(&settings);
-        let xs: Vec<f64> = placed
-            .iter()
-            .map(|(_, m)| m.bounds().unwrap().0[0])
-            .collect();
         assert_eq!(placed.len(), 2);
+        // The tabs are on the outer sides: the gap between the towers
+        // stays as it was.
+        let (left, right) = (placed[0].1.bounds().unwrap(), placed[1].1.bounds().unwrap());
         assert!(
-            (xs[1] - xs[0] - 8.0 - RETRACTION_GAP).abs() < 1e-9,
-            "{xs:?}"
+            (right.0[0] - left.1[0] - RETRACTION_GAP).abs() < 1e-9,
+            "{left:?} {right:?}"
         );
+        let tab = retraction.tab_width();
+        assert!((left.1[0] - left.0[0] - 8.0 - tab).abs() < 1e-9);
+        assert!((right.1[0] - right.0[0] - 8.0 - tab).abs() < 1e-9);
 
         let flow = Calibration::new(Kind::Flow, -10.0, 10.0, 5.0).unwrap();
         let placed = flow.placed_models(&settings);
@@ -858,6 +1074,168 @@ mod tests {
             .map(|(_, m)| m.bounds().unwrap().0[0])
             .collect();
         assert!(xs.windows(2).all(|w| w[0] < w[1]), "{xs:?}");
+    }
+
+    /// Whether `p` lies inside `shapes` (even-odd over all contours).
+    fn inside(shapes: &slicer_core::polygon::Shapes, p: Point) -> bool {
+        let mut crossings = 0;
+        for contour in shapes.iter().flatten() {
+            for (i, a) in contour.iter().enumerate() {
+                let b = contour[(i + 1) % contour.len()];
+                if (a[1] > p[1]) != (b[1] > p[1])
+                    && p[0] < a[0] + (p[1] - a[1]) / (b[1] - a[1]) * (b[0] - a[0])
+                {
+                    crossings += 1;
+                }
+            }
+        }
+        crossings % 2 == 1
+    }
+
+    /// Reads the lettering of `label` off the slices of `mesh`: for every
+    /// digit, which of the seven places hold a bar, probed in front of the
+    /// face; other characters by the middle of their bars. Returns the
+    /// text it reads.
+    fn read_label(mesh: &Mesh, label: &Label) -> String {
+        let style = &label.style;
+        let width = text::width(&label.text, style);
+        let filled = |along: f64, up: f64| {
+            let p = label
+                .face
+                .point([along, up, style.raise / 2.0], width, style.height);
+            let shapes = slicer_core::slice::slice_mesh(mesh, &[p[2]]);
+            inside(&shapes[0], [p[0], p[1]])
+        };
+        let middle = |[l, b, r, t]: text::Bar| ((l + r) / 2.0, (b + t) / 2.0);
+        let mut read = String::new();
+        for (c, left) in text::layout(&label.text, style) {
+            // Only the places within the character's own width; a narrow
+            // one is followed by the next character.
+            let (bars, own) = text::glyph(c, style).unwrap();
+            let places = text::places(style);
+            let bits = (0..7).fold(0u8, |bits, k| {
+                let (along, up) = middle(places[k]);
+                let bar = along <= own && filled(left + along, up);
+                bits | (u8::from(bar) << k)
+            });
+            if let Some(digit) = text::DIGITS.iter().position(|&d| d == bits) {
+                read.push(char::from_digit(digit as u32, 10).unwrap());
+                continue;
+            }
+            // Not a digit of seven places: the narrow 1, the point, the
+            // signs.
+            if bars
+                .iter()
+                .all(|&bar| filled(left + middle(bar).0, middle(bar).1))
+            {
+                read.push(c);
+            } else {
+                read.push('?');
+            }
+        }
+        read
+    }
+
+    #[test]
+    fn every_value_is_lettered_on_its_block_or_band() {
+        let cases = [
+            Calibration::new(Kind::Temperature, 225.0, 190.0, 5.0).unwrap(),
+            Calibration::new(Kind::Temperature, 200.0, 207.5, 2.5).unwrap(),
+            Calibration::new(Kind::Retraction, 0.2, 2.0, 0.2).unwrap(),
+            Calibration::new(Kind::Flow, -10.0, 10.0, 5.0).unwrap(),
+            Calibration::new(Kind::PressureAdvance, 0.0, 0.045, 0.005).unwrap(),
+        ];
+        for calibration in cases {
+            let models = calibration.models();
+            let labels = calibration.labels();
+            assert_eq!(labels.len(), calibration.values().len());
+            for (i, (label, &value)) in labels.iter().zip(calibration.values()).enumerate() {
+                let expected = calibration.label_text(value);
+                assert_eq!(label.text, expected);
+                let read = read_label(&models[label.model].1, label);
+                assert_eq!(read, expected, "{:?} value {i}", calibration.kind());
+                let [_, _, z] = label.face.centre;
+                let half = label.style.height / 2.0;
+                match calibration.kind() {
+                    // On the front, in the block it belongs to, clear of
+                    // its groove.
+                    Kind::Temperature => {
+                        let block = i as f64 * TOWER_BLOCK[2];
+                        assert!(z - half >= block && z + half <= block + 9.0, "{z}");
+                        // The narrow style where the text needs it.
+                        let wide = text::width(&expected, &TOWER_TEXT) > 18.0;
+                        assert_eq!(label.style != TOWER_TEXT, wide, "{expected}");
+                    }
+                    // Alternately on the left and the right tab, with the
+                    // middle of the band inside the lettering.
+                    Kind::Retraction | Kind::PressureAdvance => {
+                        let pitch = match calibration.kind() {
+                            Kind::Retraction => RETRACTION_BAND[2],
+                            _ => PRESSURE_BAND[2],
+                        };
+                        let middle = (i as f64 + 0.5) * pitch;
+                        assert!((z - middle).abs() < half, "{z} {middle}");
+                        let side = (label.face.out, label.model);
+                        if calibration.kind() == Kind::Retraction {
+                            assert_eq!(label.model, i % 2);
+                        } else if i % 2 == 0 {
+                            assert_eq!(side, ([0.0, -1.0, 0.0], 0));
+                        } else {
+                            assert_eq!(side, ([1.0, 0.0, 0.0], 0));
+                        }
+                    }
+                    // On top of its own block.
+                    Kind::Flow => {
+                        assert_eq!(label.model, i);
+                        assert_eq!(z, FLOW_BLOCK[2]);
+                    }
+                }
+            }
+            // The lettering keeps within the height of a tower, so the
+            // bands stay where they are.
+            let top = |(_, mesh): &(String, Mesh)| mesh.bounds().unwrap().1[2];
+            let count = calibration.values().len() as f64;
+            let expected_top = match calibration.kind() {
+                Kind::Temperature => count * TOWER_BLOCK[2],
+                Kind::Retraction => count * RETRACTION_BAND[2],
+                Kind::Flow => FLOW_BLOCK[2] + FLOW_TEXT.raise,
+                Kind::PressureAdvance => count * PRESSURE_BAND[2],
+            };
+            assert!(models.iter().all(|m| top(m) == expected_top));
+            // Lettering and tabs only add closed shells.
+            for (_, mesh) in &models {
+                assert_eq!(mesh.open_edge_count(), 0);
+                let mut diagnostics = Diagnostics::new();
+                mesh.check(&mut diagnostics);
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn lettering_prints_on_the_tower() {
+        // The sliced front of the temperature tower: the outer wall bulges
+        // out where the lettering stands, by about the raise.
+        let calibration = Calibration::new(Kind::Temperature, 215.0, 210.0, 5.0).unwrap();
+        let settings = calibration.settings(&Settings::default());
+        let models = calibration.models();
+        let toolpaths = slicer_fdm::generate(&models[0].1, &settings).unwrap();
+        let front = |z: f64| {
+            let layer = (toolpaths.layers.iter())
+                .find(|l| (l.z - z).abs() < 0.11)
+                .unwrap();
+            (layer.paths.iter())
+                .filter(|p| p.kind == slicer_fdm::PathKind::OuterWall)
+                .flat_map(|p| p.points.iter().map(|q| q[1]))
+                .fold(f64::INFINITY, f64::min)
+        };
+        let (lo, _) = models[0].1.bounds().unwrap();
+        // At 6 mm the upright bars of "215" stand out at full depth; at
+        // 8.5 mm, above the lettering and below the groove, the face is
+        // plain.
+        let bulge = front(8.5) - front(6.0);
+        assert!((bulge - TOWER_TEXT.raise).abs() < 0.1, "{bulge}");
+        assert!(lo[1] == -TOWER_TEXT.raise);
     }
 
     #[test]
