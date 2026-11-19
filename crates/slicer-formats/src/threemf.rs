@@ -505,7 +505,9 @@ impl<'a> Package<'a> {
         Ok(())
     }
 
-    /// Appends the object `reference` points to, with all its components.
+    /// Appends the object `reference` points to, with all its components
+    /// except, at the top (`depth` 0), those of the objects in `leave_out`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn emit(
         &mut self,
         part: &str,
@@ -514,6 +516,7 @@ impl<'a> Package<'a> {
         depth: usize,
         skipped: &mut usize,
         mesh: &mut Mesh,
+        leave_out: &[u32],
     ) -> Result<(), ThreeMfError> {
         if depth > MAX_DEPTH {
             return Err(ThreeMfError::ComponentCycle);
@@ -579,7 +582,10 @@ impl<'a> Package<'a> {
                 object: component.object,
                 transform: component.transform,
             };
-            self.emit(&part, &component, &transform, depth + 1, skipped, mesh)?;
+            if depth == 0 && leave_out.contains(&component.object) {
+                continue;
+            }
+            self.emit(&part, &component, &transform, depth + 1, skipped, mesh, &[])?;
         }
         Ok(())
     }
@@ -591,6 +597,63 @@ pub(crate) const PLATE_PART: &str = "Metadata/model_settings.config";
 /// A build plate: its number and the identifiers of the objects on it.
 type Plate = (u32, Vec<u32>);
 
+/// What a project file knows about the objects of its model: the build
+/// plates, the extruder of every object that names one (from 0), and the
+/// parts of every object that are not printed (see [`HiddenPart`]).
+#[derive(Default)]
+struct ProjectLayout {
+    plates: Vec<Plate>,
+    extruders: HashMap<u32, u32>,
+    hidden: HashMap<u32, Vec<HiddenPart>>,
+}
+
+/// A part of an object in a project of Orca Slicer or Bambu Studio that is
+/// not printed: a modifier (`subtype="modifier_part"`), a negative volume
+/// or a support blocker or enforcer (any other subtype than
+/// `normal_part`). The part's `id` is the identifier of the object that the
+/// component of the object refers to, as the project files seen so far
+/// have it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HiddenPart {
+    id: u32,
+    modifier: bool,
+}
+
+/// Notes the part `element` of `object` in `hidden` if it is not printed
+/// (see [`HiddenPart`]).
+fn hide_part(
+    element: &BytesStart,
+    object: Option<u32>,
+    hidden: &mut HashMap<u32, Vec<HiddenPart>>,
+) {
+    let [id, subtype] = attributes(element, ["id", "subtype"]);
+    let id = id.and_then(|v| v.trim().parse::<u32>().ok());
+    let subtype = subtype.unwrap_or_default();
+    if let (Some(object), Some(id)) = (object, id)
+        && !subtype.is_empty()
+        && subtype != "normal_part"
+    {
+        hidden.entry(object).or_default().push(HiddenPart {
+            id,
+            modifier: subtype == "modifier_part",
+        });
+    }
+}
+
+/// A build item of a project file read on its own (see
+/// [`parse_3mf_plate_parts`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PlateObject {
+    /// Identifier of the object the item places.
+    pub id: u32,
+    /// The printed parts, placed as the file positions the item.
+    pub mesh: Mesh,
+    /// The modifier parts of the object, which are not printed, placed
+    /// like the item: the identifier of every part (as
+    /// `Metadata/model_settings.config` names it) with its mesh.
+    pub modifiers: Vec<(u32, Mesh)>,
+}
+
 /// Reads the build plates of a Bambu Studio project, with the number of each
 /// plate and the identifiers of the objects on it, and the extruder of each
 /// object that names one, counted from 0 (the file counts from 1). The
@@ -599,9 +662,10 @@ type Plate = (u32, Vec<u32>);
 // ponytail: only the extruder of a whole object is read. Parts of an object
 // can name their own extruder (multi-colour models); they print with the
 // object's.
-fn project(text: &str) -> (Vec<Plate>, HashMap<u32, u32>) {
+fn project(text: &str) -> ProjectLayout {
     let mut plates: Vec<Plate> = Vec::new();
     let mut extruders = HashMap::new();
+    let mut hidden: HashMap<u32, Vec<HiddenPart>> = HashMap::new();
     let (mut in_plate, mut in_instance) = (false, false);
     let (mut object, mut in_part) = (None, false);
     let mut reader = quick_xml::Reader::from_str(text);
@@ -613,6 +677,11 @@ fn project(text: &str) -> (Vec<Plate>, HashMap<u32, u32>) {
             }
             Ok(Event::Start(element)) if element.local_name().into_inner() == "part" => {
                 in_part = true;
+                hide_part(&element, object, &mut hidden);
+            }
+            // A part written as an empty element has no end.
+            Ok(Event::Empty(element)) if element.local_name().into_inner() == "part" => {
+                hide_part(&element, object, &mut hidden);
             }
             Ok(Event::Start(element) | Event::Empty(element)) => {
                 match element.local_name().into_inner() {
@@ -655,7 +724,11 @@ fn project(text: &str) -> (Vec<Plate>, HashMap<u32, u32>) {
             Ok(_) => {}
         }
     }
-    (plates, extruders)
+    ProjectLayout {
+        plates,
+        extruders,
+        hidden,
+    }
 }
 
 /// Parses a 3MF package into a single mesh in millimetres.
@@ -675,7 +748,7 @@ pub fn parse_3mf_plate(
     diagnostics: &mut Diagnostics,
 ) -> Result<Mesh, ThreeMfError> {
     let mut objects = read_plate(bytes, plate, false, diagnostics)?;
-    Ok(objects.pop().map(|(_, mesh)| mesh).unwrap_or_default())
+    Ok(objects.pop().map(|object| object.mesh).unwrap_or_default())
 }
 
 /// Like [`parse_3mf_plate`], but every build item becomes a mesh of its
@@ -686,20 +759,41 @@ pub fn parse_3mf_plate_objects(
     plate: Option<u32>,
     diagnostics: &mut Diagnostics,
 ) -> Result<Vec<(u32, Mesh)>, ThreeMfError> {
+    let objects = read_plate(bytes, plate, true, diagnostics)?;
+    Ok(objects.into_iter().map(|o| (o.id, o.mesh)).collect())
+}
+
+/// Like [`parse_3mf_plate_objects`], with the modifier parts of every
+/// object of a project of Orca Slicer or Bambu Studio as meshes of their
+/// own. Parts of a project that are not printed (modifiers, negative
+/// volumes, support blockers and enforcers; see the `subtype` of the
+/// `<part>` elements in `Metadata/model_settings.config`) are left out of
+/// the printed meshes by every reader; negative volumes and support
+/// blockers and enforcers are reported (`model.parts_ignored`).
+// ponytail: a negative volume is left out, not cut out of its object.
+pub fn parse_3mf_plate_parts(
+    bytes: &[u8],
+    plate: Option<u32>,
+    diagnostics: &mut Diagnostics,
+) -> Result<Vec<PlateObject>, ThreeMfError> {
     read_plate(bytes, plate, true, diagnostics)
 }
 
 /// Reads the build items of one plate: all into a single mesh (with the
-/// identifier 0), or with `split` each into its own.
+/// identifier 0), or with `split` each into its own with its modifiers.
 fn read_plate(
     bytes: &[u8],
     plate: Option<u32>,
     split: bool,
     diagnostics: &mut Diagnostics,
-) -> Result<Vec<(u32, Mesh)>, ThreeMfError> {
+) -> Result<Vec<PlateObject>, ThreeMfError> {
     let (mut package, root) = Package::open(bytes)?;
 
-    let (plates, extruders) = package
+    let ProjectLayout {
+        plates,
+        extruders,
+        hidden,
+    } = package
         .read(PLATE_PART)?
         .map(|text| project(&text))
         .unwrap_or_default();
@@ -738,6 +832,9 @@ fn read_plate(
     let mut objects = Vec::new();
     let mut total = 0;
     let mut skipped = 0;
+    // Negative volumes, support blockers and enforcers left out, and
+    // modifiers left out without being read.
+    let (mut ignored, mut unprinted) = (0, 0);
     let items = package.parts.get(&root).map_or(0, |part| part.build.len());
     for index in 0..items {
         let Some(item) = package.parts.get(&root).map(|part| &part.build[index]) else {
@@ -752,18 +849,79 @@ fn read_plate(
             transform: item.transform,
         };
         let first = mesh.triangles.len();
-        package.emit(&root, &item, &IDENTITY, 0, &mut skipped, &mut mesh)?;
+        let parts = hidden.get(&item.object).map_or(&[][..], Vec::as_slice);
+        let leave_out: Vec<u32> = parts.iter().map(|part| part.id).collect();
+        package.emit(
+            &root,
+            &item,
+            &IDENTITY,
+            0,
+            &mut skipped,
+            &mut mesh,
+            &leave_out,
+        )?;
         mesh.set_extruder(first, extruders.get(&item.object).copied().unwrap_or(0));
+        // The parts left out: modifiers as meshes of their own, placed
+        // like the item, the others only counted.
+        let mut modifiers = Vec::new();
+        if !parts.is_empty() {
+            let holder = item.path.as_deref().map_or(root.clone(), |path| {
+                path.trim_start_matches('/').to_string()
+            });
+            let components: Vec<Reference> = package
+                .parts
+                .get(&holder)
+                .and_then(|p| p.objects.get(&item.object))
+                .map(|object| object.components.clone())
+                .unwrap_or_default();
+            let placed = then(&item.transform, &IDENTITY);
+            for component in &components {
+                let Some(part) = parts.iter().find(|part| part.id == component.object) else {
+                    continue;
+                };
+                if !part.modifier {
+                    ignored += 1;
+                } else if split {
+                    let mut volume = Mesh::default();
+                    package.emit(
+                        &holder,
+                        component,
+                        &placed,
+                        1,
+                        &mut skipped,
+                        &mut volume,
+                        &[],
+                    )?;
+                    total += volume.triangles.len();
+                    if total > MAX_TRIANGLES {
+                        return Err(ThreeMfError::TooLarge);
+                    }
+                    if !volume.triangles.is_empty() {
+                        modifiers.push((part.id, volume));
+                    }
+                } else {
+                    unprinted += 1;
+                }
+            }
+        }
         if split && !mesh.triangles.is_empty() {
             total += mesh.triangles.len();
             if total > MAX_TRIANGLES {
                 return Err(ThreeMfError::TooLarge);
             }
-            objects.push((item.object, std::mem::take(&mut mesh)));
+            objects.push(PlateObject {
+                id: item.object,
+                mesh: std::mem::take(&mut mesh),
+                modifiers,
+            });
         }
     }
     if !split && !mesh.triangles.is_empty() {
-        objects.push((0, mesh));
+        objects.push(PlateObject {
+            id: 0,
+            mesh,
+            modifiers: Vec::new(),
+        });
     }
     if objects.is_empty() {
         return Err(ThreeMfError::NoTriangles);
@@ -787,6 +945,28 @@ fn read_plate(
                 ),
             )
             .with("extensions", extensions.join(" ")),
+        );
+    }
+    if ignored > 0 {
+        diagnostics.push(
+            Diagnostic::warning(
+                "model.parts_ignored",
+                format!(
+                    "{ignored} negative part(s), support blocker(s) or enforcer(s) of the project are not printed and have no effect"
+                ),
+            )
+            .with("parts", ignored),
+        );
+    }
+    if unprinted > 0 {
+        diagnostics.push(
+            Diagnostic::warning(
+                "model.modifiers_not_printed",
+                format!(
+                    "{unprinted} modifier part(s) of the project are not printed; their settings count only with the project's settings"
+                ),
+            )
+            .with("parts", unprinted),
         );
     }
     if skipped > 0 {
@@ -1084,6 +1264,52 @@ mod tests {
         assert_eq!(whole.triangles.len(), 8);
         assert!(parse_3mf_plate(&plain, Some(2), &mut diagnostics).is_err());
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn parts_of_a_project_that_are_not_printed_are_left_out() {
+        // Object 10 has a body (object 1), a modifier (object 2, shifted by
+        // 5 mm in X) and a negative part (object 3); the item moves it by
+        // 20 mm in Y. Object 11 is a plain tetrahedron.
+        let text = model(
+            "",
+            &format!(
+                "<resources><object id=\"1\">{TETRAHEDRON}</object><object id=\"2\">{TETRAHEDRON}</object><object id=\"3\">{TETRAHEDRON}</object><object id=\"10\"><components><component objectid=\"1\"/><component objectid=\"2\" transform=\"1 0 0 0 1 0 0 0 1 5 0 0\"/><component objectid=\"3\"/></components></object><object id=\"11\">{TETRAHEDRON}</object></resources><build><item objectid=\"10\" transform=\"1 0 0 0 1 0 0 0 1 0 20 0\"/><item objectid=\"11\"/></build>"
+            ),
+        );
+        let config = concat!(
+            "<config><object id=\"10\"><metadata key=\"name\" value=\"Body\"/>",
+            "<part id=\"1\" subtype=\"normal_part\"><metadata key=\"name\" value=\"a\"/></part>",
+            "<part id=\"2\" subtype=\"modifier_part\"><metadata key=\"sparse_infill_density\" value=\"100%\"/></part>",
+            "<part id=\"3\" subtype=\"negative_part\"/>",
+            "</object></config>"
+        );
+        let bytes = package(&[("3D/3dmodel.model", &text), (PLATE_PART, config)]);
+        // As one mesh: only the body and object 11 are printed.
+        let mut diagnostics = Diagnostics::new();
+        let mesh = parse_3mf(&bytes, &mut diagnostics).unwrap();
+        assert_eq!(mesh.triangles.len(), 8);
+        assert_eq!(
+            diagnostics.codes(),
+            ["model.parts_ignored", "model.modifiers_not_printed"]
+        );
+        // Split: the modifier comes with its object, placed like it.
+        let mut diagnostics = Diagnostics::new();
+        let objects = parse_3mf_plate_parts(&bytes, None, &mut diagnostics).unwrap();
+        assert_eq!(diagnostics.codes(), ["model.parts_ignored"]);
+        assert_eq!(objects.len(), 2);
+        assert_eq!(objects[0].id, 10);
+        assert_eq!(objects[0].mesh.triangles.len(), 4);
+        assert_eq!(objects[0].mesh.bounds().unwrap().0, [0.0, 20.0, 0.0]);
+        let [(part, volume)] = objects[0].modifiers.as_slice() else {
+            panic!("one modifier expected");
+        };
+        assert_eq!(*part, 2);
+        assert_eq!(volume.bounds().unwrap().0, [5.0, 20.0, 0.0]);
+        assert!(objects[1].modifiers.is_empty());
+        let plain = parse_3mf_plate_objects(&bytes, None, &mut Diagnostics::new()).unwrap();
+        assert_eq!(plain.len(), 2);
+        assert_eq!(plain[0].1, objects[0].mesh);
     }
 
     #[test]

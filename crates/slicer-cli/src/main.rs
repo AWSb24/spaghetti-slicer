@@ -66,6 +66,15 @@ enum Command {
         /// be given several times
         #[arg(long = "range", value_name = "[N:]Z1-Z2:FILE")]
         range: Vec<String>,
+        /// Modifier of object N (1 is the first model file): MESH (STL or
+        /// 3MF, in the coordinates of the model file, moved with the
+        /// object) is not printed; inside it the object prints with the
+        /// settings file SETTINGS (TOML) over its own. It may only set top
+        /// and bottom layers, sparse infill (density, pattern except
+        /// lightning, angle, connecting) and supports. May be given several
+        /// times; where modifiers overlap, the later one counts
+        #[arg(long = "modifier", value_name = "N:MESH:SETTINGS")]
+        modifier: Vec<String>,
         /// Use the print settings stored in project files of Orca Slicer or
         /// Bambu Studio (3MF): the project's settings below the -c files
         /// and --set overrides, the settings of single objects over the
@@ -256,6 +265,7 @@ fn main() -> ExitCode {
             set,
             object,
             range,
+            modifier,
             project_settings,
             plate,
             svg,
@@ -276,6 +286,7 @@ fn main() -> ExitCode {
                             overrides: &set,
                             objects: &object,
                             ranges: &range,
+                            modifiers: &modifier,
                             project: project_settings,
                         };
                         slice(&input, output, placement, &stored, plate, svg, send)
@@ -483,6 +494,7 @@ fn read_object_files(
             text,
             name: file_name(path),
             range: None,
+            modifier: None,
         });
     }
     Ok(own)
@@ -534,8 +546,85 @@ fn read_range_files(
                     text: text.clone(),
                     name: file_name(path),
                     range: Some((from, to)),
+                    modifier: None,
                 });
             }
+        }
+    }
+    Ok(())
+}
+
+/// Splits the `MESH:SETTINGS` of a `--modifier` argument after the mesh,
+/// whose name ends in `.stl` or `.3mf`, so that both paths may hold
+/// colons (drive letters).
+fn split_modifier(text: &str) -> Option<(&str, &str)> {
+    let lower = text.to_ascii_lowercase();
+    let end = [".stl:", ".3mf:"]
+        .iter()
+        .filter_map(|ending| lower.find(ending))
+        .min()?;
+    let (mesh, settings) = (&text[..end + 4], &text[end + 5..]);
+    (!settings.is_empty()).then_some((mesh, settings))
+}
+
+/// Adds the modifiers of the `--modifier N:MESH:SETTINGS` arguments to
+/// `own`, the settings files of every model file: to those of model N.
+/// Every settings file is checked by layering it over `settings`;
+/// warnings about reading the meshes go to `warnings`.
+fn read_modifier_files(
+    own: &mut [Vec<load::ObjectLayer>],
+    modifiers: &[String],
+    settings: &Settings,
+    warnings: &mut Diagnostics,
+) -> Result<(), Diagnostic> {
+    let count = own.len();
+    if modifiers.len() > slicer_fdm::MAX_MODIFIERS {
+        return Err(Diagnostic::error(
+            "settings.too_many_modifiers",
+            format!(
+                "{} modifiers; at most {} are allowed",
+                modifiers.len(),
+                slicer_fdm::MAX_MODIFIERS
+            ),
+        )
+        .with("modifiers", modifiers.len())
+        .with("max", slicer_fdm::MAX_MODIFIERS));
+    }
+    for item in modifiers {
+        let invalid = || {
+            Diagnostic::error(
+                "cli.invalid_modifier",
+                format!(
+                    "--modifier expects N:MESH:SETTINGS with N from 1 to {count}, MESH an .stl or .3mf file and SETTINGS a TOML file, got '{item}'"
+                ),
+            )
+            .with("argument", item)
+        };
+        let (number, rest) = item.split_once(':').ok_or_else(invalid)?;
+        let model = number
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .filter(|&index| index < count)
+            .ok_or_else(invalid)?;
+        let (mesh_path, settings_path) = split_modifier(rest).ok_or_else(invalid)?;
+        let (mesh_path, settings_path) = (Path::new(mesh_path), Path::new(settings_path));
+        let bytes = fs::read(mesh_path).map_err(|e| io_error("io.read", mesh_path, &e))?;
+        let mesh =
+            slicer_formats::parse_model(&bytes, None, warnings).map_err(in_file(mesh_path))?;
+        let text = fs::read_to_string(settings_path)
+            .map_err(|e| io_error("io.read", settings_path, &e))?;
+        let mut modifier = slicer_fdm::Modifier::default();
+        slicer_fdm::apply_modifier_toml(&mut modifier, settings, &text)
+            .map_err(in_file(settings_path))?;
+        if let Some(layers) = own.get_mut(model) {
+            layers.push(load::ObjectLayer {
+                text,
+                name: file_name(settings_path),
+                range: None,
+                modifier: Some(mesh),
+            });
         }
     }
     Ok(())
@@ -564,13 +653,15 @@ fn read_settings(
 
 /// Where the settings of `slice` come from, in the order they are layered:
 /// the project files (if `project`), the files in `config`, the
-/// `overrides`, for single objects the `objects` arguments and for height
-/// ranges of objects the `ranges` arguments.
+/// `overrides`, for single objects the `objects` arguments, for height
+/// ranges of objects the `ranges` arguments and for modifiers the
+/// `modifiers` arguments.
 struct SettingsArgs<'a> {
     config: &'a [PathBuf],
     overrides: &'a [String],
     objects: &'a [String],
     ranges: &'a [String],
+    modifiers: &'a [String],
     project: bool,
 }
 
@@ -603,6 +694,7 @@ fn slice(
     let settings = read_settings(base, args.config, args.overrides)?;
     let mut object_files = read_object_files(inputs.len(), args.objects, &settings)?;
     read_range_files(&mut object_files, args.ranges, &settings)?;
+    read_modifier_files(&mut object_files, args.modifiers, &settings, &mut warnings)?;
     if files.is_empty() {
         for input in inputs {
             files.push(fs::read(input).map_err(|e| io_error("io.read", input, &e))?);
@@ -631,6 +723,7 @@ fn slice(
     let own = slicer_fdm::OwnSettings {
         objects: &objects.settings,
         ranges: &objects.ranges,
+        modifiers: &objects.modifiers,
     };
     let toolpaths = slicer_fdm::generate_plate_with_own_settings(
         &objects.meshes,

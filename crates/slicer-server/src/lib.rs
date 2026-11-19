@@ -534,6 +534,11 @@ pub fn openapi() -> Value {
         "Settings in TOML form for the layers whose middle lies from Z1 up to (not including) Z2 millimetres above the bed: range_settings_<z1>-<z2> for every model, range_settings_<n>_<z1>-<z2> for model N only (e.g. range_settings_10-20, range_settings_2_0.5-3.5), layered over the settings of the object; may only set {} (otherwise 400 settings.not_per_range); may be repeated, later ones override earlier ones for the same heights",
         slicer_fdm::RANGE_SETTINGS.join(", ")
     );
+    let modifier = "Modifier of model N (STL or 3MF), in the coordinates of the model file and moved with it: it is not printed, and inside it the object prints with the settings of the matching modifier_settings_<n> field (the k-th modifier_<n> goes with the k-th modifier_settings_<n>); may be repeated, where modifiers overlap the later one counts";
+    let modifier_settings = format!(
+        "Settings in TOML form inside the k-th modifier_<n> of model N, layered over the settings of the object; may only set {}, not lightning infill (otherwise 400 settings.not_per_modifier)",
+        slicer_fdm::MODIFIER_SETTINGS.join(", ")
+    );
     json!({
         "openapi": "3.1.0",
         "info": {
@@ -563,11 +568,13 @@ pub fn openapi() -> Value {
                         "settings": { "type": "string", "description": "Settings in TOML form; may be repeated, later ones override earlier ones" },
                         "set": { "type": "string", "description": "One override KEY=VALUE; may be repeated" },
                         "plate": { "type": "integer", "description": "Build plate of a project file with several plates" },
-                        "project_settings": { "type": "boolean", "default": false, "description": "Use the print settings stored in project files of Orca Slicer or Bambu Studio (3MF): the project's settings below the settings and set fields, the settings of single objects over the plate's and below object_settings_<n>, the settings of height ranges of objects below range_settings_...; a project whose objects have settings or height ranges of their own is sliced as those objects. Settings without a counterpart are reported as warnings (project.settings_skipped, project.object_settings_skipped, project.part_settings_skipped, project.range_settings_skipped, project.range_invalid, project.no_settings)" }
+                        "project_settings": { "type": "boolean", "default": false, "description": "Use the print settings stored in project files of Orca Slicer or Bambu Studio (3MF): the project's settings below the settings and set fields, the settings of single objects over the plate's and below object_settings_<n>, the settings of height ranges of objects below range_settings_..., the modifiers of objects (modifier parts with their settings) before the modifier_<n> fields; a project whose objects have settings, height ranges or modifiers of their own is sliced as those objects. Settings without a counterpart are reported as warnings (project.settings_skipped, project.object_settings_skipped, project.part_settings_skipped, project.range_settings_skipped, project.range_invalid, project.modifier_settings_skipped, project.no_settings). Modifier parts, negative parts and support blockers or enforcers of a project are never printed" }
                     },
                     "patternProperties": {
                         "^object_settings_[1-9][0-9]*$": { "type": "string", "description": object_settings },
-                        "^range_settings_([1-9][0-9]*_)?[0-9.]+-[0-9.]+$": { "type": "string", "description": range_settings }
+                        "^range_settings_([1-9][0-9]*_)?[0-9.]+-[0-9.]+$": { "type": "string", "description": range_settings },
+                        "^modifier_[1-9][0-9]*$": { "type": "string", "format": "binary", "description": modifier },
+                        "^modifier_settings_[1-9][0-9]*$": { "type": "string", "description": modifier_settings }
                     }
                 } } } },
                 "responses": {
@@ -876,6 +883,7 @@ fn slice(
     let own = slicer_fdm::OwnSettings {
         objects: &plate.objects.settings,
         ranges: &plate.objects.ranges,
+        modifiers: &plate.objects.modifiers,
     };
     let toolpaths = slicer_fdm::generate_plate_with_own_settings(
         &plate.objects.meshes,
@@ -937,6 +945,8 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
     let mut overrides = Vec::new();
     let mut object_texts = Vec::new();
     let mut range_texts = Vec::new();
+    let mut modifier_meshes: Vec<(String, Option<usize>, axum::body::Bytes)> = Vec::new();
+    let mut modifier_texts: Vec<(String, Option<usize>, String)> = Vec::new();
     let mut options = load::Options::default();
     loop {
         let field = match multipart.next_field().await {
@@ -951,6 +961,11 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
         };
         let object = name.strip_prefix("object_settings_");
         let range = name.strip_prefix("range_settings_").map(str::to_string);
+        let modifier_text = name.strip_prefix("modifier_settings_");
+        let modifier_mesh = name
+            .strip_prefix("modifier_")
+            .filter(|_| modifier_text.is_none());
+        let number = |n: Option<&str>| n.and_then(|n| n.parse::<usize>().ok());
         match name.as_str() {
             "model" => models.push(bytes),
             "settings" | "set" | "plate" | "project_settings" => {
@@ -988,6 +1003,15 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
                 };
                 let number = object.and_then(|n| n.parse::<usize>().ok());
                 object_texts.push((name, number, text));
+            }
+            _ if modifier_text.is_some() => {
+                let Ok(text) = String::from_utf8(bytes.to_vec()) else {
+                    return invalid(format!("field '{name}' is not valid UTF-8"));
+                };
+                modifier_texts.push((name.clone(), number(modifier_text), text));
+            }
+            _ if modifier_mesh.is_some() => {
+                modifier_meshes.push((name.clone(), number(modifier_mesh), bytes));
             }
             _ if range.is_some() => {
                 let Ok(text) = String::from_utf8(bytes.to_vec()) else {
@@ -1037,6 +1061,7 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
             text,
             name,
             range: None,
+            modifier: None,
         });
     }
     // Height ranges of every model (range_settings_<z1>-<z2>) or of one
@@ -1079,8 +1104,70 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
                     text: text.clone(),
                     name: name.clone(),
                     range: Some((from, to)),
+                    modifier: None,
                 });
             }
+        }
+    }
+    // Modifiers of a model: the k-th modifier_<n> field (the mesh) goes
+    // with the k-th modifier_settings_<n> field (its settings).
+    if modifier_meshes.len() > slicer_fdm::MAX_MODIFIERS {
+        return invalid(format!(
+            "{} modifier fields; at most {} are allowed",
+            modifier_meshes.len(),
+            slicer_fdm::MAX_MODIFIERS
+        ));
+    }
+    let named = modifier_meshes
+        .iter()
+        .map(|(name, n, _)| (name, *n))
+        .chain(modifier_texts.iter().map(|(name, n, _)| (name, *n)));
+    for (name, number) in named {
+        if number.is_none_or(|n| n == 0 || n > models.len()) {
+            return invalid(format!(
+                "field '{name}' names no object; modifier_1 and modifier_settings_1 to modifier_{0} and modifier_settings_{0} name the models in the order they are sent",
+                models.len()
+            ));
+        }
+    }
+    for (index, layers) in objects.iter_mut().enumerate() {
+        let number = index + 1;
+        let meshes: Vec<_> = modifier_meshes
+            .iter()
+            .filter(|(_, n, _)| *n == Some(number))
+            .collect();
+        let texts: Vec<_> = modifier_texts
+            .iter()
+            .filter(|(_, n, _)| *n == Some(number))
+            .collect();
+        if meshes.len() != texts.len() {
+            return invalid(format!(
+                "{} modifier_{number} field(s) but {} modifier_settings_{number} field(s); every modifier needs both",
+                meshes.len(),
+                texts.len()
+            ));
+        }
+        for ((mesh_field, _, bytes), (text_field, _, text)) in meshes.into_iter().zip(texts) {
+            // ponytail: warnings about reading the mesh of a modifier are not
+            // passed on to the job. The desktop app has no modifiers yet.
+            let mesh = match slicer_formats::parse_model(bytes, None, &mut Diagnostics::new()) {
+                Ok(mesh) => mesh,
+                Err(e) => {
+                    let name = load::Name::new(mesh_field.clone(), "field", mesh_field);
+                    return error_response(StatusCode::BAD_REQUEST, &name.apply(e));
+                }
+            };
+            let name = load::Name::new(text_field.clone(), "field", text_field);
+            let mut modifier = slicer_fdm::Modifier::default();
+            if let Err(e) = slicer_fdm::apply_modifier_toml(&mut modifier, &settings, text) {
+                return error_response(StatusCode::BAD_REQUEST, &name.apply(e));
+            }
+            layers.push(load::ObjectLayer {
+                text: text.clone(),
+                name,
+                range: None,
+                modifier: Some(mesh),
+            });
         }
     }
 

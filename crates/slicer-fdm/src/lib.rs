@@ -14,8 +14,9 @@ mod tree;
 
 pub use arrange::{Spot, arrange_outlines, arranges_outlines};
 pub use objects::{
-    HeightRange, OBJECT_SETTINGS, RANGE_SETTINGS, apply_object_orca, apply_object_toml,
-    apply_range_orca, apply_range_toml, object_settings, range_settings,
+    HeightRange, MAX_MODIFIERS, MODIFIER_SETTINGS, Modifier, OBJECT_SETTINGS, RANGE_SETTINGS,
+    apply_modifier_orca, apply_modifier_toml, apply_object_orca, apply_object_toml,
+    apply_range_orca, apply_range_toml, modifier_settings, object_settings, range_settings,
 };
 pub use plate::{ARRANGE_GAP, Placement, arrange, arrange_objects, footprint};
 pub mod progress;
@@ -519,7 +520,7 @@ pub fn generate_plate_with_object_settings(
 ) -> Result<Toolpaths, FdmError> {
     let own = OwnSettings {
         objects: own,
-        ranges: &[],
+        ..OwnSettings::default()
     };
     generate_plate_with_own_settings(
         objects,
@@ -543,6 +544,9 @@ pub struct OwnSettings<'a> {
     /// The height ranges of object `i` (see [`HeightRange`]), over its
     /// settings; objects beyond the end of the slice have none.
     pub ranges: &'a [Vec<HeightRange>],
+    /// The modifiers of object `i` (see [`Modifier`]), over its settings
+    /// and height ranges; objects beyond the end of the slice have none.
+    pub modifiers: &'a [Vec<Modifier>],
 }
 
 /// Like [`generate_plate_with_object_settings`] with `own.objects`, and the
@@ -555,6 +559,12 @@ pub struct OwnSettings<'a> {
 /// without ranges, or with ranges that change nothing, print exactly as
 /// with [`generate_plate_with_object_settings`]. Vase mode leaves the
 /// ranges out like the settings of objects.
+///
+/// Inside the modifiers `own.modifiers[i]` of object `i`, which are not
+/// printed, its layers print with the modifier's settings over those of
+/// the object and its ranges (see [`MODIFIER_SETTINGS`] for which settings
+/// and how the region of the object is split). Objects without modifiers,
+/// or with modifiers that change nothing, print exactly as without them.
 pub fn generate_plate_with_own_settings(
     objects: &[Mesh],
     own: OwnSettings,
@@ -579,7 +589,7 @@ pub fn generate_plate_with_own_settings(
     // Vase mode prints one wall and nothing inside or on top, the same for
     // every object.
     let vase;
-    let (settings, own, ranges) = if settings.spiral_vase {
+    let (settings, own, ranges, modifier_list) = if settings.spiral_vase {
         vase = Settings {
             wall_loops: 1,
             top_layers: 0,
@@ -587,13 +597,15 @@ pub fn generate_plate_with_own_settings(
             supports: false,
             ..settings.clone()
         };
-        (&vase, &[][..], &[][..])
+        (&vase, &[][..], &[][..], &[][..])
     } else {
-        (settings, own.objects, own.ranges)
+        (settings, own.objects, own.ranges, own.modifiers)
     };
     // Objects with equal settings and height ranges form a group. With a
     // single group its settings are those of the whole plate.
     let (groups, membership) = objects::groups(objects.len(), own, ranges, settings);
+    // The modifiers that change anything, cut once the layers are known.
+    let mut modifiers = objects::modifier_groups(modifier_list, &groups, &membership);
     // Speeds of objects only reach the writer, through this table.
     let object_settings = objects::speed_table(objects.len(), own, settings);
     let plate_settings = settings;
@@ -603,7 +615,7 @@ pub fn generate_plate_with_own_settings(
         _ => &several,
     };
     let settings = &single.settings;
-    let any_supports = groups.iter().any(|g| g.any(|s| s.supports));
+    let any_supports = objects::any_setting(&groups, &modifiers, |s| s.supports);
     // Turning, removing degenerate triangles, closing holes, checking.
     progress.start(Step::Preparing, 4);
     plate::check(objects, placement, settings, diagnostics)?;
@@ -769,26 +781,31 @@ pub fn generate_plate_with_own_settings(
     } else {
         Vec::new()
     };
-    // Where only some groups (or some of their height ranges) have
-    // supports, those only go under them, and only the others are warned
-    // about. A single group takes every layer whole.
-    let varied = groups.len() > 1 || groups.iter().any(|g| !g.ranges.is_empty());
-    let mixed = varied && groups.iter().any(|g| g.any(|s| !s.supports)) && any_supports;
+    if !modifiers.is_empty() {
+        objects::modifier_areas(
+            &mut modifiers,
+            objects,
+            modifier_list,
+            placement,
+            shift,
+            &cut_heights,
+        );
+    }
+    // Where only some groups (or some of their height ranges or modifiers)
+    // have supports, those only go under them, and only the others are
+    // warned about. A single group takes every layer whole.
+    let varied =
+        groups.len() > 1 || groups.iter().any(|g| !g.ranges.is_empty()) || !modifiers.is_empty();
+    let mixed =
+        varied && objects::any_setting(&groups, &modifiers, |s| !s.supports) && any_supports;
     let (supported, unsupported) = if mixed {
         let regions = if object_regions.is_empty() {
             std::slice::from_ref(&slices)
         } else {
             object_regions.as_slice()
         };
-        (
-            Some(objects::with_supports(regions, &groups, &cut_heights, true)),
-            Some(objects::with_supports(
-                regions,
-                &groups,
-                &cut_heights,
-                false,
-            )),
-        )
+        let with = |on| objects::with_supports(regions, &groups, &modifiers, &cut_heights, on);
+        (Some(with(true)), Some(with(false)))
     } else {
         (None, None)
     };
@@ -869,7 +886,7 @@ pub fn generate_plate_with_own_settings(
     } else {
         regions
             .iter()
-            .map(|(_, group, region)| lightning_infill(region, &heights, &cut_heights, group))
+            .map(|(_, _, group, region)| lightning_infill(region, &heights, &cut_heights, group))
             .collect()
     };
     let lightning_lines = |region: usize, index: usize| -> &[[Point; 2]] {
@@ -891,19 +908,36 @@ pub fn generate_plate_with_own_settings(
         if regions.is_empty() {
             let lines = lightning_lines(0, index);
             let layer_settings = single.at(z);
-            let (work, thin) =
-                region_work(&slices, &slices, &heights, index, lines, layer_settings);
+            let inside = objects::modifiers_at(&modifiers, 0, index, z, layer_settings);
+            let (work, thin) = region_work(
+                &slices,
+                &slices,
+                &heights,
+                index,
+                lines,
+                layer_settings,
+                &inside,
+            );
             groups[0].1.extend(work);
             return (groups, thin);
         }
         let mut thin = false;
-        for (r, (e, group, region)) in regions.iter().enumerate() {
+        for (r, (e, number, group, region)) in regions.iter().enumerate() {
             if region[index].is_empty() {
                 continue;
             }
             let lines = lightning_lines(r, index);
-            let (work, region_thin) =
-                region_work(region, &slices, &heights, index, lines, group.at(z));
+            let layer_settings = group.at(z);
+            let inside = objects::modifiers_at(&modifiers, *number, index, z, layer_settings);
+            let (work, region_thin) = region_work(
+                region,
+                &slices,
+                &heights,
+                index,
+                lines,
+                layer_settings,
+                &inside,
+            );
             thin |= region_thin;
             match groups.iter_mut().find(|(g, _)| g == e) {
                 Some(group) => group.1.extend(work),
@@ -1921,8 +1955,10 @@ fn interface_work(area: &Shapes, settings: &Settings, work: &mut Vec<Work>) {
 /// they are printed. `slices` is the region on every layer, `model` the
 /// whole model, which carries the region where it bridges. `lightning` are
 /// the lines of lightning infill planned for the layer (see
-/// [`lightning_infill`]). The flag tells whether a noticeable part of the
-/// layer is too narrow to be covered by a wall.
+/// [`lightning_infill`]). `modifiers` are the parts of the region inside
+/// modifiers on this layer, with their settings (see
+/// [`objects::modifiers_at`]). The flag tells whether a noticeable part of
+/// the layer is too narrow to be covered by a wall.
 fn region_work(
     slices: &[Shapes],
     model: &[Shapes],
@@ -1930,6 +1966,7 @@ fn region_work(
     index: usize,
     lightning: &[[Point; 2]],
     settings: &Settings,
+    modifiers: &[(Shapes, Settings)],
 ) -> (Vec<Work>, bool) {
     let slice = &*printed_slice(slices, index, settings);
     let width = settings.line_width;
@@ -2063,6 +2100,14 @@ fn region_work(
         return (work, thin);
     }
     let (solid, sparse) = split_solid_sparse(slices, heights, index, &fill_area, settings);
+    let (solid, sparse) = if modifiers.is_empty() {
+        (solid, sparse)
+    } else {
+        let split = (solid, sparse);
+        modifier_shells(
+            slices, heights, index, &fill_area, split, settings, modifiers,
+        )
+    };
 
     let turn = if index.is_multiple_of(2) { 0.0 } else { 90.0 };
     let direction = HatchDirection::degrees(settings.infill_angle + turn);
@@ -2094,84 +2139,33 @@ fn region_work(
     work.push(Work::Lines(solid_lines, PathKind::SolidInfill, 2.0 * width));
     work.extend(surface);
 
-    let density = settings.infill_density / 100.0;
-    if density > 0.0 {
-        if density >= 1.0 {
-            let lines = polygon::hatch(&sparse, width, direction, min_length);
-            work.push(Work::Lines(lines, PathKind::SolidInfill, 2.0 * width));
-        } else {
-            match settings.infill_pattern {
-                InfillPattern::Rectilinear => {
-                    // Line ends up to two spacings apart along the boundary
-                    // are connected; the other patterns would cross lines.
-                    let spacing = width / density;
-                    let lines = polygon::hatch(&sparse, spacing, direction, min_length);
-                    if settings.infill_connect {
-                        let lines = infill::connect(
-                            &sparse,
-                            &lines,
-                            2.0 * spacing,
-                            &fill_area,
-                            width / 4.0,
-                        );
-                        work.push(Work::Polylines(lines, PathKind::SparseInfill, 0.0));
-                    } else {
-                        work.push(Work::Lines(lines, PathKind::SparseInfill, 0.0));
-                    }
-                }
-                InfillPattern::Grid => {
-                    // Two directions share the material, so each is half as dense.
-                    for d in [direction, other] {
-                        let lines = polygon::hatch(&sparse, 2.0 * width / density, d, min_length);
-                        work.push(Work::Lines(lines, PathKind::SparseInfill, 0.0));
-                    }
-                }
-                InfillPattern::Triangles => {
-                    let spacing = 3.0 * width / density;
-                    let angle = settings.infill_angle;
-                    for lines in infill::triangles(&sparse, spacing, angle, min_length) {
-                        work.push(Work::Lines(lines, PathKind::SparseInfill, 0.0));
-                    }
-                }
-                InfillPattern::Gyroid => {
-                    // Top of the layer, as in `generate_cancellable`.
-                    let z = settings.first_layer_height + index as f64 * settings.layer_height;
-                    let angle = settings.infill_angle;
-                    let lines = infill::gyroid(&sparse, width / density, z, angle, min_length);
-                    work.push(Work::Polylines(lines, PathKind::SparseInfill, 0.0));
-                }
-                InfillPattern::Honeycomb => {
-                    let angle = settings.infill_angle;
-                    let lines = infill::honeycomb(&sparse, width / density, angle, min_length);
-                    work.push(Work::Polylines(lines, PathKind::SparseInfill, 0.0));
-                }
-                InfillPattern::Cubic => {
-                    // Three directions share the material, like triangles.
-                    let z = settings.first_layer_height + index as f64 * settings.layer_height;
-                    let spacing = 3.0 * width / density;
-                    let angle = settings.infill_angle;
-                    for lines in infill::cubic(&sparse, spacing, z, angle, min_length) {
-                        work.push(Work::Lines(lines, PathKind::SparseInfill, 0.0));
-                    }
-                }
-                InfillPattern::Concentric => {
-                    let (loops, _) = infill::concentric(&sparse, width / density, width, false);
-                    work.push(Work::Loops(
-                        loops,
-                        PathKind::SparseInfill,
-                        width,
-                        SeamPosition::Nearest,
-                    ));
-                }
-                InfillPattern::Lightning => {
-                    // Planned on the sparse area before bridges were taken
-                    // out of it; what reaches into a bridge goes.
-                    let lines: Vec<Vec<Point>> = lightning.iter().map(|l| l.to_vec()).collect();
-                    let lines = polygon::clip_polylines(&sparse, &lines);
-                    work.push(Work::Polylines(lines, PathKind::SparseInfill, 0.0));
-                }
-            }
+    // The sparse infill, inside modifiers with their settings.
+    let mut rest = std::borrow::Cow::Borrowed(&sparse);
+    let mut parts = Vec::new();
+    for (area, inside) in modifiers {
+        let same = (
+            inside.infill_density,
+            inside.infill_pattern,
+            inside.infill_angle,
+            inside.infill_connect,
+        ) == (
+            settings.infill_density,
+            settings.infill_pattern,
+            settings.infill_angle,
+            settings.infill_connect,
+        );
+        if same {
+            continue;
         }
+        let part = polygon::intersection(&rest, area);
+        if !part.is_empty() {
+            rest = std::borrow::Cow::Owned(polygon::difference(&rest, area));
+            parts.push((part, inside));
+        }
+    }
+    sparse_infill(&mut work, &rest, &fill_area, index, lightning, settings);
+    for (part, inside) in &parts {
+        sparse_infill(&mut work, part, &fill_area, index, lightning, inside);
     }
     if settings.ironing {
         // The part of the fill area that nothing covers: the top surface.
@@ -2200,6 +2194,99 @@ fn region_work(
         }
     }
     (work, thin)
+}
+
+/// Appends the sparse infill of `sparse`, part of the fill area
+/// `fill_area` of layer `index`, with the density, pattern and angle of
+/// `settings`; `lightning` are the lines of lightning infill planned for
+/// the layer.
+fn sparse_infill(
+    work: &mut Vec<Work>,
+    sparse: &Shapes,
+    fill_area: &Shapes,
+    index: usize,
+    lightning: &[[Point; 2]],
+    settings: &Settings,
+) {
+    let width = settings.line_width;
+    let turn = if index.is_multiple_of(2) { 0.0 } else { 90.0 };
+    let direction = HatchDirection::degrees(settings.infill_angle + turn);
+    let other = HatchDirection::degrees(settings.infill_angle + turn + 90.0);
+    let min_length = 0.5 * width;
+    let density = settings.infill_density / 100.0;
+    if density > 0.0 {
+        if density >= 1.0 {
+            let lines = polygon::hatch(sparse, width, direction, min_length);
+            work.push(Work::Lines(lines, PathKind::SolidInfill, 2.0 * width));
+        } else {
+            match settings.infill_pattern {
+                InfillPattern::Rectilinear => {
+                    // Line ends up to two spacings apart along the boundary
+                    // are connected; the other patterns would cross lines.
+                    let spacing = width / density;
+                    let lines = polygon::hatch(sparse, spacing, direction, min_length);
+                    if settings.infill_connect {
+                        let lines =
+                            infill::connect(sparse, &lines, 2.0 * spacing, fill_area, width / 4.0);
+                        work.push(Work::Polylines(lines, PathKind::SparseInfill, 0.0));
+                    } else {
+                        work.push(Work::Lines(lines, PathKind::SparseInfill, 0.0));
+                    }
+                }
+                InfillPattern::Grid => {
+                    // Two directions share the material, so each is half as dense.
+                    for d in [direction, other] {
+                        let lines = polygon::hatch(sparse, 2.0 * width / density, d, min_length);
+                        work.push(Work::Lines(lines, PathKind::SparseInfill, 0.0));
+                    }
+                }
+                InfillPattern::Triangles => {
+                    let spacing = 3.0 * width / density;
+                    let angle = settings.infill_angle;
+                    for lines in infill::triangles(sparse, spacing, angle, min_length) {
+                        work.push(Work::Lines(lines, PathKind::SparseInfill, 0.0));
+                    }
+                }
+                InfillPattern::Gyroid => {
+                    // Top of the layer, as in `generate_cancellable`.
+                    let z = settings.first_layer_height + index as f64 * settings.layer_height;
+                    let angle = settings.infill_angle;
+                    let lines = infill::gyroid(sparse, width / density, z, angle, min_length);
+                    work.push(Work::Polylines(lines, PathKind::SparseInfill, 0.0));
+                }
+                InfillPattern::Honeycomb => {
+                    let angle = settings.infill_angle;
+                    let lines = infill::honeycomb(sparse, width / density, angle, min_length);
+                    work.push(Work::Polylines(lines, PathKind::SparseInfill, 0.0));
+                }
+                InfillPattern::Cubic => {
+                    // Three directions share the material, like triangles.
+                    let z = settings.first_layer_height + index as f64 * settings.layer_height;
+                    let spacing = 3.0 * width / density;
+                    let angle = settings.infill_angle;
+                    for lines in infill::cubic(sparse, spacing, z, angle, min_length) {
+                        work.push(Work::Lines(lines, PathKind::SparseInfill, 0.0));
+                    }
+                }
+                InfillPattern::Concentric => {
+                    let (loops, _) = infill::concentric(sparse, width / density, width, false);
+                    work.push(Work::Loops(
+                        loops,
+                        PathKind::SparseInfill,
+                        width,
+                        SeamPosition::Nearest,
+                    ));
+                }
+                InfillPattern::Lightning => {
+                    // Planned on the sparse area before bridges were taken
+                    // out of it; what reaches into a bridge goes.
+                    let lines: Vec<Vec<Point>> = lightning.iter().map(|l| l.to_vec()).collect();
+                    let lines = polygon::clip_polylines(sparse, &lines);
+                    work.push(Work::Polylines(lines, PathKind::SparseInfill, 0.0));
+                }
+            }
+        }
+    }
 }
 
 /// `contour` with a point every `fuzzy_skin_point_distance` along it, each
@@ -2348,6 +2435,41 @@ fn split_solid_sparse(
     );
     if solid.is_empty() {
         return (solid, fill_area.clone());
+    }
+    let sparse = polygon::difference(fill_area, &solid);
+    (solid, sparse)
+}
+
+/// The solid and sparse parts of the fill area of a layer, `split` as
+/// [`split_solid_sparse`] found them with `settings`, with the shells
+/// inside `modifiers` (parts of the layer with their settings) as thick as
+/// their `top_layers` and `bottom_layers` ask for. The surfaces are those
+/// of the region in `slices`, so a modifier starts or ends none.
+fn modifier_shells(
+    slices: &[Shapes],
+    heights: &[f64],
+    index: usize,
+    fill_area: &Shapes,
+    split: (Shapes, Shapes),
+    settings: &Settings,
+    modifiers: &[(Shapes, Settings)],
+) -> (Shapes, Shapes) {
+    let (mut solid, sparse) = split;
+    let mut changed = false;
+    for (area, inside) in modifiers {
+        let shells = |s: &Settings| (s.top_layers, s.bottom_layers);
+        if shells(inside) == shells(settings) || polygon::intersection(fill_area, area).is_empty() {
+            continue;
+        }
+        let (own, _) = split_solid_sparse(slices, heights, index, fill_area, inside);
+        solid = polygon::union(
+            &polygon::difference(&solid, area),
+            &polygon::intersection(&own, area),
+        );
+        changed = true;
+    }
+    if !changed {
+        return (solid, sparse);
     }
     let sparse = polygon::difference(fill_area, &solid);
     (solid, sparse)

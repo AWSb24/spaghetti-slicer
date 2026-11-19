@@ -179,13 +179,27 @@ pub fn arrange(sizes: &[[f64; 2]], settings: &Settings, gap: f64) -> Vec<Point> 
 /// [`crate::arrange_outlines`] puts their outlines, turned about Z as it
 /// says.
 pub fn arrange_objects(objects: &mut [Mesh], settings: &Settings, gap: f64) {
-    if crate::arranges_outlines(settings) {
-        let outlines: Vec<Contour> = objects.iter().map(footprint).collect();
-        let spots = crate::arrange_outlines(&outlines, settings, gap);
-        for (mesh, spot) in objects.iter_mut().zip(spots) {
+    let spots = arrangement(objects, settings, gap);
+    for (mesh, spot) in objects.iter_mut().zip(spots) {
+        if let Some(spot) = spot {
             spot.apply(mesh);
         }
-        return;
+    }
+}
+
+/// Where [`arrange_objects`] moves every one of `objects`; `None` for an
+/// object without vertices, which stays where it is.
+pub(crate) fn arrangement(
+    objects: &[Mesh],
+    settings: &Settings,
+    gap: f64,
+) -> Vec<Option<crate::Spot>> {
+    if crate::arranges_outlines(settings) {
+        let outlines: Vec<Contour> = objects.iter().map(footprint).collect();
+        return crate::arrange_outlines(&outlines, settings, gap)
+            .into_iter()
+            .map(Some)
+            .collect();
     }
     let bounds: Vec<_> = objects.iter().map(Mesh::bounds).collect();
     let sizes: Vec<[f64; 2]> = bounds
@@ -193,11 +207,13 @@ pub fn arrange_objects(objects: &mut [Mesh], settings: &Settings, gap: f64) {
         .map(|b| b.map_or([0.0, 0.0], |(lo, hi)| [hi[0] - lo[0], hi[1] - lo[1]]))
         .collect();
     let corners = arrange(&sizes, settings, gap);
-    for ((mesh, bounds), corner) in objects.iter_mut().zip(&bounds).zip(corners) {
-        if let Some((lo, _)) = bounds {
-            mesh.translate([corner[0] - lo[0], corner[1] - lo[1], 0.0]);
-        }
-    }
+    bounds
+        .iter()
+        .zip(corners)
+        .map(|(bounds, corner)| {
+            bounds.map(|(lo, _)| crate::Spot::shifted([corner[0] - lo[0], corner[1] - lo[1]]))
+        })
+        .collect()
 }
 
 #[cfg(test)]

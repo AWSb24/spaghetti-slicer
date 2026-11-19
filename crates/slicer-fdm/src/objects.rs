@@ -4,7 +4,7 @@
 
 use slicer_core::slice::slice_mesh;
 use slicer_core::{Diagnose, Diagnostic, Mesh, Shapes, parallel_map, polygon};
-use slicer_profiles::Settings;
+use slicer_profiles::{InfillPattern, Settings};
 
 use crate::plate::{self, Placement};
 use crate::{DEGENERATE_HEIGHT, MAX_HOLE_EDGES};
@@ -186,6 +186,177 @@ pub fn apply_range_orca(
             skipped.push((orca, error.to_string()));
         } else {
             range.put(&ours, value);
+        }
+    }
+    skipped
+}
+
+/// Settings of [`RANGE_SETTINGS`] that a modifier (see [`Modifier`]) may
+/// set for the part of its object inside it: the thickness of the top and
+/// bottom shells, the sparse infill (density, pattern, angle, connecting
+/// its lines) and whether it gets supports.
+///
+/// The object keeps one region on every layer, which gets the walls and in
+/// which the top and bottom surfaces are found, exactly as without the
+/// modifier. Only the fill area inside the walls is split: the sparse
+/// infill inside the modifier gets its pattern, density and angle (at
+/// 100 % it is solid infill), the shells inside it are as thick as its
+/// `top_layers` and `bottom_layers` ask for, measured against the
+/// surfaces of the object. The modifier's own top and bottom therefore
+/// start or end no surface: a modifier with 100 % infill inside an object
+/// with 15 % fills its part of each layer with solid infill, without
+/// extra shells above or below it.
+// ponytail: walls, their order and seam and the infill overlap stay those
+// of the object, since walls inside an object along the borders of a
+// modifier would need the region split at the walls. Lightning infill
+// cannot be asked for, because it is planned for a whole region across its
+// layers; a modifier of an object with lightning infill keeps that.
+pub const MODIFIER_SETTINGS: &[&str] = &[
+    "top_layers",
+    "bottom_layers",
+    "infill_density",
+    "infill_pattern",
+    "infill_angle",
+    "infill_connect",
+    "supports",
+];
+
+/// Largest number of modifiers of one object.
+pub const MAX_MODIFIERS: usize = 64;
+
+/// A modifier of an object: a mesh that is not printed. Inside its volume
+/// the object prints with `values` over its settings; only those of
+/// [`MODIFIER_SETTINGS`] count. Where modifiers of an object overlap, the
+/// later one counts. A modifier reaches only its own object, never other
+/// objects it overlaps.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Modifier {
+    /// The volume, in the same coordinates as the mesh of its object; it
+    /// is moved with the object when that is put on the bed.
+    pub mesh: Mesh,
+    /// Settings by name with their values as text, in the form
+    /// [`Settings::set`] takes.
+    pub values: Vec<(String, String)>,
+}
+
+impl Modifier {
+    /// A modifier of the volume `mesh` that changes nothing yet.
+    pub fn new(mesh: Mesh) -> Self {
+        Self {
+            mesh,
+            values: Vec::new(),
+        }
+    }
+
+    /// Sets `key` to `value`, replacing an earlier value of it.
+    fn put(&mut self, key: &str, value: String) {
+        match self.values.iter_mut().find(|(k, _)| k == key) {
+            Some(entry) => entry.1 = value,
+            None => self.values.push((key.to_string(), value)),
+        }
+    }
+}
+
+/// The settings inside `modifier`: `object`, the settings of its object on
+/// a layer, with the values of the modifier that are settings of
+/// [`MODIFIER_SETTINGS`] over them.
+pub fn modifier_settings(object: &Settings, modifier: &Modifier) -> Settings {
+    let mut settings = object.clone();
+    let values = modifier
+        .values
+        .iter()
+        .filter(|(key, _)| MODIFIER_SETTINGS.contains(&key.as_str()))
+        .map(|(key, value)| (key.as_str(), value.as_str()));
+    // The values were checked when the modifier was made; values that do
+    // not fit leave the object's settings as they are, as does lightning
+    // infill, which no modifier plans.
+    if settings.set_all(values).is_err()
+        || (settings.infill_pattern == InfillPattern::Lightning
+            && object.infill_pattern != InfillPattern::Lightning)
+    {
+        return object.clone();
+    }
+    settings
+}
+
+/// Why `key` = `value` cannot be set per modifier, if it cannot.
+fn not_per_modifier(key: &str, value: &Settings) -> Option<String> {
+    if !MODIFIER_SETTINGS.contains(&key) {
+        return Some(format!("'{key}' cannot be set per modifier"));
+    }
+    (key == "infill_pattern" && value.infill_pattern == InfillPattern::Lightning)
+        .then(|| "lightning infill cannot be set per modifier".to_string())
+}
+
+/// Layers a settings file in TOML form over `modifier`, a modifier of an
+/// object whose settings are `object`, as the command line and the server
+/// do. Fails, changing nothing, if the file names a setting outside
+/// [`MODIFIER_SETTINGS`] or asks for lightning infill
+/// (`settings.not_per_modifier`), or holds a value that is not valid.
+pub fn apply_modifier_toml(
+    modifier: &mut Modifier,
+    object: &Settings,
+    text: &str,
+) -> Result<(), Diagnostic> {
+    let keys = Settings::toml_keys(text).map_err(|e| e.diagnostic())?;
+    let refuse = |key: &str, reason: String| {
+        let allowed = MODIFIER_SETTINGS.join(", ");
+        Diagnostic::error(
+            "settings.not_per_modifier",
+            format!("{reason} (allowed: {allowed}, not lightning infill)"),
+        )
+        .with("key", key)
+        .with("allowed", allowed)
+    };
+    for key in &keys {
+        if !MODIFIER_SETTINGS.contains(&key.as_str()) {
+            return Err(refuse(
+                key,
+                format!("setting '{key}' cannot be set per modifier"),
+            ));
+        }
+    }
+    let mut trial = modifier_settings(object, modifier);
+    trial.apply_toml(text).map_err(|e| e.diagnostic())?;
+    let values = trial.values();
+    for key in &keys {
+        if let Some(reason) = not_per_modifier(key, &trial) {
+            return Err(refuse(key, reason));
+        }
+    }
+    for key in keys {
+        if let Some(value) = values.get(&key) {
+            modifier.put(&key, value.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Layers settings by the names of Orca Slicer and Bambu Studio, as their
+/// project files store them for a modifier of an object, over `modifier`;
+/// `object` are the settings of the object. Only settings of
+/// [`MODIFIER_SETTINGS`] are taken; the others are returned by their Orca
+/// name with the reason, as by [`apply_object_orca`].
+pub fn apply_modifier_orca(
+    modifier: &mut Modifier,
+    object: &Settings,
+    values: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut trial = modifier_settings(object, modifier);
+    let pairs = values
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()));
+    let import = slicer_profiles::import_orca_values(pairs, &mut trial.clone());
+    let mut skipped = import.skipped;
+    for (ours, value, orca) in import.taken {
+        let mut next = trial.clone();
+        if let Err(error) = next.set(&ours, &value) {
+            skipped.push((orca, error.to_string()));
+        } else if let Some(reason) = not_per_modifier(&ours, &next) {
+            skipped.push((orca, reason));
+        } else {
+            trial = next;
+            modifier.put(&ours, value);
         }
     }
     skipped
@@ -436,58 +607,236 @@ pub(crate) fn regions(
 }
 
 /// On every layer (cut at `cut_heights`), everything that groups whose
-/// supports are `on` on that layer take.
+/// supports are `on` on that layer take, with the parts of their objects
+/// inside `modifiers` that say otherwise taken out or added.
 pub(crate) fn with_supports(
     regions: &[Vec<Shapes>],
     groups: &[Group],
+    modifiers: &[ModifierArea],
     cut_heights: &[f64],
     on: bool,
 ) -> Vec<Shapes> {
     let layers = regions.first().map_or(0, Vec::len);
     parallel_map(layers, |index| {
         let z = cut_heights.get(index).copied().unwrap_or(0.0);
-        regions
-            .iter()
-            .zip(groups)
-            .filter(|(_, group)| group.at(z).supports == on)
-            .fold(Vec::new(), |area, (region, _)| {
-                polygon::union(&area, &region[index])
-            })
+        let mut area = Vec::new();
+        for (number, (region, group)) in regions.iter().zip(groups).enumerate() {
+            let region = &region[index];
+            let mut own = if group.at(z).supports == on {
+                Some(std::borrow::Cow::Borrowed(region))
+            } else {
+                None
+            };
+            // Later modifiers count over earlier ones.
+            for modifier in modifiers.iter().filter(|m| m.group == number) {
+                let inside = &modifier.area[index];
+                if inside.is_empty() {
+                    continue;
+                }
+                let none = Vec::new();
+                let current = own.as_deref().unwrap_or(&none);
+                let next = if modifier.settings.at(z).supports == on {
+                    polygon::union(current, &polygon::intersection(region, inside))
+                } else {
+                    polygon::difference(current, inside)
+                };
+                own = Some(std::borrow::Cow::Owned(next));
+            }
+            if let Some(own) = own {
+                area = polygon::union(&area, &own);
+            }
+        }
+        area
     })
 }
 
-/// The regions to print with their extruder and settings: the regions of
-/// the extruders (`extruders`, empty if one extruder prints everything)
-/// split by the regions of the groups of objects (`objects`, empty if all
-/// objects have the same settings, which are `single`). Without either,
-/// empty.
+/// A modifier of an object (see [`Modifier`]) as the layers see it: the
+/// group of its object, the settings inside it on every height (those of
+/// the group with the modifier's values over them) and the part of its
+/// object inside it on every layer.
+#[derive(Debug, Clone)]
+pub(crate) struct ModifierArea {
+    /// Index of the group of its object.
+    pub(crate) group: usize,
+    /// The settings inside it by height.
+    pub(crate) settings: Group,
+    /// The part of its object inside it on every layer; empty until
+    /// [`modifier_areas`] cuts it.
+    pub(crate) area: Vec<Shapes>,
+    /// Index of its object.
+    object: usize,
+    /// Index of the modifier among those of its object.
+    number: usize,
+}
+
+/// Whether `test` holds for the settings of some height of a group or
+/// inside one of `modifiers`.
+pub(crate) fn any_setting(
+    groups: &[Group],
+    modifiers: &[ModifierArea],
+    test: impl Fn(&Settings) -> bool,
+) -> bool {
+    groups.iter().any(|g| g.any(&test)) || modifiers.iter().any(|m| m.settings.any(&test))
+}
+
+/// The modifiers of every object (`modifiers[i]` those of object `i`,
+/// whose group is `membership[i]`) that change anything, with the settings
+/// inside them, in the order of the objects and their modifiers; not yet
+/// cut (see [`modifier_areas`]).
+pub(crate) fn modifier_groups(
+    modifiers: &[Vec<Modifier>],
+    groups: &[Group],
+    membership: &[usize],
+) -> Vec<ModifierArea> {
+    let mut found = Vec::new();
+    for (object, list) in modifiers.iter().enumerate() {
+        let Some(group_index) = membership.get(object).copied() else {
+            continue;
+        };
+        let Some(group) = groups.get(group_index) else {
+            continue;
+        };
+        for (number, modifier) in list.iter().enumerate().take(MAX_MODIFIERS) {
+            let settings = Group {
+                settings: modifier_settings(&group.settings, modifier),
+                ranges: group
+                    .ranges
+                    .iter()
+                    .map(|(from, to, s)| (*from, *to, modifier_settings(s, modifier)))
+                    .collect(),
+            };
+            if settings != *group {
+                found.push(ModifierArea {
+                    group: group_index,
+                    settings,
+                    area: Vec::new(),
+                    object,
+                    number,
+                });
+            }
+        }
+    }
+    found
+}
+
+/// Cuts the modifiers found by [`modifier_groups`] at `cut_heights`, after
+/// they were put on the bed with their objects as for the whole plate and
+/// moved by `shift`: on every layer the part of its object inside it.
+pub(crate) fn modifier_areas(
+    found: &mut [ModifierArea],
+    objects: &[Mesh],
+    modifiers: &[Vec<Modifier>],
+    placement: Placement,
+    shift: Option<[f64; 3]>,
+    cut_heights: &[f64],
+) {
+    // Repaired, put on the bed with the object and cut, as the plate is.
+    let cut = |mut mesh: Mesh, lift: f64| {
+        mesh.orient();
+        mesh.remove_degenerate(DEGENERATE_HEIGHT);
+        mesh.close_holes(MAX_HOLE_EDGES);
+        let [x, y, z] = shift.unwrap_or([0.0; 3]);
+        mesh.translate([x, y, z - lift]);
+        slice_mesh(&mesh, cut_heights)
+    };
+    let mut current: Option<(usize, Vec<Shapes>)> = None;
+    for modifier in found.iter_mut() {
+        let (Some(object), Some(volume)) = (
+            objects.get(modifier.object),
+            modifiers
+                .get(modifier.object)
+                .and_then(|list| list.get(modifier.number)),
+        ) else {
+            continue;
+        };
+        // An object placed as given stands on the bed on its own; its
+        // modifiers go down with it.
+        let lift = match (placement, object.bounds()) {
+            (Placement::AsGiven, Some((min, _))) => min[2],
+            _ => 0.0,
+        };
+        if current.as_ref().is_none_or(|(o, _)| *o != modifier.object) {
+            current = Some((modifier.object, cut(object.clone(), lift)));
+        }
+        let Some((_, own)) = &current else {
+            continue;
+        };
+        let inside = cut(volume.mesh.clone(), lift);
+        modifier.area = parallel_map(cut_heights.len(), |index| {
+            match (own.get(index), inside.get(index)) {
+                (Some(own), Some(inside)) if !own.is_empty() && !inside.is_empty() => {
+                    polygon::intersection(own, inside)
+                }
+                _ => Vec::new(),
+            }
+        });
+    }
+}
+
+/// The modifiers of the objects of group `group` on layer `index`, whose
+/// middle lies `z` above the bed: the part of the layer that each one
+/// takes, with later ones taking where they overlap earlier ones, and the
+/// settings there. Modifiers that change nothing on this layer are left
+/// out.
+pub(crate) fn modifiers_at(
+    modifiers: &[ModifierArea],
+    group: usize,
+    index: usize,
+    z: f64,
+    settings: &Settings,
+) -> Vec<(Shapes, Settings)> {
+    let mut found: Vec<(Shapes, Settings)> = Vec::new();
+    for modifier in modifiers.iter().filter(|m| m.group == group) {
+        let Some(area) = modifier.area.get(index).filter(|a| !a.is_empty()) else {
+            continue;
+        };
+        // A later modifier takes its part from earlier ones, even if it
+        // gives it the object's own settings again.
+        for (earlier, _) in &mut found {
+            *earlier = polygon::difference(earlier, area);
+        }
+        let inside = modifier.settings.at(z);
+        if inside != settings {
+            found.push((area.clone(), inside.clone()));
+        }
+    }
+    found.retain(|(area, _)| !area.is_empty());
+    found
+}
+
+/// The regions to print with their extruder, the index of their group and
+/// its settings: the regions of the extruders (`extruders`, empty if one
+/// extruder prints everything) split by the regions of the groups of
+/// objects (`objects`, empty if all objects have the same settings, which
+/// are `single`, group 0). Without either, empty.
 pub(crate) fn split<'a>(
     extruders: Vec<(u32, Vec<Shapes>)>,
     objects: Vec<Vec<Shapes>>,
     groups: &'a [Group],
     extruder: u32,
     single: &'a Group,
-) -> Vec<(u32, &'a Group, Vec<Shapes>)> {
+) -> Vec<(u32, usize, &'a Group, Vec<Shapes>)> {
     if objects.is_empty() {
         return extruders
             .into_iter()
-            .map(|(e, region)| (e, single, region))
+            .map(|(e, region)| (e, 0, single, region))
             .collect();
     }
     if extruders.is_empty() {
         return objects
             .into_iter()
             .zip(groups)
-            .map(|(region, group)| (extruder, group, region))
+            .enumerate()
+            .map(|(number, (region, group))| (extruder, number, group, region))
             .collect();
     }
     let mut regions = Vec::new();
     for (e, region) in &extruders {
-        for (area, group) in objects.iter().zip(groups) {
+        for (number, (area, group)) in objects.iter().zip(groups).enumerate() {
             let part = parallel_map(region.len(), |index| {
                 polygon::intersection(&region[index], &area[index])
             });
-            regions.push((*e, group, part));
+            regions.push((*e, number, group, part));
         }
     }
     regions
@@ -846,8 +1195,8 @@ mod tests {
     ) -> (Toolpaths, Diagnostics) {
         let mut diagnostics = Diagnostics::new();
         let own = OwnSettings {
-            objects: &[],
             ranges,
+            ..OwnSettings::default()
         };
         let toolpaths = generate_plate_with_own_settings(
             objects,
@@ -1049,5 +1398,260 @@ mod tests {
                 .iter()
                 .all(|(_, reason)| reason.contains("height range"))
         );
+    }
+
+    /// Slices `objects` placed as `placement`, object `i` with the
+    /// modifiers `modifiers[i]`.
+    fn slice_modifiers(
+        objects: &[Mesh],
+        modifiers: &[Vec<Modifier>],
+        placement: Placement,
+        settings: &Settings,
+    ) -> (Toolpaths, Diagnostics) {
+        let mut diagnostics = Diagnostics::new();
+        let own = OwnSettings {
+            modifiers,
+            ..OwnSettings::default()
+        };
+        let toolpaths = generate_plate_with_own_settings(
+            objects,
+            own,
+            placement,
+            settings,
+            &mut diagnostics,
+            &AtomicBool::new(false),
+            &Progress::new(),
+        )
+        .unwrap();
+        (toolpaths, diagnostics)
+    }
+
+    /// A cube of `size` mm with its smallest corner at `corner`, as a
+    /// modifier with the settings `text` over `settings`.
+    fn modifier(corner: [f64; 3], size: f64, settings: &Settings, text: &str) -> Modifier {
+        let mut mesh = Mesh::cuboid(size, size, size);
+        mesh.translate(corner);
+        let mut modifier = Modifier::new(mesh);
+        apply_modifier_toml(&mut modifier, settings, text).unwrap();
+        modifier
+    }
+
+    /// Whether every point of `path` lies within `margin` of the square
+    /// from `lo` to `hi` (X and Y).
+    fn within(path: &crate::Path, lo: [f64; 2], hi: [f64; 2], margin: f64) -> bool {
+        path.points
+            .iter()
+            .all(|p| (0..2).all(|a| p[a] >= lo[a] - margin && p[a] <= hi[a] + margin))
+    }
+
+    #[test]
+    fn modifiers_change_the_infill_inside_them_only() {
+        let settings = Settings {
+            skirt_loops: 0,
+            ..Settings::default()
+        };
+        let objects = [cube(20.0)];
+        let (plain, plain_warnings) = slice(&objects, &[], &settings);
+        // A 10 mm cube in the middle of the 20 mm cube, from 5 to 15 mm.
+        let (lo, hi) = ([25.0, 55.0], [35.0, 65.0]);
+        let width = settings.line_width;
+        use PathKind::*;
+        for text in ["infill_density = 100.0", "infill_pattern = \"gyroid\""] {
+            let inside = modifier([25.0, 55.0, 5.0], 10.0, &settings, text);
+            let (toolpaths, warnings) =
+                slice_modifiers(&objects, &[vec![inside]], Placement::AsGiven, &settings);
+            assert_eq!(warnings.codes(), plain_warnings.codes(), "{text}");
+            assert_eq!(toolpaths.layers.len(), plain.layers.len());
+            for (layer, before) in toolpaths.layers.iter().zip(&plain.layers) {
+                let z = middle(layer);
+                if !(5.0..15.0).contains(&z) {
+                    // Outside the modifier nothing changes: no shells
+                    // above or below it.
+                    assert_eq!(layer, before, "{text} at {z}");
+                    continue;
+                }
+                // The modifier is not printed: the walls stay those of the
+                // cube.
+                let walls = |l: &Layer| -> Vec<crate::Path> {
+                    l.paths
+                        .iter()
+                        .filter(|p| matches!(p.kind, OuterWall | InnerWall))
+                        .cloned()
+                        .collect()
+                };
+                assert_eq!(walls(layer), walls(before), "{text} at {z}");
+                assert_ne!(layer, before, "{text} at {z}");
+                // Sparse infill is left outside the modifier; inside it is
+                // solid or gyroid.
+                let sparse: Vec<&crate::Path> = layer
+                    .paths
+                    .iter()
+                    .filter(|p| p.kind == SparseInfill)
+                    .collect();
+                assert!(!sparse.is_empty());
+                if text.contains("100") {
+                    assert!(kinds(before, true).iter().all(|k| *k != SolidInfill));
+                    let solid: Vec<_> = layer
+                        .paths
+                        .iter()
+                        .filter(|p| p.kind == SolidInfill)
+                        .collect();
+                    assert!(!solid.is_empty());
+                    assert!(solid.iter().all(|p| within(p, lo, hi, width)));
+                    // Rectilinear lines outside keep their places: the
+                    // sparse infill of the cube without the modifier's
+                    // square.
+                    assert!(sparse.iter().all(|p| !within(p, lo, hi, -width)));
+                } else {
+                    let polylines = sparse.iter().filter(|p| p.points.len() > 2).count();
+                    assert!(polylines > 0, "gyroid curves at {z}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn modifiers_follow_their_object_when_it_is_centred() {
+        let settings = Settings {
+            skirt_loops: 0,
+            ..Settings::default()
+        };
+        let objects = [cube(20.0)];
+        let inside = modifier([25.0, 55.0, 5.0], 10.0, &settings, "infill_density = 100.0");
+        let (toolpaths, _) =
+            slice_modifiers(&objects, &[vec![inside]], Placement::Centre, &settings);
+        let centre = [settings.bed_size_x / 2.0, settings.bed_size_y / 2.0];
+        let lo = [centre[0] - 5.0, centre[1] - 5.0];
+        let hi = [centre[0] + 5.0, centre[1] + 5.0];
+        let layer = &toolpaths.layers[50];
+        let solid: Vec<_> = layer
+            .paths
+            .iter()
+            .filter(|p| p.kind == PathKind::SolidInfill)
+            .collect();
+        assert!(!solid.is_empty());
+        assert!(solid.iter().all(|p| within(p, lo, hi, settings.line_width)));
+    }
+
+    #[test]
+    fn objects_without_modifiers_print_as_before() {
+        let settings = Settings::default();
+        let objects = [cube(20.0), tee(140.0)];
+        let (plain, warnings) = slice(&objects, &[], &settings);
+        // No modifiers, and modifiers that change nothing or lie outside
+        // their object, or overlap another object.
+        let text = settings.to_toml_keys(&["infill_density", "supports"]);
+        let same = modifier([25.0, 55.0, 5.0], 10.0, &settings, &text);
+        let outside = modifier([60.0, 55.0, 5.0], 10.0, &settings, "infill_density = 100.0");
+        let other = modifier(
+            [140.0, 50.0, 0.0],
+            30.0,
+            &settings,
+            "infill_density = 100.0",
+        );
+        let lists = [
+            vec![],
+            vec![vec![], vec![]],
+            vec![vec![same], vec![]],
+            vec![vec![outside, other], vec![]],
+        ];
+        for modifiers in lists {
+            let (own, own_warnings) =
+                slice_modifiers(&objects, &modifiers, Placement::AsGiven, &settings);
+            assert_eq!(own, plain);
+            assert_eq!(own_warnings.codes(), warnings.codes());
+        }
+    }
+
+    #[test]
+    fn supports_and_shells_follow_the_modifiers() {
+        let objects = [tee(20.0)];
+        let plate = Settings::default();
+        let supported = |toolpaths: &Toolpaths| {
+            toolpaths
+                .layers
+                .iter()
+                .any(|layer| kinds(layer, true).contains(&PathKind::Support))
+        };
+        // A modifier around the overhangs at 10 mm brings supports; the
+        // object itself has none.
+        let around = modifier([15.0, 45.0, 8.0], 40.0, &plate, "supports = true");
+        let (toolpaths, warnings) =
+            slice_modifiers(&objects, &[vec![around]], Placement::AsGiven, &plate);
+        assert!(supported(&toolpaths));
+        assert!(warnings.is_empty(), "{:?}", warnings.codes());
+        // And the other way round.
+        let with = Settings {
+            supports: true,
+            ..plate.clone()
+        };
+        let around = modifier([15.0, 45.0, 8.0], 40.0, &with, "supports = false");
+        let (toolpaths, _) = slice_modifiers(&objects, &[vec![around]], Placement::AsGiven, &with);
+        assert!(!supported(&toolpaths));
+
+        // Thicker top shells inside a modifier around the whole cube.
+        let settings = Settings {
+            skirt_loops: 0,
+            ..Settings::default()
+        };
+        let cubes = [cube(20.0)];
+        let solid_layers = |toolpaths: &Toolpaths| {
+            toolpaths
+                .layers
+                .iter()
+                .filter(|layer| kinds(layer, true).contains(&PathKind::SolidInfill))
+                .count()
+        };
+        let (plain, _) = slice(&cubes, &[], &settings);
+        let thick = modifier([10.0, 40.0, -1.0], 40.0, &settings, "top_layers = 10");
+        let (toolpaths, _) = slice_modifiers(&cubes, &[vec![thick]], Placement::AsGiven, &settings);
+        assert_eq!(solid_layers(&toolpaths), solid_layers(&plain) + 5);
+    }
+
+    #[test]
+    fn modifiers_take_only_their_own_keys() {
+        let object = Settings::default();
+        let mut inside = Modifier::default();
+        apply_modifier_toml(
+            &mut inside,
+            &object,
+            "infill_density = 40.0\nsupports = true",
+        )
+        .unwrap();
+        apply_modifier_toml(&mut inside, &object, "infill_density = 50.0").unwrap();
+        assert_eq!(inside.values.len(), 2);
+        let settings = modifier_settings(&object, &inside);
+        assert_eq!((settings.infill_density, settings.supports), (50.0, true));
+        for text in [
+            "wall_loops = 4",
+            "infill_speed = 20.0",
+            "infill_pattern = \"lightning\"",
+        ] {
+            let error = apply_modifier_toml(&mut inside, &object, text).unwrap_err();
+            assert_eq!(error.code, "settings.not_per_modifier", "{text}");
+        }
+        assert!(apply_modifier_toml(&mut inside, &object, "infill_density = -5.0").is_err());
+        assert_eq!(inside.values.len(), 2);
+        for key in MODIFIER_SETTINGS {
+            assert!(RANGE_SETTINGS.contains(key), "{key}");
+        }
+        // From a project: keys a modifier cannot have are returned.
+        let values: Vec<(String, String)> = [
+            ("sparse_infill_density", "100%"),
+            ("sparse_infill_pattern", "lightning"),
+            ("wall_loops", "4"),
+            ("top_shell_layers", "6"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let mut stored = Modifier::default();
+        let skipped = apply_modifier_orca(&mut stored, &object, &values);
+        let settings = modifier_settings(&object, &stored);
+        assert_eq!((settings.infill_density, settings.top_layers), (100.0, 6));
+        assert_eq!(settings.infill_pattern, object.infill_pattern);
+        let mut keys: Vec<&str> = skipped.iter().map(|(key, _)| key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["sparse_infill_pattern", "wall_loops"]);
     }
 }

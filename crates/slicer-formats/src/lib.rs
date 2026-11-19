@@ -10,11 +10,13 @@ pub use bambu::{PLATE_THUMBNAIL_SIZE, PLATE_THUMBNAIL_SMALL_SIZE, PrintInfo, wri
 pub use project::{
     ProjectItem, ProjectObject, ProjectPackage, read_part, read_project, write_project,
 };
-pub use project_settings::{ObjectSettings, ProjectSettings, RangeSettings, read_project_settings};
+pub use project_settings::{
+    ModifierSettings, ObjectSettings, ProjectSettings, RangeSettings, read_project_settings,
+};
 pub use stl::{StlError, parse_stl, write_stl_binary};
 pub use threemf::{
-    ThreeMfError, looks_like_3mf, parse_3mf, parse_3mf_plate, parse_3mf_plate_objects, write_3mf,
-    write_binary_package, write_package,
+    PlateObject, ThreeMfError, looks_like_3mf, parse_3mf, parse_3mf_plate, parse_3mf_plate_objects,
+    parse_3mf_plate_parts, write_3mf, write_binary_package, write_package,
 };
 
 use slicer_core::{Diagnose, Diagnostic, Diagnostics, Mesh};
