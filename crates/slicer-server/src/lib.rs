@@ -539,6 +539,10 @@ pub fn openapi() -> Value {
         "Settings in TOML form inside the k-th modifier_<n> of model N, layered over the settings of the object; may only set {}, not lightning infill (otherwise 400 settings.not_per_modifier)",
         slicer_fdm::MODIFIER_SETTINGS.join(", ")
     );
+    let negative = format!(
+        "Negative volume of model N (STL or 3MF), in the coordinates of the model file and moved with it: cut out of every object of the model before anything else, so walls go round the hole and surfaces form at it; may be repeated, at most {} in all and per object (otherwise 400 model.too_many_negatives); negative parts of a project come first",
+        slicer_fdm::MAX_NEGATIVES
+    );
     json!({
         "openapi": "3.1.0",
         "info": {
@@ -568,13 +572,14 @@ pub fn openapi() -> Value {
                         "settings": { "type": "string", "description": "Settings in TOML form; may be repeated, later ones override earlier ones" },
                         "set": { "type": "string", "description": "One override KEY=VALUE; may be repeated" },
                         "plate": { "type": "integer", "description": "Build plate of a project file with several plates" },
-                        "project_settings": { "type": "boolean", "default": false, "description": "Use the print settings stored in project files of Orca Slicer or Bambu Studio (3MF): the project's settings below the settings and set fields, the settings of single objects over the plate's and below object_settings_<n>, the settings of height ranges of objects below range_settings_..., the modifiers of objects (modifier parts with their settings) before the modifier_<n> fields; a project whose objects have settings, height ranges or modifiers of their own is sliced as those objects. Settings without a counterpart are reported as warnings (project.settings_skipped, project.object_settings_skipped, project.part_settings_skipped, project.range_settings_skipped, project.range_invalid, project.modifier_settings_skipped, project.no_settings). Modifier parts, negative parts and support blockers or enforcers of a project are never printed" }
+                        "project_settings": { "type": "boolean", "default": false, "description": "Use the print settings stored in project files of Orca Slicer or Bambu Studio (3MF): the project's settings below the settings and set fields, the settings of single objects over the plate's and below object_settings_<n>, the settings of height ranges of objects below range_settings_..., the modifiers of objects (modifier parts with their settings) before the modifier_<n> fields; a project whose objects have settings, height ranges or modifiers of their own is sliced as those objects. Settings without a counterpart are reported as warnings (project.settings_skipped, project.object_settings_skipped, project.part_settings_skipped, project.range_settings_skipped, project.range_invalid, project.modifier_settings_skipped, project.no_settings). Modifier parts, negative parts and support blockers or enforcers of a project are never printed; negative parts are cut out of their objects with or without this field, and a project with negative parts is sliced as its objects" }
                     },
                     "patternProperties": {
                         "^object_settings_[1-9][0-9]*$": { "type": "string", "description": object_settings },
                         "^range_settings_([1-9][0-9]*_)?[0-9.]+-[0-9.]+$": { "type": "string", "description": range_settings },
                         "^modifier_[1-9][0-9]*$": { "type": "string", "format": "binary", "description": modifier },
-                        "^modifier_settings_[1-9][0-9]*$": { "type": "string", "description": modifier_settings }
+                        "^modifier_settings_[1-9][0-9]*$": { "type": "string", "description": modifier_settings },
+                        "^negative_[1-9][0-9]*$": { "type": "string", "format": "binary", "description": negative }
                     }
                 } } } },
                 "responses": {
@@ -884,6 +889,7 @@ fn slice(
         objects: &plate.objects.settings,
         ranges: &plate.objects.ranges,
         modifiers: &plate.objects.modifiers,
+        negatives: &plate.objects.negatives,
     };
     let toolpaths = slicer_fdm::generate_plate_with_own_settings(
         &plate.objects.meshes,
@@ -947,6 +953,7 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
     let mut range_texts = Vec::new();
     let mut modifier_meshes: Vec<(String, Option<usize>, axum::body::Bytes)> = Vec::new();
     let mut modifier_texts: Vec<(String, Option<usize>, String)> = Vec::new();
+    let mut negative_meshes: Vec<(String, Option<usize>, axum::body::Bytes)> = Vec::new();
     let mut options = load::Options::default();
     loop {
         let field = match multipart.next_field().await {
@@ -965,6 +972,7 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
         let modifier_mesh = name
             .strip_prefix("modifier_")
             .filter(|_| modifier_text.is_none());
+        let negative = name.strip_prefix("negative_");
         let number = |n: Option<&str>| n.and_then(|n| n.parse::<usize>().ok());
         match name.as_str() {
             "model" => models.push(bytes),
@@ -1012,6 +1020,9 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
             }
             _ if modifier_mesh.is_some() => {
                 modifier_meshes.push((name.clone(), number(modifier_mesh), bytes));
+            }
+            _ if negative.is_some() => {
+                negative_meshes.push((name.clone(), number(negative), bytes));
             }
             _ if range.is_some() => {
                 let Ok(text) = String::from_utf8(bytes.to_vec()) else {
@@ -1062,6 +1073,7 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
             name,
             range: None,
             modifier: None,
+            negative: None,
         });
     }
     // Height ranges of every model (range_settings_<z1>-<z2>) or of one
@@ -1105,6 +1117,7 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
                     name: name.clone(),
                     range: Some((from, to)),
                     modifier: None,
+                    negative: None,
                 });
             }
         }
@@ -1167,8 +1180,50 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
                 name,
                 range: None,
                 modifier: Some(mesh),
+                negative: None,
             });
         }
+    }
+    // Negative volumes of a model (negative_<n>), cut out of its objects.
+    if negative_meshes.len() > slicer_fdm::MAX_NEGATIVES {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &Diagnostic::error(
+                "model.too_many_negatives",
+                format!(
+                    "{} negative fields; at most {} are allowed",
+                    negative_meshes.len(),
+                    slicer_fdm::MAX_NEGATIVES
+                ),
+            )
+            .with("negatives", negative_meshes.len())
+            .with("max", slicer_fdm::MAX_NEGATIVES),
+        );
+    }
+    for (field, number, bytes) in &negative_meshes {
+        let Some(layers) = number
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|index| objects.get_mut(index))
+        else {
+            return invalid(format!(
+                "field '{field}' names no object; negative_1 to negative_{} name the models in the order they are sent",
+                models.len()
+            ));
+        };
+        let name = load::Name::new(field.clone(), "field", field);
+        // ponytail: warnings about reading the mesh of a negative volume
+        // are not passed on to the job, as for modifiers.
+        let mesh = match slicer_formats::parse_model(bytes, None, &mut Diagnostics::new()) {
+            Ok(mesh) => mesh,
+            Err(e) => return error_response(StatusCode::BAD_REQUEST, &name.apply(e)),
+        };
+        layers.push(load::ObjectLayer {
+            text: String::new(),
+            name,
+            range: None,
+            modifier: None,
+            negative: Some(mesh),
+        });
     }
 
     let id = Uuid::new_v4();
