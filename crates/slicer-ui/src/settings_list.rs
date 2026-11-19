@@ -125,6 +125,7 @@ pub fn setting_unit(key: &str) -> &'static str {
         "acceleration" => "mm/s²",
         "jerk" => "mm/s",
         "filament_density" => "g/cm³",
+        "flush_volumes" => "mm³",
         "infill_density" | "infill_overlap" => "%",
         _ if key.contains("fan_") && key.ends_with("_speed") => "%",
         _ if key.ends_with("_speed") => "mm/s",

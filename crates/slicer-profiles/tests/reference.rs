@@ -85,6 +85,9 @@ fn settings_reference_is_current() {
                 | "arrange_outlines"
                 | "arrange_rotation" => "`true`, `false`".to_string(),
                 "thumbnails" => "sizes like `48x48,300x300`, empty for none".to_string(),
+                "flush_volumes" => {
+                    "`extruder_count`² numbers of at least 0 in mm³, empty for none".to_string()
+                }
                 "start_gcode" | "end_gcode" | "toolchange_gcode" => {
                     "text with `{key}` placeholders".to_string()
                 }

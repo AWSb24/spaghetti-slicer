@@ -928,7 +928,7 @@ pub fn generate_plate_with_own_settings(
         tool = order.last().copied().unwrap_or(tool);
         orders.push(order);
     }
-    let tower = PrimeTower::plan(&orders, settings);
+    let tower = PrimeTower::plan(&orders, &heights, settings, plate_settings.flow_ratio);
     if let Some(tower) = &tower
         && slices[..tower.layers]
             .iter()
@@ -944,6 +944,21 @@ pub fn generate_plate_with_own_settings(
             )
             .with("x", settings.prime_tower_x)
             .with("y", settings.prime_tower_y),
+        );
+    }
+    if let Some(short) = tower.as_ref().and_then(|t| t.short) {
+        diagnostics.push(
+            Diagnostic::warning(
+                "slicing.flush_too_large",
+                format!(
+                    "the purges of {} layer(s) with tool changes do not fit into the prime tower (up to {:.0} mm³ where a layer holds {:.0} mm³) and are cut short; widen prime_tower_width to about {} mm or lower flush_volumes",
+                    short.layers, short.wanted, short.held, short.width
+                ),
+            )
+            .with("layers", short.layers)
+            .with("wanted", format!("{:.1}", short.wanted))
+            .with("held", format!("{:.1}", short.held))
+            .with("width", short.width),
         );
     }
     // Every layer is counted twice: once in order, once for the travels.
@@ -1218,43 +1233,89 @@ fn push_work(piece: Work, position: &mut Point, paths: &mut Vec<Path>) {
 /// model. It stands on every layer up to the last tool change; on a layer
 /// with tool changes the extruders changed to share its lines, on a layer
 /// without the extruder that starts the layer prints all of it.
-// ponytail: solid on every layer whatever the extruders need to purge, and
-// the skirt does not go around it. Purge volumes per pair of filaments and a
-// sparse tower are the upgrade.
+///
+/// Without `flush_volumes` every layer is solid and the extruders changed
+/// to on a layer get every n-th line each. With it, each of them gets one
+/// stretch of a zig-zag through the square, as long as its purge volume
+/// for the change it follows; the zig-zag is as sparse as the sum of the
+/// purges of the layer needs ([`purge_fill`]).
+// ponytail: the skirt does not go around the tower, and a layer without
+// tool changes stays solid.
 struct PrimeTower {
     /// The square on the bed.
     footprint: Shapes,
     /// For every layer of the tower, the extruders that print a share of
     /// it, in printing order. The first one also prints the outline.
     shares: Vec<Vec<u32>>,
+    /// With `flush_volumes`, for every layer with tool changes: the line
+    /// each share prints, in the order of `shares`. `None` for a layer
+    /// whose solid fill the shares split line by line.
+    purges: Vec<Option<Vec<Vec<Point>>>>,
+    /// Layers whose purges did not fit into the tower.
+    short: Option<Shortfall>,
     /// Number of layers the tower reaches up.
     layers: usize,
     /// Line width.
     width: f64,
 }
 
+/// Layers of the prime tower too small for the purges of their tool
+/// changes: they purge only what the solid layer holds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Shortfall {
+    /// Number of such layers.
+    layers: usize,
+    /// The purges of the worst of them, in mm³.
+    wanted: f64,
+    /// What that layer of the tower holds, in mm³.
+    held: f64,
+    /// About the side of a tower that holds every purge, in mm.
+    width: f64,
+}
+
+/// The least share of a solid layer that a layer of the prime tower with
+/// tool changes fills, so that the layer above has lines to stand on.
+// ponytail: a fixed share; small purges extrude this much instead.
+const MIN_PURGE_DENSITY: f64 = 0.1;
+
 impl PrimeTower {
     /// The tower for the extruders printing every layer in the given order,
-    /// or `None` if there is no tool change or no tower.
-    fn plan(orders: &[Vec<u32>], settings: &Settings) -> Option<Self> {
+    /// or `None` if there is no tool change or no tower. `heights` are the
+    /// layer heights and `flow_ratio` the flow the tower is printed with,
+    /// for the volumes of `flush_volumes`.
+    fn plan(
+        orders: &[Vec<u32>],
+        heights: &[f64],
+        settings: &Settings,
+        flow_ratio: f64,
+    ) -> Option<Self> {
         if settings.extruder_count < 2 || settings.prime_tower_width <= 0.0 {
             return None;
         }
+        // The settings were checked when they were read.
+        let matrix = settings.flush_matrix().unwrap_or_default();
         let mut tool = orders.iter().flatten().next().copied()?;
         let mut shares = Vec::new();
+        let mut volumes = Vec::new();
         let mut layers = 0;
         for (index, order) in orders.iter().enumerate() {
-            let changed: Vec<u32> = order
-                .iter()
-                .copied()
-                .filter(|&e| std::mem::replace(&mut tool, e) != e)
-                .collect();
+            let mut changed = Vec::new();
+            let mut volume = Vec::new();
+            for &e in order {
+                let from = std::mem::replace(&mut tool, e);
+                if from != e {
+                    changed.push(e);
+                    let row = matrix.get(from as usize);
+                    volume.push(row.and_then(|r| r.get(e as usize)).copied().unwrap_or(0.0));
+                }
+            }
             if changed.is_empty() {
                 shares.push(order.first().copied().into_iter().collect());
             } else {
                 layers = index + 1;
                 shares.push(changed);
             }
+            volumes.push(volume);
         }
         if layers == 0 {
             return None;
@@ -1268,17 +1329,49 @@ impl PrimeTower {
             [x + half, y + half],
             [x - half, y + half],
         ];
+        let footprint = vec![vec![square]];
+        let width = settings.line_width;
+        let mut purges = vec![None; layers];
+        let mut short: Option<Shortfall> = None;
+        if !matrix.is_empty() {
+            for (index, volume) in volumes.iter().enumerate().take(layers) {
+                if volume.is_empty() {
+                    continue;
+                }
+                let height = heights.get(index).copied().unwrap_or(settings.layer_height);
+                let section = width * height * flow_ratio;
+                let (lines, held) = purge_fill(&footprint, width, section, index, volume);
+                purges[index] = Some(lines);
+                let wanted: f64 = volume.iter().sum();
+                if let Some(held) = held {
+                    // The fill needed, plus the outline and the gap to it.
+                    let side = ((wanted / section * width).sqrt() + 2.0 * width).ceil();
+                    let layers = short.map_or(0, |s| s.layers) + 1;
+                    short = Some(match short {
+                        Some(s) if s.width >= side => Shortfall { layers, ..s },
+                        _ => Shortfall {
+                            layers,
+                            wanted,
+                            held,
+                            width: side,
+                        },
+                    });
+                }
+            }
+        }
         Some(Self {
-            footprint: vec![vec![square]],
+            footprint,
             shares,
+            purges,
+            short,
             layers,
-            width: settings.line_width,
+            width,
         })
     }
 
     /// Appends the share of the tower that `extruder` prints on layer
-    /// `index`, if any: every n-th line of a solid fill when n extruders
-    /// share the layer.
+    /// `index`, if any: its stretch of the purge zig-zag, or every n-th
+    /// line of a solid fill when n extruders share the layer.
     fn push(&self, index: usize, extruder: u32, position: &mut Point, paths: &mut Vec<Path>) {
         let Some(shares) = self.shares.get(index) else {
             return;
@@ -1291,6 +1384,11 @@ impl PrimeTower {
             let outline = contours(&polygon::offset(&self.footprint, -0.5 * width));
             let kind = PathKind::PrimeTower;
             push_loops(outline, kind, width, SeamPosition::Nearest, position, paths);
+        }
+        if let Some(Some(lines)) = self.purges.get(index) {
+            let line = lines.get(share).cloned().unwrap_or_default();
+            push_lines(vec![line], PathKind::PrimeTower, 0.0, position, paths);
+            return;
         }
         let direction = if index.is_multiple_of(2) {
             HatchDirection::Diagonal45
@@ -1308,6 +1406,116 @@ impl PrimeTower {
         let join = 2.0 * shares.len() as f64 * width;
         push_lines(lines, PathKind::PrimeTower, join, position, paths);
     }
+}
+
+/// The lines of a layer of the prime tower for purges of `volumes` mm³, one
+/// per tool change of the layer in printing order, where a millimetre of
+/// line holds `section` mm³: one zig-zag through the square inside the
+/// outline, cut into one stretch per change. The outline, which the first
+/// change prints, counts towards its purge. The zig-zag is as dense as the
+/// purges need, at least [`MIN_PURGE_DENSITY`] of a solid layer (small
+/// purges then grow alike) and at most solid; then the purges shrink alike
+/// and the second value is what the layer holds in mm³.
+fn purge_fill(
+    footprint: &Shapes,
+    width: f64,
+    section: f64,
+    index: usize,
+    volumes: &[f64],
+) -> (Vec<Vec<Point>>, Option<f64>) {
+    let direction = if index.is_multiple_of(2) {
+        HatchDirection::Diagonal45
+    } else {
+        HatchDirection::Diagonal135
+    };
+    let fill = polygon::offset(footprint, -width);
+    // Hatch lines alternate in direction, so one runs on where the one
+    // before ends; joined, they form the zig-zag.
+    let zigzag = |spacing: f64| -> Vec<Point> {
+        let lines = polygon::hatch(&fill, spacing, direction, 0.5 * width);
+        lines.into_iter().flatten().collect()
+    };
+    let length = |line: &[Point]| -> f64 { line.windows(2).map(|p| distance(p[0], p[1])).sum() };
+    let outline: f64 = contours(&polygon::offset(footprint, -0.5 * width))
+        .iter()
+        .map(|c| {
+            length(c)
+                + c.first()
+                    .zip(c.last())
+                    .map_or(0.0, |(a, b)| distance(*a, *b))
+        })
+        .sum();
+    let mut wanted: Vec<f64> = volumes.iter().map(|v| v / section).collect();
+    if let Some(first) = wanted.first_mut() {
+        *first = (*first - outline).max(0.0);
+    }
+    let solid = zigzag(width);
+    let full = length(&solid);
+    let mut total: f64 = wanted.iter().sum();
+    let least = MIN_PURGE_DENSITY * full;
+    if total < least {
+        let extra = (least - total) / wanted.len() as f64;
+        for w in &mut wanted {
+            *w += extra;
+        }
+        total = least;
+    }
+    let (line, held) = if total >= full {
+        for w in &mut wanted {
+            *w *= full / total;
+        }
+        let held = (total > full * 1.001).then_some((full + outline) * section);
+        (solid, held)
+    } else {
+        // Lines further apart than a solid fill, brought closer until the
+        // zig-zag is long enough; the rest of it is left out.
+        let mut spacing = width * full / total;
+        let mut line = zigzag(spacing);
+        for _ in 0..100 {
+            if length(&line) >= total || spacing <= width {
+                break;
+            }
+            spacing = (spacing * 0.98).max(width);
+            line = zigzag(spacing);
+        }
+        (line, None)
+    };
+    // Cut the zig-zag into consecutive stretches of the wanted lengths.
+    let mut pieces = Vec::with_capacity(wanted.len());
+    // The next corner of the zig-zag to reach, and where the stretch starts.
+    let mut next = 1;
+    let mut from = line.first().copied();
+    for &want in &wanted {
+        let Some(start) = from.take() else {
+            pieces.push(Vec::new());
+            continue;
+        };
+        let mut piece = vec![start];
+        let (mut here, mut left) = (start, want);
+        while let Some(&corner) = line.get(next) {
+            let step = distance(here, corner);
+            if step >= left {
+                let t = if step > 0.0 { left / step } else { 0.0 };
+                let cut = [
+                    here[0] + (corner[0] - here[0]) * t,
+                    here[1] + (corner[1] - here[1]) * t,
+                ];
+                piece.push(cut);
+                from = Some(cut);
+                break;
+            }
+            left -= step;
+            piece.push(corner);
+            here = corner;
+            next += 1;
+        }
+        // Stretches of no length are left out.
+        if length(&piece) < 1e-3 {
+            piece.clear();
+        }
+        pieces.push(piece);
+    }
+    (pieces, held)
 }
 
 /// For every path of a layer: whether the move to its start stays inside
@@ -3859,6 +4067,95 @@ mod tests {
         // layer 10 starts without a change.
         assert_eq!(towers.iter().filter(|&&t| t).count(), 10, "{towers:?}");
         assert!(towers[..10].iter().all(|&t| t));
+    }
+
+    /// The material of the prime tower on every layer, in mm³ as the
+    /// G-code writer extrudes it.
+    fn tower_volumes(toolpaths: &Toolpaths, settings: &Settings) -> Vec<f64> {
+        (toolpaths.layers.iter())
+            .map(|layer| {
+                let section = settings.line_width * layer.height * settings.flow_ratio;
+                let tower = layer
+                    .paths
+                    .iter()
+                    .filter(|p| p.kind == PathKind::PrimeTower);
+                tower.map(Path::length).sum::<f64>() * section
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tool_changes_purge_their_flush_volumes() {
+        let mut settings = Settings::default();
+        settings.extruder_count = 2;
+        settings.prime_tower_width = 40.0;
+        settings.prime_tower_x = 150.0;
+        settings.prime_tower_y = 150.0;
+        settings.set("flush_volumes", "0,50;200,0").unwrap();
+        let mesh = two_cubes(10.0, 2.0);
+        let mut diagnostics = Diagnostics::new();
+        let toolpaths = generate_reporting(&mesh, &settings, &mut diagnostics).unwrap();
+        assert!(diagnostics.is_empty(), "{:?}", diagnostics.codes());
+        // Every layer changes tools once, from 0 to 1 on even layers and
+        // back on odd ones.
+        let volumes = tower_volumes(&toolpaths, &settings);
+        assert_eq!(volumes.len(), 10);
+        for (index, volume) in volumes.iter().enumerate() {
+            let wanted = if index % 2 == 0 { 50.0 } else { 200.0 };
+            assert!(
+                (volume / wanted - 1.0).abs() < 0.05,
+                "layer {index}: {volume}"
+            );
+            // Only the extruder changed to prints the tower.
+            let layer = &toolpaths.layers[index];
+            let tower = layer
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::PrimeTower);
+            for path in tower {
+                assert_eq!(path.extruder, 1 - index as u32 % 2, "layer {index}");
+                for p in &path.points {
+                    assert!((p[0] - 150.0).abs() < 20.0 && (p[1] - 150.0).abs() < 20.0);
+                }
+            }
+        }
+
+        // The multiplier scales every volume.
+        settings.flush_multiplier = 1.2;
+        let toolpaths = generate(&mesh, &settings).unwrap();
+        let volumes = tower_volumes(&toolpaths, &settings);
+        assert!((volumes[0] / 60.0 - 1.0).abs() < 0.05, "{volumes:?}");
+        assert!((volumes[1] / 240.0 - 1.0).abs() < 0.05, "{volumes:?}");
+
+        // Tiny purges still fill a tenth of the layer, for the layer above.
+        settings.flush_multiplier = 1.0;
+        settings.set("flush_volumes", "0,0,1,0").unwrap();
+        let toolpaths = generate(&mesh, &settings).unwrap();
+        let volumes = tower_volumes(&toolpaths, &settings);
+        let solid = 39.1 * 39.1 * 0.2;
+        for volume in &volumes {
+            assert!(
+                *volume > 0.1 * solid && *volume < 0.2 * solid,
+                "{volumes:?}"
+            );
+        }
+
+        // A tower too small for a purge is filled and the rest is reported.
+        settings.prime_tower_width = 20.0;
+        settings.set("flush_volumes", "0,50;200,0").unwrap();
+        let mut diagnostics = Diagnostics::new();
+        let toolpaths = generate_reporting(&mesh, &settings, &mut diagnostics).unwrap();
+        assert_eq!(diagnostics.codes(), ["slicing.flush_too_large"]);
+        let context = &diagnostics.as_slice()[0].context;
+        assert_eq!(context["layers"], "5");
+        assert_eq!(context["wanted"], "200.0");
+        // The 200 mm³ need about 32 mm of fill plus the outline.
+        assert_eq!(context["width"], "33");
+        let volumes = tower_volumes(&toolpaths, &settings);
+        let held: f64 = context["held"].parse().unwrap();
+        assert!((volumes[1] / held - 1.0).abs() < 0.02, "{volumes:?} {held}");
+        assert!(volumes[1] < 100.0, "{volumes:?}");
+        assert!((volumes[0] / 50.0 - 1.0).abs() < 0.05, "{volumes:?}");
     }
 
     #[test]

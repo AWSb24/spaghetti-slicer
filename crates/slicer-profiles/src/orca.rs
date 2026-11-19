@@ -29,6 +29,8 @@ enum Kind {
     /// The kind of brim: "no_brim" means a brim width of 0, the kinds that
     /// go around the outside keep the width, the others are not supported.
     BrimType,
+    /// A square table as a list of numbers, row by row.
+    Table,
 }
 
 /// Orca setting, our setting, and how to convert.
@@ -139,6 +141,9 @@ const MAPPING: &[(&str, &str, Kind)] = &[
     ("travel_speed", "travel_speed", Kind::Number),
     ("default_acceleration", "acceleration", Kind::Number),
     ("default_jerk", "jerk", Kind::Number),
+    // Multiple filaments
+    ("flush_volumes_matrix", "flush_volumes", Kind::Table),
+    ("flush_multiplier", "flush_multiplier", Kind::Number),
 ];
 
 /// Keys that describe the profile itself, not the print.
@@ -223,6 +228,8 @@ fn convert(kind: Kind, value: &str) -> Result<String, String> {
             .ok_or_else(|| format!("'{value}' is not available")),
         // Needs the whole list; see `bed_size`.
         Kind::BedArea => Err(format!("'{value}' is not a list of corners")),
+        // Needs the whole list; see `table`.
+        Kind::Table => Err(format!("'{value}' is not a list of numbers")),
         Kind::BrimType => match value {
             "no_brim" => Ok("0".into()),
             _ => Err(format!("'{value}' is not available")),
@@ -245,6 +252,26 @@ fn bed_size(value: &Value) -> Option<(f64, f64)> {
         values.clone().fold(f64::MIN, f64::max) - values.fold(f64::MAX, f64::min)
     };
     (corners.len() >= 3).then(|| (span(|c| c.0), span(|c| c.1)))
+}
+
+/// A list of n × n numbers (as texts or numbers) as rows separated by `;`,
+/// such as `0,280;230,0`.
+fn table(value: &Value) -> Option<String> {
+    let numbers: Vec<String> = value
+        .as_array()?
+        .iter()
+        .map(|item| match item {
+            Value::String(text) => text.trim().parse::<f64>().ok(),
+            Value::Number(number) => number.as_f64(),
+            _ => None,
+        })
+        .map(|number| number.map(|n| n.to_string()))
+        .collect::<Option<_>>()?;
+    let side = (1..=numbers.len()).find(|n| n * n >= numbers.len())?;
+    (side * side == numbers.len()).then(|| {
+        let rows: Vec<String> = numbers.chunks(side).map(|row| row.join(",")).collect();
+        rows.join(";")
+    })
 }
 
 /// Reads one Orca profile (printer, material or process) and checks every
@@ -306,6 +333,11 @@ fn import_entries(entries: &Map<String, Value>, settings: &mut Settings) -> Orca
                     ("bed_size_y".to_string(), y.to_string()),
                 ]),
                 None => Err("not a list of corners".to_string()),
+            }
+        } else if let Kind::Table = kind {
+            match table(value) {
+                Some(text) => Ok(vec![((*ours).to_string(), text)]),
+                None => Err("not a square table of numbers".to_string()),
             }
         } else {
             let Some(value) = text(value) else { continue };
@@ -470,6 +502,39 @@ mod tests {
                 "no matching setting".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn flush_volumes_come_from_projects() {
+        // As Bambu Studio stores them: row i is the change from filament i.
+        let project = r#"{
+            "flush_volumes_matrix": ["0", "353", "191", "298", "0", "210", "463", "487", "0"],
+            "flush_multiplier": ["1.5"]
+        }"#;
+        let mut settings = Settings::default();
+        let import = import_orca(project, &mut settings).unwrap();
+        assert!(import.skipped.is_empty(), "{:?}", import.skipped);
+        assert_eq!(settings.flush_volumes, "0,353,191;298,0,210;463,487,0");
+        assert_eq!(settings.flush_multiplier, 1.5);
+        // With as many extruders the table is used.
+        settings.set("extruder_count", "3").unwrap();
+        let matrix = settings.flush_matrix().unwrap();
+        assert_eq!(matrix[2], [694.5, 730.5, 0.0]);
+
+        // A table that does not fit the extruders is left out.
+        let mut two = Settings::default();
+        two.set("extruder_count", "2").unwrap();
+        let import = import_orca(project, &mut two).unwrap();
+        assert_eq!(import.skipped.len(), 1);
+        assert!(
+            import.skipped[0].1.contains("extruder_count"),
+            "{:?}",
+            import.skipped
+        );
+        assert_eq!(two.flush_volumes, "");
+        let odd = r#"{ "flush_volumes_matrix": ["0", "1", "2"] }"#;
+        let import = import_orca(odd, &mut two).unwrap();
+        assert_eq!(import.skipped[0].1, "not a square table of numbers");
     }
 
     #[test]

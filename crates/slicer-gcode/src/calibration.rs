@@ -1481,6 +1481,8 @@ mod tests {
                 filament_weight_g: 0.0,
                 print_time_s: 0.0,
                 extruders: Vec::new(),
+                flush_volume_cm3: 0.0,
+                flush_weight_g: 0.0,
                 times: Vec::new(),
             },
         };
