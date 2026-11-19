@@ -2638,6 +2638,7 @@ dependencies = [
  "serde",
  "slicer-core",
  "slicer-fdm",
+ "slicer-formats",
  "slicer-profiles",
 ]
 

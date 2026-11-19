@@ -213,6 +213,7 @@ pub fn encode_output(
         filament_m: output.stats.filament_length_mm / 1000.0,
         layers: output.stats.layers,
         nozzle_diameter: settings.nozzle_diameter,
+        filaments: slicer_gcode::filaments(&output.stats, settings),
         // ponytail: no picture of the plate here, the meshes are not at
         // hand; the command line tool and the server add one.
         ..slicer_formats::PrintInfo::default()

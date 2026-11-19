@@ -243,6 +243,23 @@ pub struct Settings {
     /// print: `M900 K` for Marlin, `SET_PRESSURE_ADVANCE` for Klipper. 0
     /// leaves the printer's own value.
     pub pressure_advance: f64,
+    /// Colour of the filament of every extruder, as `#RRGGBB` separated by
+    /// commas in the order of the extruders, such as `#FF8000,#202020`;
+    /// empty for none. With more than one extruder (`extruder_count`) at
+    /// most one colour per extruder; extruders without one keep their
+    /// colour from the built-in palette. With one extruder any number is
+    /// accepted (as projects of Bambu Studio bring them) and the first one
+    /// is used. Thumbnails draw every object in the colour of its extruder,
+    /// a `.gcode.3mf` names the colour of every filament, and
+    /// `flush_from_colours` derives purge volumes from them. Changes
+    /// nothing in the G-code itself.
+    pub filament_colours: String,
+    /// Kind of the filament of every extruder, such as `PLA` or `PETG`,
+    /// separated by commas in the order of the extruders; empty for none.
+    /// Letters, digits, spaces and `+-_.` only; at most one per extruder
+    /// as with `filament_colours`. Only written to the `.gcode.3mf`
+    /// container (`PLA` where none is given).
+    pub filament_type: String,
 
     // Process
     /// Layer height.
@@ -374,8 +391,22 @@ pub struct Settings {
     /// tool change shares the solid tower layer with the other changes of
     /// its layer.
     pub flush_volumes: String,
-    /// Factor on every value of `flush_volumes`.
+    /// Factor on every value of `flush_volumes`, also on the volumes that
+    /// `flush_from_colours` derives.
     pub flush_multiplier: f64,
+    /// Whether, while `flush_volumes` is empty and there is more than one
+    /// extruder, the purge volumes are derived from `filament_colours`,
+    /// which then needs a colour for every extruder. A change from colour
+    /// A to colour B purges 50 + 500 × max(0, L(B) − L(A)) + 100 × D mm³
+    /// (times `flush_multiplier`), where L is the lightness of a colour
+    /// from 0 (black) to 1 (white), the square root of 0.2126 r² + 0.7152
+    /// g² + 0.0722 b² with r, g, b from 0 to 1, and D the distance of the
+    /// two colours from 0 (same) to 1 (black and white), the square root
+    /// of the mean of the squared differences of r, g and b. So black to
+    /// white purges 650 mm³, white to black 150 and a change between equal
+    /// colours 50: a dark colour shows through a light one. Own rule of
+    /// thumb, not measured.
+    pub flush_from_colours: bool,
     /// Whether every object on the plate is printed completely, all its
     /// layers, before the next one starts, lowest first; between objects
     /// the nozzle rises above everything printed. The objects must stand
@@ -497,6 +528,8 @@ impl Default for Settings {
             min_layer_time: 0.0,
             min_print_speed: 10.0,
             pressure_advance: 0.0,
+            filament_colours: String::new(),
+            filament_type: String::new(),
             layer_height: 0.2,
             first_layer_height: 0.2,
             adaptive_layers: false,
@@ -541,6 +574,7 @@ impl Default for Settings {
             prime_tower_y: 190.0,
             flush_volumes: String::new(),
             flush_multiplier: 1.0,
+            flush_from_colours: false,
             sequential_print: false,
             extruder_clearance_radius: 35.0,
             gantry_height: 20.0,
@@ -652,6 +686,45 @@ fn range(key: &'static str, value: f64, min: f64, max: f64) -> Result<(), Settin
 
 /// Largest width or height of a picture in `thumbnails`, in pixels.
 pub const MAX_THUMBNAIL_SIZE: u32 = 1024;
+
+/// A colour written as `#RRGGBB` (hexadecimal digits in either case) as
+/// red, green and blue.
+pub fn parse_colour(text: &str) -> Option<[u8; 3]> {
+    let digits = text.strip_prefix('#')?;
+    if digits.len() != 6 || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let channel = |at: usize| u8::from_str_radix(&digits[at..at + 2], 16).ok();
+    Some([channel(0)?, channel(2)?, channel(4)?])
+}
+
+/// A colour as `#RRGGBB` with upper-case digits.
+pub fn colour_hex([r, g, b]: [u8; 3]) -> String {
+    format!("#{r:02X}{g:02X}{b:02X}")
+}
+
+/// Purge volume in mm³ that a change from filament colour `from` to `to`
+/// needs by the rule of thumb of `flush_from_colours`, before
+/// `flush_multiplier`: 50 + 500 × max(0, L(to) − L(from)) + 100 × D, with
+/// the lightness L and the colour distance D both from 0 to 1. Only
+/// multiplications, additions and square roots, so the same on every
+/// platform.
+pub fn colour_flush_volume(from: [u8; 3], to: [u8; 3]) -> f64 {
+    /// Purge of every change, also between equal colours.
+    const BASE: f64 = 50.0;
+    /// Purge for a change from black to white on top of the rest.
+    const LIGHTER: f64 = 500.0;
+    /// Purge for the largest colour distance.
+    const DIFFERENT: f64 = 100.0;
+    let unit = |colour: [u8; 3]| colour.map(|c| f64::from(c) / 255.0);
+    let (a, b) = (unit(from), unit(to));
+    // ponytail: squaring stands in for the sRGB curve (exponent 2.4), and
+    // the square root of the luminance for perceived lightness.
+    let lightness = |[r, g, b]: [f64; 3]| (0.2126 * r * r + 0.7152 * g * g + 0.0722 * b * b).sqrt();
+    let squares: f64 = (0..3).map(|i| (a[i] - b[i]) * (a[i] - b[i])).sum();
+    let distance = (squares / 3.0).sqrt();
+    BASE + LIGHTER * (lightness(b) - lightness(a)).max(0.0) + DIFFERENT * distance
+}
 
 impl Settings {
     /// Parses settings from TOML. Missing keys take their default value,
@@ -780,19 +853,77 @@ impl Settings {
             range(key, value, min, max)?;
         }
         self.thumbnail_sizes()?;
+        self.filament_colours()?;
+        self.filament_types()?;
         self.flush_matrix()?;
         Ok(())
     }
 
+    /// The colours of `filament_colours` as red, green and blue, in the
+    /// order of the extruders; empty if none are given.
+    pub fn filament_colours(&self) -> Result<Vec<[u8; 3]>, SettingsError> {
+        let colours = self
+            .per_extruder("filament_colours", &self.filament_colours)?
+            .into_iter()
+            .map(|entry| {
+                parse_colour(entry).ok_or_else(|| {
+                    SettingsError::Parse(format!(
+                        "filament_colours: '{entry}' is not a colour like #FF8000"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(colours)
+    }
+
+    /// The kinds of `filament_type` in the order of the extruders; empty if
+    /// none are given.
+    pub fn filament_types(&self) -> Result<Vec<&str>, SettingsError> {
+        let types = self.per_extruder("filament_type", &self.filament_type)?;
+        let allowed = |c: char| c.is_ascii_alphanumeric() || " +-_.".contains(c);
+        if let Some(entry) = types.iter().find(|entry| !entry.chars().all(allowed)) {
+            return Err(SettingsError::Parse(format!(
+                "filament_type: '{entry}' may only hold letters, digits, spaces and +-_."
+            )));
+        }
+        Ok(types)
+    }
+
+    /// The entries of a list with one value per extruder, separated by
+    /// commas and trimmed; empty for an empty text. No entry may be empty,
+    /// and with more than one extruder there may be at most one per
+    /// extruder.
+    fn per_extruder<'a>(&self, key: &str, text: &'a str) -> Result<Vec<&'a str>, SettingsError> {
+        if text.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let entries: Vec<&str> = text.split(',').map(str::trim).collect();
+        if entries.iter().any(|entry| entry.is_empty()) {
+            return Err(SettingsError::Parse(format!(
+                "{key}: an entry between commas is empty"
+            )));
+        }
+        if self.extruder_count > 1 && entries.len() > self.extruder_count as usize {
+            return Err(SettingsError::Parse(format!(
+                "{key}: {} entries, but only {} extruders (extruder_count)",
+                entries.len(),
+                self.extruder_count
+            )));
+        }
+        Ok(entries)
+    }
+
     /// The purge volumes of `flush_volumes` in mm³, already multiplied by
     /// `flush_multiplier`: `matrix[i][j]` for the change from extruder `i`
-    /// to extruder `j`, with zeros on the diagonal. Empty if
-    /// `flush_volumes` is empty or there is only one extruder.
+    /// to extruder `j`, with zeros on the diagonal. With `flush_volumes`
+    /// empty they come from `filament_colours` if `flush_from_colours` is
+    /// on (see [`colour_flush_volume`]). Empty if there is only one
+    /// extruder, or if `flush_volumes` is empty and not derived.
     pub fn flush_matrix(&self) -> Result<Vec<Vec<f64>>, SettingsError> {
         let invalid = |message: String| SettingsError::Parse(format!("flush_volumes: {message}"));
         let text = self.flush_volumes.trim();
         if text.is_empty() {
-            return Ok(Vec::new());
+            return self.flush_matrix_from_colours();
         }
         let rows: Vec<&str> = text.trim_end_matches(';').split(';').collect();
         let mut values = Vec::new();
@@ -858,6 +989,35 @@ impl Settings {
                             0.0
                         } else {
                             v * self.flush_multiplier
+                        }
+                    })
+                    .collect()
+            })
+            .collect())
+    }
+
+    /// The matrix of [`Settings::flush_matrix`] derived from the colours,
+    /// if `flush_from_colours` asks for it and there are several extruders.
+    fn flush_matrix_from_colours(&self) -> Result<Vec<Vec<f64>>, SettingsError> {
+        if !self.flush_from_colours || self.extruder_count < 2 {
+            return Ok(Vec::new());
+        }
+        let colours = self.filament_colours()?;
+        let count = self.extruder_count as usize;
+        if colours.len() < count {
+            return Err(SettingsError::Parse(format!(
+                "flush_from_colours: {} colours in filament_colours, but {count} extruders (extruder_count) need one each",
+                colours.len()
+            )));
+        }
+        Ok((0..count)
+            .map(|from| {
+                (0..count)
+                    .map(|to| {
+                        if from == to {
+                            0.0
+                        } else {
+                            colour_flush_volume(colours[from], colours[to]) * self.flush_multiplier
                         }
                     })
                     .collect()
@@ -1189,6 +1349,107 @@ mod tests {
             .set_all([("extruder_count", "3"), ("flush_volumes", "")])
             .unwrap();
         assert!(settings.set("flush_multiplier", "-1").is_err());
+    }
+
+    #[test]
+    fn filament_colours_and_types_are_read_and_checked() {
+        let mut settings = Settings::default();
+        assert!(settings.filament_colours().unwrap().is_empty());
+        assert!(settings.filament_types().unwrap().is_empty());
+        // With one extruder any number is accepted, as projects bring them.
+        settings
+            .set("filament_colours", " #ff8000, #202020 ,#0000FF")
+            .unwrap();
+        assert_eq!(
+            settings.filament_colours().unwrap(),
+            [[0xFF, 0x80, 0x00], [0x20, 0x20, 0x20], [0, 0, 0xFF]]
+        );
+        settings
+            .set("filament_type", "PLA, PETG HF,PLA-CF")
+            .unwrap();
+        assert_eq!(
+            settings.filament_types().unwrap(),
+            ["PLA", "PETG HF", "PLA-CF"]
+        );
+        for wrong in [
+            "FF8000",
+            "#FF800",
+            "#FF80000",
+            "#GG8000",
+            "#FF8000,,#000000",
+            "red",
+        ] {
+            let error = settings.set("filament_colours", wrong).unwrap_err();
+            assert!(error.to_string().contains("filament_colours"), "{error}");
+        }
+        for wrong in ["PLA,<x>", "PLA,", "a\"b"] {
+            let error = settings.set("filament_type", wrong).unwrap_err();
+            assert!(error.to_string().contains("filament_type"), "{error}");
+        }
+        // With several extruders at most one each.
+        assert!(settings.set("extruder_count", "2").is_err());
+        settings
+            .set_all([
+                ("extruder_count", "2"),
+                ("filament_colours", "#FF8000"),
+                ("filament_type", "PLA,PETG"),
+            ])
+            .unwrap();
+        assert_eq!(settings.filament_colours().unwrap(), [[0xFF, 0x80, 0]]);
+        let error = settings
+            .set("filament_colours", "#000000,#111111,#222222")
+            .unwrap_err();
+        assert!(error.to_string().contains("extruder_count"), "{error}");
+        assert_eq!(colour_hex([0xFF, 0x80, 0x0A]), "#FF800A");
+        assert_eq!(parse_colour("#ff800a"), Some([0xFF, 0x80, 0x0A]));
+    }
+
+    #[test]
+    fn flush_volumes_come_from_colours_only_when_asked() {
+        let mut settings = Settings::default();
+        settings
+            .set_all([
+                ("extruder_count", "3"),
+                ("filament_colours", "#101010,#F0F0F0,#FF0000"),
+            ])
+            .unwrap();
+        // Off by default: no table, as before.
+        assert!(settings.flush_matrix().unwrap().is_empty());
+        settings.set("flush_from_colours", "true").unwrap();
+        let matrix = settings.flush_matrix().unwrap();
+        assert_eq!(matrix.len(), 3);
+        for (i, row) in matrix.iter().enumerate() {
+            assert_eq!(row.len(), 3);
+            assert_eq!(row[i], 0.0);
+        }
+        // Dark to light purges more than light to dark.
+        assert!(matrix[0][1] > matrix[1][0], "{matrix:?}");
+        assert!(matrix[0][2] > matrix[2][0], "{matrix:?}");
+        assert!(matrix[2][1] > matrix[1][2], "{matrix:?}");
+        assert!(matrix.iter().flatten().all(|v| *v >= 0.0 && *v <= 650.001));
+        // The ends of the scale.
+        let (black, white) = ([0, 0, 0], [255, 255, 255]);
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(near(colour_flush_volume(black, white), 650.0));
+        assert!(near(colour_flush_volume(white, black), 150.0));
+        assert!(near(colour_flush_volume(white, white), 50.0));
+        // The multiplier scales them, a table of its own wins.
+        let before = matrix[0][1];
+        settings.set("flush_multiplier", "2").unwrap();
+        assert_eq!(settings.flush_matrix().unwrap()[0][1], 2.0 * before);
+        settings.set("flush_volumes", "0,1,2;3,0,5;6,7,0").unwrap();
+        assert_eq!(settings.flush_matrix().unwrap()[0][1], 2.0);
+        // Every extruder needs a colour.
+        settings.set("flush_volumes", "").unwrap();
+        let error = settings
+            .set("filament_colours", "#101010,#F0F0F0")
+            .unwrap_err();
+        assert!(error.to_string().contains("flush_from_colours"), "{error}");
+        // One extruder purges nothing.
+        settings
+            .set_all([("extruder_count", "1"), ("filament_colours", "#101010")])
+            .unwrap();
+        assert!(settings.flush_matrix().unwrap().is_empty());
     }
 
     #[test]

@@ -20,7 +20,7 @@
 
 use slicer_core::Mesh;
 use slicer_core::png::{ColorType, encode};
-use slicer_core::thumbnail::{Style, render};
+use slicer_core::thumbnail::{DEFAULT_COLORS, Style, render};
 use slicer_fdm::Placement;
 use slicer_profiles::Settings;
 
@@ -55,19 +55,47 @@ fn on_the_bed(meshes: &[Mesh], placement: Placement) -> Vec<Mesh> {
         .collect()
 }
 
+/// How the pictures of a plate look with `settings`: every extruder in its
+/// colour of `filament_colours`, those without one in the colour of the
+/// built-in palette ([`DEFAULT_COLORS`]). With one extruder everything is
+/// drawn in the first colour, since everything prints with one filament.
+/// Without colours the palette alone, as before the setting existed.
+pub fn thumbnail_style(settings: &Settings) -> Style {
+    // Settings are checked when they are read.
+    let colours = settings.filament_colours().unwrap_or_default();
+    let mut style = Style::default();
+    if let Some(&first) = colours.first() {
+        style.colors = if settings.extruder_count <= 1 {
+            vec![first]
+        } else {
+            (0..settings.extruder_count as usize)
+                .map(|i| {
+                    colours
+                        .get(i)
+                        .copied()
+                        .unwrap_or(DEFAULT_COLORS[i % DEFAULT_COLORS.len()])
+                })
+                .collect()
+        };
+    }
+    style
+}
+
 /// Draws the objects of a plate, as they are given to
 /// `slicer_fdm::generate_plate` with `placement`, once in every size of
-/// `sizes` (width, height) and encodes the pictures as PNG.
+/// `sizes` (width, height) in the colours of `settings` (see
+/// [`thumbnail_style`]) and encodes the pictures as PNG.
 pub fn render_thumbnails(
     meshes: &[Mesh],
     placement: Placement,
     sizes: &[[u32; 2]],
+    settings: &Settings,
 ) -> std::io::Result<Vec<Thumbnail>> {
     if sizes.is_empty() {
         return Ok(Vec::new());
     }
     let meshes = on_the_bed(meshes, placement);
-    let style = Style::default();
+    let style = thumbnail_style(settings);
     sizes
         .iter()
         .map(|&[width, height]| {
@@ -93,7 +121,10 @@ pub fn add_thumbnails(
     // Settings are checked when they are read, so sizes that cannot be
     // read do not get here.
     let sizes = settings.thumbnail_sizes().unwrap_or_default();
-    insert_thumbnails(gcode, &render_thumbnails(meshes, placement, &sizes)?);
+    insert_thumbnails(
+        gcode,
+        &render_thumbnails(meshes, placement, &sizes, settings)?,
+    );
     Ok(())
 }
 
@@ -231,21 +262,103 @@ mod tests {
     fn thumbnails_are_pngs_of_the_sizes() {
         let mut cube = Mesh::cuboid(10.0, 10.0, 10.0);
         cube.translate([0.0, 0.0, 5.0]);
-        let thumbnails =
-            render_thumbnails(&[cube.clone()], Placement::AsGiven, &[[48, 48], [64, 32]]).unwrap();
+        let settings = Settings::default();
+        let thumbnails = render_thumbnails(
+            &[cube.clone()],
+            Placement::AsGiven,
+            &[[48, 48], [64, 32]],
+            &settings,
+        )
+        .unwrap();
         assert_eq!(thumbnails.len(), 2);
         assert_eq!(
             slicer_core::png::header(&thumbnails[1].png),
             Some((64, 32, ColorType::Rgba))
         );
         assert_eq!(
-            render_thumbnails(&[cube], Placement::Centre, &[[48, 48]]).unwrap()[0],
+            render_thumbnails(&[cube], Placement::Centre, &[[48, 48]], &settings).unwrap()[0],
             thumbnails[0]
         );
         assert!(
-            render_thumbnails(&[], Placement::Centre, &[])
+            render_thumbnails(&[], Placement::Centre, &[], &settings)
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// The colours of the pixels of an RGBA image that are fully covered.
+    fn opaque_colours(pixels: &[u8]) -> Vec<[u8; 3]> {
+        pixels
+            .chunks(4)
+            .filter(|p| p[3] == 255)
+            .map(|p| [p[0], p[1], p[2]])
+            .collect()
+    }
+
+    /// Whether `pixel` is `colour` shaded by some brightness: every channel
+    /// scaled by about the same factor.
+    fn shade_of(pixel: [u8; 3], colour: [u8; 3]) -> bool {
+        let factor = f64::from(pixel[0].max(pixel[1]).max(pixel[2]))
+            / f64::from(colour[0].max(colour[1]).max(colour[2]));
+        (0..3).all(|i| (f64::from(pixel[i]) - factor * f64::from(colour[i])).abs() <= 2.0)
+    }
+
+    #[test]
+    fn two_extruders_are_drawn_in_their_filament_colours() {
+        // Two cubes side by side, the right one on the second extruder.
+        let left = Mesh::cuboid(10.0, 10.0, 10.0);
+        let mut right = Mesh::cuboid(10.0, 10.0, 10.0);
+        right.translate([15.0, 0.0, 0.0]);
+        right.extruders = vec![1; right.triangles.len()];
+        let mut settings = Settings::default();
+        settings
+            .set_all([
+                ("extruder_count", "2"),
+                ("filament_colours", "#00C000,#C000C0"),
+            ])
+            .unwrap();
+        let meshes = [left, right];
+        let style = thumbnail_style(&settings);
+        assert_eq!(style.colors, [[0, 0xC0, 0], [0xC0, 0, 0xC0]]);
+        let pixels = render(&meshes, 64, 32, &style);
+        let colours = opaque_colours(&pixels);
+        let green = colours
+            .iter()
+            .filter(|&&p| shade_of(p, [0, 0xC0, 0]))
+            .count();
+        let purple = colours
+            .iter()
+            .filter(|&&p| shade_of(p, [0xC0, 0, 0xC0]))
+            .count();
+        assert!(green > 50 && purple > 50, "{green} {purple}");
+        // Only where the cubes meet are pixels mixed.
+        assert!(10 * (green + purple) >= 9 * colours.len());
+        if let Some(dir) = std::env::var_os("THUMBNAIL_OUT") {
+            let picture = render_thumbnails(&meshes, Placement::AsGiven, &[[300, 300]], &settings)
+                .unwrap()
+                .remove(0);
+            std::fs::write(
+                std::path::Path::new(&dir).join("two-colours.png"),
+                picture.png,
+            )
+            .unwrap();
+        }
+
+        // Without colours the palette, as before; a missing colour comes
+        // from it too.
+        assert_eq!(thumbnail_style(&Settings::default()), Style::default());
+        settings.set("filament_colours", "#00C000").unwrap();
+        assert_eq!(
+            thumbnail_style(&settings).colors,
+            [[0, 0xC0, 0], DEFAULT_COLORS[1]]
+        );
+        // With one extruder everything in the first colour.
+        settings
+            .set_all([
+                ("extruder_count", "1"),
+                ("filament_colours", "#00C000,#C000C0"),
+            ])
+            .unwrap();
+        assert_eq!(thumbnail_style(&settings).colors, [[0, 0xC0, 0]]);
     }
 }

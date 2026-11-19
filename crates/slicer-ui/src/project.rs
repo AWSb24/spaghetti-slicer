@@ -237,10 +237,18 @@ fn project_thumbnail(meshes: &[Mesh]) -> Vec<u8> {
         return Vec::new();
     }
     let size = [THUMBNAIL_SIZE, THUMBNAIL_SIZE];
-    slicer_gcode::thumbnails::render_thumbnails(meshes, slicer_fdm::Placement::AsGiven, &[size])
-        .ok()
-        .and_then(|pictures| pictures.into_iter().next())
-        .map_or(Vec::new(), |picture| picture.png)
+    // ponytail: the palette colours; the settings of the project are not
+    // resolved here, so `filament_colours` does not reach this picture.
+    let settings = slicer_profiles::Settings::default();
+    slicer_gcode::thumbnails::render_thumbnails(
+        meshes,
+        slicer_fdm::Placement::AsGiven,
+        &[size],
+        &settings,
+    )
+    .ok()
+    .and_then(|pictures| pictures.into_iter().next())
+    .map_or(Vec::new(), |picture| picture.png)
 }
 
 /// Reads a project file. The warnings say what could not be taken over.
