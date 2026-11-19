@@ -773,6 +773,7 @@ fn slice(
             &objects.meshes,
             placement,
             &[[large, large], [small, small]],
+            &settings,
         )
         .map_err(|e| thumbnail_error(&e))?
         .into_iter()
@@ -785,6 +786,7 @@ fn slice(
             nozzle_diameter: settings.nozzle_diameter,
             thumbnail: pictures.next().unwrap_or_default(),
             thumbnail_small: pictures.next().unwrap_or_default(),
+            filaments: slicer_gcode::filaments(&result.stats, &settings),
         };
         slicer_formats::write_gcode_3mf(&result.gcode, &info).map_err(|e| e.diagnostic())?
     } else {

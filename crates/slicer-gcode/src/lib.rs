@@ -71,6 +71,43 @@ pub struct ExtruderStats {
     pub print_time_s: f64,
 }
 
+/// The filaments of a print for the description files of a `.gcode.3mf`
+/// container ([`slicer_formats::PrintInfo::filaments`]): one per extruder
+/// the print uses (with more than one extruder, from
+/// [`Stats::extruders`]), otherwise the one of the first extruder with
+/// all the filament. Each has its kind from `filament_type` and its colour
+/// from `filament_colours`; without one, `PLA` and white `#FFFFFF`, as
+/// the container wrote before these settings existed.
+pub fn filaments(stats: &Stats, settings: &Settings) -> Vec<slicer_formats::Filament> {
+    // Settings are checked when they are read.
+    let colours = settings.filament_colours().unwrap_or_default();
+    let types = settings.filament_types().unwrap_or_default();
+    let filament = |extruder: u32, length_mm: f64, weight_g: f64| {
+        let index = extruder as usize;
+        slicer_formats::Filament {
+            id: extruder + 1,
+            kind: types.get(index).copied().unwrap_or("PLA").to_owned(),
+            colour: colours
+                .get(index)
+                .map_or_else(|| "#FFFFFF".to_owned(), |&c| slicer_profiles::colour_hex(c)),
+            used_m: length_mm / 1000.0,
+            used_g: weight_g,
+        }
+    };
+    if stats.extruders.is_empty() {
+        return vec![filament(
+            0,
+            stats.filament_length_mm,
+            stats.filament_weight_g,
+        )];
+    }
+    stats
+        .extruders
+        .iter()
+        .map(|e| filament(e.extruder, e.filament_length_mm, e.filament_weight_g))
+        .collect()
+}
+
 /// Generated G-code with its statistics.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Output {
@@ -2024,6 +2061,74 @@ SET_PRESSURE_ADVANCE ADVANCE=0.04
         // Without a tower nothing is purged, and JSON leaves it out.
         assert!(is_zero(&plain.stats.flush_volume_cm3));
         assert!(is_zero(&plain.stats.flush_weight_g));
+    }
+
+    #[test]
+    fn purges_come_from_the_colours_only_with_the_switch() {
+        let mut settings = Settings::default();
+        settings.extruder_count = 2;
+        settings.prime_tower_width = 40.0;
+        settings.prime_tower_x = 160.0;
+        settings.prime_tower_y = 160.0;
+        let before = slice(&two_cubes(), &settings);
+        // Colours alone change nothing but the settings list at the end.
+        settings.set("filament_colours", "#101010,#F0F0F0").unwrap();
+        let coloured = slice(&two_cubes(), &settings);
+        let body = |output: &Output| output.gcode.split("; settings\n").next().map(str::to_owned);
+        assert_eq!(body(&coloured), body(&before));
+        assert_eq!(coloured.stats, before.stats);
+        // With the switch, the changes purge what the colours ask for: dark
+        // to light more than back.
+        settings.set("flush_from_colours", "true").unwrap();
+        let derived = slice(&two_cubes(), &settings);
+        let matrix = settings.flush_matrix().unwrap();
+        let mut table = settings.clone();
+        table.flush_from_colours = false;
+        table
+            .set(
+                "flush_volumes",
+                &format!("0,{};{},0", matrix[0][1], matrix[1][0]),
+            )
+            .unwrap();
+        assert_eq!(derived.stats, slice(&two_cubes(), &table).stats);
+        assert!(matrix[0][1] > matrix[1][0]);
+        assert!(derived.stats.flush_volume_cm3 > 0.0);
+    }
+
+    #[test]
+    fn filaments_carry_their_colours_and_use() {
+        let mut settings = Settings::default();
+        settings.extruder_count = 2;
+        settings.prime_tower_width = 0.0;
+        settings
+            .set_all([
+                ("filament_colours", "#FF8000,#202020"),
+                ("filament_type", "PLA,PETG"),
+            ])
+            .unwrap();
+        let output = slice(&two_cubes(), &settings);
+        let list = filaments(&output.stats, &settings);
+        assert_eq!(list.len(), 2);
+        assert_eq!(
+            (list[0].id, list[0].kind.as_str(), list[0].colour.as_str()),
+            (1, "PLA", "#FF8000")
+        );
+        assert_eq!(
+            (list[1].id, list[1].kind.as_str(), list[1].colour.as_str()),
+            (2, "PETG", "#202020")
+        );
+        let e = &output.stats.extruders[1];
+        assert_eq!(list[1].used_m, e.filament_length_mm / 1000.0);
+        assert_eq!(list[1].used_g, e.filament_weight_g);
+        // One extruder without settings: the white PLA of before.
+        let plain = slice(&two_cubes(), &Settings::default());
+        let list = filaments(&plain.stats, &Settings::default());
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            (list[0].id, list[0].kind.as_str(), list[0].colour.as_str()),
+            (1, "PLA", "#FFFFFF")
+        );
+        assert_eq!(list[0].used_m, plain.stats.filament_length_mm / 1000.0);
     }
 
     #[test]

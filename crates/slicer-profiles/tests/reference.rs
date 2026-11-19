@@ -83,8 +83,13 @@ fn settings_reference_is_current() {
                 | "label_objects"
                 | "sequential_print"
                 | "arrange_outlines"
-                | "arrange_rotation" => "`true`, `false`".to_string(),
+                | "arrange_rotation"
+                | "flush_from_colours" => "`true`, `false`".to_string(),
                 "thumbnails" => "sizes like `48x48,300x300`, empty for none".to_string(),
+                "filament_colours" => {
+                    "colours like `#FF8000,#202020`, one per extruder, empty for none".to_string()
+                }
+                "filament_type" => "kinds like `PLA,PETG`, one per extruder, empty for none".to_string(),
                 "flush_volumes" => {
                     "`extruder_count`² numbers of at least 0 in mm³, empty for none".to_string()
                 }

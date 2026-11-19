@@ -165,6 +165,17 @@ impl Config {
     }
 }
 
+/// A filament as [`Job::save`] stores it; `None` if it cannot be read.
+fn stored_filament(value: &Value) -> Option<slicer_formats::Filament> {
+    Some(slicer_formats::Filament {
+        id: u32::try_from(value["id"].as_u64()?).ok()?,
+        kind: value["type"].as_str()?.to_owned(),
+        colour: value["colour"].as_str()?.to_owned(),
+        used_m: value["used_m"].as_f64()?,
+        used_g: value["used_g"].as_f64()?,
+    })
+}
+
 /// Seconds since 1970.
 fn unix_now() -> f64 {
     SystemTime::now()
@@ -278,6 +289,13 @@ impl Job {
                 "filament_m": info.filament_m,
                 "layers": info.layers,
                 "nozzle_diameter": info.nozzle_diameter,
+                "filaments": info.filaments.iter().map(|f| json!({
+                    "id": f.id,
+                    "type": f.kind,
+                    "colour": f.colour,
+                    "used_m": f.used_m,
+                    "used_g": f.used_g,
+                })).collect::<Vec<_>>(),
             })
         });
         let record = json!({
@@ -321,6 +339,11 @@ impl Job {
                 // versions have none.
                 thumbnail: std::fs::read(dir.join(format!("{id}.png"))).unwrap_or_default(),
                 thumbnail_small: std::fs::read(dir.join(format!("{id}.small.png")))
+                    .unwrap_or_default(),
+                // Jobs of older versions have none: one white PLA filament.
+                filaments: info["filaments"]
+                    .as_array()
+                    .map(|list| list.iter().filter_map(stored_filament).collect())
                     .unwrap_or_default(),
             };
             (Some(Arc::new(gcode)), Some(info))
@@ -914,6 +937,7 @@ fn slice(
         meshes,
         plate.placement,
         &[[large, large], [small, small]],
+        settings,
     )
     .map_err(thumbnail_error)?
     .into_iter()
@@ -926,6 +950,7 @@ fn slice(
         nozzle_diameter: settings.nozzle_diameter,
         thumbnail: pictures.next().unwrap_or_default(),
         thumbnail_small: pictures.next().unwrap_or_default(),
+        filaments: slicer_gcode::filaments(&output.stats, settings),
     };
     Ok((output, warnings, info))
 }
