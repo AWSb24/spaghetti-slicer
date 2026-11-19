@@ -31,6 +31,7 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `fan_layer_time` | 0 | 0 to 600 | Layers that take less than this many seconds get more fan than `fan_speed`, the more the shorter they are, up to `fan_max_speed` at `min_layer_time` (or at no time at all without it). 0 turns it off. |
 | `fan_max_speed` | 100 | 0 to 100 | Fan speed in percent for the shortest layers, see `fan_layer_time`. |
 | `overhang_fan_speed` | 100 | 0 to 100 | Fan speed in percent while printing overhanging walls, see `overhang_speed`. |
+| `support_interface_fan_speed` | -1 | -1 to 100 | Fan speed in percent while printing the dense support interface, for example 100 so that it bonds less to the model and comes off more easily; -1 keeps the fan of the layer. |
 | `min_layer_time` | 0 | 0 to 600 | Shortest time in seconds a layer may take, so that it can cool before the next one goes on top; smaller layers are printed slower. 0 turns it off. |
 | `min_print_speed` | 10 | 1 to 1000 | Slowest speed in mm/s that `min_layer_time` slows extrusion down to. |
 | `pressure_advance` | 0 | 0 to 2 | Pressure advance (linear advance) factor written at the start of the print: `M900 K` for Marlin, `SET_PRESSURE_ADVANCE` for Klipper. 0 leaves the printer's own value. |
@@ -69,6 +70,9 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `support_style` | normal | `normal`, `tree` | Shape of the supports: straight columns (`normal`) or branches that merge into trunks (`tree`). |
 | `support_spacing` | 2.5 | 0.5 to 20 | Distance between the lines of a support. Tree supports also touch the surface they carry at points this far apart. |
 | `support_interface_layers` | 2 | 0 to 10 | Number of densely filled support layers right under the surface they carry. |
+| `support_bottom_interface_layers` | 0 | 0 to 10 | Number of densely filled support layers where a support stands on the model (bottom interface), so that it leaves a smoother surface there; 0 turns them off. |
+| `support_interface_pattern` | lines | `lines`, `concentric`, `grid` | Pattern of the dense interface layers: `lines`, `concentric` or `grid`. |
+| `support_interface_spacing` | 0 | 0 to 20 | Distance between the lines (or loops) of the dense interface, at least one line width; 0 means two line widths. |
 | `support_bridge_length` | 10 | 0 to 1000 | Bridges up to this length in millimetres get no supports; 0 supports every bridge. |
 | `prime_tower_width` | 15 | 0 to 100 | Side of the square tower that every tool change primes the new extruder into, on every layer up to the last tool change; 0 disables it. Only used with more than one extruder. |
 | `prime_tower_x` | 190 | 0 to 2000 * | X of the centre of the prime tower on the bed. |
@@ -85,7 +89,8 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `overhang_speed` | 0 | 0 to 1000 | Speed of walls where more than half the line hangs over the edge of the layer below; these parts of walls are printed as overhang walls with `overhang_fan_speed`. 0 turns it off: walls keep their speed. |
 | `overhang_speed_full` | 0 | 0 to 1000 | Speed of walls that hang free entirely, the middle of the line more than half a line width beyond the edge of the layer below; only with `overhang_speed`. 0 turns it off: they print at `overhang_speed`. |
 | `ironing_speed` | 20 | 1 to 1000 | Speed of ironing. |
-| `support_speed` | 0 | 0 to 1000 | Speed of supports, their dense interface under the surface they carry included; 0 prints them at `infill_speed`. |
+| `support_speed` | 0 | 0 to 1000 | Speed of supports; 0 prints them at `infill_speed`. |
+| `support_interface_speed` | 0 | 0 to 1000 | Speed of the dense support interface layers; 0 prints them at `support_speed`. |
 | `bridge_flow` | 1 | 0.5 to 2 | Multiplier on the extruded amount of bridges, on top of `flow_ratio`. |
 | `first_layer_speed` | 25 | 1 to 1000 | Speed of all extrusion on the first layer. |
 | `travel_speed` | 150 | 1 to 2000 | Speed of moves without extrusion. |

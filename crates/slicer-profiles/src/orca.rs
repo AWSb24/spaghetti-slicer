@@ -58,6 +58,11 @@ const MAPPING: &[(&str, &str, Kind)] = &[
     ),
     ("fan_max_speed", "fan_speed", Kind::Number),
     (
+        "support_material_interface_fan_speed",
+        "support_interface_fan_speed",
+        Kind::Number,
+    ),
+    (
         "close_fan_the_first_x_layers",
         "fan_off_layers",
         Kind::Number,
@@ -124,6 +129,12 @@ const MAPPING: &[(&str, &str, Kind)] = &[
     ("inner_wall_speed", "inner_wall_speed", Kind::Number),
     ("sparse_infill_speed", "infill_speed", Kind::Number),
     ("bridge_speed", "bridge_speed", Kind::Number),
+    ("support_speed", "support_speed", Kind::Number),
+    (
+        "support_interface_speed",
+        "support_interface_speed",
+        Kind::Number,
+    ),
     ("initial_layer_speed", "first_layer_speed", Kind::Number),
     ("travel_speed", "travel_speed", Kind::Number),
     ("default_acceleration", "acceleration", Kind::Number),
@@ -410,6 +421,16 @@ mod tests {
         assert_eq!(settings.infill_pattern, InfillPattern::Honeycomb);
         assert_eq!(settings.top_surface_pattern, SurfacePattern::Monotonic);
         assert_eq!(settings.bottom_surface_pattern, SurfacePattern::Concentric);
+
+        // Speeds and fan of supports and their interface; -1 keeps the
+        // fan of the layer in both.
+        let supports = r#"{ "support_speed": "70", "support_interface_speed": "35",
+            "support_material_interface_fan_speed": ["-1"] }"#;
+        let supports = import_orca(supports, &mut settings).unwrap();
+        assert!(supports.skipped.is_empty());
+        assert_eq!(settings.support_speed, 70.0);
+        assert_eq!(settings.support_interface_speed, 35.0);
+        assert_eq!(settings.support_interface_fan_speed, -1.0);
     }
 
     #[test]

@@ -113,6 +113,7 @@ pub fn path_color(kind: PathKind) -> [u8; 3] {
     match kind {
         PathKind::Skirt | PathKind::Brim => [0x00, 0x87, 0x6e],
         PathKind::Support => [0x5e, 0xd1, 0x94],
+        PathKind::SupportInterface => [0x2e, 0x8b, 0x57],
         PathKind::OuterWall => [0xff, 0x7d, 0x38],
         PathKind::InnerWall => [0xff, 0xe6, 0x4d],
         PathKind::GapFill => [0xff, 0xff, 0xff],

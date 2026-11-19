@@ -143,6 +143,7 @@ fn label(kind: PathKind) -> &'static str {
         PathKind::Skirt => "Skirt",
         PathKind::Brim => "Brim",
         PathKind::Support => "Support",
+        PathKind::SupportInterface => "Support interface",
         PathKind::OuterWall => "Outer wall",
         PathKind::InnerWall => "Inner wall",
         PathKind::GapFill => "Gap infill",
@@ -876,6 +877,9 @@ fn write_layer(
         let wanted = match path.kind {
             PathKind::Bridge => own.bridge_fan_speed,
             PathKind::OverhangWall | PathKind::OverhangWallFull => own.overhang_fan_speed,
+            PathKind::SupportInterface if own.support_interface_fan_speed >= 0.0 => {
+                own.support_interface_fan_speed
+            }
             _ => layer_fan(own, index, time),
         };
         if wanted != carry.fan {
@@ -1119,12 +1123,16 @@ pub fn path_speed(settings: &Settings, kind: PathKind, layer: usize) -> f64 {
         }
         PathKind::OverhangWallFull => settings.overhang_speed,
         PathKind::InnerWall | PathKind::GapFill => settings.inner_wall_speed,
-        PathKind::Support if settings.support_speed > 0.0 => settings.support_speed,
-        // ponytail: the dense interface of supports prints as support, so it
-        // has no speed of its own.
+        PathKind::SupportInterface if settings.support_interface_speed > 0.0 => {
+            settings.support_interface_speed
+        }
+        PathKind::Support | PathKind::SupportInterface if settings.support_speed > 0.0 => {
+            settings.support_speed
+        }
         PathKind::SolidInfill
         | PathKind::SparseInfill
         | PathKind::Support
+        | PathKind::SupportInterface
         | PathKind::PrimeTower => settings.infill_speed,
         PathKind::Bridge => settings.bridge_speed,
         PathKind::Ironing => settings.ironing_speed,
@@ -2665,7 +2673,8 @@ SET_PRESSURE_ADVANCE ADVANCE=0.04
         for (b, a) in before.iter().zip(&after) {
             assert_eq!((&b.0, b.1, &b.3), (&a.0, a.1, &a.3));
             let extruding = a.3.starts_with("G1 X") && word(&a.3, 'E').is_some_and(|e| e > 0.0);
-            if a.0 == "Support" && a.1 && extruding {
+            // The interface prints at the speed of supports too.
+            if a.0.starts_with("Support") && a.1 && extruding {
                 assert_eq!(b.2, settings.infill_speed * 60.0);
                 assert_eq!(a.2, slow.support_speed * 60.0);
                 supports += 1;
@@ -2674,5 +2683,72 @@ SET_PRESSURE_ADVANCE ADVANCE=0.04
             }
         }
         assert!(supports > 100, "{supports}");
+    }
+
+    #[test]
+    fn support_interfaces_get_their_own_speed_and_fan() {
+        let mut mesh = Mesh::cuboid(10.0, 10.0, 12.0);
+        mesh.translate([105.0, 105.0, 0.0]);
+        let mut top = Mesh::cuboid(30.0, 10.0, 2.0);
+        top.translate([95.0, 105.0, 10.0]);
+        mesh.merge(&top);
+        let settings = Settings {
+            supports: true,
+            min_layer_time: 0.0,
+            fan_speed: 40.0,
+            ..Settings::default()
+        };
+        let own = Settings {
+            support_interface_speed: 15.0,
+            support_interface_fan_speed: 100.0,
+            ..settings.clone()
+        };
+        // Every move: line type, layer above the first, feed rate and fan
+        // in effect and the line without the feed rate.
+        let moves = |gcode: &str| -> Vec<(String, bool, f64, f64, String)> {
+            let (mut kind, mut above, mut feed, mut fan) = ("", false, 0.0, 0.0);
+            let mut moves = Vec::new();
+            for line in gcode.lines() {
+                if let Some(name) = line.strip_prefix(";TYPE:") {
+                    kind = name;
+                }
+                if let Some(z) = line.strip_prefix(";Z:") {
+                    above = z.parse::<f64>().unwrap() > settings.first_layer_height + 1e-6;
+                }
+                if line.starts_with("M106") {
+                    fan = word(line, 'S').unwrap();
+                }
+                if let Some(f) = word(line, 'F') {
+                    feed = f;
+                }
+                if line.starts_with("G0") || line.starts_with("G1") {
+                    let words = line.split_whitespace().filter(|w| !w.starts_with('F'));
+                    let text = words.collect::<Vec<_>>().join(" ");
+                    moves.push((kind.to_owned(), above, feed, fan, text));
+                }
+            }
+            moves
+        };
+        let before = moves(&slice(&mesh, &settings).gcode);
+        let after = moves(&slice(&mesh, &own).gcode);
+        assert_eq!(before.len(), after.len());
+        let (mut interface, mut support) = (0, 0);
+        for (b, a) in before.iter().zip(&after) {
+            assert_eq!((&b.0, b.1, &b.4), (&a.0, a.1, &a.4));
+            let extruding = a.4.starts_with("G1 X") && word(&a.4, 'E').is_some_and(|e| e > 0.0);
+            if !(a.1 && extruding) {
+                continue;
+            }
+            if a.0 == "Support interface" {
+                assert_eq!(b.2, settings.infill_speed * 60.0);
+                assert_eq!(a.2, own.support_interface_speed * 60.0);
+                assert_eq!((b.3, a.3), (102.0, 255.0));
+                interface += 1;
+            } else {
+                assert_eq!((a.2, a.3), (b.2, b.3), "{}", a.4);
+                support += usize::from(a.0 == "Support");
+            }
+        }
+        assert!(interface > 20 && support > 100, "{interface} {support}");
     }
 }

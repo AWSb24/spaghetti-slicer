@@ -28,7 +28,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use slicer_core::polygon::{self, HatchDirection, distance};
 use slicer_core::slice::{slice_mesh, slice_mesh_reporting};
 use slicer_core::{Contour, Diagnostic, Diagnostics, Mesh, Point, Shapes, parallel_map};
-use slicer_profiles::{InfillPattern, SeamPosition, Settings, SupportStyle, WallOrder};
+use slicer_profiles::{
+    InfillPattern, SeamPosition, Settings, SupportInterfacePattern, SupportStyle, WallOrder,
+};
 
 /// Difference in Y below which two points count as equally far back when
 /// placing the seam, in millimetres.
@@ -63,7 +65,8 @@ const MIN_SUPPORT_AREA: f64 = 0.25;
 /// dropped from it, in millimetres.
 const SUPPORT_RESOLUTION: f64 = 0.05;
 
-/// Distance between the lines of the dense support layers, in line widths.
+/// Distance between the lines of the dense support layers, in line widths,
+/// unless `support_interface_spacing` sets it.
 const SUPPORT_INTERFACE_SPACING: f64 = 2.0;
 
 /// How far the lines of a bridge reach onto what carries them, in line
@@ -125,6 +128,10 @@ pub enum PathKind {
     Brim,
     /// Lines that carry overhangs and are removed after printing.
     Support,
+    /// The dense layers of a support right under the surface it carries,
+    /// and where it stands on the model (see
+    /// `Settings::support_interface_layers`).
+    SupportInterface,
     /// The visible outermost wall.
     OuterWall,
     /// Walls behind the outer wall.
@@ -1118,7 +1125,11 @@ fn assign_objects(
     let own = |path: &Path| {
         !matches!(
             path.kind,
-            PathKind::Skirt | PathKind::Brim | PathKind::Support | PathKind::PrimeTower
+            PathKind::Skirt
+                | PathKind::Brim
+                | PathKind::Support
+                | PathKind::SupportInterface
+                | PathKind::PrimeTower
         )
     };
     if objects.len() == 1 {
@@ -1514,9 +1525,11 @@ fn travels_inside(layer: &Layer, slice: &Shapes) -> Vec<bool> {
 /// densely: below everything that hangs free, down to the bed or to the
 /// model, with one empty layer under the surface they carry and above the
 /// model they stand on, and one line width of distance to its sides. The
-/// dense part is what lies right under a carried surface. Tree supports
-/// (`support_style = tree`) replace the columns below the dense part by
-/// branches.
+/// dense part (the interface) is what lies right under a carried surface,
+/// `support_interface_layers` deep, and with `support_bottom_interface_layers`
+/// what lies that many layers above the model a support stands on. Tree
+/// supports (`support_style = tree`) replace the columns below the dense
+/// part by branches.
 // ponytail: the gaps are one layer whatever its thickness, so with adaptive
 // layers they are as thin as the layers there.
 fn support_areas(
@@ -1539,12 +1552,20 @@ fn support_areas(
         SupportStyle::Tree => tree::areas(hanging, &keep_out, cut_heights, settings),
     };
     let dense_layers = settings.support_interface_layers as usize;
+    let bottom_layers = settings.support_bottom_interface_layers as usize;
     parallel_map(areas.len(), |index| {
         let area = areas[index].clone();
         let mut carried = Vec::new();
         if !area.is_empty() {
             for above in hanging.iter().skip(index + 2).take(dense_layers) {
                 carried = polygon::union(&carried, above);
+            }
+            // A support stands on the model one empty layer above it, so
+            // the model two layers down and the layers below that mark
+            // where it stands.
+            let under = &slices[..index.saturating_sub(1)];
+            for below in under.iter().rev().take(bottom_layers) {
+                carried = polygon::union(&carried, below);
             }
         }
         let dense = polygon::intersection(&area, &carried);
@@ -1647,16 +1668,45 @@ fn shared_work(
             0.5 * width,
         );
         work.push(Work::Lines(lines, PathKind::Support, 0.0));
-        // Close lines across the walls below carry the surface.
-        let lines = polygon::hatch(
-            &polygon::intersection(&inner, dense),
-            SUPPORT_INTERFACE_SPACING * width,
-            HatchDirection::Diagonal135,
-            0.5 * width,
-        );
-        work.push(Work::Lines(lines, PathKind::Support, 0.0));
+        interface_work(&polygon::intersection(&inner, dense), settings, &mut work);
     }
     work
+}
+
+/// The dense interface of a support in `area` (where the middles of its
+/// lines may go), in `support_interface_pattern`: close lines across the
+/// walls below carry the surface, concentric loops follow its outline, a
+/// grid crosses lines in both directions.
+// ponytail: concentric loops leave out narrow tails of wider parts of the
+// interface (parts too narrow for any loop get lines instead), and the
+// loop around the whole support stays support.
+fn interface_work(area: &Shapes, settings: &Settings, work: &mut Vec<Work>) {
+    let width = settings.line_width;
+    let spacing = if settings.support_interface_spacing > 0.0 {
+        settings.support_interface_spacing.max(width)
+    } else {
+        SUPPORT_INTERFACE_SPACING * width
+    };
+    let kind = PathKind::SupportInterface;
+    let pattern = settings.support_interface_pattern;
+    let mut lined = area;
+    let narrow: Shapes;
+    if pattern == SupportInterfacePattern::Concentric {
+        let (wide, rest): (Shapes, Shapes) = area
+            .iter()
+            .cloned()
+            .partition(|shape| !polygon::offset(&vec![shape.clone()], -0.5 * spacing).is_empty());
+        let (loops, _) = infill::concentric(&wide, spacing, width, false);
+        work.push(Work::Loops(loops, kind, width, SeamPosition::Nearest));
+        narrow = rest;
+        lined = &narrow;
+    }
+    let lines = polygon::hatch(lined, spacing, HatchDirection::Diagonal135, 0.5 * width);
+    work.push(Work::Lines(lines, kind, 0.0));
+    if pattern == SupportInterfacePattern::Grid {
+        let lines = polygon::hatch(area, spacing, HatchDirection::Diagonal45, 0.5 * width);
+        work.push(Work::Lines(lines, kind, 0.0));
+    }
 }
 
 /// Generates the walls and infill of one layer of a region, in the order
@@ -3921,7 +3971,7 @@ mod tests {
             layer
                 .paths
                 .iter()
-                .filter(|p| p.kind == PathKind::Support)
+                .filter(|p| matches!(p.kind, PathKind::Support | PathKind::SupportInterface))
                 .flat_map(|p| p.points.windows(2))
                 .map(|w| distance(w[0], w[1]))
                 .sum()
@@ -3973,7 +4023,7 @@ mod tests {
             layer
                 .paths
                 .iter()
-                .filter(|p| p.kind == PathKind::Support)
+                .filter(|p| matches!(p.kind, PathKind::Support | PathKind::SupportInterface))
                 .collect()
         }
         let length = |toolpaths: &Toolpaths| -> f64 {
@@ -4036,6 +4086,171 @@ mod tests {
             .filter(|&i| !support(&toolpaths.layers[i]).is_empty())
             .collect();
         assert_eq!(layers, (11..59).collect::<Vec<usize>>());
+    }
+
+    /// The T of `supports_stand_under_overhangs`, and the same with a base
+    /// under the column that the supports stand on (layers 11 to 58).
+    fn tee_models() -> (Mesh, Mesh) {
+        let mut t = Mesh::cuboid(10.0, 10.0, 10.0);
+        t.translate([10.0, 0.0, 0.0]);
+        let mut plate = Mesh::cuboid(30.0, 10.0, 2.0);
+        plate.translate([0.0, 0.0, 10.0]);
+        t.merge(&plate);
+        let mut h = Mesh::cuboid(30.0, 10.0, 2.0);
+        let mut column = Mesh::cuboid(10.0, 10.0, 10.0);
+        column.translate([10.0, 0.0, 2.0]);
+        h.merge(&column);
+        plate.translate([0.0, 0.0, 2.0]);
+        h.merge(&plate);
+        (t, h)
+    }
+
+    /// The layers that have paths of `kind`.
+    fn layers_with(toolpaths: &Toolpaths, kind: PathKind) -> Vec<usize> {
+        (0..toolpaths.layers.len())
+            .filter(|&i| toolpaths.layers[i].paths.iter().any(|p| p.kind == kind))
+            .collect()
+    }
+
+    #[test]
+    fn support_interfaces_are_a_line_type_of_their_own() {
+        let (t, h) = tee_models();
+        for style in [SupportStyle::Normal, SupportStyle::Tree] {
+            let settings = Settings {
+                supports: true,
+                support_style: style,
+                ..Settings::default()
+            };
+            // The two layers right under the empty layer below the plate
+            // (layer 50) are the interface; everything below is support.
+            let toolpaths = generate(&t, &settings).unwrap();
+            let interface = layers_with(&toolpaths, PathKind::SupportInterface);
+            assert_eq!(interface, [47, 48], "{style:?}");
+            assert_eq!(
+                layers_with(&toolpaths, PathKind::Support),
+                (0..49).collect::<Vec<usize>>()
+            );
+            // Its lines run across the whole overhang, left and right of
+            // the column (x 105 to 115), and nowhere else.
+            for &index in &interface {
+                let points: Vec<Point> = toolpaths.layers[index]
+                    .paths
+                    .iter()
+                    .filter(|p| p.kind == PathKind::SupportInterface)
+                    .flat_map(|p| p.points.iter().copied())
+                    .collect();
+                for p in &points {
+                    assert!((94.99..=125.01).contains(&p[0]), "{p:?}");
+                    assert!(p[0] <= 105.0 - 0.4 || p[0] >= 115.0 + 0.4, "{p:?}");
+                    assert!((104.99..=115.01).contains(&p[1]), "{p:?}");
+                }
+                assert!(points.iter().any(|p| p[0] < 100.0));
+                assert!(points.iter().any(|p| p[0] > 120.0));
+            }
+
+            // The default spacing is two line widths; the lines and all
+            // other paths stay where they were.
+            let spaced = Settings {
+                support_interface_spacing: 2.0 * settings.line_width,
+                ..settings.clone()
+            };
+            assert_eq!(generate(&t, &spaced).unwrap(), toolpaths);
+            // Without interface layers there are no interface lines.
+            let none = Settings {
+                support_interface_layers: 0,
+                ..settings.clone()
+            };
+            let toolpaths = generate(&t, &none).unwrap();
+            assert!(layers_with(&toolpaths, PathKind::SupportInterface).is_empty());
+
+            // Bottom interfaces where the supports stand on the base: the
+            // first two support layers above it, one empty layer up.
+            let toolpaths = generate(&h, &settings).unwrap();
+            assert_eq!(
+                layers_with(&toolpaths, PathKind::SupportInterface),
+                [57, 58],
+                "{style:?}"
+            );
+            let bottom = Settings {
+                support_bottom_interface_layers: 2,
+                ..settings.clone()
+            };
+            let toolpaths = generate(&h, &bottom).unwrap();
+            assert_eq!(
+                layers_with(&toolpaths, PathKind::SupportInterface),
+                [11, 12, 57, 58],
+                "{style:?}"
+            );
+            assert_eq!(
+                layers_with(&toolpaths, PathKind::Support),
+                (11..59).collect::<Vec<usize>>()
+            );
+        }
+    }
+
+    #[test]
+    fn support_interface_patterns() {
+        let (t, _) = tee_models();
+        let length = |settings: &Settings| -> f64 {
+            generate(&t, settings).unwrap().layers[48]
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::SupportInterface)
+                .map(Path::length)
+                .sum()
+        };
+        let lines = Settings {
+            supports: true,
+            ..Settings::default()
+        };
+        // A grid crosses lines in both directions: twice the line.
+        let grid = Settings {
+            support_interface_pattern: SupportInterfacePattern::Grid,
+            ..lines.clone()
+        };
+        let ratio = length(&grid) / length(&lines);
+        assert!((1.8..2.2).contains(&ratio), "{ratio}");
+        // Twice the spacing, half the line.
+        let sparse = Settings {
+            support_interface_spacing: 4.0 * lines.line_width,
+            ..lines.clone()
+        };
+        let ratio = length(&sparse) / length(&lines);
+        assert!((0.4..0.6).contains(&ratio), "{ratio}");
+
+        // Concentric loops are closed and lie inside the overhang, left and
+        // right of the column, inside the loop around the support.
+        let concentric = Settings {
+            support_interface_pattern: SupportInterfacePattern::Concentric,
+            ..lines.clone()
+        };
+        let toolpaths = generate(&t, &concentric).unwrap();
+        assert_eq!(
+            layers_with(&toolpaths, PathKind::SupportInterface),
+            [47, 48]
+        );
+        let loops: Vec<&Path> = toolpaths.layers[48]
+            .paths
+            .iter()
+            .filter(|p| p.kind == PathKind::SupportInterface)
+            .collect();
+        assert!(loops.len() >= 4, "{}", loops.len());
+        // The support (a width away from the column) has its own loop half
+        // a width inside its outline, the first interface loop lies half a
+        // spacing (one width) further in.
+        let inset = 0.5 * 0.45 + 0.45 - 0.06;
+        let gap = 0.45;
+        for path in &loops {
+            assert!(path.closed);
+            for p in &path.points {
+                let left = (95.0 + inset..=105.0 - gap - inset).contains(&p[0]);
+                let right = (115.0 + gap + inset..=125.0 - inset).contains(&p[0]);
+                assert!(left || right, "{p:?}");
+                assert!((105.0 + inset..=115.0 - inset).contains(&p[1]), "{p:?}");
+            }
+        }
+        assert!(loops.iter().any(|p| p.points[0][0] < 105.0));
+        assert!(loops.iter().any(|p| p.points[0][0] > 115.0));
     }
 
     #[test]
