@@ -80,6 +80,7 @@ pub const PROCESS_TABS: [ProcessTab; 5] = [
                     "infill_speed",
                     "bridge_speed",
                     "support_speed",
+                    "support_interface_speed",
                 ],
             ),
             ("Travel speed", &["travel_speed"]),
@@ -92,7 +93,14 @@ pub const PROCESS_TABS: [ProcessTab; 5] = [
             ("Support", &["supports", "support_style", "support_spacing"]),
             (
                 "Advanced",
-                &["support_interface_layers", "support_bridge_length"],
+                &[
+                    "support_interface_layers",
+                    "support_bottom_interface_layers",
+                    "support_interface_pattern",
+                    "support_interface_spacing",
+                    "support_interface_fan_speed",
+                    "support_bridge_length",
+                ],
             ),
         ],
     ),
@@ -496,6 +504,9 @@ mod tests {
             ("overhang_fan_speed", "%"),
             ("fan_max_speed", "%"),
             ("support_speed", "mm/s"),
+            ("support_interface_speed", "mm/s"),
+            ("support_interface_fan_speed", "%"),
+            ("support_interface_spacing", "mm"),
             ("wall_loops", ""),
             ("supports", ""),
         ] {

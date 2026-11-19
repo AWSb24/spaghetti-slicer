@@ -108,6 +108,20 @@ pub enum SupportStyle {
     Tree,
 }
 
+/// Pattern of the dense support interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SupportInterfacePattern {
+    /// Parallel lines, the same direction on every layer, across the lines
+    /// of the support below.
+    Lines,
+    /// Loops following the outline of the interface, one inside the other.
+    Concentric,
+    /// Lines in both diagonal directions, each `support_interface_spacing`
+    /// apart, so twice the material of `lines`.
+    Grid,
+}
+
 /// Which top surfaces are ironed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -215,6 +229,10 @@ pub struct Settings {
     /// Fan speed in percent while printing overhanging walls, see
     /// `overhang_speed`.
     pub overhang_fan_speed: f64,
+    /// Fan speed in percent while printing the dense support interface,
+    /// for example 100 so that it bonds less to the model and comes off
+    /// more easily; -1 keeps the fan of the layer.
+    pub support_interface_fan_speed: f64,
     /// Shortest time in seconds a layer may take, so that it can cool
     /// before the next one goes on top; smaller layers are printed slower.
     /// 0 turns it off.
@@ -325,6 +343,16 @@ pub struct Settings {
     pub support_spacing: f64,
     /// Number of densely filled support layers right under the surface they carry.
     pub support_interface_layers: u32,
+    /// Number of densely filled support layers where a support stands on
+    /// the model (bottom interface), so that it leaves a smoother surface
+    /// there; 0 turns them off.
+    pub support_bottom_interface_layers: u32,
+    /// Pattern of the dense interface layers: `lines`, `concentric` or
+    /// `grid`.
+    pub support_interface_pattern: SupportInterfacePattern,
+    /// Distance between the lines (or loops) of the dense interface, at
+    /// least one line width; 0 means two line widths.
+    pub support_interface_spacing: f64,
     /// Bridges up to this length in millimetres get no supports; 0 supports
     /// every bridge.
     pub support_bridge_length: f64,
@@ -382,9 +410,11 @@ pub struct Settings {
     pub overhang_speed_full: f64,
     /// Speed of ironing.
     pub ironing_speed: f64,
-    /// Speed of supports, their dense interface under the surface they
-    /// carry included; 0 prints them at `infill_speed`.
+    /// Speed of supports; 0 prints them at `infill_speed`.
     pub support_speed: f64,
+    /// Speed of the dense support interface layers; 0 prints them at
+    /// `support_speed`.
+    pub support_interface_speed: f64,
     /// Multiplier on the extruded amount of bridges, on top of `flow_ratio`.
     pub bridge_flow: f64,
     /// Speed of all extrusion on the first layer.
@@ -451,6 +481,7 @@ impl Default for Settings {
             fan_layer_time: 0.0,
             fan_max_speed: 100.0,
             overhang_fan_speed: 100.0,
+            support_interface_fan_speed: -1.0,
             min_layer_time: 0.0,
             min_print_speed: 10.0,
             pressure_advance: 0.0,
@@ -489,6 +520,9 @@ impl Default for Settings {
             support_style: SupportStyle::Normal,
             support_spacing: 2.5,
             support_interface_layers: 2,
+            support_bottom_interface_layers: 0,
+            support_interface_pattern: SupportInterfacePattern::Lines,
+            support_interface_spacing: 0.0,
             support_bridge_length: 10.0,
             prime_tower_width: 15.0,
             prime_tower_x: 190.0,
@@ -506,6 +540,7 @@ impl Default for Settings {
             overhang_speed_full: 0.0,
             ironing_speed: 20.0,
             support_speed: 0.0,
+            support_interface_speed: 0.0,
             bridge_flow: 1.0,
             first_layer_speed: 25.0,
             travel_speed: 150.0,
@@ -866,6 +901,18 @@ impl Settings {
                 0.0,
                 10.0,
             ),
+            (
+                "support_bottom_interface_layers",
+                f64::from(self.support_bottom_interface_layers),
+                0.0,
+                10.0,
+            ),
+            (
+                "support_interface_spacing",
+                self.support_interface_spacing,
+                0.0,
+                20.0,
+            ),
             ("prime_tower_width", self.prime_tower_width, 0.0, 100.0),
             ("prime_tower_x", self.prime_tower_x, tower_x.0, tower_x.1),
             ("prime_tower_y", self.prime_tower_y, tower_y.0, tower_y.1),
@@ -906,6 +953,18 @@ impl Settings {
             ("ironing_spacing", self.ironing_spacing, 0.01, 2.0),
             ("ironing_speed", self.ironing_speed, 1.0, 1000.0),
             ("support_speed", self.support_speed, 0.0, 1000.0),
+            (
+                "support_interface_speed",
+                self.support_interface_speed,
+                0.0,
+                1000.0,
+            ),
+            (
+                "support_interface_fan_speed",
+                self.support_interface_fan_speed,
+                -1.0,
+                100.0,
+            ),
             ("fuzzy_skin_thickness", self.fuzzy_skin_thickness, 0.0, 2.0),
             (
                 "fuzzy_skin_point_distance",
