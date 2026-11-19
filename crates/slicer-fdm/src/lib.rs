@@ -6,6 +6,7 @@ mod comb;
 mod infill;
 mod lightning;
 pub mod load;
+mod negatives;
 mod objects;
 mod plate;
 pub mod preview;
@@ -13,6 +14,7 @@ mod sequential;
 mod tree;
 
 pub use arrange::{Spot, arrange_outlines, arranges_outlines};
+pub use negatives::MAX_NEGATIVES;
 pub use objects::{
     HeightRange, MAX_MODIFIERS, MODIFIER_SETTINGS, Modifier, OBJECT_SETTINGS, RANGE_SETTINGS,
     apply_modifier_orca, apply_modifier_toml, apply_object_orca, apply_object_toml,
@@ -547,6 +549,13 @@ pub struct OwnSettings<'a> {
     /// The modifiers of object `i` (see [`Modifier`]), over its settings
     /// and height ranges; objects beyond the end of the slice have none.
     pub modifiers: &'a [Vec<Modifier>],
+    /// The negative volumes of object `i`: meshes in the same coordinates
+    /// as the mesh of their object, moved with it when it is put on the
+    /// bed, whose volume is cut out of the object (see
+    /// [`generate_plate_with_own_settings`]); objects beyond the end of the
+    /// slice have none. Only the first [`MAX_NEGATIVES`] of an object
+    /// count.
+    pub negatives: &'a [Vec<Mesh>],
 }
 
 /// Like [`generate_plate_with_object_settings`] with `own.objects`, and the
@@ -565,6 +574,18 @@ pub struct OwnSettings<'a> {
 /// the object and its ranges (see [`MODIFIER_SETTINGS`] for which settings
 /// and how the region of the object is split). Objects without modifiers,
 /// or with modifiers that change nothing, print exactly as without them.
+///
+/// The negative volumes `own.negatives[i]` of object `i` are cut out of it
+/// on every layer right after slicing, before anything else: walls go
+/// round the cut, top and bottom surfaces form at it, and an opening
+/// facing down counts as an overhang that gets supports where supports are
+/// on. A negative volume reaches only its own object. Layers it cuts away
+/// whole stay empty; a plate cut away entirely fails like an empty one.
+/// They count in vase mode too. Plates without negative volumes print
+/// exactly as without them.
+// ponytail: layer heights, adaptive layers and the checks of the plate
+// (size, bed, overlap) still see the whole objects; only what is printed
+// follows the cut.
 pub fn generate_plate_with_own_settings(
     objects: &[Mesh],
     own: OwnSettings,
@@ -586,6 +607,7 @@ pub fn generate_plate_with_own_settings(
         );
     }
     let stopped = || stop.load(Ordering::Relaxed);
+    let negative_list = own.negatives;
     // Vase mode prints one wall and nothing inside or on top, the same for
     // every object.
     let vase;
@@ -760,6 +782,10 @@ pub fn generate_plate_with_own_settings(
         .collect();
     progress.start(Step::Cutting, 1);
     let slices = slice_mesh_reporting(&mesh, &cut_heights, diagnostics);
+    // The negative volumes are cut out first, so everything below sees the
+    // objects with their holes.
+    let cuts = negatives::cuts(objects, negative_list, placement, shift, &cut_heights);
+    let slices = negatives::apply(slices, &cuts);
     progress.advance();
     if stopped() {
         return Err(FdmError::Cancelled);
@@ -778,6 +804,9 @@ pub fn generate_plate_with_own_settings(
             shift,
             &cut_heights,
         )
+        .into_iter()
+        .map(|region| negatives::apply(region, &cuts))
+        .collect()
     } else {
         Vec::new()
     };
@@ -790,6 +819,9 @@ pub fn generate_plate_with_own_settings(
             shift,
             &cut_heights,
         );
+        for modifier in &mut modifiers {
+            modifier.area = negatives::apply(std::mem::take(&mut modifier.area), &cuts);
+        }
     }
     // Where only some groups (or some of their height ranges or modifiers)
     // have supports, those only go under them, and only the others are
@@ -859,7 +891,10 @@ pub fn generate_plate_with_own_settings(
     let extruder_regions: Vec<(u32, Vec<Shapes>)> = if count > 1 && used.len() > 1 {
         let own: Vec<Vec<Shapes>> = used
             .iter()
-            .map(|&e| slice_mesh(&with_extruder(&mesh, e), &cut_heights))
+            .map(|&e| {
+                let own = slice_mesh(&with_extruder(&mesh, e), &cut_heights);
+                negatives::apply(own, &cuts)
+            })
             .collect();
         (0..own.len())
             .map(|i| {

@@ -1297,3 +1297,109 @@ fn settings_stored_in_a_project_file_are_used_on_request() {
     let (_, report) = slice("stl.gcode", &stl, &["--project-settings"]);
     assert!(codes(&report).is_empty());
 }
+
+/// `mesh` as the `<mesh>` element of a 3MF model.
+fn mesh_element(mesh: &Mesh) -> String {
+    let vertices: String = mesh
+        .vertices
+        .iter()
+        .map(|[x, y, z]| format!("<vertex x=\"{x}\" y=\"{y}\" z=\"{z}\"/>"))
+        .collect();
+    let triangles: String = mesh
+        .triangles
+        .iter()
+        .map(|[a, b, c]| format!("<triangle v1=\"{a}\" v2=\"{b}\" v3=\"{c}\"/>"))
+        .collect();
+    format!("<mesh><vertices>{vertices}</vertices><triangles>{triangles}</triangles></mesh>")
+}
+
+#[test]
+fn negative_volumes_cut_holes_into_their_objects() {
+    let dir = workdir("negatives");
+    let a = dir.join("a.stl");
+    let cube = Mesh::cuboid(20.0, 20.0, 20.0);
+    fs::write(&a, slicer_formats::write_stl_binary(&cube)).unwrap();
+    // A 10 mm square column through the middle of the model, in the
+    // model's coordinates: a quarter of every layer.
+    let mut column = Mesh::cuboid(10.0, 10.0, 30.0);
+    column.translate([5.0, 5.0, -5.0]);
+    let hole = dir.join("hole.stl");
+    fs::write(&hole, slicer_formats::write_stl_binary(&column)).unwrap();
+    let slice = |input: &PathBuf, args: &[String]| {
+        let out = bin()
+            .arg("slice")
+            .arg(input)
+            .arg("-o")
+            .arg(dir.join("out.gcode"))
+            .args(["--json", "--set", "infill_density=100"])
+            .args(args)
+            .output()
+            .unwrap();
+        let report: serde_json::Value = if out.status.success() {
+            serde_json::from_slice(&out.stdout).unwrap()
+        } else {
+            serde_json::from_slice(&out.stderr).unwrap()
+        };
+        (out.status.success(), report)
+    };
+    let weight =
+        |report: &serde_json::Value| report["stats"]["filament_weight_g"].as_f64().unwrap();
+    let (ok, plain) = slice(&a, &[]);
+    assert!(ok, "{plain}");
+    // The drive letter of a Windows path is part of MESH.
+    let (ok, cut) = slice(&a, &[format!("--negative=1:{}", hole.display())]);
+    assert!(ok, "{cut}");
+    let share = weight(&cut) / weight(&plain);
+    assert!((0.65..0.85).contains(&share), "{share}");
+    assert_eq!(cut["warnings"].as_array().unwrap().len(), 0);
+
+    // A project's negative part is cut out with or without its settings.
+    let model = format!(
+        "<?xml version=\"1.0\"?><model unit=\"millimeter\" xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\"><resources><object id=\"1\" type=\"model\">{}</object><object id=\"2\" type=\"model\">{}</object><object id=\"3\" type=\"model\"><components><component objectid=\"1\"/><component objectid=\"2\"/></components></object></resources><build><item objectid=\"3\" transform=\"1 0 0 0 1 0 0 0 1 80 100 0\"/></build></model>",
+        mesh_element(&cube),
+        mesh_element(&column)
+    );
+    let parts = "<config><object id=\"3\"><metadata key=\"name\" value=\"Box\"/><part id=\"1\" subtype=\"normal_part\"/><part id=\"2\" subtype=\"negative_part\"/></object></config>";
+    let project = dir.join("project.3mf");
+    fs::write(
+        &project,
+        slicer_formats::write_package(&[
+            ("3D/3dmodel.model", &model),
+            ("Metadata/project_settings.config", "{}"),
+            ("Metadata/model_settings.config", parts),
+        ])
+        .unwrap(),
+    )
+    .unwrap();
+    for args in [vec![], vec!["--project-settings".to_string()]] {
+        let (ok, report) = slice(&project, &args);
+        assert!(ok, "{report}");
+        let share = weight(&report) / weight(&plain);
+        assert!((0.65..0.85).contains(&share), "{args:?}: {share}");
+        let codes: Vec<&str> = report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|w| w["code"].as_str())
+            .collect();
+        assert!(!codes.contains(&"model.parts_ignored"), "{codes:?}");
+    }
+
+    for argument in ["2:", "0:", "x:", "", "1:"] {
+        let negative = if argument == "1:" {
+            "--negative=1:".to_string()
+        } else {
+            format!("--negative={argument}{}", hole.display())
+        };
+        let (ok, report) = slice(&a, &[negative]);
+        assert!(!ok);
+        assert_eq!(
+            report["error"]["code"], "cli.invalid_negative",
+            "{argument}"
+        );
+    }
+    let missing = format!("--negative=1:{}", dir.join("none.stl").display());
+    let (ok, report) = slice(&a, &[missing]);
+    assert!(!ok);
+    assert_eq!(report["error"]["code"], "io.read");
+}

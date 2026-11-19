@@ -11,7 +11,9 @@
 //! Height ranges of an object ([`HeightRange`]) come from the project and
 //! from the caller in the same order; they set their keys over whatever
 //! the object ends up with. So do modifiers ([`Modifier`]): those of the
-//! project first, then the caller's.
+//! project first, then the caller's. Negative volumes of objects are
+//! geometry, not settings: those of a project are always taken, with or
+//! without its settings, followed by the caller's.
 //! [`read_plate`] does all of it; the steps are public for callers that
 //! read their files in between.
 //!
@@ -22,8 +24,9 @@ use slicer_formats::{ObjectSettings, ProjectSettings};
 use slicer_profiles::Settings;
 
 use crate::{
-    ARRANGE_GAP, HeightRange, MAX_MODIFIERS, Modifier, Placement, apply_modifier_orca,
-    apply_modifier_toml, apply_object_orca, apply_object_toml, apply_range_orca, apply_range_toml,
+    ARRANGE_GAP, HeightRange, MAX_MODIFIERS, MAX_NEGATIVES, Modifier, Placement,
+    apply_modifier_orca, apply_modifier_toml, apply_object_orca, apply_object_toml,
+    apply_range_orca, apply_range_toml,
 };
 
 /// Largest number of setting names a warning lists in its message; the
@@ -94,6 +97,7 @@ pub struct Model<'a> {
 /// the settings of each of them. They may only set
 /// [`crate::OBJECT_SETTINGS`], for a height range
 /// [`crate::RANGE_SETTINGS`], for a modifier [`crate::MODIFIER_SETTINGS`].
+/// A layer may instead give a negative volume, which has no settings.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectLayer {
     /// The settings in TOML form.
@@ -109,6 +113,11 @@ pub struct ObjectLayer {
     /// moved with; every layer with one makes a modifier of its own of
     /// every object of the model file. `range` must be `None` then.
     pub modifier: Option<Mesh>,
+    /// A negative volume, in the coordinates of the model file, which it
+    /// is moved with: cut out of every object of the model file (see
+    /// [`crate::OwnSettings::negatives`]). `text` is not read then, and
+    /// `range` and `modifier` must be `None`.
+    pub negative: Option<Mesh>,
 }
 
 /// How the objects are put on the bed.
@@ -144,6 +153,9 @@ pub struct Objects {
     /// The modifiers of every object, for
     /// [`crate::generate_plate_with_own_settings`], placed with it.
     pub modifiers: Vec<Vec<Modifier>>,
+    /// The negative volumes of every object, for
+    /// [`crate::generate_plate_with_own_settings`], placed with it.
+    pub negatives: Vec<Vec<Mesh>>,
     /// The model file (its index) every object comes from.
     pub model: Vec<usize>,
 }
@@ -400,15 +412,24 @@ fn project_ranges(
 }
 
 /// One object read by [`model_objects`]: its mesh, its settings if it has
-/// its own, its height ranges and its modifiers.
-pub type ModelObject = (Mesh, Option<Settings>, Vec<HeightRange>, Vec<Modifier>);
+/// its own, its height ranges, its modifiers and its negative volumes.
+pub type ModelObject = (
+    Mesh,
+    Option<Settings>,
+    Vec<HeightRange>,
+    Vec<Modifier>,
+    Vec<Mesh>,
+);
 
 /// Reads `model` as one object, or, if `stored` (what [`project_base`]
 /// returned for it) gives settings of their own, height ranges or
 /// modifiers with settings to objects on the plate (over `settings`, the
 /// plate's), as one object per build item, each with the settings, ranges
-/// and modifiers of its object. `plate` selects a build plate of a project
-/// file with several plates. Modifier parts of a project are never printed.
+/// and modifiers of its object. A project file with negative volumes
+/// (parts with `subtype="negative_part"`) is always read as one object per
+/// build item, each with its negative volumes, with or without `stored`.
+/// `plate` selects a build plate of a project file with several plates.
+/// Modifier parts and negative volumes of a project are never printed.
 pub fn model_objects(
     model: Model,
     stored: Option<&ProjectSettings>,
@@ -417,28 +438,47 @@ pub fn model_objects(
     warnings: &mut Diagnostics,
 ) -> Result<Vec<ModelObject>, Diagnostic> {
     let name = model.name;
-    if let Some(stored) = stored.filter(|stored| !stored.objects.is_empty()) {
+    let stored = stored.filter(|stored| !stored.objects.is_empty());
+    let negative = slicer_formats::looks_like_3mf(model.bytes)
+        && slicer_formats::has_negative_parts(model.bytes);
+    if stored.is_some() || negative {
         let mut found = Diagnostics::new();
         let objects = slicer_formats::parse_3mf_plate_parts(model.bytes, plate, &mut found)
             .map_err(|e| named(name, e.diagnostic()))?;
         // The settings of every object on the plate, once per object.
         let mut by_id: Vec<(u32, ProjectObject)> = Vec::new();
-        for object in &objects {
+        for object in stored.map_or(&[][..], |_| objects.as_slice()) {
             if by_id.iter().all(|(known, _)| *known != object.id) {
-                let own = match stored.object(object.id) {
+                let own = match stored.and_then(|stored| stored.object(object.id)) {
                     Some(stored) => project_object(name, stored, settings, &mut found),
                     None => (None, Vec::new(), Vec::new()),
                 };
                 by_id.push((object.id, own));
             }
         }
-        // Without settings of their own the objects are read as one, as
-        // without the project's settings.
-        if by_id.iter().any(|(_, (own, ranges, modifiers))| {
-            own.is_some() || !ranges.is_empty() || !modifiers.is_empty()
-        }) {
+        // Without settings of their own or negative volumes the objects
+        // are read as one, as without the project's settings.
+        if negative
+            || by_id.iter().any(|(_, (own, ranges, modifiers))| {
+                own.is_some() || !ranges.is_empty() || !modifiers.is_empty()
+            })
+        {
             for warning in found.as_slice() {
                 warnings.push(warning.clone());
+            }
+            // Read without the project's settings, its modifiers are left
+            // out, as when it is read as one.
+            let unprinted: usize = objects.iter().map(|o| o.modifiers.len()).sum();
+            if stored.is_none() && unprinted > 0 {
+                warnings.push(
+                    Diagnostic::warning(
+                        "model.modifiers_not_printed",
+                        format!(
+                            "{unprinted} modifier part(s) of the project are not printed; their settings count only with the project's settings"
+                        ),
+                    )
+                    .with("parts", unprinted),
+                );
             }
             return Ok(objects
                 .into_iter()
@@ -446,7 +486,7 @@ pub fn model_objects(
                     let Some((_, (own, ranges, stored))) =
                         by_id.iter().find(|(known, _)| *known == object.id)
                     else {
-                        return (object.mesh, None, Vec::new(), Vec::new());
+                        return (object.mesh, None, Vec::new(), Vec::new(), object.negatives);
                     };
                     // Every modifier with settings gets its volume.
                     let modifiers = object
@@ -460,7 +500,13 @@ pub fn model_objects(
                             })
                         })
                         .collect();
-                    (object.mesh, own.clone(), ranges.clone(), modifiers)
+                    (
+                        object.mesh,
+                        own.clone(),
+                        ranges.clone(),
+                        modifiers,
+                        object.negatives,
+                    )
                 })
                 .collect());
         }
@@ -474,7 +520,7 @@ pub fn model_objects(
     }
     let mesh =
         slicer_formats::parse_model(model.bytes, plate, warnings).map_err(|e| named(name, e))?;
-    Ok(vec![(mesh, None, Vec::new(), Vec::new())])
+    Ok(vec![(mesh, None, Vec::new(), Vec::new(), Vec::new())])
 }
 
 impl Objects {
@@ -484,8 +530,10 @@ impl Objects {
     /// model `i`, layered over each of them in order: first those for the
     /// whole object, then those for height ranges and modifiers. Fails if
     /// an object ends up with more than [`MAX_RANGES`] height ranges
-    /// (`settings.too_many_ranges`) or [`MAX_MODIFIERS`] modifiers
-    /// (`settings.too_many_modifiers`).
+    /// (`settings.too_many_ranges`), [`MAX_MODIFIERS`] modifiers
+    /// (`settings.too_many_modifiers`) or [`MAX_NEGATIVES`] negative
+    /// volumes (`model.too_many_negatives`); the negative volumes of
+    /// `layers` follow those of the project.
     pub fn read(
         models: &[Model],
         stored: &[Option<ProjectSettings>],
@@ -498,17 +546,22 @@ impl Objects {
         for (index, model) in models.iter().enumerate() {
             let stored = stored.get(index).and_then(Option::as_ref);
             let layers = layers.get(index).map_or(&[][..], Vec::as_slice);
-            for (mesh, mut own, mut ranges, mut modifiers) in
+            for (mesh, mut own, mut ranges, mut modifiers, mut negatives) in
                 model_objects(*model, stored, settings, plate, warnings)?
             {
-                let whole =
-                    |layer: &&ObjectLayer| layer.range.is_none() && layer.modifier.is_none();
+                let whole = |layer: &&ObjectLayer| {
+                    layer.range.is_none() && layer.modifier.is_none() && layer.negative.is_none()
+                };
                 for layer in layers.iter().filter(whole) {
                     let object = own.get_or_insert_with(|| settings.clone());
                     apply_object_toml(object, &layer.text).map_err(|e| layer.name.apply(e))?;
                 }
                 let object = own.as_ref().unwrap_or(settings);
                 for layer in layers {
+                    if let Some(volume) = &layer.negative {
+                        negatives.push(volume.clone());
+                        continue;
+                    }
                     if let Some(volume) = &layer.modifier {
                         let mut modifier = Modifier::new(volume.clone());
                         apply_modifier_toml(&mut modifier, object, &layer.text)
@@ -557,10 +610,25 @@ impl Objects {
                         .with("max", MAX_MODIFIERS),
                     ));
                 }
+                if negatives.len() > MAX_NEGATIVES {
+                    return Err(named(
+                        model.name,
+                        Diagnostic::error(
+                            "model.too_many_negatives",
+                            format!(
+                                "an object has {} negative volumes; at most {MAX_NEGATIVES} are allowed",
+                                negatives.len()
+                            ),
+                        )
+                        .with("negatives", negatives.len())
+                        .with("max", MAX_NEGATIVES),
+                    ));
+                }
                 objects.meshes.push(mesh);
                 objects.settings.push(own);
                 objects.ranges.push(ranges);
                 objects.modifiers.push(modifiers);
+                objects.negatives.push(negatives);
                 objects.model.push(index);
             }
         }
@@ -570,7 +638,7 @@ impl Objects {
     /// Puts the objects on the bed: as the files place them, centred (one
     /// model file, `files` < 2) or arranged side by side (several). The
     /// objects of one model file keep their places relative to each other;
-    /// modifiers move with their objects. Returns how
+    /// modifiers and negative volumes move with their objects. Returns how
     /// [`crate::generate_plate`] is to take them.
     pub fn place(&mut self, files: usize, placing: Placing, settings: &Settings) -> Placement {
         if placing.keep_positions {
@@ -580,13 +648,13 @@ impl Objects {
             return Placement::Centre;
         }
         let meshes = &mut self.meshes;
-        let modifiers = &mut self.modifiers;
+        let (modifiers, negatives) = (&mut self.modifiers, &mut self.negatives);
         if meshes.len() == files {
             let spots = crate::plate::arrangement(meshes, settings, placing.gap);
             for (object, (mesh, spot)) in meshes.iter_mut().zip(spots).enumerate() {
                 if let Some(spot) = spot {
                     spot.apply(mesh);
-                    move_modifiers(modifiers, object, |volume| spot.apply(volume));
+                    move_parts(modifiers, negatives, object, |volume| spot.apply(volume));
                 }
             }
             return Placement::AsGiven;
@@ -604,7 +672,7 @@ impl Objects {
             for (object, (mesh, &file)) in meshes.iter_mut().zip(&self.model).enumerate() {
                 if let Some(spot) = spots.get(file) {
                     spot.apply(mesh);
-                    move_modifiers(modifiers, object, |volume| spot.apply(volume));
+                    move_parts(modifiers, negatives, object, |volume| spot.apply(volume));
                 }
             }
             return Placement::AsGiven;
@@ -634,18 +702,28 @@ impl Objects {
             if let (Some(Some((lo, _))), Some(corner)) = (bounds.get(file), corners.get(file)) {
                 let shift = [corner[0] - lo[0], corner[1] - lo[1], 0.0];
                 mesh.translate(shift);
-                move_modifiers(modifiers, object, |volume| volume.translate(shift));
+                move_parts(modifiers, negatives, object, |volume| {
+                    volume.translate(shift);
+                });
             }
         }
         Placement::AsGiven
     }
 }
 
-/// Moves the modifiers of object `object` among `modifiers` with `apply`,
-/// as the object was moved.
-fn move_modifiers(modifiers: &mut [Vec<Modifier>], object: usize, apply: impl Fn(&mut Mesh)) {
+/// Moves the modifiers and negative volumes of object `object` among
+/// `modifiers` and `negatives` with `apply`, as the object was moved.
+fn move_parts(
+    modifiers: &mut [Vec<Modifier>],
+    negatives: &mut [Vec<Mesh>],
+    object: usize,
+    apply: impl Fn(&mut Mesh),
+) {
     for modifier in modifiers.get_mut(object).into_iter().flatten() {
         apply(&mut modifier.mesh);
+    }
+    for volume in negatives.get_mut(object).into_iter().flatten() {
+        apply(volume);
     }
 }
 
@@ -764,6 +842,7 @@ mod tests {
             name: Name::new("one.toml", "path", "one.toml"),
             range: None,
             modifier: None,
+            negative: None,
         }]];
         let mut warnings = Diagnostics::new();
         let plate = read_plate(
@@ -835,6 +914,7 @@ mod tests {
             name: Name::new("r.toml", "path", "r.toml"),
             range,
             modifier: None,
+            negative: None,
         };
         let layers = vec![vec![
             layer("wall_loops = 4", Some((2.0, 4.0))),
@@ -958,6 +1038,7 @@ mod tests {
             name: Name::new("m.toml", "path", "m.toml"),
             range: None,
             modifier: Some(volume.clone()),
+            negative: None,
         }]];
         let mut warnings = Diagnostics::new();
         let plate = read_plate(&models, options, Ok, &layers, &mut warnings).unwrap();
@@ -1014,9 +1095,102 @@ mod tests {
             name: Name::new("m.toml", "path", "m.toml"),
             range: None,
             modifier: Some(volume),
+            negative: None,
         }]];
         let error = read_plate(&models, options, Ok, &layers, &mut Diagnostics::new()).unwrap_err();
         assert_eq!(error.code, "settings.not_per_modifier");
         assert!(error.message.starts_with("m.toml: "));
+    }
+
+    /// A project file of Orca Slicer reduced to what is read: a 20 mm
+    /// cube (object 4) of a body, a negative part (a 10 mm square column
+    /// through it, 5 mm in from its sides) and a modifier, placed at 80,
+    /// 100.
+    fn project_with_negative() -> Vec<u8> {
+        let body = mesh_xml(&Mesh::cuboid(20.0, 20.0, 20.0));
+        let column = mesh_xml(&Mesh::cuboid(10.0, 10.0, 22.0));
+        let inside = mesh_xml(&Mesh::cuboid(4.0, 4.0, 4.0));
+        let model = format!(
+            "<?xml version=\"1.0\"?><model unit=\"millimeter\" xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\"><resources><object id=\"1\" type=\"model\">{body}</object><object id=\"2\" type=\"model\">{column}</object><object id=\"3\" type=\"model\">{inside}</object><object id=\"4\" type=\"model\"><components><component objectid=\"1\"/><component objectid=\"2\" transform=\"1 0 0 0 1 0 0 0 1 5 5 -1\"/><component objectid=\"3\"/></components></object></resources><build><item objectid=\"4\" transform=\"1 0 0 0 1 0 0 0 1 80 100 0\"/></build></model>"
+        );
+        let settings = concat!(
+            "<config><object id=\"4\"><metadata key=\"name\" value=\"Box\"/>",
+            "<part id=\"1\" subtype=\"normal_part\"/>",
+            "<part id=\"2\" subtype=\"negative_part\"/>",
+            "<part id=\"3\" subtype=\"modifier_part\"><metadata key=\"sparse_infill_density\" value=\"100%\"/></part>",
+            "</object></config>"
+        );
+        slicer_formats::write_package(&[
+            ("3D/3dmodel.model", &model),
+            ("Metadata/project_settings.config", "{}"),
+            ("Metadata/model_settings.config", settings),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn negative_volumes_come_from_the_project_and_the_caller() {
+        let bytes = project_with_negative();
+        let models = [Model {
+            bytes: &bytes,
+            name: None,
+        }];
+        // Without the project's settings the negative part is taken all
+        // the same, the modifier is not.
+        let mut warnings = Diagnostics::new();
+        let plate = read_plate(&models, Options::default(), Ok, &[], &mut warnings).unwrap();
+        let objects = &plate.objects;
+        assert_eq!(objects.meshes.len(), 1);
+        assert_eq!(objects.meshes[0].triangles.len(), 12);
+        let [stored] = objects.negatives[0].as_slice() else {
+            panic!("one negative volume expected");
+        };
+        assert_eq!(stored.bounds().unwrap().0, [85.0, 105.0, -1.0]);
+        assert!(objects.modifiers[0].is_empty());
+        assert_eq!(warnings.codes(), ["model.modifiers_not_printed"]);
+
+        // With them, both; the caller's negative volumes follow.
+        let options = Options {
+            project_settings: true,
+            ..Options::default()
+        };
+        let mut volume = Mesh::cuboid(2.0, 2.0, 30.0);
+        volume.translate([81.0, 101.0, -5.0]);
+        let layers = vec![vec![ObjectLayer {
+            text: String::new(),
+            name: Name::new("n.stl", "path", "n.stl"),
+            range: None,
+            modifier: None,
+            negative: Some(volume.clone()),
+        }]];
+        let mut warnings = Diagnostics::new();
+        let plate = read_plate(&models, options, Ok, &layers, &mut warnings).unwrap();
+        assert_eq!(plate.objects.modifiers[0].len(), 1);
+        assert_eq!(plate.objects.negatives[0].len(), 2);
+        assert_eq!(plate.objects.negatives[0][1], volume);
+        assert_eq!(plate.objects.settings[0], None);
+        assert!(!warnings.codes().contains(&"model.parts_ignored"));
+
+        // Arranged with another model, the negative volumes move with
+        // their object.
+        let other = slicer_formats::write_3mf(&Mesh::cuboid(10.0, 10.0, 10.0)).unwrap();
+        let both = [
+            models[0],
+            Model {
+                bytes: &other,
+                name: None,
+            },
+        ];
+        let plate = read_plate(&both, options, Ok, &layers, &mut Diagnostics::new()).unwrap();
+        let corner = plate.objects.meshes[0].bounds().unwrap().0;
+        assert_ne!(corner, [80.0, 100.0, 0.0]);
+        let inside = plate.objects.negatives[0][0].bounds().unwrap().0;
+        assert_eq!([0, 1, 2].map(|a| inside[a] - corner[a]), [5.0, 5.0, -1.0]);
+        assert!(plate.objects.negatives[1].is_empty());
+
+        // An object takes at most MAX_NEGATIVES of them.
+        let many = vec![layers[0][0].clone(); MAX_NEGATIVES];
+        let error = read_plate(&models, options, Ok, &[many], &mut Diagnostics::new()).unwrap_err();
+        assert_eq!(error.code, "model.too_many_negatives");
     }
 }
