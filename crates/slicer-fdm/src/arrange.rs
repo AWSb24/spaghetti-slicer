@@ -83,7 +83,7 @@ pub struct Spot {
 
 impl Spot {
     /// An unturned spot.
-    fn shifted(offset: Point) -> Self {
+    pub(crate) fn shifted(offset: Point) -> Self {
         Self {
             turn: 0.0,
             sin: 0.0,

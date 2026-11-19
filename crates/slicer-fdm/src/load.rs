@@ -10,7 +10,8 @@
 //! caller's settings for the objects of its model file ([`ObjectLayer`]).
 //! Height ranges of an object ([`HeightRange`]) come from the project and
 //! from the caller in the same order; they set their keys over whatever
-//! the object ends up with.
+//! the object ends up with. So do modifiers ([`Modifier`]): those of the
+//! project first, then the caller's.
 //! [`read_plate`] does all of it; the steps are public for callers that
 //! read their files in between.
 //!
@@ -21,8 +22,8 @@ use slicer_formats::{ObjectSettings, ProjectSettings};
 use slicer_profiles::Settings;
 
 use crate::{
-    ARRANGE_GAP, HeightRange, Placement, apply_object_orca, apply_object_toml, apply_range_orca,
-    apply_range_toml,
+    ARRANGE_GAP, HeightRange, MAX_MODIFIERS, Modifier, Placement, apply_modifier_orca,
+    apply_modifier_toml, apply_object_orca, apply_object_toml, apply_range_orca, apply_range_toml,
 };
 
 /// Largest number of setting names a warning lists in its message; the
@@ -91,8 +92,8 @@ pub struct Model<'a> {
 
 /// Settings in TOML form for every object of one model file, layered over
 /// the settings of each of them. They may only set
-/// [`crate::OBJECT_SETTINGS`], or, for a height range,
-/// [`crate::RANGE_SETTINGS`].
+/// [`crate::OBJECT_SETTINGS`], for a height range
+/// [`crate::RANGE_SETTINGS`], for a modifier [`crate::MODIFIER_SETTINGS`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectLayer {
     /// The settings in TOML form.
@@ -103,6 +104,11 @@ pub struct ObjectLayer {
     /// the settings count (see [`HeightRange`]); `None` for the whole
     /// object. Layers for the same heights go into one range.
     pub range: Option<(f64, f64)>,
+    /// The volume of a modifier inside which the settings count (see
+    /// [`Modifier`]), in the coordinates of the model file, which it is
+    /// moved with; every layer with one makes a modifier of its own of
+    /// every object of the model file. `range` must be `None` then.
+    pub modifier: Option<Mesh>,
 }
 
 /// How the objects are put on the bed.
@@ -135,6 +141,9 @@ pub struct Objects {
     /// The height ranges of every object, for
     /// [`crate::generate_plate_with_own_settings`].
     pub ranges: Vec<Vec<HeightRange>>,
+    /// The modifiers of every object, for
+    /// [`crate::generate_plate_with_own_settings`], placed with it.
+    pub modifiers: Vec<Vec<Modifier>>,
     /// The model file (its index) every object comes from.
     pub model: Vec<usize>,
 }
@@ -204,16 +213,21 @@ pub fn project_base(
     Ok(Some(stored))
 }
 
+/// What a project file sets for one object: its settings, `None` if they
+/// change nothing, its height ranges, and the settings of its modifiers by
+/// the identifier of their part (with no volume yet).
+type ProjectObject = (Option<Settings>, Vec<HeightRange>, Vec<(u32, Modifier)>);
+
 /// The settings of one object of a project file over `settings`, the
-/// plate's, `None` if they change nothing, and its height ranges. Settings
-/// that are not taken are reported, as are ranges whose heights are not
-/// valid.
+/// plate's, `None` if they change nothing, its height ranges and its
+/// modifiers. Settings that are not taken are reported, as are ranges
+/// whose heights are not valid.
 fn project_object(
     name: Option<&Name>,
     object: &ObjectSettings,
     settings: &Settings,
     warnings: &mut Diagnostics,
-) -> (Option<Settings>, Vec<HeightRange>) {
+) -> ProjectObject {
     let object_name = match &object.name {
         Some(object_name) => format!("object '{object_name}' (id {})", object.id),
         None => format!("object {}", object.id),
@@ -253,7 +267,7 @@ fn project_object(
             Diagnostic::warning(
                 "project.part_settings_skipped",
                 format!(
-                    "{object_name}: settings of its parts and modifiers are not read: {}",
+                    "{object_name}: settings of its parts other than modifiers are not read: {}",
                     listed(&keys)
                 ),
             )
@@ -262,7 +276,59 @@ fn project_object(
         ));
     }
     let ranges = project_ranges(name, object, &object_name, &own, warnings);
-    ((own != *settings).then_some(own), ranges)
+    let modifiers = project_modifiers(name, object, &object_name, &own, warnings);
+    ((own != *settings).then_some(own), ranges, modifiers)
+}
+
+/// The settings of the modifiers of one object of a project file, whose
+/// settings are `own`, by the identifier of their part; modifiers that
+/// change nothing are left out. Settings that are not taken are reported
+/// (`project.modifier_settings_skipped`).
+fn project_modifiers(
+    name: Option<&Name>,
+    object: &ObjectSettings,
+    object_name: &str,
+    own: &Settings,
+    warnings: &mut Diagnostics,
+) -> Vec<(u32, Modifier)> {
+    let mut modifiers = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut reasons: Vec<String> = Vec::new();
+    for stored in &object.modifiers {
+        let mut modifier = Modifier::default();
+        for (key, reason) in apply_modifier_orca(&mut modifier, own, &stored.values) {
+            if !skipped.contains(&key) {
+                if reasons.len() < LISTED_KEYS {
+                    reasons.push(format!("{key} ({reason})"));
+                }
+                skipped.push(key);
+            }
+        }
+        if !modifier.values.is_empty() {
+            modifiers.push((stored.id, modifier));
+        }
+    }
+    if !skipped.is_empty() {
+        let more = if skipped.len() > LISTED_KEYS {
+            ", ..."
+        } else {
+            ""
+        };
+        warnings.push(named(
+            name,
+            Diagnostic::warning(
+                "project.modifier_settings_skipped",
+                format!(
+                    "{object_name}: {} setting(s) of its modifiers were left out: {}{more}",
+                    skipped.len(),
+                    reasons.join(", "),
+                ),
+            )
+            .with("object", object.id)
+            .with("keys", skipped.join(" ")),
+        ));
+    }
+    modifiers
 }
 
 /// The height ranges of one object of a project file, whose settings are
@@ -334,14 +400,15 @@ fn project_ranges(
 }
 
 /// One object read by [`model_objects`]: its mesh, its settings if it has
-/// its own, and its height ranges.
-pub type ModelObject = (Mesh, Option<Settings>, Vec<HeightRange>);
+/// its own, its height ranges and its modifiers.
+pub type ModelObject = (Mesh, Option<Settings>, Vec<HeightRange>, Vec<Modifier>);
 
 /// Reads `model` as one object, or, if `stored` (what [`project_base`]
-/// returned for it) gives settings of their own or height ranges to
-/// objects on the plate (over `settings`, the plate's), as one object per
-/// build item, each with the settings and ranges of its object. `plate`
-/// selects a build plate of a project file with several plates.
+/// returned for it) gives settings of their own, height ranges or
+/// modifiers with settings to objects on the plate (over `settings`, the
+/// plate's), as one object per build item, each with the settings, ranges
+/// and modifiers of its object. `plate` selects a build plate of a project
+/// file with several plates. Modifier parts of a project are never printed.
 pub fn model_objects(
     model: Model,
     stored: Option<&ProjectSettings>,
@@ -352,36 +419,49 @@ pub fn model_objects(
     let name = model.name;
     if let Some(stored) = stored.filter(|stored| !stored.objects.is_empty()) {
         let mut found = Diagnostics::new();
-        let objects = slicer_formats::parse_3mf_plate_objects(model.bytes, plate, &mut found)
+        let objects = slicer_formats::parse_3mf_plate_parts(model.bytes, plate, &mut found)
             .map_err(|e| named(name, e.diagnostic()))?;
         // The settings of every object on the plate, once per object.
-        let mut by_id: Vec<(u32, Option<Settings>, Vec<HeightRange>)> = Vec::new();
-        for (id, _) in &objects {
-            if by_id.iter().all(|(known, ..)| known != id) {
-                let (own, ranges) = match stored.object(*id) {
-                    Some(object) => project_object(name, object, settings, &mut found),
-                    None => (None, Vec::new()),
+        let mut by_id: Vec<(u32, ProjectObject)> = Vec::new();
+        for object in &objects {
+            if by_id.iter().all(|(known, _)| *known != object.id) {
+                let own = match stored.object(object.id) {
+                    Some(stored) => project_object(name, stored, settings, &mut found),
+                    None => (None, Vec::new(), Vec::new()),
                 };
-                by_id.push((*id, own, ranges));
+                by_id.push((object.id, own));
             }
         }
         // Without settings of their own the objects are read as one, as
         // without the project's settings.
-        if by_id
-            .iter()
-            .any(|(_, own, ranges)| own.is_some() || !ranges.is_empty())
-        {
+        if by_id.iter().any(|(_, (own, ranges, modifiers))| {
+            own.is_some() || !ranges.is_empty() || !modifiers.is_empty()
+        }) {
             for warning in found.as_slice() {
                 warnings.push(warning.clone());
             }
             return Ok(objects
                 .into_iter()
-                .map(
-                    |(id, mesh)| match by_id.iter().find(|(known, ..)| *known == id) {
-                        Some((_, own, ranges)) => (mesh, own.clone(), ranges.clone()),
-                        None => (mesh, None, Vec::new()),
-                    },
-                )
+                .map(|object| {
+                    let Some((_, (own, ranges, stored))) =
+                        by_id.iter().find(|(known, _)| *known == object.id)
+                    else {
+                        return (object.mesh, None, Vec::new(), Vec::new());
+                    };
+                    // Every modifier with settings gets its volume.
+                    let modifiers = object
+                        .modifiers
+                        .into_iter()
+                        .filter_map(|(part, mesh)| {
+                            let (_, modifier) = stored.iter().find(|(id, _)| *id == part)?;
+                            Some(Modifier {
+                                mesh,
+                                ..modifier.clone()
+                            })
+                        })
+                        .collect();
+                    (object.mesh, own.clone(), ranges.clone(), modifiers)
+                })
                 .collect());
         }
         // Only what was found about the settings counts, the rest is
@@ -394,7 +474,7 @@ pub fn model_objects(
     }
     let mesh =
         slicer_formats::parse_model(model.bytes, plate, warnings).map_err(|e| named(name, e))?;
-    Ok(vec![(mesh, None, Vec::new())])
+    Ok(vec![(mesh, None, Vec::new(), Vec::new())])
 }
 
 impl Objects {
@@ -402,9 +482,10 @@ impl Objects {
     /// `stored[i]` is what [`project_base`] returned for model `i` (none if
     /// the slice is shorter), `layers[i]` the settings for the objects of
     /// model `i`, layered over each of them in order: first those for the
-    /// whole object, then those for height ranges. Fails if an object ends
-    /// up with more than [`MAX_RANGES`] height ranges
-    /// (`settings.too_many_ranges`).
+    /// whole object, then those for height ranges and modifiers. Fails if
+    /// an object ends up with more than [`MAX_RANGES`] height ranges
+    /// (`settings.too_many_ranges`) or [`MAX_MODIFIERS`] modifiers
+    /// (`settings.too_many_modifiers`).
     pub fn read(
         models: &[Model],
         stored: &[Option<ProjectSettings>],
@@ -417,15 +498,24 @@ impl Objects {
         for (index, model) in models.iter().enumerate() {
             let stored = stored.get(index).and_then(Option::as_ref);
             let layers = layers.get(index).map_or(&[][..], Vec::as_slice);
-            for (mesh, mut own, mut ranges) in
+            for (mesh, mut own, mut ranges, mut modifiers) in
                 model_objects(*model, stored, settings, plate, warnings)?
             {
-                for layer in layers.iter().filter(|layer| layer.range.is_none()) {
+                let whole =
+                    |layer: &&ObjectLayer| layer.range.is_none() && layer.modifier.is_none();
+                for layer in layers.iter().filter(whole) {
                     let object = own.get_or_insert_with(|| settings.clone());
                     apply_object_toml(object, &layer.text).map_err(|e| layer.name.apply(e))?;
                 }
                 let object = own.as_ref().unwrap_or(settings);
                 for layer in layers {
+                    if let Some(volume) = &layer.modifier {
+                        let mut modifier = Modifier::new(volume.clone());
+                        apply_modifier_toml(&mut modifier, object, &layer.text)
+                            .map_err(|e| layer.name.apply(e))?;
+                        modifiers.push(modifier);
+                        continue;
+                    }
                     let Some((from, to)) = layer.range else {
                         continue;
                     };
@@ -453,9 +543,24 @@ impl Objects {
                         .with("max", MAX_RANGES),
                     ));
                 }
+                if modifiers.len() > MAX_MODIFIERS {
+                    return Err(named(
+                        model.name,
+                        Diagnostic::error(
+                            "settings.too_many_modifiers",
+                            format!(
+                                "an object has {} modifiers; at most {MAX_MODIFIERS} are allowed",
+                                modifiers.len()
+                            ),
+                        )
+                        .with("modifiers", modifiers.len())
+                        .with("max", MAX_MODIFIERS),
+                    ));
+                }
                 objects.meshes.push(mesh);
                 objects.settings.push(own);
                 objects.ranges.push(ranges);
+                objects.modifiers.push(modifiers);
                 objects.model.push(index);
             }
         }
@@ -464,8 +569,9 @@ impl Objects {
 
     /// Puts the objects on the bed: as the files place them, centred (one
     /// model file, `files` < 2) or arranged side by side (several). The
-    /// objects of one model file keep their places relative to each other.
-    /// Returns how [`crate::generate_plate`] is to take them.
+    /// objects of one model file keep their places relative to each other;
+    /// modifiers move with their objects. Returns how
+    /// [`crate::generate_plate`] is to take them.
     pub fn place(&mut self, files: usize, placing: Placing, settings: &Settings) -> Placement {
         if placing.keep_positions {
             return Placement::AsGiven;
@@ -474,8 +580,15 @@ impl Objects {
             return Placement::Centre;
         }
         let meshes = &mut self.meshes;
+        let modifiers = &mut self.modifiers;
         if meshes.len() == files {
-            crate::arrange_objects(meshes, settings, placing.gap);
+            let spots = crate::plate::arrangement(meshes, settings, placing.gap);
+            for (object, (mesh, spot)) in meshes.iter_mut().zip(spots).enumerate() {
+                if let Some(spot) = spot {
+                    spot.apply(mesh);
+                    move_modifiers(modifiers, object, |volume| spot.apply(volume));
+                }
+            }
             return Placement::AsGiven;
         }
         if crate::arranges_outlines(settings) {
@@ -488,9 +601,10 @@ impl Objects {
                 }
             }
             let spots = crate::arrange_outlines(&points, settings, placing.gap);
-            for (mesh, &file) in meshes.iter_mut().zip(&self.model) {
+            for (object, (mesh, &file)) in meshes.iter_mut().zip(&self.model).enumerate() {
                 if let Some(spot) = spots.get(file) {
                     spot.apply(mesh);
+                    move_modifiers(modifiers, object, |volume| spot.apply(volume));
                 }
             }
             return Placement::AsGiven;
@@ -516,12 +630,22 @@ impl Objects {
             .map(|b| b.map_or([0.0, 0.0], |(lo, hi)| [hi[0] - lo[0], hi[1] - lo[1]]))
             .collect();
         let corners = crate::arrange(&sizes, settings, placing.gap);
-        for (mesh, &file) in meshes.iter_mut().zip(&self.model) {
+        for (object, (mesh, &file)) in meshes.iter_mut().zip(&self.model).enumerate() {
             if let (Some(Some((lo, _))), Some(corner)) = (bounds.get(file), corners.get(file)) {
-                mesh.translate([corner[0] - lo[0], corner[1] - lo[1], 0.0]);
+                let shift = [corner[0] - lo[0], corner[1] - lo[1], 0.0];
+                mesh.translate(shift);
+                move_modifiers(modifiers, object, |volume| volume.translate(shift));
             }
         }
         Placement::AsGiven
+    }
+}
+
+/// Moves the modifiers of object `object` among `modifiers` with `apply`,
+/// as the object was moved.
+fn move_modifiers(modifiers: &mut [Vec<Modifier>], object: usize, apply: impl Fn(&mut Mesh)) {
+    for modifier in modifiers.get_mut(object).into_iter().flatten() {
+        apply(&mut modifier.mesh);
     }
 }
 
@@ -639,6 +763,7 @@ mod tests {
             text: "wall_loops = 5".into(),
             name: Name::new("one.toml", "path", "one.toml"),
             range: None,
+            modifier: None,
         }]];
         let mut warnings = Diagnostics::new();
         let plate = read_plate(
@@ -709,6 +834,7 @@ mod tests {
             text: text.into(),
             name: Name::new("r.toml", "path", "r.toml"),
             range,
+            modifier: None,
         };
         let layers = vec![vec![
             layer("wall_loops = 4", Some((2.0, 4.0))),
@@ -772,5 +898,125 @@ mod tests {
         assert_eq!(error.code, "model.unrecognized");
         assert!(error.message.starts_with("model 2: "));
         assert_eq!(error.context["model"], "2");
+    }
+
+    /// The mesh of `cube` as 3MF elements.
+    fn mesh_xml(cube: &Mesh) -> String {
+        let vertices: String = cube
+            .vertices
+            .iter()
+            .map(|[x, y, z]| format!("<vertex x=\"{x}\" y=\"{y}\" z=\"{z}\"/>"))
+            .collect();
+        let triangles: String = cube
+            .triangles
+            .iter()
+            .map(|[a, b, c]| format!("<triangle v1=\"{a}\" v2=\"{b}\" v3=\"{c}\"/>"))
+            .collect();
+        format!("<mesh><vertices>{vertices}</vertices><triangles>{triangles}</triangles></mesh>")
+    }
+
+    /// A project file of Orca Slicer reduced to what is read: a 20 mm
+    /// cube (object 3) of a body and a modifier with 100 % infill, 5 mm
+    /// inside it, placed at 80, 100.
+    fn project_with_modifier() -> Vec<u8> {
+        let body = mesh_xml(&Mesh::cuboid(20.0, 20.0, 20.0));
+        let inside = mesh_xml(&Mesh::cuboid(10.0, 10.0, 10.0));
+        let model = format!(
+            "<?xml version=\"1.0\"?><model unit=\"millimeter\" xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\"><resources><object id=\"1\" type=\"model\">{body}</object><object id=\"2\" type=\"model\">{inside}</object><object id=\"3\" type=\"model\"><components><component objectid=\"1\"/><component objectid=\"2\" transform=\"1 0 0 0 1 0 0 0 1 5 5 5\"/></components></object></resources><build><item objectid=\"3\" transform=\"1 0 0 0 1 0 0 0 1 80 100 0\"/></build></model>"
+        );
+        let settings = concat!(
+            "<config><object id=\"3\"><metadata key=\"name\" value=\"Box\"/>",
+            "<part id=\"1\" subtype=\"normal_part\"/>",
+            "<part id=\"2\" subtype=\"modifier_part\"><metadata key=\"name\" value=\"Core\"/>",
+            "<metadata key=\"sparse_infill_density\" value=\"100%\"/>",
+            "<metadata key=\"wall_loops\" value=\"4\"/></part>",
+            "</object></config>"
+        );
+        slicer_formats::write_package(&[
+            ("3D/3dmodel.model", &model),
+            ("Metadata/project_settings.config", "{}"),
+            ("Metadata/model_settings.config", settings),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn modifiers_come_from_the_project_and_the_caller() {
+        let bytes = project_with_modifier();
+        let models = [Model {
+            bytes: &bytes,
+            name: None,
+        }];
+        let options = Options {
+            project_settings: true,
+            ..Options::default()
+        };
+        let mut volume = Mesh::cuboid(4.0, 4.0, 4.0);
+        volume.translate([82.0, 102.0, 2.0]);
+        let layers = vec![vec![ObjectLayer {
+            text: "infill_pattern = \"gyroid\"".into(),
+            name: Name::new("m.toml", "path", "m.toml"),
+            range: None,
+            modifier: Some(volume.clone()),
+        }]];
+        let mut warnings = Diagnostics::new();
+        let plate = read_plate(&models, options, Ok, &layers, &mut warnings).unwrap();
+        let objects = &plate.objects;
+        // The modifier alone splits the project into its object; it is not
+        // printed.
+        assert_eq!(objects.meshes.len(), 1);
+        assert_eq!(objects.meshes[0].triangles.len(), 12);
+        assert_eq!(objects.settings[0], None);
+        let [stored, given] = objects.modifiers[0].as_slice() else {
+            panic!("two modifiers expected");
+        };
+        assert_eq!(stored.mesh.bounds().unwrap().0, [85.0, 105.0, 5.0]);
+        assert_eq!(
+            stored.values,
+            [("infill_density".to_string(), "100".to_string())]
+        );
+        assert_eq!(given.mesh, volume);
+        assert_eq!(
+            crate::modifier_settings(&plate.settings, given).infill_pattern,
+            slicer_profiles::InfillPattern::Gyroid
+        );
+        assert_eq!(warnings.codes(), ["project.modifier_settings_skipped"]);
+        assert_eq!(warnings.as_slice()[0].context["keys"], "wall_loops");
+
+        // Without the project's settings the modifier is not printed
+        // either.
+        let mut warnings = Diagnostics::new();
+        let plate = read_plate(&models, Options::default(), Ok, &[], &mut warnings).unwrap();
+        assert_eq!(plate.objects.meshes[0].triangles.len(), 12);
+        assert!(plate.objects.modifiers[0].is_empty());
+        assert_eq!(warnings.codes(), ["model.modifiers_not_printed"]);
+
+        // Arranged with another model, the modifiers move with their
+        // object.
+        let other = slicer_formats::write_3mf(&Mesh::cuboid(10.0, 10.0, 10.0)).unwrap();
+        let both = [
+            models[0],
+            Model {
+                bytes: &other,
+                name: None,
+            },
+        ];
+        let plate = read_plate(&both, options, Ok, &layers, &mut Diagnostics::new()).unwrap();
+        assert_eq!(plate.placement, Placement::AsGiven);
+        let corner = plate.objects.meshes[0].bounds().unwrap().0;
+        assert_ne!(corner, [80.0, 100.0, 0.0]);
+        let inside = plate.objects.modifiers[0][0].mesh.bounds().unwrap().0;
+        assert_eq!([0, 1, 2].map(|a| inside[a] - corner[a]), [5.0, 5.0, 5.0]);
+
+        // Settings a modifier cannot have fail, naming their file.
+        let layers = vec![vec![ObjectLayer {
+            text: "wall_loops = 3".into(),
+            name: Name::new("m.toml", "path", "m.toml"),
+            range: None,
+            modifier: Some(volume),
+        }]];
+        let error = read_plate(&models, options, Ok, &layers, &mut Diagnostics::new()).unwrap_err();
+        assert_eq!(error.code, "settings.not_per_modifier");
+        assert!(error.message.starts_with("m.toml: "));
     }
 }

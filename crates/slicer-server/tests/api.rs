@@ -442,6 +442,68 @@ async fn height_ranges_get_settings_of_their_own() {
     }
 }
 
+#[tokio::test]
+async fn modifiers_get_settings_of_their_own() {
+    let router = App::new(Config::default()).router();
+    let stl = slicer_formats::write_stl_binary(&Mesh::cuboid(20.0, 20.0, 10.0));
+    let mut core = Mesh::cuboid(10.0, 10.0, 6.0);
+    core.translate([5.0, 5.0, 2.0]);
+    let core = slicer_formats::write_stl_binary(&core);
+    let model = [("model", &stl[..])];
+    let plain = sliced(&router, &model).await;
+    let dense: &[u8] = b"infill_density = 100";
+    let fields = [
+        &model[..],
+        &[("modifier_1", &core[..]), ("modifier_settings_1", dense)],
+    ]
+    .concat();
+    assert_ne!(plain, sliced(&router, &fields).await);
+    // The object's own values print as without a modifier.
+    let same: &[u8] = b"infill_density = 15";
+    let fields = [
+        &model[..],
+        &[("modifier_1", &core[..]), ("modifier_settings_1", same)],
+    ]
+    .concat();
+    assert_eq!(plain, sliced(&router, &fields).await);
+
+    let (status, body) = create(
+        &router,
+        &[
+            ("model", &stl),
+            ("modifier_1", &core),
+            ("modifier_settings_1", b"wall_loops = 4"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "settings.not_per_modifier");
+    assert_eq!(body["error"]["context"]["field"], "modifier_settings_1");
+    let invalid: [&[(&str, &[u8])]; 4] = [
+        &[("modifier_1", &core)],
+        &[("modifier_settings_1", dense)],
+        &[("modifier_2", &core), ("modifier_settings_2", dense)],
+        &[("modifier_x", &core), ("modifier_settings_x", dense)],
+    ];
+    for extra in invalid {
+        let fields = [&[("model", &stl[..])][..], extra].concat();
+        let (status, body) = create(&router, &fields).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{:?}", extra[0].0);
+        assert_eq!(body["error"]["code"], "request.invalid", "{:?}", extra[0].0);
+    }
+    let (status, body) = create(
+        &router,
+        &[
+            ("model", &stl),
+            ("modifier_1", b"not a mesh"),
+            ("modifier_settings_1", dense),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["context"]["field"], "modifier_1");
+}
+
 /// A project file as Orca Slicer and Bambu Studio write it, reduced to
 /// what is read: two cubes (objects 1 and 2), the project's settings and,
 /// with `object_settings`, settings of object 2 of its own. The same as in
@@ -544,7 +606,7 @@ async fn settings_stored_in_a_project_file_are_used_on_request() {
         .unwrap();
     assert_eq!(object["context"]["keys"], "layer_height");
     assert!(object["message"].as_str().unwrap().contains("'Right'"));
-    assert!(codes(&warnings).contains(&"project.part_settings_skipped".to_string()));
+    assert!(codes(&warnings).contains(&"project.modifier_settings_skipped".to_string()));
 
     // The object's own infill makes a difference.
     let plate_only = sliced(&router, &[("model", &plain), on]).await;

@@ -171,7 +171,7 @@ pub fn read_project(bytes: &[u8], parts: &[&str]) -> Result<ProjectPackage, Thre
                 };
                 let mut mesh = Mesh::default();
                 let mut skipped = 0;
-                package.emit(&root, &local, &IDENTITY, 0, &mut skipped, &mut mesh)?;
+                package.emit(&root, &local, &IDENTITY, 0, &mut skipped, &mut mesh, &[])?;
                 let index = (!mesh.triangles.is_empty()).then(|| {
                     let name = package
                         .parts

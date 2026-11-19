@@ -8,9 +8,18 @@
 //! - `Metadata/model_settings.config` is XML. Every `<object id="…">` (the
 //!   identifier of the object in the 3D model) holds
 //!   `<metadata key="…" value="…"/>` entries: its name, its extruder and
-//!   the settings changed for this object only. Its `<part>` elements
-//!   (parts, modifiers) carry their own entries, among them settings of
-//!   modifiers, which are not read here.
+//!   the settings changed for this object only. Its `<part id="…"
+//!   subtype="…">` elements carry their own entries: `normal_part` for a
+//!   printed part, `modifier_part` for a modifier with the settings
+//!   changed inside it, and (from the user documentation)
+//!   `negative_part`, `support_blocker` and `support_enforcer`. The `id`
+//!   of a part is the identifier of the object that the matching
+//!   `<component>` of the object in the 3D model refers to. Settings of
+//!   modifiers are read; those of other parts are only named.
+//! - None of the project files examined so far has a modifier, so how the
+//!   settings of a modifier are stored is inferred: as the
+//!   `<metadata key="…" value="…"/>` entries of its part, like those of
+//!   the object.
 //! - Settings for a range of the height of an object ("height range
 //!   modifiers") are not in any of the project files seen so far. They are
 //!   read from `<range min_z="…" max_z="…">` elements inside the object
@@ -61,6 +70,20 @@ pub struct RangeSettings {
     pub values: Vec<(String, String)>,
 }
 
+/// Settings changed inside a modifier of an object (a part with
+/// `subtype="modifier_part"`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModifierSettings {
+    /// Identifier of the part, as `parse_3mf_plate_parts` gives it with the
+    /// mesh of the modifier.
+    pub id: u32,
+    /// Name of the modifier, if the project gives one.
+    pub name: Option<String>,
+    /// The settings by the program's own names, with their values as text,
+    /// in the order of the file.
+    pub values: Vec<(String, String)>,
+}
+
 /// Settings changed for one object of a project.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ObjectSettings {
@@ -71,9 +94,12 @@ pub struct ObjectSettings {
     /// The settings by the program's own names, with their values as text,
     /// in the order of the file.
     pub values: Vec<(String, String)>,
-    /// Names of settings on parts or modifiers of the object, which are not
-    /// read.
+    /// Names of settings on parts of the object other than modifiers,
+    /// which are not read.
     pub part_keys: Vec<String>,
+    /// The modifiers of the object that set anything, in the order of the
+    /// file.
+    pub modifiers: Vec<ModifierSettings>,
     /// Settings changed for ranges of its height, in the order of the file.
     pub ranges: Vec<RangeSettings>,
 }
@@ -118,6 +144,8 @@ fn object_settings(text: &str) -> Result<Vec<ObjectSettings>, ThreeMfError> {
     let mut objects = Vec::new();
     let mut current: Option<ObjectSettings> = None;
     let mut in_part = false;
+    // The modifier whose part is being read.
+    let mut modifier: Option<ModifierSettings> = None;
     // The height range being read, and the setting of the `<option>`
     // element being read with its text so far.
     let mut range: Option<RangeSettings> = None;
@@ -140,8 +168,19 @@ fn object_settings(text: &str) -> Result<Vec<ObjectSettings>, ThreeMfError> {
                             });
                     in_part = false;
                     range = None;
+                    modifier = None;
                 }
-                "part" => in_part = true,
+                "part" => {
+                    in_part = true;
+                    let [id, subtype] = attributes(&element, ["id", "subtype"]);
+                    modifier = id
+                        .and_then(|id| id.trim().parse::<u32>().ok())
+                        .filter(|_| subtype.as_deref() == Some("modifier_part"))
+                        .map(|id| ModifierSettings {
+                            id,
+                            ..ModifierSettings::default()
+                        });
+                }
                 "range" if current.is_some() && !in_part => {
                     let [min, max] = attributes(&element, ["min_z", "max_z"]);
                     let height = |text: Option<String>| {
@@ -179,6 +218,12 @@ fn object_settings(text: &str) -> Result<Vec<ObjectSettings>, ThreeMfError> {
                     }
                 } else if key == "name" && !in_part {
                     object.name = Some(value);
+                } else if let Some(modifier) = modifier.as_mut().filter(|_| in_part) {
+                    if key == "name" {
+                        modifier.name = Some(value);
+                    } else if !NOT_SETTINGS.contains(&key.as_str()) {
+                        modifier.values.push((key, value));
+                    }
                 } else if NOT_SETTINGS.contains(&key.as_str()) {
                     // Describes the object or part.
                 } else if !in_part {
@@ -192,12 +237,20 @@ fn object_settings(text: &str) -> Result<Vec<ObjectSettings>, ThreeMfError> {
                     if let Some(object) = current.take()
                         && !(object.values.is_empty()
                             && object.part_keys.is_empty()
+                            && object.modifiers.is_empty()
                             && object.ranges.is_empty())
                     {
                         objects.push(object);
                     }
                 }
-                "part" => in_part = false,
+                "part" => {
+                    in_part = false;
+                    if let (Some(object), Some(modifier)) = (current.as_mut(), modifier.take())
+                        && !modifier.values.is_empty()
+                    {
+                        object.modifiers.push(modifier);
+                    }
+                }
                 "range" => {
                     if let (Some(object), Some(range)) = (current.as_mut(), range.take()) {
                         object.ranges.push(range);
@@ -241,6 +294,10 @@ mod tests {
     <part id="2" subtype="modifier_part">
       <metadata key="name" value="Modifier"/>
       <metadata key="wall_loops" value="5"/>
+    </part>
+    <part id="7" subtype="negative_part">
+      <metadata key="name" value="Hole"/>
+      <metadata key="extruder" value="1"/>
     </part>
   </object>
   <object id="4">
@@ -296,7 +353,12 @@ mod tests {
                     ("sparse_infill_density".into(), "40%".into()),
                     ("brim_type".into(), "no_brim".into()),
                 ],
-                part_keys: vec!["wall_loops".into()],
+                part_keys: Vec::new(),
+                modifiers: vec![ModifierSettings {
+                    id: 2,
+                    name: Some("Modifier".into()),
+                    values: vec![("wall_loops".into(), "5".into())],
+                }],
                 ranges: Vec::new(),
             }]
         );

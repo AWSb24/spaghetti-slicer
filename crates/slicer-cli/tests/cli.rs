@@ -903,6 +903,78 @@ fn height_ranges_get_settings_of_their_own() {
 }
 
 #[test]
+fn modifiers_change_the_settings_inside_them() {
+    let dir = workdir("modifiers");
+    let a = dir.join("a.stl");
+    fs::write(
+        &a,
+        slicer_formats::write_stl_binary(&Mesh::cuboid(20.0, 20.0, 20.0)),
+    )
+    .unwrap();
+    // A 10 mm cube in the middle of the model, in the model's coordinates.
+    let mut core = Mesh::cuboid(10.0, 10.0, 10.0);
+    core.translate([5.0, 5.0, 5.0]);
+    let mesh = dir.join("core.stl");
+    fs::write(&mesh, slicer_formats::write_stl_binary(&core)).unwrap();
+    let dense = dir.join("dense.toml");
+    fs::write(&dense, "infill_density = 100\n").unwrap();
+    let same = dir.join("same.toml");
+    fs::write(&same, "infill_density = 15\n").unwrap();
+    let walls = dir.join("walls.toml");
+    fs::write(&walls, "wall_loops = 4\n").unwrap();
+    let slice = |name: &str, modifiers: &[String]| {
+        let output = dir.join(name);
+        let mut command = bin();
+        command
+            .args(["slice", a.to_str().unwrap(), "-o"])
+            .arg(&output)
+            .arg("--json");
+        for modifier in modifiers {
+            command.arg(format!("--modifier={modifier}"));
+        }
+        let out = command.output().unwrap();
+        let text = fs::read_to_string(&output).unwrap_or_default();
+        (out, text)
+    };
+    let modifier = |prefix: &str, settings: &PathBuf| {
+        format!("{prefix}{}:{}", mesh.display(), settings.display())
+    };
+    let (out, plain) = slice("plain.gcode", &[]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let (out, dense_gcode) = slice("dense.gcode", &[modifier("1:", &dense)]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_ne!(plain, dense_gcode);
+    // More solid infill, the same number of layers.
+    let solid = |gcode: &str| gcode.matches(";TYPE:Solid infill").count();
+    assert!(solid(&dense_gcode) > solid(&plain));
+    // A modifier with the object's own values prints as without it.
+    let (_, unchanged) = slice("same.gcode", &[modifier("1:", &same)]);
+    assert_eq!(plain, unchanged);
+
+    let error = |modifiers: &[String]| {
+        let (out, _) = slice("error.gcode", modifiers);
+        assert!(!out.status.success());
+        let error: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+        error["error"].clone()
+    };
+    let wrong = error(&[modifier("1:", &walls)]);
+    assert_eq!(wrong["code"], "settings.not_per_modifier");
+    assert_eq!(wrong["context"]["key"], "wall_loops");
+    for prefix in ["2:", "0:", "x:", ""] {
+        let wrong = error(&[modifier(prefix, &dense)]);
+        assert_eq!(wrong["code"], "cli.invalid_modifier", "{prefix}");
+    }
+    let wrong = error(&[format!("1:{}", dense.display())]);
+    assert_eq!(wrong["code"], "cli.invalid_modifier");
+    let missing = error(&[format!(
+        "1:{}:{}",
+        dir.join("none.stl").display(),
+        dense.display()
+    )]);
+    assert_eq!(missing["code"], "io.read");
+}
+
+#[test]
 fn build_items_of_a_3mf_can_keep_their_positions() {
     let dir = workdir("keep");
     let cube = Mesh::cuboid(10.0, 10.0, 10.0);
@@ -1117,7 +1189,7 @@ fn settings_stored_in_a_project_file_are_used_on_request() {
         .unwrap();
     assert_eq!(object["context"]["keys"], "layer_height");
     assert!(object["message"].as_str().unwrap().contains("'Right'"));
-    assert!(codes(&report).contains(&"project.part_settings_skipped".to_string()));
+    assert!(codes(&report).contains(&"project.modifier_settings_skipped".to_string()));
 
     // The object's own infill makes a difference ...
     let (plate_only, _) = slice("plate_only.gcode", &plain, &["--project-settings"]);
