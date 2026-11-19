@@ -504,6 +504,60 @@ async fn modifiers_get_settings_of_their_own() {
     assert_eq!(body["error"]["context"]["field"], "modifier_1");
 }
 
+#[tokio::test]
+async fn support_blockers_and_enforcers_move_supports() {
+    let router = App::new(Config::default()).router();
+    // A T: a column with a wide plate on top, and a box around the plate.
+    let mut t = Mesh::cuboid(10.0, 10.0, 10.0);
+    t.translate([10.0, 0.0, 0.0]);
+    let mut plate = Mesh::cuboid(30.0, 10.0, 2.0);
+    plate.translate([0.0, 0.0, 10.0]);
+    t.merge(&plate);
+    let stl = slicer_formats::write_stl_binary(&t);
+    let mut around = Mesh::cuboid(32.0, 12.0, 4.0);
+    around.translate([-1.0, -1.0, 9.0]);
+    let around = slicer_formats::write_stl_binary(&around);
+    let supported = |gcode: &str| gcode.contains(";TYPE:Support");
+    let model = [("model", &stl[..])];
+    assert!(!supported(&sliced(&router, &model).await));
+    let enforced = [&model[..], &[("support_enforcer_1", &around[..])]].concat();
+    assert!(supported(&sliced(&router, &enforced).await));
+    let on: &[u8] = b"supports=true";
+    let blocked = [
+        &model[..],
+        &[("set", on), ("support_blocker_1", &around[..])],
+    ]
+    .concat();
+    assert!(!supported(&sliced(&router, &blocked).await));
+
+    for name in [
+        "support_blocker_2",
+        "support_enforcer_0",
+        "support_blocker_x",
+        "support_enforcer_",
+    ] {
+        let (status, body) = create(&router, &[("model", &stl), (name, &around)]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}");
+        assert_eq!(body["error"]["code"], "request.invalid", "{name}");
+    }
+    let (status, body) = create(
+        &router,
+        &[("model", &stl), ("support_blocker_1", b"not a mesh")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["context"]["field"], "support_blocker_1");
+    // Both fields are described.
+    let fields = &slicer_server::openapi()["paths"]["/v1/jobs"]["post"]["requestBody"]["content"]["multipart/form-data"]
+        ["schema"]["patternProperties"];
+    for pattern in [
+        "^support_blocker_[1-9][0-9]*$",
+        "^support_enforcer_[1-9][0-9]*$",
+    ] {
+        assert_eq!(fields[pattern]["format"], "binary", "{pattern}");
+    }
+}
+
 /// A project file as Orca Slicer and Bambu Studio write it, reduced to
 /// what is read: two cubes (objects 1 and 2), the project's settings and,
 /// with `object_settings`, settings of object 2 of its own. The same as in

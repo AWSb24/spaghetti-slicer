@@ -11,7 +11,9 @@
 //! Height ranges of an object ([`HeightRange`]) come from the project and
 //! from the caller in the same order; they set their keys over whatever
 //! the object ends up with. So do modifiers ([`Modifier`]): those of the
-//! project first, then the caller's.
+//! project first, then the caller's. Support blockers and enforcers
+//! ([`SupportVolume`]) of the project and of the caller go with their
+//! objects too.
 //! [`read_plate`] does all of it; the steps are public for callers that
 //! read their files in between.
 //!
@@ -22,8 +24,9 @@ use slicer_formats::{ObjectSettings, ProjectSettings};
 use slicer_profiles::Settings;
 
 use crate::{
-    ARRANGE_GAP, HeightRange, MAX_MODIFIERS, Modifier, Placement, apply_modifier_orca,
-    apply_modifier_toml, apply_object_orca, apply_object_toml, apply_range_orca, apply_range_toml,
+    ARRANGE_GAP, HeightRange, MAX_MODIFIERS, MAX_SUPPORT_VOLUMES, Modifier, Placement,
+    SupportVolume, apply_modifier_orca, apply_modifier_toml, apply_object_orca, apply_object_toml,
+    apply_range_orca, apply_range_toml,
 };
 
 /// Largest number of setting names a warning lists in its message; the
@@ -144,6 +147,9 @@ pub struct Objects {
     /// The modifiers of every object, for
     /// [`crate::generate_plate_with_own_settings`], placed with it.
     pub modifiers: Vec<Vec<Modifier>>,
+    /// The support blockers and enforcers of every object, for
+    /// [`crate::generate_plate_with_own_settings`], placed with it.
+    pub support_volumes: Vec<Vec<SupportVolume>>,
     /// The model file (its index) every object comes from.
     pub model: Vec<usize>,
 }
@@ -400,8 +406,15 @@ fn project_ranges(
 }
 
 /// One object read by [`model_objects`]: its mesh, its settings if it has
-/// its own, its height ranges and its modifiers.
-pub type ModelObject = (Mesh, Option<Settings>, Vec<HeightRange>, Vec<Modifier>);
+/// its own, its height ranges, its modifiers and its support blockers and
+/// enforcers.
+pub type ModelObject = (
+    Mesh,
+    Option<Settings>,
+    Vec<HeightRange>,
+    Vec<Modifier>,
+    Vec<SupportVolume>,
+);
 
 /// Reads `model` as one object, or, if `stored` (what [`project_base`]
 /// returned for it) gives settings of their own, height ranges or
@@ -409,6 +422,8 @@ pub type ModelObject = (Mesh, Option<Settings>, Vec<HeightRange>, Vec<Modifier>)
 /// plate's), as one object per build item, each with the settings, ranges
 /// and modifiers of its object. `plate` selects a build plate of a project
 /// file with several plates. Modifier parts of a project are never printed.
+/// Support blockers and enforcers of a project split it like modifiers and
+/// come with their objects.
 pub fn model_objects(
     model: Model,
     stored: Option<&ProjectSettings>,
@@ -434,19 +449,30 @@ pub fn model_objects(
         }
         // Without settings of their own the objects are read as one, as
         // without the project's settings.
-        if by_id.iter().any(|(_, (own, ranges, modifiers))| {
-            own.is_some() || !ranges.is_empty() || !modifiers.is_empty()
-        }) {
+        let supported = objects.iter().any(|o| !o.support_parts.is_empty());
+        if supported
+            || by_id.iter().any(|(_, (own, ranges, modifiers))| {
+                own.is_some() || !ranges.is_empty() || !modifiers.is_empty()
+            })
+        {
             for warning in found.as_slice() {
                 warnings.push(warning.clone());
             }
             return Ok(objects
                 .into_iter()
                 .map(|object| {
+                    let volumes = object
+                        .support_parts
+                        .into_iter()
+                        .map(|(kind, mesh)| match kind {
+                            slicer_formats::SupportPart::Blocker => SupportVolume::blocker(mesh),
+                            slicer_formats::SupportPart::Enforcer => SupportVolume::enforcer(mesh),
+                        })
+                        .collect();
                     let Some((_, (own, ranges, stored))) =
                         by_id.iter().find(|(known, _)| *known == object.id)
                     else {
-                        return (object.mesh, None, Vec::new(), Vec::new());
+                        return (object.mesh, None, Vec::new(), Vec::new(), volumes);
                     };
                     // Every modifier with settings gets its volume.
                     let modifiers = object
@@ -460,7 +486,7 @@ pub fn model_objects(
                             })
                         })
                         .collect();
-                    (object.mesh, own.clone(), ranges.clone(), modifiers)
+                    (object.mesh, own.clone(), ranges.clone(), modifiers, volumes)
                 })
                 .collect());
         }
@@ -474,7 +500,7 @@ pub fn model_objects(
     }
     let mesh =
         slicer_formats::parse_model(model.bytes, plate, warnings).map_err(|e| named(name, e))?;
-    Ok(vec![(mesh, None, Vec::new(), Vec::new())])
+    Ok(vec![(mesh, None, Vec::new(), Vec::new(), Vec::new())])
 }
 
 impl Objects {
@@ -484,8 +510,9 @@ impl Objects {
     /// model `i`, layered over each of them in order: first those for the
     /// whole object, then those for height ranges and modifiers. Fails if
     /// an object ends up with more than [`MAX_RANGES`] height ranges
-    /// (`settings.too_many_ranges`) or [`MAX_MODIFIERS`] modifiers
-    /// (`settings.too_many_modifiers`).
+    /// (`settings.too_many_ranges`), [`MAX_MODIFIERS`] modifiers
+    /// (`settings.too_many_modifiers`) or [`MAX_SUPPORT_VOLUMES`] support
+    /// blockers and enforcers (`settings.too_many_support_volumes`).
     pub fn read(
         models: &[Model],
         stored: &[Option<ProjectSettings>],
@@ -498,7 +525,7 @@ impl Objects {
         for (index, model) in models.iter().enumerate() {
             let stored = stored.get(index).and_then(Option::as_ref);
             let layers = layers.get(index).map_or(&[][..], Vec::as_slice);
-            for (mesh, mut own, mut ranges, mut modifiers) in
+            for (mesh, mut own, mut ranges, mut modifiers, volumes) in
                 model_objects(*model, stored, settings, plate, warnings)?
             {
                 let whole =
@@ -557,20 +584,40 @@ impl Objects {
                         .with("max", MAX_MODIFIERS),
                     ));
                 }
+                too_many_support_volumes(volumes.len()).map_err(|e| named(model.name, e))?;
                 objects.meshes.push(mesh);
                 objects.settings.push(own);
                 objects.ranges.push(ranges);
                 objects.modifiers.push(modifiers);
+                objects.support_volumes.push(volumes);
                 objects.model.push(index);
             }
         }
         Ok(objects)
     }
 
+    /// Adds the support blockers and enforcers `volumes[i]`, in the
+    /// coordinates of model file `i`, to every object of that file, after
+    /// those of the project. Fails if an object ends up with more than
+    /// [`MAX_SUPPORT_VOLUMES`] (`settings.too_many_support_volumes`).
+    pub fn add_support_volumes(
+        &mut self,
+        volumes: &[Vec<SupportVolume>],
+    ) -> Result<(), Diagnostic> {
+        for (own, &file) in self.support_volumes.iter_mut().zip(&self.model) {
+            if let Some(added) = volumes.get(file) {
+                too_many_support_volumes(own.len() + added.len())?;
+                own.extend(added.iter().cloned());
+            }
+        }
+        Ok(())
+    }
+
     /// Puts the objects on the bed: as the files place them, centred (one
     /// model file, `files` < 2) or arranged side by side (several). The
     /// objects of one model file keep their places relative to each other;
-    /// modifiers move with their objects. Returns how
+    /// modifiers, support blockers and enforcers move with their objects.
+    /// Returns how
     /// [`crate::generate_plate`] is to take them.
     pub fn place(&mut self, files: usize, placing: Placing, settings: &Settings) -> Placement {
         if placing.keep_positions {
@@ -581,12 +628,14 @@ impl Objects {
         }
         let meshes = &mut self.meshes;
         let modifiers = &mut self.modifiers;
+        let volumes = &mut self.support_volumes;
         if meshes.len() == files {
             let spots = crate::plate::arrangement(meshes, settings, placing.gap);
             for (object, (mesh, spot)) in meshes.iter_mut().zip(spots).enumerate() {
                 if let Some(spot) = spot {
                     spot.apply(mesh);
                     move_modifiers(modifiers, object, |volume| spot.apply(volume));
+                    move_support_volumes(volumes, object, |volume| spot.apply(volume));
                 }
             }
             return Placement::AsGiven;
@@ -605,6 +654,7 @@ impl Objects {
                 if let Some(spot) = spots.get(file) {
                     spot.apply(mesh);
                     move_modifiers(modifiers, object, |volume| spot.apply(volume));
+                    move_support_volumes(volumes, object, |volume| spot.apply(volume));
                 }
             }
             return Placement::AsGiven;
@@ -635,6 +685,7 @@ impl Objects {
                 let shift = [corner[0] - lo[0], corner[1] - lo[1], 0.0];
                 mesh.translate(shift);
                 move_modifiers(modifiers, object, |volume| volume.translate(shift));
+                move_support_volumes(volumes, object, |volume| volume.translate(shift));
             }
         }
         Placement::AsGiven
@@ -647,6 +698,34 @@ fn move_modifiers(modifiers: &mut [Vec<Modifier>], object: usize, apply: impl Fn
     for modifier in modifiers.get_mut(object).into_iter().flatten() {
         apply(&mut modifier.mesh);
     }
+}
+
+/// Moves the support blockers and enforcers of object `object` among
+/// `volumes` with `apply`, as the object was moved.
+fn move_support_volumes(
+    volumes: &mut [Vec<SupportVolume>],
+    object: usize,
+    apply: impl Fn(&mut Mesh),
+) {
+    for volume in volumes.get_mut(object).into_iter().flatten() {
+        apply(&mut volume.mesh);
+    }
+}
+
+/// Fails if an object has more than [`MAX_SUPPORT_VOLUMES`] support
+/// blockers and enforcers (`settings.too_many_support_volumes`).
+fn too_many_support_volumes(count: usize) -> Result<(), Diagnostic> {
+    if count <= MAX_SUPPORT_VOLUMES {
+        return Ok(());
+    }
+    Err(Diagnostic::error(
+        "settings.too_many_support_volumes",
+        format!(
+            "an object has {count} support blockers and enforcers; at most {MAX_SUPPORT_VOLUMES} are allowed"
+        ),
+    )
+    .with("support_volumes", count)
+    .with("max", MAX_SUPPORT_VOLUMES))
 }
 
 /// What [`read_plate`] does besides reading the models.
@@ -678,7 +757,9 @@ pub struct Plate {
 /// ([`project_base`], in the order of the models), and over those what
 /// `settings` makes of them (the caller's settings for the plate). Then the
 /// objects are read ([`Objects::read`]) with `layers` over the settings of
-/// the objects of each model, and put on the bed ([`Objects::place`]).
+/// the objects of each model, get the support blockers and enforcers
+/// `support_volumes[i]` of model `i` ([`Objects::add_support_volumes`]),
+/// and are put on the bed ([`Objects::place`]).
 /// Warnings, among them those about stored settings that are left out, go
 /// to `warnings`.
 pub fn read_plate(
@@ -686,6 +767,7 @@ pub fn read_plate(
     options: Options,
     settings: impl FnOnce(Settings) -> Result<Settings, Diagnostic>,
     layers: &[Vec<ObjectLayer>],
+    support_volumes: &[Vec<SupportVolume>],
     warnings: &mut Diagnostics,
 ) -> Result<Plate, Diagnostic> {
     let mut base = Settings::default();
@@ -697,6 +779,7 @@ pub fn read_plate(
     }
     let settings = settings(base)?;
     let mut objects = Objects::read(models, &stored, &settings, layers, options.plate, warnings)?;
+    objects.add_support_volumes(support_volumes)?;
     let placement = objects.place(models.len(), options.placing, &settings);
     Ok(Plate {
         settings,
@@ -776,6 +859,7 @@ mod tests {
                 Ok(base)
             },
             &layers,
+            &[],
             &mut warnings,
         )
         .unwrap();
@@ -804,7 +888,7 @@ mod tests {
 
         // Without the option nothing of the project counts.
         let mut warnings = Diagnostics::new();
-        let plate = read_plate(&models, Options::default(), Ok, &[], &mut warnings).unwrap();
+        let plate = read_plate(&models, Options::default(), Ok, &[], &[], &mut warnings).unwrap();
         assert_eq!(plate.settings, Settings::default());
         assert_eq!(plate.objects.meshes.len(), 1);
         assert!(warnings.is_empty());
@@ -842,7 +926,7 @@ mod tests {
             layer("infill_density = 30.0", None),
         ]];
         let mut warnings = Diagnostics::new();
-        let plate = read_plate(&models, options, Ok, &layers, &mut warnings).unwrap();
+        let plate = read_plate(&models, options, Ok, &layers, &[], &mut warnings).unwrap();
         // The ranges alone split the project into its objects.
         let objects = &plate.objects;
         assert_eq!(objects.meshes.len(), 2);
@@ -874,7 +958,8 @@ mod tests {
 
         // Settings that a range cannot have fail, naming their file.
         let layers = vec![vec![layer("layer_height = 0.1", Some((1.0, 2.0)))]];
-        let error = read_plate(&models, options, Ok, &layers, &mut Diagnostics::new()).unwrap_err();
+        let error =
+            read_plate(&models, options, Ok, &layers, &[], &mut Diagnostics::new()).unwrap_err();
         assert_eq!(error.code, "settings.not_per_range");
         assert!(error.message.starts_with("r.toml: "));
         assert_eq!(parse_height_range(" 2.5-7.25 "), Some((2.5, 7.25)));
@@ -894,7 +979,8 @@ mod tests {
             project_settings: true,
             ..Options::default()
         };
-        let error = read_plate(&models, options, Ok, &[], &mut Diagnostics::new()).unwrap_err();
+        let error =
+            read_plate(&models, options, Ok, &[], &[], &mut Diagnostics::new()).unwrap_err();
         assert_eq!(error.code, "model.unrecognized");
         assert!(error.message.starts_with("model 2: "));
         assert_eq!(error.context["model"], "2");
@@ -960,7 +1046,7 @@ mod tests {
             modifier: Some(volume.clone()),
         }]];
         let mut warnings = Diagnostics::new();
-        let plate = read_plate(&models, options, Ok, &layers, &mut warnings).unwrap();
+        let plate = read_plate(&models, options, Ok, &layers, &[], &mut warnings).unwrap();
         let objects = &plate.objects;
         // The modifier alone splits the project into its object; it is not
         // printed.
@@ -986,7 +1072,7 @@ mod tests {
         // Without the project's settings the modifier is not printed
         // either.
         let mut warnings = Diagnostics::new();
-        let plate = read_plate(&models, Options::default(), Ok, &[], &mut warnings).unwrap();
+        let plate = read_plate(&models, Options::default(), Ok, &[], &[], &mut warnings).unwrap();
         assert_eq!(plate.objects.meshes[0].triangles.len(), 12);
         assert!(plate.objects.modifiers[0].is_empty());
         assert_eq!(warnings.codes(), ["model.modifiers_not_printed"]);
@@ -1001,7 +1087,7 @@ mod tests {
                 name: None,
             },
         ];
-        let plate = read_plate(&both, options, Ok, &layers, &mut Diagnostics::new()).unwrap();
+        let plate = read_plate(&both, options, Ok, &layers, &[], &mut Diagnostics::new()).unwrap();
         assert_eq!(plate.placement, Placement::AsGiven);
         let corner = plate.objects.meshes[0].bounds().unwrap().0;
         assert_ne!(corner, [80.0, 100.0, 0.0]);
@@ -1015,8 +1101,111 @@ mod tests {
             range: None,
             modifier: Some(volume),
         }]];
-        let error = read_plate(&models, options, Ok, &layers, &mut Diagnostics::new()).unwrap_err();
+        let error =
+            read_plate(&models, options, Ok, &layers, &[], &mut Diagnostics::new()).unwrap_err();
         assert_eq!(error.code, "settings.not_per_modifier");
         assert!(error.message.starts_with("m.toml: "));
+    }
+
+    /// A project file reduced to what is read: a 20 mm cube (object 3)
+    /// with a support blocker and a support enforcer of 10 mm, 5 mm inside
+    /// it, placed at 80, 100, and no settings of its own.
+    fn project_with_support_parts() -> Vec<u8> {
+        let body = mesh_xml(&Mesh::cuboid(20.0, 20.0, 20.0));
+        let inside = mesh_xml(&Mesh::cuboid(10.0, 10.0, 10.0));
+        let model = format!(
+            "<?xml version=\"1.0\"?><model unit=\"millimeter\" xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\"><resources><object id=\"1\" type=\"model\">{body}</object><object id=\"2\" type=\"model\">{inside}</object><object id=\"4\" type=\"model\">{inside}</object><object id=\"3\" type=\"model\"><components><component objectid=\"1\"/><component objectid=\"2\" transform=\"1 0 0 0 1 0 0 0 1 5 5 5\"/><component objectid=\"4\" transform=\"1 0 0 0 1 0 0 0 1 5 5 15\"/></components></object></resources><build><item objectid=\"3\" transform=\"1 0 0 0 1 0 0 0 1 80 100 0\"/></build></model>"
+        );
+        let settings = concat!(
+            "<config><object id=\"3\"><metadata key=\"name\" value=\"Box\"/>",
+            "<part id=\"1\" subtype=\"normal_part\"/>",
+            "<part id=\"2\" subtype=\"support_blocker\"/>",
+            "<part id=\"4\" subtype=\"support_enforcer\"/>",
+            "</object></config>"
+        );
+        slicer_formats::write_package(&[
+            ("3D/3dmodel.model", &model),
+            ("Metadata/project_settings.config", "{}"),
+            ("Metadata/model_settings.config", settings),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn support_volumes_come_from_the_project_and_the_caller() {
+        use crate::SupportVolumeKind;
+
+        let bytes = project_with_support_parts();
+        let models = [Model {
+            bytes: &bytes,
+            name: None,
+        }];
+        let options = Options {
+            project_settings: true,
+            ..Options::default()
+        };
+        let mut given = Mesh::cuboid(4.0, 4.0, 4.0);
+        given.translate([82.0, 102.0, 2.0]);
+        let caller = vec![vec![SupportVolume::blocker(given.clone())]];
+        let mut warnings = Diagnostics::new();
+        let plate = read_plate(&models, options, Ok, &[], &caller, &mut warnings).unwrap();
+        assert!(warnings.is_empty(), "{:?}", warnings.codes());
+        let objects = &plate.objects;
+        // They split the project into its object and are not printed.
+        assert_eq!(objects.meshes.len(), 1);
+        assert_eq!(objects.meshes[0].triangles.len(), 12);
+        assert_eq!(objects.settings[0], None);
+        let kinds: Vec<SupportVolumeKind> = objects.support_volumes[0]
+            .iter()
+            .map(|volume| volume.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                SupportVolumeKind::Blocker,
+                SupportVolumeKind::Enforcer,
+                SupportVolumeKind::Blocker
+            ]
+        );
+        let corner = |index: usize| objects.support_volumes[0][index].mesh.bounds().unwrap().0;
+        assert_eq!(corner(0), [85.0, 105.0, 5.0]);
+        assert_eq!(corner(1), [85.0, 105.0, 15.0]);
+        assert_eq!(objects.support_volumes[0][2].mesh, given);
+
+        // Without the project's settings they are left out, and that is
+        // said.
+        let mut warnings = Diagnostics::new();
+        let plate = read_plate(&models, Options::default(), Ok, &[], &[], &mut warnings).unwrap();
+        assert!(plate.objects.support_volumes[0].is_empty());
+        assert_eq!(warnings.codes(), ["model.support_parts_not_applied"]);
+
+        // Arranged with another model, they move with their object.
+        let other = slicer_formats::write_3mf(&Mesh::cuboid(10.0, 10.0, 10.0)).unwrap();
+        let both = [
+            models[0],
+            Model {
+                bytes: &other,
+                name: None,
+            },
+        ];
+        let plate = read_plate(&both, options, Ok, &[], &caller, &mut Diagnostics::new()).unwrap();
+        assert_eq!(plate.placement, Placement::AsGiven);
+        let corner = plate.objects.meshes[0].bounds().unwrap().0;
+        assert_ne!(corner, [80.0, 100.0, 0.0]);
+        for (volume, offset) in plate.objects.support_volumes[0].iter().zip([
+            [5.0, 5.0, 5.0],
+            [5.0, 5.0, 15.0],
+            [2.0, 2.0, 2.0],
+        ]) {
+            let inside = volume.mesh.bounds().unwrap().0;
+            assert_eq!([0, 1, 2].map(|a| inside[a] - corner[a]), offset);
+        }
+        assert!(plate.objects.support_volumes[1].is_empty());
+
+        // Too many of them fail.
+        let many = vec![vec![SupportVolume::enforcer(given); MAX_SUPPORT_VOLUMES]];
+        let error =
+            read_plate(&models, options, Ok, &[], &many, &mut Diagnostics::new()).unwrap_err();
+        assert_eq!(error.code, "settings.too_many_support_volumes");
     }
 }

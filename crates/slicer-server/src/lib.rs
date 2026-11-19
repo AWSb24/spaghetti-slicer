@@ -535,6 +535,8 @@ pub fn openapi() -> Value {
         slicer_fdm::RANGE_SETTINGS.join(", ")
     );
     let modifier = "Modifier of model N (STL or 3MF), in the coordinates of the model file and moved with it: it is not printed, and inside it the object prints with the settings of the matching modifier_settings_<n> field (the k-th modifier_<n> goes with the k-th modifier_settings_<n>); may be repeated, where modifiers overlap the later one counts";
+    let support_blocker = "Support blocker of model N (STL or 3MF), in the coordinates of the model file and moved with it: it is not printed, and overhangs inside it or above it get no supports; may be repeated";
+    let support_enforcer = "Support enforcer of model N (STL or 3MF), given like support_blocker_<n>: overhangs inside it get supports, even with supports off and even short bridges; where it overlaps a blocker, the blocker counts; may be repeated";
     let modifier_settings = format!(
         "Settings in TOML form inside the k-th modifier_<n> of model N, layered over the settings of the object; may only set {}, not lightning infill (otherwise 400 settings.not_per_modifier)",
         slicer_fdm::MODIFIER_SETTINGS.join(", ")
@@ -568,13 +570,15 @@ pub fn openapi() -> Value {
                         "settings": { "type": "string", "description": "Settings in TOML form; may be repeated, later ones override earlier ones" },
                         "set": { "type": "string", "description": "One override KEY=VALUE; may be repeated" },
                         "plate": { "type": "integer", "description": "Build plate of a project file with several plates" },
-                        "project_settings": { "type": "boolean", "default": false, "description": "Use the print settings stored in project files of Orca Slicer or Bambu Studio (3MF): the project's settings below the settings and set fields, the settings of single objects over the plate's and below object_settings_<n>, the settings of height ranges of objects below range_settings_..., the modifiers of objects (modifier parts with their settings) before the modifier_<n> fields; a project whose objects have settings, height ranges or modifiers of their own is sliced as those objects. Settings without a counterpart are reported as warnings (project.settings_skipped, project.object_settings_skipped, project.part_settings_skipped, project.range_settings_skipped, project.range_invalid, project.modifier_settings_skipped, project.no_settings). Modifier parts, negative parts and support blockers or enforcers of a project are never printed" }
+                        "project_settings": { "type": "boolean", "default": false, "description": "Use the print settings stored in project files of Orca Slicer or Bambu Studio (3MF): the project's settings below the settings and set fields, the settings of single objects over the plate's and below object_settings_<n>, the settings of height ranges of objects below range_settings_..., the modifiers of objects (modifier parts with their settings) before the modifier_<n> fields, the support blockers and enforcers of objects before the support_blocker_<n> and support_enforcer_<n> fields; a project whose objects have settings, height ranges, modifiers, support blockers or enforcers of their own is sliced as those objects. Settings without a counterpart are reported as warnings (project.settings_skipped, project.object_settings_skipped, project.part_settings_skipped, project.range_settings_skipped, project.range_invalid, project.modifier_settings_skipped, project.no_settings). Modifier parts, negative parts and support blockers or enforcers of a project are never printed; without project_settings support blockers and enforcers of a project are left out (model.support_parts_not_applied)" }
                     },
                     "patternProperties": {
                         "^object_settings_[1-9][0-9]*$": { "type": "string", "description": object_settings },
                         "^range_settings_([1-9][0-9]*_)?[0-9.]+-[0-9.]+$": { "type": "string", "description": range_settings },
                         "^modifier_[1-9][0-9]*$": { "type": "string", "format": "binary", "description": modifier },
-                        "^modifier_settings_[1-9][0-9]*$": { "type": "string", "description": modifier_settings }
+                        "^modifier_settings_[1-9][0-9]*$": { "type": "string", "description": modifier_settings },
+                        "^support_blocker_[1-9][0-9]*$": { "type": "string", "format": "binary", "description": support_blocker },
+                        "^support_enforcer_[1-9][0-9]*$": { "type": "string", "format": "binary", "description": support_enforcer }
                     }
                 } } } },
                 "responses": {
@@ -839,6 +843,9 @@ struct JobInput {
     /// The `object_settings_<n>` fields of every model, in the order they
     /// were sent, followed by the `range_settings_...` fields.
     objects: Vec<Vec<load::ObjectLayer>>,
+    /// The `support_blocker_<n>` and `support_enforcer_<n>` fields of
+    /// every model.
+    support_volumes: Vec<Vec<slicer_fdm::SupportVolume>>,
     /// Whether to use the stored settings of project files, and the plate.
     options: load::Options,
 }
@@ -877,6 +884,7 @@ fn slice(
         input.options,
         |base| input.settings.apply(base),
         &input.objects,
+        &input.support_volumes,
         &mut warnings,
     )?;
     let settings = &plate.settings;
@@ -884,6 +892,7 @@ fn slice(
         objects: &plate.objects.settings,
         ranges: &plate.objects.ranges,
         modifiers: &plate.objects.modifiers,
+        support_volumes: &plate.objects.support_volumes,
     };
     let toolpaths = slicer_fdm::generate_plate_with_own_settings(
         &plate.objects.meshes,
@@ -947,6 +956,9 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
     let mut range_texts = Vec::new();
     let mut modifier_meshes: Vec<(String, Option<usize>, axum::body::Bytes)> = Vec::new();
     let mut modifier_texts: Vec<(String, Option<usize>, String)> = Vec::new();
+    // Support blockers and enforcers: field name, model number, whether a
+    // blocker, mesh.
+    let mut support_fields: Vec<(String, Option<usize>, bool, axum::body::Bytes)> = Vec::new();
     let mut options = load::Options::default();
     loop {
         let field = match multipart.next_field().await {
@@ -966,6 +978,8 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
             .strip_prefix("modifier_")
             .filter(|_| modifier_text.is_none());
         let number = |n: Option<&str>| n.and_then(|n| n.parse::<usize>().ok());
+        let blocker = name.strip_prefix("support_blocker_");
+        let enforcer = name.strip_prefix("support_enforcer_");
         match name.as_str() {
             "model" => models.push(bytes),
             "settings" | "set" | "plate" | "project_settings" => {
@@ -1012,6 +1026,10 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
             }
             _ if modifier_mesh.is_some() => {
                 modifier_meshes.push((name.clone(), number(modifier_mesh), bytes));
+            }
+            _ if blocker.is_some() || enforcer.is_some() => {
+                let model = number(blocker.or(enforcer));
+                support_fields.push((name.clone(), model, blocker.is_some(), bytes));
             }
             _ if range.is_some() => {
                 let Ok(text) = String::from_utf8(bytes.to_vec()) else {
@@ -1171,6 +1189,41 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
         }
     }
 
+    // Support blockers and enforcers of a model.
+    if support_fields.len() > slicer_fdm::MAX_SUPPORT_VOLUMES {
+        return invalid(format!(
+            "{} support_blocker and support_enforcer fields; at most {} are allowed",
+            support_fields.len(),
+            slicer_fdm::MAX_SUPPORT_VOLUMES
+        ));
+    }
+    let mut support_volumes: Vec<Vec<slicer_fdm::SupportVolume>> = vec![Vec::new(); models.len()];
+    for (name, number, blocker, bytes) in support_fields {
+        let Some(volumes) = number
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|index| support_volumes.get_mut(index))
+        else {
+            return invalid(format!(
+                "field '{name}' names no object; support_blocker_1 and support_enforcer_1 to support_blocker_{0} and support_enforcer_{0} name the models in the order they are sent",
+                models.len()
+            ));
+        };
+        // ponytail: warnings about reading the mesh are not passed on to
+        // the job, as for modifiers.
+        let mesh = match slicer_formats::parse_model(&bytes, None, &mut Diagnostics::new()) {
+            Ok(mesh) => mesh,
+            Err(e) => {
+                let name = load::Name::new(name.clone(), "field", name);
+                return error_response(StatusCode::BAD_REQUEST, &name.apply(e));
+            }
+        };
+        volumes.push(if blocker {
+            slicer_fdm::SupportVolume::blocker(mesh)
+        } else {
+            slicer_fdm::SupportVolume::enforcer(mesh)
+        });
+    }
+
     let id = Uuid::new_v4();
     {
         let mut jobs = app.jobs();
@@ -1209,6 +1262,7 @@ async fn create_job(State(app): State<App>, mut multipart: Multipart) -> Respons
         models,
         settings: plate_settings,
         objects,
+        support_volumes,
         options,
     };
     tokio::spawn(run_job(app.clone(), id, input));

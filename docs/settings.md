@@ -74,6 +74,9 @@ Lengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML 
 | `support_interface_pattern` | lines | `lines`, `concentric`, `grid` | Pattern of the dense interface layers: `lines`, `concentric` or `grid`. |
 | `support_interface_spacing` | 0 | 0 to 20 | Distance between the lines (or loops) of the dense interface, at least one line width; 0 means two line widths. |
 | `support_bridge_length` | 10 | 0 to 1000 | Bridges up to this length in millimetres get no supports; 0 supports every bridge. |
+| `support_top_z_distance` | 0 | 0 to 10 | Gap between the top of a support and the surface it carries, in millimetres, rounded to whole layers of `layer_height`, at least one layer; 0 means one layer, whatever its thickness. |
+| `support_bottom_z_distance` | 0 | 0 to 10 | Gap between the model a support stands on and the support, in millimetres, rounded to whole layers of `layer_height`, at least one layer; 0 means one layer, whatever its thickness. |
+| `support_xy_distance` | 0 | 0 to 10 | Distance between a support and the sides of the model, in millimetres; 0 means one line width. |
 | `prime_tower_width` | 15 | 0 to 100 | Side of the square tower that every tool change primes the new extruder into, on every layer up to the last tool change; 0 disables it. Only used with more than one extruder. |
 | `prime_tower_x` | 190 | 0 to 2000 * | X of the centre of the prime tower on the bed. |
 | `prime_tower_y` | 190 | 0 to 2000 * | Y of the centre of the prime tower on the bed. |

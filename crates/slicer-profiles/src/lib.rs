@@ -112,8 +112,8 @@ pub enum SupportStyle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SupportInterfacePattern {
-    /// Parallel lines, the same direction on every layer, across the lines
-    /// of the support below.
+    /// Parallel lines, turned by 90 degrees from one layer to the next, so
+    /// that every interface layer crosses the one below it.
     Lines,
     /// Loops following the outline of the interface, one inside the other.
     Concentric,
@@ -356,6 +356,17 @@ pub struct Settings {
     /// Bridges up to this length in millimetres get no supports; 0 supports
     /// every bridge.
     pub support_bridge_length: f64,
+    /// Gap between the top of a support and the surface it carries, in
+    /// millimetres, rounded to whole layers of `layer_height`, at least one
+    /// layer; 0 means one layer, whatever its thickness.
+    pub support_top_z_distance: f64,
+    /// Gap between the model a support stands on and the support, in
+    /// millimetres, rounded to whole layers of `layer_height`, at least one
+    /// layer; 0 means one layer, whatever its thickness.
+    pub support_bottom_z_distance: f64,
+    /// Distance between a support and the sides of the model, in
+    /// millimetres; 0 means one line width.
+    pub support_xy_distance: f64,
     /// Side of the square tower that every tool change primes the new
     /// extruder into, on every layer up to the last tool change; 0 disables
     /// it. Only used with more than one extruder.
@@ -536,6 +547,9 @@ impl Default for Settings {
             support_interface_pattern: SupportInterfacePattern::Lines,
             support_interface_spacing: 0.0,
             support_bridge_length: 10.0,
+            support_top_z_distance: 0.0,
+            support_bottom_z_distance: 0.0,
+            support_xy_distance: 0.0,
             prime_tower_width: 15.0,
             prime_tower_x: 190.0,
             prime_tower_y: 190.0,
@@ -1009,6 +1023,19 @@ impl Settings {
                 0.0,
                 20.0,
             ),
+            (
+                "support_top_z_distance",
+                self.support_top_z_distance,
+                0.0,
+                10.0,
+            ),
+            (
+                "support_bottom_z_distance",
+                self.support_bottom_z_distance,
+                0.0,
+                10.0,
+            ),
+            ("support_xy_distance", self.support_xy_distance, 0.0, 10.0),
             ("prime_tower_width", self.prime_tower_width, 0.0, 100.0),
             ("prime_tower_x", self.prime_tower_x, tower_x.0, tower_x.1),
             ("prime_tower_y", self.prime_tower_y, tower_y.0, tower_y.1),

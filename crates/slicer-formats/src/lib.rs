@@ -15,8 +15,8 @@ pub use project_settings::{
 };
 pub use stl::{StlError, parse_stl, write_stl_binary};
 pub use threemf::{
-    PlateObject, ThreeMfError, looks_like_3mf, parse_3mf, parse_3mf_plate, parse_3mf_plate_objects,
-    parse_3mf_plate_parts, write_3mf, write_binary_package, write_package,
+    PlateObject, SupportPart, ThreeMfError, looks_like_3mf, parse_3mf, parse_3mf_plate,
+    parse_3mf_plate_objects, parse_3mf_plate_parts, write_3mf, write_binary_package, write_package,
 };
 
 use slicer_core::{Diagnose, Diagnostic, Diagnostics, Mesh};

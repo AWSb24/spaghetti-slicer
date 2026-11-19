@@ -222,16 +222,17 @@ fn contact_points(hanging: &Shapes, spacing: f64) -> Vec<(Point, f64)> {
     nodes
 }
 
-/// Where tree supports go on every layer: under every overhang
+/// Where tree supports go on every layer: under every overhang, starting
+/// on the layers of `starts` (what hangs free the gap above them),
 /// `interface` layers of its own shape (the dense interface), below that
 /// the branches, all of it clear of `keep_out`.
 pub(crate) fn areas(
-    hanging: &[Shapes],
+    starts: &[Shapes],
     keep_out: &[Shapes],
     cut_heights: &[f64],
     settings: &Settings,
 ) -> Vec<Shapes> {
-    let branches = branches(hanging, keep_out, cut_heights, settings);
+    let branches = branches(starts, keep_out, cut_heights, settings);
     let interface = settings.support_interface_layers as usize;
     let circle: Vec<(f64, f64)> = (0..CIRCLE_SEGMENTS)
         .map(|k| {
@@ -239,7 +240,7 @@ pub(crate) fn areas(
             (cos, sin)
         })
         .collect();
-    parallel_map(hanging.len(), |index| {
+    parallel_map(starts.len(), |index| {
         let circles: Vec<Contour> = branches[index]
             .iter()
             .map(|node| {
@@ -255,7 +256,7 @@ pub(crate) fn areas(
             })
             .collect();
         let mut area = polygon::from_oriented_loops(&circles);
-        for above in hanging.iter().skip(index + 2).take(interface) {
+        for above in starts.iter().skip(index).take(interface) {
             area = polygon::union(&area, above);
         }
         if area.is_empty() {
@@ -300,12 +301,12 @@ fn towards(from: Point, to: Point, step: f64) -> Point {
 // `LOOK_AHEAD` layers, so a branch can still lean into a dead end farther
 // down.
 fn branches(
-    hanging: &[Shapes],
+    starts: &[Shapes],
     keep_out: &[Shapes],
     cut_heights: &[f64],
     settings: &Settings,
 ) -> Vec<Vec<Node>> {
-    let count = hanging.len();
+    let count = starts.len();
     let width = settings.line_width;
     let spacing = settings.support_spacing;
     let interface = settings.support_interface_layers as usize;
@@ -391,7 +392,7 @@ fn branches(
         }
 
         // New branches start right under the dense interface.
-        if let Some(above) = hanging.get(index + 2 + interface) {
+        if let Some(above) = starts.get(index + interface) {
             for (at, load) in contact_points(above, spacing) {
                 let radius = target(load);
                 if let Some(at) = outline
@@ -471,9 +472,10 @@ mod tests {
                 }
             })
             .collect();
-        let hanging: Vec<Shapes> = (0..count)
+        // The supports start one empty layer below the plate.
+        let starts: Vec<Shapes> = (0..count)
             .map(|i| match i {
-                50 => polygon::difference(&plate, &slices[49]),
+                48 => polygon::difference(&plate, &slices[49]),
                 _ => Vec::new(),
             })
             .collect();
@@ -484,7 +486,7 @@ mod tests {
             })
             .collect();
         let heights: Vec<f64> = (0..count).map(|i| 0.2 * (i + 1) as f64).collect();
-        let branches = branches(&hanging, &keep_out, &heights, &settings);
+        let branches = branches(&starts, &keep_out, &heights, &settings);
         (branches, keep_out, settings)
     }
 

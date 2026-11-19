@@ -617,6 +617,20 @@ struct ProjectLayout {
 struct HiddenPart {
     id: u32,
     modifier: bool,
+    /// A support blocker or enforcer.
+    support: Option<SupportPart>,
+}
+
+/// What a support part of a project does (`subtype="support_blocker"` or
+/// `"support_enforcer"` of a `<part>` in `Metadata/model_settings.config`).
+// ponytail: the subtype names follow the part types the user documentation
+// of Orca Slicer and Bambu Studio names; no project file with them was seen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupportPart {
+    /// No supports for the overhangs inside it.
+    Blocker,
+    /// Supports for the overhangs inside it.
+    Enforcer,
 }
 
 /// Notes the part `element` of `object` in `hidden` if it is not printed
@@ -636,6 +650,11 @@ fn hide_part(
         hidden.entry(object).or_default().push(HiddenPart {
             id,
             modifier: subtype == "modifier_part",
+            support: match subtype.as_str() {
+                "support_blocker" => Some(SupportPart::Blocker),
+                "support_enforcer" => Some(SupportPart::Enforcer),
+                _ => None,
+            },
         });
     }
 }
@@ -652,6 +671,9 @@ pub struct PlateObject {
     /// like the item: the identifier of every part (as
     /// `Metadata/model_settings.config` names it) with its mesh.
     pub modifiers: Vec<(u32, Mesh)>,
+    /// The support blockers and enforcers of the object, which are not
+    /// printed, placed like the item.
+    pub support_parts: Vec<(SupportPart, Mesh)>,
 }
 
 /// Reads the build plates of a Bambu Studio project, with the number of each
@@ -768,8 +790,9 @@ pub fn parse_3mf_plate_objects(
 /// own. Parts of a project that are not printed (modifiers, negative
 /// volumes, support blockers and enforcers; see the `subtype` of the
 /// `<part>` elements in `Metadata/model_settings.config`) are left out of
-/// the printed meshes by every reader; negative volumes and support
-/// blockers and enforcers are reported (`model.parts_ignored`).
+/// the printed meshes by every reader; support blockers and enforcers come
+/// with their object like modifiers, negative volumes are reported
+/// (`model.parts_ignored`).
 // ponytail: a negative volume is left out, not cut out of its object.
 pub fn parse_3mf_plate_parts(
     bytes: &[u8],
@@ -832,9 +855,9 @@ fn read_plate(
     let mut objects = Vec::new();
     let mut total = 0;
     let mut skipped = 0;
-    // Negative volumes, support blockers and enforcers left out, and
-    // modifiers left out without being read.
-    let (mut ignored, mut unprinted) = (0, 0);
+    // Negative volumes left out, and modifiers, support blockers and
+    // enforcers left out without being read.
+    let (mut ignored, mut unprinted, mut unapplied) = (0, 0, 0);
     let items = package.parts.get(&root).map_or(0, |part| part.build.len());
     for index in 0..items {
         let Some(item) = package.parts.get(&root).map(|part| &part.build[index]) else {
@@ -864,6 +887,7 @@ fn read_plate(
         // The parts left out: modifiers as meshes of their own, placed
         // like the item, the others only counted.
         let mut modifiers = Vec::new();
+        let mut support_parts = Vec::new();
         if !parts.is_empty() {
             let holder = item.path.as_deref().map_or(root.clone(), |path| {
                 path.trim_start_matches('/').to_string()
@@ -879,7 +903,29 @@ fn read_plate(
                 let Some(part) = parts.iter().find(|part| part.id == component.object) else {
                     continue;
                 };
-                if !part.modifier {
+                if let Some(kind) = part.support {
+                    if split {
+                        let mut volume = Mesh::default();
+                        package.emit(
+                            &holder,
+                            component,
+                            &placed,
+                            1,
+                            &mut skipped,
+                            &mut volume,
+                            &[],
+                        )?;
+                        total += volume.triangles.len();
+                        if total > MAX_TRIANGLES {
+                            return Err(ThreeMfError::TooLarge);
+                        }
+                        if !volume.triangles.is_empty() {
+                            support_parts.push((kind, volume));
+                        }
+                    } else {
+                        unapplied += 1;
+                    }
+                } else if !part.modifier {
                     ignored += 1;
                 } else if split {
                     let mut volume = Mesh::default();
@@ -913,6 +959,7 @@ fn read_plate(
                 id: item.object,
                 mesh: std::mem::take(&mut mesh),
                 modifiers,
+                support_parts,
             });
         }
     }
@@ -921,6 +968,7 @@ fn read_plate(
             id: 0,
             mesh,
             modifiers: Vec::new(),
+            support_parts: Vec::new(),
         });
     }
     if objects.is_empty() {
@@ -952,7 +1000,7 @@ fn read_plate(
             Diagnostic::warning(
                 "model.parts_ignored",
                 format!(
-                    "{ignored} negative part(s), support blocker(s) or enforcer(s) of the project are not printed and have no effect"
+                    "{ignored} negative part(s) of the project are not printed and have no effect"
                 ),
             )
             .with("parts", ignored),
@@ -967,6 +1015,17 @@ fn read_plate(
                 ),
             )
             .with("parts", unprinted),
+        );
+    }
+    if unapplied > 0 {
+        diagnostics.push(
+            Diagnostic::warning(
+                "model.support_parts_not_applied",
+                format!(
+                    "{unapplied} support blocker(s) or enforcer(s) of the project are not printed; they count only with the project's settings"
+                ),
+            )
+            .with("parts", unapplied),
         );
     }
     if skipped > 0 {
@@ -1310,6 +1369,50 @@ mod tests {
         let plain = parse_3mf_plate_objects(&bytes, None, &mut Diagnostics::new()).unwrap();
         assert_eq!(plain.len(), 2);
         assert_eq!(plain[0].1, objects[0].mesh);
+    }
+
+    #[test]
+    fn support_blockers_and_enforcers_come_with_their_object() {
+        // Object 10 has a body (object 1), a blocker (object 2, shifted by
+        // 5 mm in X) and an enforcer (object 3); the item moves it by 20 mm
+        // in Y.
+        let text = model(
+            "",
+            &format!(
+                "<resources><object id=\"1\">{TETRAHEDRON}</object><object id=\"2\">{TETRAHEDRON}</object><object id=\"3\">{TETRAHEDRON}</object><object id=\"10\"><components><component objectid=\"1\"/><component objectid=\"2\" transform=\"1 0 0 0 1 0 0 0 1 5 0 0\"/><component objectid=\"3\"/></components></object></resources><build><item objectid=\"10\" transform=\"1 0 0 0 1 0 0 0 1 0 20 0\"/></build>"
+            ),
+        );
+        let config = concat!(
+            "<config><object id=\"10\"><metadata key=\"name\" value=\"Body\"/>",
+            "<part id=\"1\" subtype=\"normal_part\"/>",
+            "<part id=\"2\" subtype=\"support_blocker\"/>",
+            "<part id=\"3\" subtype=\"support_enforcer\"/>",
+            "</object></config>"
+        );
+        let bytes = package(&[("3D/3dmodel.model", &text), (PLATE_PART, config)]);
+        // As one mesh they are not printed, and say so.
+        let mut diagnostics = Diagnostics::new();
+        let mesh = parse_3mf(&bytes, &mut diagnostics).unwrap();
+        assert_eq!(mesh.triangles.len(), 4);
+        assert_eq!(diagnostics.codes(), ["model.support_parts_not_applied"]);
+        // Split: they come with their object, placed like it.
+        let mut diagnostics = Diagnostics::new();
+        let objects = parse_3mf_plate_parts(&bytes, None, &mut diagnostics).unwrap();
+        assert!(diagnostics.is_empty(), "{:?}", diagnostics.codes());
+        let [object] = objects.as_slice() else {
+            panic!("one object expected");
+        };
+        assert_eq!(object.mesh.triangles.len(), 4);
+        assert!(object.modifiers.is_empty());
+        let [(blocker, a), (enforcer, b)] = object.support_parts.as_slice() else {
+            panic!("two support parts expected");
+        };
+        assert_eq!(
+            (*blocker, *enforcer),
+            (SupportPart::Blocker, SupportPart::Enforcer)
+        );
+        assert_eq!(a.bounds().unwrap().0, [5.0, 20.0, 0.0]);
+        assert_eq!(b.bounds().unwrap().0, [0.0, 20.0, 0.0]);
     }
 
     #[test]

@@ -1297,3 +1297,65 @@ fn settings_stored_in_a_project_file_are_used_on_request() {
     let (_, report) = slice("stl.gcode", &stl, &["--project-settings"]);
     assert!(codes(&report).is_empty());
 }
+
+#[test]
+fn support_blockers_and_enforcers_move_supports() {
+    let dir = workdir("support_volumes");
+    // A T: a column with a wide plate on top.
+    let mut t = Mesh::cuboid(10.0, 10.0, 10.0);
+    t.translate([10.0, 0.0, 0.0]);
+    let mut plate = Mesh::cuboid(30.0, 10.0, 2.0);
+    plate.translate([0.0, 0.0, 10.0]);
+    t.merge(&plate);
+    let model = dir.join("t.stl");
+    fs::write(&model, slicer_formats::write_stl_binary(&t)).unwrap();
+    // A box around the whole plate, in the model's coordinates.
+    let mut around = Mesh::cuboid(32.0, 12.0, 4.0);
+    around.translate([-1.0, -1.0, 9.0]);
+    let volume = dir.join("around.stl");
+    fs::write(&volume, slicer_formats::write_stl_binary(&around)).unwrap();
+    let slice = |name: &str, args: &[String]| {
+        let output = dir.join(name);
+        let out = bin()
+            .args(["slice", model.to_str().unwrap(), "-o"])
+            .arg(&output)
+            .arg("--json")
+            .args(args)
+            .output()
+            .unwrap();
+        let text = fs::read_to_string(&output).unwrap_or_default();
+        (out, text)
+    };
+    let supported = |gcode: &str| gcode.contains(";TYPE:Support");
+    let on = "--set=supports=true".to_string();
+    let blocker = format!("--support-blocker=1:{}", volume.display());
+    let enforcer = format!("--support-enforcer=1:{}", volume.display());
+
+    let (out, plain) = slice("plain.gcode", &[]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(!supported(&plain));
+    let (out, enforced) = slice("enforced.gcode", std::slice::from_ref(&enforcer));
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(supported(&enforced));
+    let (_, on_gcode) = slice("on.gcode", std::slice::from_ref(&on));
+    assert!(supported(&on_gcode));
+    let (out, blocked) = slice("blocked.gcode", &[on, blocker]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(!supported(&blocked));
+
+    let error = |args: &[String]| {
+        let (out, _) = slice("error.gcode", args);
+        assert!(!out.status.success());
+        let error: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+        error["error"].clone()
+    };
+    for prefix in ["2:", "0:", "x:", ""] {
+        let wrong = error(&[format!("--support-enforcer={prefix}{}", volume.display())]);
+        assert_eq!(wrong["code"], "cli.invalid_support_volume", "{prefix}");
+    }
+    let missing = error(&[format!(
+        "--support-blocker=1:{}",
+        dir.join("none.stl").display()
+    )]);
+    assert_eq!(missing["code"], "io.read");
+}
