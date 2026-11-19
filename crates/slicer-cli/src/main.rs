@@ -77,6 +77,13 @@ enum Command {
         /// times; where modifiers overlap, the later one counts
         #[arg(long = "modifier", value_name = "N:MESH:SETTINGS")]
         modifier: Vec<String>,
+        /// Negative volume of object N (1 is the first model file): MESH
+        /// (STL or 3MF, in the coordinates of the model file, moved with
+        /// the object) is cut out of the object before anything else, so
+        /// walls go round the hole and surfaces form at it. May be given
+        /// several times
+        #[arg(long = "negative", value_name = "N:MESH")]
+        negative: Vec<String>,
         /// Support blocker of object N (1 is the first model file): MESH
         /// (STL or 3MF, in the coordinates of the model file, moved with the
         /// object) is not printed; overhangs inside it or above it get no
@@ -280,6 +287,7 @@ fn main() -> ExitCode {
             object,
             range,
             modifier,
+            negative,
             support_blocker,
             support_enforcer,
             project_settings,
@@ -303,6 +311,7 @@ fn main() -> ExitCode {
                             objects: &object,
                             ranges: &range,
                             modifiers: &modifier,
+                            negatives: &negative,
                             blockers: &support_blocker,
                             enforcers: &support_enforcer,
                             project: project_settings,
@@ -513,6 +522,7 @@ fn read_object_files(
             name: file_name(path),
             range: None,
             modifier: None,
+            negative: None,
         });
     }
     Ok(own)
@@ -565,6 +575,7 @@ fn read_range_files(
                     name: file_name(path),
                     range: Some((from, to)),
                     modifier: None,
+                    negative: None,
                 });
             }
         }
@@ -642,8 +653,65 @@ fn read_modifier_files(
                 name: file_name(settings_path),
                 range: None,
                 modifier: Some(mesh),
+                negative: None,
             });
         }
+    }
+    Ok(())
+}
+
+/// Adds the negative volumes of the `--negative N:MESH` arguments to `own`,
+/// the settings files of every model file: to those of model N. Warnings
+/// about reading the meshes go to `warnings`.
+fn read_negative_files(
+    own: &mut [Vec<load::ObjectLayer>],
+    negatives: &[String],
+    warnings: &mut Diagnostics,
+) -> Result<(), Diagnostic> {
+    let count = own.len();
+    if negatives.len() > slicer_fdm::MAX_NEGATIVES {
+        return Err(Diagnostic::error(
+            "model.too_many_negatives",
+            format!(
+                "{} negative volumes; at most {} are allowed",
+                negatives.len(),
+                slicer_fdm::MAX_NEGATIVES
+            ),
+        )
+        .with("negatives", negatives.len())
+        .with("max", slicer_fdm::MAX_NEGATIVES));
+    }
+    for item in negatives {
+        let invalid = || {
+            Diagnostic::error(
+                "cli.invalid_negative",
+                format!(
+                    "--negative expects N:MESH with N from 1 to {count} and MESH an .stl or .3mf file, got '{item}'"
+                ),
+            )
+            .with("argument", item)
+        };
+        // The number comes first, so the path may hold colons (drive
+        // letters).
+        let (number, path) = item.split_once(':').ok_or_else(invalid)?;
+        let layers = number
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|index| own.get_mut(index))
+            .filter(|_| !path.is_empty())
+            .ok_or_else(invalid)?;
+        let path = Path::new(path);
+        let bytes = fs::read(path).map_err(|e| io_error("io.read", path, &e))?;
+        let mesh = slicer_formats::parse_model(&bytes, None, warnings).map_err(in_file(path))?;
+        layers.push(load::ObjectLayer {
+            text: String::new(),
+            name: file_name(path),
+            range: None,
+            modifier: None,
+            negative: Some(mesh),
+        });
     }
     Ok(())
 }
@@ -729,14 +797,16 @@ fn read_settings(
 /// the project files (if `project`), the files in `config`, the
 /// `overrides`, for single objects the `objects` arguments, for height
 /// ranges of objects the `ranges` arguments and for modifiers the
-/// `modifiers` arguments; with them the support blockers and enforcers of
-/// the `blockers` and `enforcers` arguments.
+/// `modifiers` arguments; the negative volumes of objects come from the
+/// `negatives` arguments, their support blockers and enforcers from the
+/// `blockers` and `enforcers` arguments.
 struct SettingsArgs<'a> {
     config: &'a [PathBuf],
     overrides: &'a [String],
     objects: &'a [String],
     ranges: &'a [String],
     modifiers: &'a [String],
+    negatives: &'a [String],
     blockers: &'a [String],
     enforcers: &'a [String],
     project: bool,
@@ -772,6 +842,7 @@ fn slice(
     let mut object_files = read_object_files(inputs.len(), args.objects, &settings)?;
     read_range_files(&mut object_files, args.ranges, &settings)?;
     read_modifier_files(&mut object_files, args.modifiers, &settings, &mut warnings)?;
+    read_negative_files(&mut object_files, args.negatives, &mut warnings)?;
     let support_volumes =
         read_support_volumes(inputs.len(), args.blockers, args.enforcers, &mut warnings)?;
     if files.is_empty() {
@@ -804,6 +875,7 @@ fn slice(
         objects: &objects.settings,
         ranges: &objects.ranges,
         modifiers: &objects.modifiers,
+        negatives: &objects.negatives,
         support_volumes: &objects.support_volumes,
     };
     let toolpaths = slicer_fdm::generate_plate_with_own_settings(
@@ -854,6 +926,7 @@ fn slice(
             &objects.meshes,
             placement,
             &[[large, large], [small, small]],
+            &settings,
         )
         .map_err(|e| thumbnail_error(&e))?
         .into_iter()
@@ -866,6 +939,7 @@ fn slice(
             nozzle_diameter: settings.nozzle_diameter,
             thumbnail: pictures.next().unwrap_or_default(),
             thumbnail_small: pictures.next().unwrap_or_default(),
+            filaments: slicer_gcode::filaments(&result.stats, &settings),
         };
         slicer_formats::write_gcode_3mf(&result.gcode, &info).map_err(|e| e.diagnostic())?
     } else {

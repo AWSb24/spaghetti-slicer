@@ -1124,3 +1124,45 @@ fn printers_come_from_the_environment() {
         assert!(!error.contains("password"), "{error}");
     }
 }
+
+#[tokio::test]
+async fn negative_volumes_are_cut_out_of_their_model() {
+    let router = App::new(Config::default()).router();
+    let stl = slicer_formats::write_stl_binary(&Mesh::cuboid(20.0, 20.0, 10.0));
+    let mut column = Mesh::cuboid(10.0, 10.0, 14.0);
+    column.translate([5.0, 5.0, -2.0]);
+    let column = slicer_formats::write_stl_binary(&column);
+    let two = [("model", &stl[..]), ("model", &stl[..])];
+    let plain = sliced(&router, &two).await;
+    let first = sliced(
+        &router,
+        &[&two[..], &[("negative_1", &column[..])]].concat(),
+    )
+    .await;
+    let second = sliced(
+        &router,
+        &[&two[..], &[("negative_2", &column[..])]].concat(),
+    )
+    .await;
+    assert_ne!(plain, first);
+    assert_ne!(plain, second);
+    assert_ne!(first, second);
+
+    for name in ["negative_3", "negative_0", "negative_x", "negative_"] {
+        let fields = [&two[..], &[(name, &column[..])]].concat();
+        let (status, body) = create(&router, &fields).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}");
+        assert_eq!(body["error"]["code"], "request.invalid", "{name}");
+    }
+    let (status, body) = create(&router, &[("model", &stl), ("negative_1", b"not a mesh")]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["context"]["field"], "negative_1");
+    let mut many = vec![("model", &stl[..])];
+    many.extend(std::iter::repeat_n(("negative_1", &column[..]), 65));
+    let (status, body) = create(&router, &many).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "model.too_many_negatives");
+    let fields = &slicer_server::openapi()["paths"]["/v1/jobs"]["post"]["requestBody"]["content"]["multipart/form-data"]
+        ["schema"]["patternProperties"];
+    assert_eq!(fields["^negative_[1-9][0-9]*$"]["format"], "binary");
+}

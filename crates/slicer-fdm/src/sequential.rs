@@ -31,9 +31,10 @@ pub(crate) fn generate(
 ) -> Result<Toolpaths, FdmError> {
     plate::check(objects, placement, settings, diagnostics)?;
     let mut placed = objects.to_vec();
-    // The modifiers, support blockers and enforcers go along with their
-    // objects.
+    // The modifiers, negative volumes, support blockers and enforcers go
+    // along with their objects.
     let mut modifiers = own.modifiers.to_vec();
+    let mut negatives = own.negatives.to_vec();
     let mut support_volumes = own.support_volumes.to_vec();
     if placement == Placement::Centre {
         // The objects keep their places relative to each other, centred on
@@ -63,6 +64,9 @@ pub(crate) fn generate(
         for modifier in modifiers.iter_mut().flatten() {
             modifier.mesh.translate(shift);
         }
+        for volume in negatives.iter_mut().flatten() {
+            volume.translate(shift);
+        }
         for volume in support_volumes.iter_mut().flatten() {
             volume.mesh.translate(shift);
         }
@@ -79,11 +83,13 @@ pub(crate) fn generate(
         let settings_of_one = [own.objects.get(index).cloned().flatten()];
         let ranges_of_one = [own.ranges.get(index).cloned().unwrap_or_default()];
         let modifiers_of_one = [modifiers.get(index).cloned().unwrap_or_default()];
+        let negatives_of_one = [negatives.get(index).cloned().unwrap_or_default()];
         let volumes_of_one = [support_volumes.get(index).cloned().unwrap_or_default()];
         let one = OwnSettings {
             objects: &settings_of_one,
             ranges: &ranges_of_one,
             modifiers: &modifiers_of_one,
+            negatives: &negatives_of_one,
             support_volumes: &volumes_of_one,
         };
         let toolpaths = crate::generate_plate_with_own_settings(

@@ -31,6 +31,11 @@ enum Kind {
     BrimType,
     /// A square table as a list of numbers, row by row.
     Table,
+    /// One text per filament, joined by commas.
+    List,
+    /// One colour per filament (`#RRGGBB`, or `#RRGGBBAA` with opacity),
+    /// joined by commas.
+    Colours,
 }
 
 /// Orca setting, our setting, and how to convert.
@@ -161,6 +166,8 @@ const MAPPING: &[(&str, &str, Kind)] = &[
     // Multiple filaments
     ("flush_volumes_matrix", "flush_volumes", Kind::Table),
     ("flush_multiplier", "flush_multiplier", Kind::Number),
+    ("filament_colour", "filament_colours", Kind::Colours),
+    ("filament_type", "filament_type", Kind::List),
 ];
 
 /// Keys that describe the profile itself, not the print.
@@ -245,8 +252,9 @@ fn convert(kind: Kind, value: &str) -> Result<String, String> {
             .ok_or_else(|| format!("'{value}' is not available")),
         // Needs the whole list; see `bed_size`.
         Kind::BedArea => Err(format!("'{value}' is not a list of corners")),
-        // Needs the whole list; see `table`.
+        // Need the whole list; see `table` and `list`.
         Kind::Table => Err(format!("'{value}' is not a list of numbers")),
+        Kind::List | Kind::Colours => Err(format!("'{value}' is not a list")),
         Kind::BrimType => match value {
             "no_brim" => Ok("0".into()),
             _ => Err(format!("'{value}' is not available")),
@@ -289,6 +297,28 @@ fn table(value: &Value) -> Option<String> {
         let rows: Vec<String> = numbers.chunks(side).map(|row| row.join(",")).collect();
         rows.join(";")
     })
+}
+
+/// The texts of a list with one per filament (or a single text) joined by
+/// commas; `None` if an entry is not a text. Colours lose their opacity.
+fn list(value: &Value, colours: bool) -> Option<String> {
+    let items = match value {
+        Value::Array(items) => items.as_slice(),
+        single => std::slice::from_ref(single),
+    };
+    let entries: Vec<&str> = items
+        .iter()
+        .map(|item| {
+            let text = item.as_str()?.trim();
+            // ponytail: the opacity of `#RRGGBBAA` is dropped; filaments
+            // are opaque here.
+            Some(match text.get(..7) {
+                Some(rgb) if colours && text.len() == 9 && text.starts_with('#') => rgb,
+                _ => text,
+            })
+        })
+        .collect::<Option<_>>()?;
+    Some(entries.join(","))
 }
 
 /// Reads one Orca profile (printer, material or process) and checks every
@@ -355,6 +385,11 @@ fn import_entries(entries: &Map<String, Value>, settings: &mut Settings) -> Orca
             match table(value) {
                 Some(text) => Ok(vec![((*ours).to_string(), text)]),
                 None => Err("not a square table of numbers".to_string()),
+            }
+        } else if let Kind::List | Kind::Colours = kind {
+            match list(value, matches!(kind, Kind::Colours)) {
+                Some(text) => Ok(vec![((*ours).to_string(), text)]),
+                None => Err("not a list of texts".to_string()),
             }
         } else {
             let Some(value) = text(value) else { continue };
@@ -561,6 +596,37 @@ mod tests {
         let odd = r#"{ "flush_volumes_matrix": ["0", "1", "2"] }"#;
         let import = import_orca(odd, &mut two).unwrap();
         assert_eq!(import.skipped[0].1, "not a square table of numbers");
+    }
+
+    #[test]
+    fn filament_colours_and_types_come_from_projects() {
+        // As Bambu Studio stores them, one per filament, some with opacity.
+        let project = r##"{
+            "filament_colour": ["#000000", "#0000FF", "#FF0000FE", "#161616"],
+            "filament_type": ["PLA", "PETG", "PLA", "PETG"],
+            "default_filament_colour": ["#000000", "", "", ""]
+        }"##;
+        let mut settings = Settings::default();
+        let import = import_orca(project, &mut settings).unwrap();
+        assert!(import.skipped.is_empty(), "{:?}", import.skipped);
+        assert_eq!(settings.filament_colours, "#000000,#0000FF,#FF0000,#161616");
+        assert_eq!(settings.filament_type, "PLA,PETG,PLA,PETG");
+        assert_eq!(settings.filament_colours().unwrap()[2], [0xFF, 0, 0]);
+        // With as many extruders they are used.
+        settings.set("extruder_count", "4").unwrap();
+
+        // Fewer extruders than filaments: left out, as the flush table.
+        let mut two = Settings::default();
+        two.set("extruder_count", "2").unwrap();
+        let import = import_orca(project, &mut two).unwrap();
+        assert_eq!(import.skipped.len(), 2, "{:?}", import.skipped);
+        assert_eq!(two.filament_colours, "");
+        // A filament profile names one type and is taken as well.
+        let filament = r#"{ "filament_type": ["PETG"], "filament_colour": ["oops"] }"#;
+        let import = import_orca(filament, &mut two).unwrap();
+        assert_eq!(two.filament_type, "PETG");
+        assert_eq!(import.skipped.len(), 1);
+        assert_eq!(import.skipped[0].0, "filament_colour");
     }
 
     #[test]

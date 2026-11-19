@@ -609,14 +609,15 @@ struct ProjectLayout {
 
 /// A part of an object in a project of Orca Slicer or Bambu Studio that is
 /// not printed: a modifier (`subtype="modifier_part"`), a negative volume
-/// or a support blocker or enforcer (any other subtype than
-/// `normal_part`). The part's `id` is the identifier of the object that the
-/// component of the object refers to, as the project files seen so far
-/// have it.
+/// (`subtype="negative_part"`) or a support blocker or enforcer (any other
+/// subtype than `normal_part`). The part's `id` is the identifier of the
+/// object that the component of the object refers to, as the project files
+/// seen so far have it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct HiddenPart {
     id: u32,
     modifier: bool,
+    negative: bool,
     /// A support blocker or enforcer.
     support: Option<SupportPart>,
 }
@@ -650,6 +651,7 @@ fn hide_part(
         hidden.entry(object).or_default().push(HiddenPart {
             id,
             modifier: subtype == "modifier_part",
+            negative: subtype == "negative_part",
             support: match subtype.as_str() {
                 "support_blocker" => Some(SupportPart::Blocker),
                 "support_enforcer" => Some(SupportPart::Enforcer),
@@ -671,6 +673,10 @@ pub struct PlateObject {
     /// like the item: the identifier of every part (as
     /// `Metadata/model_settings.config` names it) with its mesh.
     pub modifiers: Vec<(u32, Mesh)>,
+    /// The negative volumes of the object (parts with
+    /// `subtype="negative_part"`), which are cut out of it, placed like
+    /// the item.
+    pub negatives: Vec<Mesh>,
     /// The support blockers and enforcers of the object, which are not
     /// printed, placed like the item.
     pub support_parts: Vec<(SupportPart, Mesh)>,
@@ -785,15 +791,16 @@ pub fn parse_3mf_plate_objects(
     Ok(objects.into_iter().map(|o| (o.id, o.mesh)).collect())
 }
 
-/// Like [`parse_3mf_plate_objects`], with the modifier parts of every
-/// object of a project of Orca Slicer or Bambu Studio as meshes of their
-/// own. Parts of a project that are not printed (modifiers, negative
-/// volumes, support blockers and enforcers; see the `subtype` of the
-/// `<part>` elements in `Metadata/model_settings.config`) are left out of
-/// the printed meshes by every reader; support blockers and enforcers come
-/// with their object like modifiers, negative volumes are reported
-/// (`model.parts_ignored`).
-// ponytail: a negative volume is left out, not cut out of its object.
+/// Like [`parse_3mf_plate_objects`], with the modifier parts, the
+/// negative volumes and the support blockers and enforcers of every object
+/// of a project of Orca Slicer or Bambu Studio as meshes of their own.
+/// Parts of a project that are not printed (modifiers, negative volumes,
+/// support blockers and enforcers; see the `subtype` of the `<part>`
+/// elements in `Metadata/model_settings.config`) are left out of the
+/// printed meshes by every reader; the readers that give no parts report
+/// negative volumes (`model.parts_ignored`, see [`has_negative_parts`]),
+/// modifiers (`model.modifiers_not_printed`) and support blockers and
+/// enforcers (`model.support_parts_not_applied`).
 pub fn parse_3mf_plate_parts(
     bytes: &[u8],
     plate: Option<u32>,
@@ -802,8 +809,28 @@ pub fn parse_3mf_plate_parts(
     read_plate(bytes, plate, true, diagnostics)
 }
 
+/// Whether some object of a project of Orca Slicer or Bambu Studio has a
+/// negative volume (a part with `subtype="negative_part"`), which only
+/// [`parse_3mf_plate_parts`] gives; reads only the project's part list,
+/// not the model. False for anything else, also for broken files.
+pub fn has_negative_parts(bytes: &[u8]) -> bool {
+    let Ok(archive) = zip::ZipArchive::new(Cursor::new(bytes)) else {
+        return false;
+    };
+    let mut package = Package::from_archive(archive);
+    let Ok(Some(text)) = package.read(PLATE_PART) else {
+        return false;
+    };
+    project(&text)
+        .hidden
+        .values()
+        .flatten()
+        .any(|part| part.negative)
+}
+
 /// Reads the build items of one plate: all into a single mesh (with the
-/// identifier 0), or with `split` each into its own with its modifiers.
+/// identifier 0), or with `split` each into its own with its modifiers and
+/// negative volumes.
 fn read_plate(
     bytes: &[u8],
     plate: Option<u32>,
@@ -884,9 +911,10 @@ fn read_plate(
             &leave_out,
         )?;
         mesh.set_extruder(first, extruders.get(&item.object).copied().unwrap_or(0));
-        // The parts left out: modifiers as meshes of their own, placed
-        // like the item, the others only counted.
-        let mut modifiers = Vec::new();
+        // The parts left out: modifiers, negative volumes, support blockers
+        // and enforcers as meshes of their own, placed like the item, the
+        // others only counted.
+        let (mut modifiers, mut negatives) = (Vec::new(), Vec::new());
         let mut support_parts = Vec::new();
         if !parts.is_empty() {
             let holder = item.path.as_deref().map_or(root.clone(), |path| {
@@ -925,7 +953,7 @@ fn read_plate(
                     } else {
                         unapplied += 1;
                     }
-                } else if !part.modifier {
+                } else if !part.modifier && !(part.negative && split) {
                     ignored += 1;
                 } else if split {
                     let mut volume = Mesh::default();
@@ -943,7 +971,11 @@ fn read_plate(
                         return Err(ThreeMfError::TooLarge);
                     }
                     if !volume.triangles.is_empty() {
-                        modifiers.push((part.id, volume));
+                        if part.modifier {
+                            modifiers.push((part.id, volume));
+                        } else {
+                            negatives.push(volume);
+                        }
                     }
                 } else {
                     unprinted += 1;
@@ -960,6 +992,7 @@ fn read_plate(
                 mesh: std::mem::take(&mut mesh),
                 modifiers,
                 support_parts,
+                negatives,
             });
         }
     }
@@ -969,6 +1002,7 @@ fn read_plate(
             mesh,
             modifiers: Vec::new(),
             support_parts: Vec::new(),
+            negatives: Vec::new(),
         });
     }
     if objects.is_empty() {
@@ -1352,10 +1386,13 @@ mod tests {
             diagnostics.codes(),
             ["model.parts_ignored", "model.modifiers_not_printed"]
         );
-        // Split: the modifier comes with its object, placed like it.
+        // Split: the modifier and the negative part come with their
+        // object, placed like it.
+        assert!(has_negative_parts(&bytes));
+        assert!(!has_negative_parts(b"not a package"));
         let mut diagnostics = Diagnostics::new();
         let objects = parse_3mf_plate_parts(&bytes, None, &mut diagnostics).unwrap();
-        assert_eq!(diagnostics.codes(), ["model.parts_ignored"]);
+        assert!(diagnostics.is_empty());
         assert_eq!(objects.len(), 2);
         assert_eq!(objects[0].id, 10);
         assert_eq!(objects[0].mesh.triangles.len(), 4);
@@ -1365,7 +1402,11 @@ mod tests {
         };
         assert_eq!(*part, 2);
         assert_eq!(volume.bounds().unwrap().0, [5.0, 20.0, 0.0]);
-        assert!(objects[1].modifiers.is_empty());
+        let [negative] = objects[0].negatives.as_slice() else {
+            panic!("one negative part expected");
+        };
+        assert_eq!(negative.bounds().unwrap().0, [0.0, 20.0, 0.0]);
+        assert!(objects[1].modifiers.is_empty() && objects[1].negatives.is_empty());
         let plain = parse_3mf_plate_objects(&bytes, None, &mut Diagnostics::new()).unwrap();
         assert_eq!(plain.len(), 2);
         assert_eq!(plain[0].1, objects[0].mesh);

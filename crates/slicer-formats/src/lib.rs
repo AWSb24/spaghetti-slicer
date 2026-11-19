@@ -6,7 +6,9 @@ pub mod project_settings;
 pub mod stl;
 pub mod threemf;
 
-pub use bambu::{PLATE_THUMBNAIL_SIZE, PLATE_THUMBNAIL_SMALL_SIZE, PrintInfo, write_gcode_3mf};
+pub use bambu::{
+    Filament, PLATE_THUMBNAIL_SIZE, PLATE_THUMBNAIL_SMALL_SIZE, PrintInfo, write_gcode_3mf,
+};
 pub use project::{
     ProjectItem, ProjectObject, ProjectPackage, read_part, read_project, write_project,
 };
@@ -15,8 +17,9 @@ pub use project_settings::{
 };
 pub use stl::{StlError, parse_stl, write_stl_binary};
 pub use threemf::{
-    PlateObject, SupportPart, ThreeMfError, looks_like_3mf, parse_3mf, parse_3mf_plate,
-    parse_3mf_plate_objects, parse_3mf_plate_parts, write_3mf, write_binary_package, write_package,
+    PlateObject, SupportPart, ThreeMfError, has_negative_parts, looks_like_3mf, parse_3mf,
+    parse_3mf_plate, parse_3mf_plate_objects, parse_3mf_plate_parts, write_3mf,
+    write_binary_package, write_package,
 };
 
 use slicer_core::{Diagnose, Diagnostic, Diagnostics, Mesh};

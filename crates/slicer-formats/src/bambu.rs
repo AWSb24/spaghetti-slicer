@@ -37,6 +37,42 @@ pub struct PrintInfo {
     /// Smaller picture of the plate as PNG,
     /// [`PLATE_THUMBNAIL_SMALL_SIZE`] pixels square; empty for none.
     pub thumbnail_small: Vec<u8>,
+    /// The filaments the print uses; empty for one white PLA filament with
+    /// all of [`PrintInfo::filament_m`] and [`PrintInfo::weight_g`].
+    pub filaments: Vec<Filament>,
+}
+
+/// One filament of a print, as the description files list it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Filament {
+    /// Number of the filament, counted from 1 (extruder `T0` is 1).
+    pub id: u32,
+    /// Kind, such as `PLA`. Must not need escaping in XML: letters, digits,
+    /// spaces and `+-_.` only (as `filament_type` allows).
+    pub kind: String,
+    /// Colour as `#RRGGBB`.
+    pub colour: String,
+    /// Filament used, in metres.
+    pub used_m: f64,
+    /// Filament used, in grams.
+    pub used_g: f64,
+}
+
+impl PrintInfo {
+    /// [`PrintInfo::filaments`], or the one white PLA filament it stands
+    /// for when empty.
+    fn filament_list(&self) -> Vec<Filament> {
+        if !self.filaments.is_empty() {
+            return self.filaments.clone();
+        }
+        vec![Filament {
+            id: 1,
+            kind: "PLA".to_owned(),
+            colour: "#FFFFFF".to_owned(),
+            used_m: self.filament_m,
+            used_g: self.weight_g,
+        }]
+    }
 }
 
 /// Sine-derived constants of MD5 (RFC 1321).
@@ -136,12 +172,22 @@ pub fn write_gcode_3mf(gcode: &str, info: &PrintInfo) -> Result<Vec<u8>, ThreeMf
     let model_settings = format!(
         "{XML}<config>\n  <plate>\n    <metadata key=\"plater_id\" value=\"1\"/>\n    <metadata key=\"plater_name\" value=\"\"/>\n    <metadata key=\"locked\" value=\"false\"/>\n    <metadata key=\"gcode_file\" value=\"Metadata/plate_1.gcode\"/>\n{thumbnail_file}  </plate>\n</config>\n"
     );
+    let filaments: String = info
+        .filament_list()
+        .iter()
+        .map(|f| {
+            format!(
+                "    <filament id=\"{}\" type=\"{}\" color=\"{}\" used_m=\"{:.2}\" used_g=\"{:.2}\"/>\n",
+                f.id, f.kind, f.colour, f.used_m, f.used_g
+            )
+        })
+        .collect();
+    // ponytail: every layer is listed with filament 0 as before; which
+    // filaments a layer uses is not known here.
     let slice_info = format!(
-        "{XML}<config>\n  <header>\n    <header_item key=\"X-BBL-Client-Type\" value=\"slicer\"/>\n    <header_item key=\"X-BBL-Client-Version\" value=\"\"/>\n  </header>\n  <plate>\n    <metadata key=\"index\" value=\"1\"/>\n    <metadata key=\"nozzle_diameters\" value=\"{}\"/>\n    <metadata key=\"prediction\" value=\"{:.0}\"/>\n    <metadata key=\"weight\" value=\"{:.2}\"/>\n    <metadata key=\"outside\" value=\"false\"/>\n    <metadata key=\"support_used\" value=\"false\"/>\n    <filament id=\"1\" type=\"PLA\" color=\"#FFFFFF\" used_m=\"{:.2}\" used_g=\"{:.2}\"/>\n    <layer_filament_lists>\n      <layer_filament_list filament_list=\"0\" layer_ranges=\"0 {}\" />\n    </layer_filament_lists>\n  </plate>\n</config>\n",
+        "{XML}<config>\n  <header>\n    <header_item key=\"X-BBL-Client-Type\" value=\"slicer\"/>\n    <header_item key=\"X-BBL-Client-Version\" value=\"\"/>\n  </header>\n  <plate>\n    <metadata key=\"index\" value=\"1\"/>\n    <metadata key=\"nozzle_diameters\" value=\"{}\"/>\n    <metadata key=\"prediction\" value=\"{:.0}\"/>\n    <metadata key=\"weight\" value=\"{:.2}\"/>\n    <metadata key=\"outside\" value=\"false\"/>\n    <metadata key=\"support_used\" value=\"false\"/>\n{filaments}    <layer_filament_lists>\n      <layer_filament_list filament_list=\"0\" layer_ranges=\"0 {}\" />\n    </layer_filament_lists>\n  </plate>\n</config>\n",
         info.nozzle_diameter,
         info.seconds,
-        info.weight_g,
-        info.filament_m,
         info.weight_g,
         info.layers.saturating_sub(1)
     );
@@ -220,12 +266,44 @@ mod tests {
         assert!(info.contains("key=\"prediction\" value=\"1234\""), "{info}");
         assert!(info.contains("key=\"weight\" value=\"3.46\""), "{info}");
         assert!(info.contains("layer_ranges=\"0 99\""), "{info}");
+        assert!(
+            info.contains("<filament id=\"1\" type=\"PLA\" color=\"#FFFFFF\" used_m=\"1.20\" used_g=\"3.46\"/>"),
+            "{info}"
+        );
         assert!(read("Metadata/model_settings.config").contains("Metadata/plate_1.gcode"));
         for name in ["[Content_Types].xml", "_rels/.rels", "3D/3dmodel.model"] {
             assert!(read(name).starts_with("<?xml"), "{name}");
         }
         assert!(!read("_rels/.rels").contains("png"));
         assert!(archive.by_name("Metadata/plate_1.png").is_err());
+    }
+
+    #[test]
+    fn container_lists_the_filaments_with_their_colours() {
+        let filament = |id: u32, kind: &str, colour: &str, used_m: f64| Filament {
+            id,
+            kind: kind.to_owned(),
+            colour: colour.to_owned(),
+            used_m,
+            used_g: used_m * 3.0,
+        };
+        let info = PrintInfo {
+            filaments: vec![
+                filament(1, "PLA", "#FF8000", 1.5),
+                filament(3, "PETG", "#202020", 0.25),
+            ],
+            ..PrintInfo::default()
+        };
+        let bytes = write_gcode_3mf("G28\n", &info).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut text = String::new();
+        archive
+            .by_name("Metadata/slice_info.config")
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert!(text.contains("    <filament id=\"1\" type=\"PLA\" color=\"#FF8000\" used_m=\"1.50\" used_g=\"4.50\"/>\n    <filament id=\"3\" type=\"PETG\" color=\"#202020\" used_m=\"0.25\" used_g=\"0.75\"/>\n    <layer_filament_lists>"), "{text}");
+        assert_eq!(text.matches("<filament ").count(), 2);
     }
 
     #[test]
