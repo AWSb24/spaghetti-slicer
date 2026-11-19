@@ -336,6 +336,18 @@ pub struct Settings {
     pub prime_tower_x: f64,
     /// Y of the centre of the prime tower on the bed.
     pub prime_tower_y: f64,
+    /// How much a tool change purges into the prime tower, in mm³ of
+    /// filament, for every pair of extruders: `extruder_count` ×
+    /// `extruder_count` numbers separated by commas, row by row, row i
+    /// being the change from extruder i (counted from 0) and column j the
+    /// change to extruder j, such as `0,50,200,0` for two extruders; a `;`
+    /// may end a row (`0,50;200,0`). The diagonal is ignored. With one
+    /// extruder any square table is accepted and not used. Empty: every
+    /// tool change shares the solid tower layer with the other changes of
+    /// its layer.
+    pub flush_volumes: String,
+    /// Factor on every value of `flush_volumes`.
+    pub flush_multiplier: f64,
     /// Whether every object on the plate is printed completely, all its
     /// layers, before the next one starts, lowest first; between objects
     /// the nozzle rises above everything printed. The objects must stand
@@ -493,6 +505,8 @@ impl Default for Settings {
             prime_tower_width: 15.0,
             prime_tower_x: 190.0,
             prime_tower_y: 190.0,
+            flush_volumes: String::new(),
+            flush_multiplier: 1.0,
             sequential_print: false,
             extruder_clearance_radius: 35.0,
             gantry_height: 20.0,
@@ -731,7 +745,89 @@ impl Settings {
             range(key, value, min, max)?;
         }
         self.thumbnail_sizes()?;
+        self.flush_matrix()?;
         Ok(())
+    }
+
+    /// The purge volumes of `flush_volumes` in mm³, already multiplied by
+    /// `flush_multiplier`: `matrix[i][j]` for the change from extruder `i`
+    /// to extruder `j`, with zeros on the diagonal. Empty if
+    /// `flush_volumes` is empty or there is only one extruder.
+    pub fn flush_matrix(&self) -> Result<Vec<Vec<f64>>, SettingsError> {
+        let invalid = |message: String| SettingsError::Parse(format!("flush_volumes: {message}"));
+        let text = self.flush_volumes.trim();
+        if text.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<&str> = text.trim_end_matches(';').split(';').collect();
+        let mut values = Vec::new();
+        let mut row_lengths = Vec::new();
+        for row in &rows {
+            let mut length = 0;
+            for entry in row.split(',').map(str::trim) {
+                let value = entry
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "'{entry}' is not a volume in mm³ (a number of at least 0)"
+                        ))
+                    })?;
+                values.push(value);
+                length += 1;
+            }
+            row_lengths.push(length);
+        }
+        // The side of the table: the whole number whose square is the count.
+        let side = (1..=values.len())
+            .find(|n| n * n >= values.len())
+            .unwrap_or(0);
+        let several = self.extruder_count > 1;
+        let wanted = if several {
+            self.extruder_count as usize
+        } else {
+            side
+        };
+        if values.len() != wanted * wanted {
+            return Err(invalid(if several {
+                format!(
+                    "{} values, but {} extruders (extruder_count) need {} ({wanted} rows of {wanted})",
+                    values.len(),
+                    wanted,
+                    wanted * wanted
+                )
+            } else {
+                format!(
+                    "{} values do not form a square table (rows of as many values as there are rows)",
+                    values.len()
+                )
+            }));
+        }
+        if rows.len() > 1 && row_lengths.iter().any(|&n| n != wanted) {
+            return Err(invalid(format!(
+                "every row separated by ';' needs {wanted} values"
+            )));
+        }
+        if !several {
+            return Ok(Vec::new());
+        }
+        Ok(values
+            .chunks(wanted)
+            .enumerate()
+            .map(|(from, row)| {
+                row.iter()
+                    .enumerate()
+                    .map(|(to, v)| {
+                        if from == to {
+                            0.0
+                        } else {
+                            v * self.flush_multiplier
+                        }
+                    })
+                    .collect()
+            })
+            .collect())
     }
 
     /// The sizes of `thumbnails` as width and height in pixels, in the
@@ -869,6 +965,7 @@ impl Settings {
             ("prime_tower_width", self.prime_tower_width, 0.0, 100.0),
             ("prime_tower_x", self.prime_tower_x, tower_x.0, tower_x.1),
             ("prime_tower_y", self.prime_tower_y, tower_y.0, tower_y.1),
+            ("flush_multiplier", self.flush_multiplier, 0.0, 10.0),
             ("outer_wall_speed", self.outer_wall_speed, 1.0, 1000.0),
             ("inner_wall_speed", self.inner_wall_speed, 1.0, 1000.0),
             ("infill_speed", self.infill_speed, 1.0, 1000.0),
@@ -988,6 +1085,51 @@ mod tests {
             assert!(error.to_string().contains("thumbnails"), "{error}");
         }
         assert_eq!(settings.thumbnails, "48x48, 300X200/PNG,,");
+    }
+
+    #[test]
+    fn flush_volumes_are_read_and_checked() {
+        let mut settings = Settings::default();
+        assert!(settings.flush_matrix().unwrap().is_empty());
+        // With one extruder any square table is kept and not used.
+        settings.set("flush_volumes", "0,1,2;3,4,5;6,7,8").unwrap();
+        assert!(settings.flush_matrix().unwrap().is_empty());
+        settings
+            .set_all([("extruder_count", "2"), ("flush_volumes", "0, 50, 200, 0")])
+            .unwrap();
+        assert_eq!(
+            settings.flush_matrix().unwrap(),
+            [[0.0, 50.0], [200.0, 0.0]]
+        );
+        // The diagonal is ignored, a row may end with ';', the multiplier
+        // scales.
+        settings.set("flush_volumes", "9,50;200,9;").unwrap();
+        settings.set("flush_multiplier", "1.5").unwrap();
+        assert_eq!(
+            settings.flush_matrix().unwrap(),
+            [[0.0, 75.0], [300.0, 0.0]]
+        );
+        for wrong in [
+            "0,50,200",
+            "0,-5,1,0",
+            "0,x,1,0",
+            "0,,1,0",
+            "0,inf,1,0",
+            "0,50,200;0",
+            "0,1,2;3,4,5;6,7,8",
+        ] {
+            let error = settings.set("flush_volumes", wrong).unwrap_err();
+            assert!(error.to_string().contains("flush_volumes"), "{error}");
+        }
+        let error = settings.set("flush_volumes", "0,1,2,3,4").unwrap_err();
+        assert!(error.to_string().contains("extruder_count"), "{error}");
+        assert_eq!(settings.flush_volumes, "9,50;200,9;");
+        // A third extruder needs a bigger table.
+        assert!(settings.set("extruder_count", "3").is_err());
+        settings
+            .set_all([("extruder_count", "3"), ("flush_volumes", "")])
+            .unwrap();
+        assert!(settings.set("flush_multiplier", "-1").is_err());
     }
 
     #[test]

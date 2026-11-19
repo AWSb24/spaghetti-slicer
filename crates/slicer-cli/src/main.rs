@@ -860,6 +860,13 @@ fn print_summary(result: &serde_json::Value) {
             number("filament_length_mm") / 1000.0,
             number("filament_weight_g")
         );
+        if stats.get("flush_weight_g").is_some() {
+            println!(
+                "  of that into the prime tower: {:.2} cm³, {:.1} g",
+                number("flush_volume_cm3"),
+                number("flush_weight_g")
+            );
+        }
         println!(
             "  time:      {}h {:02}m {:02}s (estimate with acceleration, without heating)",
             seconds / 3600,

@@ -338,6 +338,8 @@ fn write_stats(out: &mut Writer, stats: &Stats) {
         filament_weight_g,
         print_time_s,
         extruders,
+        flush_volume_cm3,
+        flush_weight_g,
         times,
     } = stats;
     out.len(*layers);
@@ -368,6 +370,8 @@ fn write_stats(out: &mut Writer, stats: &Stats) {
             out.f64(*value);
         }
     }
+    out.f64(*flush_volume_cm3);
+    out.f64(*flush_weight_g);
     out.len(times.len());
     for (kind, seconds) in times {
         out.u8(kind.map_or(NO_KIND, kind_code));
@@ -391,6 +395,8 @@ fn read_stats(input: &mut Reader) -> Result<Stats, Malformed> {
                 print_time_s: input.f64()?,
             })
         })?,
+        flush_volume_cm3: input.f64()?,
+        flush_weight_g: input.f64()?,
         times: input.list(|input| {
             let kind = match input.u8()? {
                 NO_KIND => None,

@@ -1015,6 +1015,11 @@ fn writes_calibration_prints() {
 /// what is read: two cubes (objects 1 and 2), the project's settings and,
 /// with `object_settings`, settings of object 2 of its own.
 fn orca_project(object_settings: bool) -> Vec<u8> {
+    orca_project_on(object_settings, 1)
+}
+
+/// [`orca_project`] with the right object on extruder `right` (from 1).
+fn orca_project_on(object_settings: bool, right: u32) -> Vec<u8> {
     let cube = Mesh::cuboid(20.0, 20.0, 6.0);
     let vertices: String = cube
         .vertices
@@ -1040,6 +1045,8 @@ fn orca_project(object_settings: bool) -> Vec<u8> {
     "sparse_infill_density": ["15%"],
     "brim_type": "no_brim",
     "brim_width": "5",
+    "flush_volumes_matrix": ["0", "50", "200", "0"],
+    "flush_multiplier": ["1"],
     "made_up_setting": "7"
 }"#;
     let own = if object_settings {
@@ -1048,7 +1055,7 @@ fn orca_project(object_settings: bool) -> Vec<u8> {
         ""
     };
     let settings = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><config><object id=\"1\"><metadata key=\"name\" value=\"Left\"/><metadata key=\"extruder\" value=\"1\"/></object><object id=\"2\"><metadata key=\"name\" value=\"Right\"/><metadata key=\"extruder\" value=\"1\"/>{own}</object><plate><metadata key=\"plater_id\" value=\"1\"/><model_instance><metadata key=\"object_id\" value=\"1\"/></model_instance><model_instance><metadata key=\"object_id\" value=\"2\"/></model_instance></plate></config>"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><config><object id=\"1\"><metadata key=\"name\" value=\"Left\"/><metadata key=\"extruder\" value=\"1\"/></object><object id=\"2\"><metadata key=\"name\" value=\"Right\"/><metadata key=\"extruder\" value=\"{right}\"/>{own}</object><plate><metadata key=\"plater_id\" value=\"1\"/><model_instance><metadata key=\"object_id\" value=\"1\"/></model_instance><model_instance><metadata key=\"object_id\" value=\"2\"/></model_instance></plate></config>"
     );
     slicer_formats::write_package(&[
         ("3D/3dmodel.model", &model),
@@ -1056,6 +1063,47 @@ fn orca_project(object_settings: bool) -> Vec<u8> {
         ("Metadata/model_settings.config", &settings),
     ])
     .unwrap()
+}
+
+#[test]
+fn flush_volumes_of_a_project_are_purged_and_counted() {
+    let dir = workdir("flush_volumes");
+    let project = dir.join("two.3mf");
+    fs::write(&project, orca_project_on(false, 2)).unwrap();
+    let slice = |args: &[&str]| {
+        let out = bin()
+            .arg("slice")
+            .arg(&project)
+            .arg("-o")
+            .arg(dir.join("two.gcode"))
+            .args(["--set", "extruder_count=2", "--set", "prime_tower_width=30"])
+            .args(["--set", "prime_tower_x=180", "--set", "prime_tower_y=180"])
+            .args(args)
+            .output()
+            .unwrap();
+        (out.status.success(), text(&out.stdout), text(&out.stderr))
+    };
+    let (ok, stdout, stderr) = slice(&["--project-settings", "--json"]);
+    assert!(ok, "{stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    // 24 layers, one change each: 12 of 50 mm³ and 12 of 200 mm³.
+    let flush = report["stats"]["flush_volume_cm3"].as_f64().unwrap();
+    assert!((flush / 3.0 - 1.0).abs() < 0.05, "{flush}");
+    assert!(report["stats"]["flush_weight_g"].as_f64().unwrap() > 3.0);
+    let (ok, stdout, _) = slice(&["--project-settings"]);
+    assert!(ok);
+    assert!(
+        stdout.contains("of that into the prime tower: 3."),
+        "{stdout}"
+    );
+
+    // A table that does not fit is refused with the setting named.
+    let (ok, _, stderr) = slice(&["--set", "flush_volumes=0,50,200", "--json"]);
+    assert!(!ok);
+    let report: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+    assert_eq!(report["error"]["code"], "settings.parse");
+    let message = report["error"]["message"].as_str().unwrap();
+    assert!(message.contains("flush_volumes: 3 values"), "{message}");
 }
 
 #[test]
@@ -1105,6 +1153,7 @@ fn settings_stored_in_a_project_file_are_used_on_request() {
     assert!(with.contains("; layer_height = 0.25\n"), "{with}");
     assert!(with.contains("; wall_loops = 3\n"));
     assert!(with.contains("; brim_width = 0\n"));
+    assert!(with.contains("; flush_volumes = 0,50;200,0\n"), "{with}");
     let warnings = report["warnings"].as_array().unwrap();
     let skipped = warnings
         .iter()

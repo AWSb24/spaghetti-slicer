@@ -35,11 +35,24 @@ pub struct Stats {
     /// one extruder (`extruder_count`); empty otherwise.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub extruders: Vec<ExtruderStats>,
+    /// Filament extruded into the prime tower, in cm³: the purges of the
+    /// tool changes (`flush_volumes`), already part of the figures above.
+    /// 0, and left out of JSON, without a tower.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub flush_volume_cm3: f64,
+    /// The same in grams.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub flush_weight_g: f64,
     /// Estimated seconds per line type, in the order the types first
     /// appear; travel, retraction and Z moves are under `None`. They add up
     /// to `print_time_s`. Not written to the file or to JSON.
     #[serde(skip)]
     pub times: Vec<(Option<PathKind>, f64)>,
+}
+
+/// Whether a figure is 0, to leave it out of JSON.
+fn is_zero(value: &f64) -> bool {
+    *value == 0.0
 }
 
 /// Summary of what one extruder prints.
@@ -282,6 +295,8 @@ struct Writer<'a> {
     retracted: Vec<Option<Retraction>>,
     /// Per extruder: filament pushed through so far, in millimetres.
     filament: Vec<f64>,
+    /// Of that, what went into the prime tower, in millimetres.
+    tower: f64,
     /// Filament extruded since the last `G92 E0`; only used for absolute
     /// extrusion.
     e: f64,
@@ -365,6 +380,7 @@ impl<'a> Writer<'a> {
             retraction: self.retraction,
             retracted: self.retracted.clone(),
             filament: self.filament.clone(),
+            tower: self.tower,
             e: self.e,
             moves: Vec::new(),
             nozzle_z: self.nozzle_z,
@@ -517,11 +533,19 @@ impl<'a> Writer<'a> {
         let f = self.feed_word(speed);
         let word = self.e_word(e);
         let _ = writeln!(self.out, "G1 X{:.3} Y{:.3} Z{z:.3}{word}{f}", to[0], to[1]);
-        self.filament[self.tool] += e;
+        self.count(e, kind);
         let direction = [(to[0] - from[0]) / length, (to[1] - from[1]) / length];
         self.record(direction, length, speed, Some(kind));
         self.position = Some(to);
         self.nozzle_z = Some(z);
+    }
+
+    /// Counts `e` mm of filament extruded for a line of `kind`.
+    fn count(&mut self, e: f64, kind: PathKind) {
+        self.filament[self.tool] += e;
+        if kind == PathKind::PrimeTower {
+            self.tower += e;
+        }
     }
 
     /// A straight move without extrusion, retraction or lift.
@@ -550,7 +574,7 @@ impl<'a> Writer<'a> {
         let f = self.feed_word(speed);
         let word = self.e_word(e);
         let _ = writeln!(self.out, "G1 X{:.3} Y{:.3}{word}{f}", to[0], to[1]);
-        self.filament[self.tool] += e;
+        self.count(e, kind);
         let direction = [(to[0] - from[0]) / length, (to[1] - from[1]) / length];
         self.record(direction, length, speed, Some(kind));
         self.position = Some(to);
@@ -615,7 +639,7 @@ impl<'a> Writer<'a> {
                 centre[0] - from[0],
                 centre[1] - from[1]
             );
-            self.filament[self.tool] += e;
+            self.count(e, kind);
             for pair in run[i..=end].windows(2) {
                 let d = distance(pair[0], pair[1]);
                 let direction = [(pair[1][0] - pair[0][0]) / d, (pair[1][1] - pair[0][1]) / d];
@@ -1162,6 +1186,7 @@ pub fn write_gcode_with_progress(
         retraction: Retraction::of(settings),
         retracted: vec![None],
         filament: vec![0.0],
+        tower: 0.0,
         e: 0.0,
         moves: Vec::new(),
         nozzle_z: None,
@@ -1257,6 +1282,8 @@ pub fn write_gcode_with_progress(
         filament_weight_g: volume(total) * settings.filament_density,
         print_time_s: times.iter().sum(),
         extruders,
+        flush_volume_cm3: volume(w.tower),
+        flush_weight_g: volume(w.tower) * settings.filament_density,
         times: by_kind,
     };
 
@@ -1930,6 +1957,65 @@ SET_PRESSURE_ADVANCE ADVANCE=0.04
         for e in &tower.stats.extruders {
             assert!(e.filament_volume_cm3 > 0.5 + 0.3 * expected, "{e:?}");
         }
+    }
+
+    #[test]
+    fn tool_changes_purge_their_flush_volumes_into_the_tower() {
+        let mut settings = Settings::default();
+        settings.extruder_count = 2;
+        settings.prime_tower_width = 40.0;
+        settings.prime_tower_x = 160.0;
+        settings.prime_tower_y = 160.0;
+        let solid = slice(&two_cubes(), &settings);
+        settings.set("flush_volumes", "0,50;200,0").unwrap();
+        let output = slice(&two_cubes(), &settings);
+        settings.prime_tower_width = 0.0;
+        let plain = slice(&two_cubes(), &settings);
+        // Layer by layer: from extruder 0 to 1 on even layers, back on odd
+        // ones, the tower gets the volume of that change.
+        let area = PI * (settings.filament_diameter / 2.0).powi(2);
+        let layers: Vec<&str> = output.gcode.split(";LAYER_CHANGE").skip(1).collect();
+        assert_eq!(layers.len(), 25);
+        for (index, layer) in layers.iter().enumerate() {
+            let volume: f64 = (extrusions(layer).iter())
+                .filter(|(kind, ..)| kind == "Prime tower")
+                .map(|(_, _, e)| e * area)
+                .sum();
+            let wanted = if index % 2 == 0 { 50.0 } else { 200.0 };
+            assert!(
+                (volume / wanted - 1.0).abs() < 0.05,
+                "layer {index}: {volume}"
+            );
+        }
+        // The statistics count the purges with their extruders and on
+        // their own: 13 changes of 50 mm³, 12 of 200 mm³.
+        let stats = &output.stats;
+        let expected = (13.0 * 50.0 + 12.0 * 200.0) / 1000.0;
+        assert!(
+            (stats.flush_volume_cm3 / expected - 1.0).abs() < 0.05,
+            "{stats:?}"
+        );
+        let weight = stats.flush_volume_cm3 * settings.filament_density;
+        assert!((stats.flush_weight_g - weight).abs() < 1e-9);
+        let cubes = solid.stats.filament_volume_cm3 - solid.stats.flush_volume_cm3;
+        let total = stats.filament_volume_cm3 - stats.flush_volume_cm3;
+        assert!((total - cubes).abs() < 1e-6, "{total} {cubes}");
+        assert!((total - plain.stats.filament_volume_cm3).abs() < 1e-6);
+        let volumes = |output: &Output| -> Vec<f64> {
+            (output.stats.extruders.iter())
+                .map(|e| e.filament_volume_cm3)
+                .collect()
+        };
+        let (with, without) = (volumes(&output), volumes(&plain));
+        // Extruder 1 purges 13 × 50 mm³, extruder 0 12 × 200 mm³.
+        let (one, zero) = (with[1] - without[1], with[0] - without[0]);
+        assert!((one / 0.65 - 1.0).abs() < 0.08, "{one}");
+        assert!((zero / 2.4 - 1.0).abs() < 0.08, "{zero}");
+        assert!(stats.print_time_s > plain.stats.print_time_s);
+
+        // Without a tower nothing is purged, and JSON leaves it out.
+        assert!(is_zero(&plain.stats.flush_volume_cm3));
+        assert!(is_zero(&plain.stats.flush_weight_g));
     }
 
     #[test]
