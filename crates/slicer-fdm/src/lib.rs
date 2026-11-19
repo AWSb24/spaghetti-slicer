@@ -11,6 +11,7 @@ mod objects;
 mod plate;
 pub mod preview;
 mod sequential;
+mod support_volumes;
 mod tree;
 
 pub use arrange::{Spot, arrange_outlines, arranges_outlines};
@@ -21,6 +22,7 @@ pub use objects::{
     apply_range_orca, apply_range_toml, modifier_settings, object_settings, range_settings,
 };
 pub use plate::{ARRANGE_GAP, Placement, arrange, arrange_objects, footprint};
+pub use support_volumes::{MAX_SUPPORT_VOLUMES, SupportVolume, SupportVolumeKind};
 pub mod progress;
 
 pub use progress::{Progress, Step};
@@ -556,6 +558,9 @@ pub struct OwnSettings<'a> {
     /// slice have none. Only the first [`MAX_NEGATIVES`] of an object
     /// count.
     pub negatives: &'a [Vec<Mesh>],
+    /// The support blockers and enforcers of object `i` (see
+    /// [`SupportVolume`]); objects beyond the end of the slice have none.
+    pub support_volumes: &'a [Vec<SupportVolume>],
 }
 
 /// Like [`generate_plate_with_object_settings`] with `own.objects`, and the
@@ -583,6 +588,10 @@ pub struct OwnSettings<'a> {
 /// whole stay empty; a plate cut away entirely fails like an empty one.
 /// They count in vase mode too. Plates without negative volumes print
 /// exactly as without them.
+///
+/// The support blockers and enforcers `own.support_volumes[i]` of object
+/// `i` take overhangs out of the supports or add them (see
+/// [`SupportVolumeKind`]); vase mode leaves them out.
 // ponytail: layer heights, adaptive layers and the checks of the plate
 // (size, bed, overlap) still see the whole objects; only what is printed
 // follows the cut.
@@ -611,7 +620,7 @@ pub fn generate_plate_with_own_settings(
     // Vase mode prints one wall and nothing inside or on top, the same for
     // every object.
     let vase;
-    let (settings, own, ranges, modifier_list) = if settings.spiral_vase {
+    let (settings, own, ranges, modifier_list, support_volumes) = if settings.spiral_vase {
         vase = Settings {
             wall_loops: 1,
             top_layers: 0,
@@ -619,9 +628,15 @@ pub fn generate_plate_with_own_settings(
             supports: false,
             ..settings.clone()
         };
-        (&vase, &[][..], &[][..], &[][..])
+        (&vase, &[][..], &[][..], &[][..], &[][..])
     } else {
-        (settings, own.objects, own.ranges, own.modifiers)
+        (
+            settings,
+            own.objects,
+            own.ranges,
+            own.modifiers,
+            own.support_volumes,
+        )
     };
     // Objects with equal settings and height ranges form a group. With a
     // single group its settings are those of the whole plate.
@@ -638,6 +653,8 @@ pub fn generate_plate_with_own_settings(
     };
     let settings = &single.settings;
     let any_supports = objects::any_setting(&groups, &modifiers, |s| s.supports);
+    // Enforcers make supports where the settings have none.
+    let enforcing = support_volumes::any_of(support_volumes, SupportVolumeKind::Enforcer);
     // Turning, removing degenerate triangles, closing holes, checking.
     progress.start(Step::Preparing, 4);
     plate::check(objects, placement, settings, diagnostics)?;
@@ -823,6 +840,7 @@ pub fn generate_plate_with_own_settings(
             modifier.area = negatives::apply(std::mem::take(&mut modifier.area), &cuts);
         }
     }
+    let masks = support_volumes::masks(support_volumes, objects, placement, shift, &cut_heights);
     // Where only some groups (or some of their height ranges or modifiers)
     // have supports, those only go under them, and only the others are
     // warned about. A single group takes every layer whole.
@@ -849,7 +867,7 @@ pub fn generate_plate_with_own_settings(
     // is half a line width (about 50 degrees from vertical at the default
     // layer height); without, only a full line width is worth a warning.
     progress.start(Step::Geometry, slices.len());
-    let (reach, least) = if any_supports {
+    let (reach, least) = if any_supports || enforcing {
         (0.5 * settings.line_width, 0.01)
     } else {
         (settings.line_width, MIN_OVERHANG_AREA)
@@ -867,18 +885,32 @@ pub fn generate_plate_with_own_settings(
         let below = polygon::offset(&slices[index - 1], reach);
         polygon::clean(polygon::difference(&slices[index], &below), least, 0.0)
     });
-    let supports = if any_supports {
+    let supports = if any_supports || enforcing {
         // Short bridges carry themselves.
         let carried: Vec<Shapes> = parallel_map(slices.len(), |index| {
-            let carried: Shapes = hanging[index]
-                .iter()
-                .filter(|shape| !spans_freely(shape, &slices[index - 1], settings))
-                .cloned()
-                .collect();
-            match &supported {
-                Some(supported) => polygon::intersection(&carried, &supported[index]),
-                None => carried,
+            let mut carried: Shapes = if any_supports {
+                hanging[index]
+                    .iter()
+                    .filter(|shape| !spans_freely(shape, &slices[index - 1], settings))
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if let Some(supported) = &supported {
+                carried = polygon::intersection(&carried, &supported[index]);
             }
+            // Enforcers take bridges too; blockers win over them.
+            if let Some(masks) = &masks {
+                if let Some(enforced) = masks.enforced(index) {
+                    let inside = polygon::intersection(&hanging[index], enforced);
+                    carried = polygon::union(&carried, &inside);
+                }
+                if let Some(blocked) = masks.blocked(index) {
+                    carried = polygon::difference(&carried, blocked);
+                }
+            }
+            carried
         });
         support_areas(&slices, &carried, &cut_heights, settings)
     } else {
@@ -1145,6 +1177,19 @@ pub fn generate_plate_with_own_settings(
         }),
         None if any_supports => Vec::new(),
         None => hanging,
+    };
+    // Nor about what enforcers support.
+    // ponytail: with enforcers, what hangs free is measured with the reach
+    // used for supports, as where only some objects have supports.
+    let hanging = match masks.as_ref().filter(|m| !m.enforced.is_empty()) {
+        Some(masks) if !hanging.is_empty() => parallel_map(hanging.len(), |index| {
+            let free = match masks.enforced(index) {
+                Some(enforced) => polygon::difference(&hanging[index], enforced),
+                None => hanging[index].clone(),
+            };
+            polygon::clean(free, MIN_OVERHANG_AREA, 0.0)
+        }),
+        _ => hanging,
     };
     let hanging_layers: Vec<usize> = (0..hanging.len())
         .filter(|&index| !hanging[index].is_empty())
@@ -1800,33 +1845,54 @@ fn travels_inside(layer: &Layer, slice: &Shapes) -> Vec<bool> {
 
 /// Where supports go on every layer, and which part of that is filled
 /// densely: below everything that hangs free, down to the bed or to the
-/// model, with one empty layer under the surface they carry and above the
-/// model they stand on, and one line width of distance to its sides. The
-/// dense part (the interface) is what lies right under a carried surface,
-/// `support_interface_layers` deep, and with `support_bottom_interface_layers`
-/// what lies that many layers above the model a support stands on. Tree
-/// supports (`support_style = tree`) replace the columns below the dense
-/// part by branches.
-// ponytail: the gaps are one layer whatever its thickness, so with adaptive
-// layers they are as thin as the layers there.
+/// model, with `support_top_z_distance` empty under the surface they carry,
+/// `support_bottom_z_distance` empty above the model they stand on (see
+/// [`gap_layers`]) and `support_xy_distance` to its sides (see
+/// [`support_xy_distance`]). The dense part (the interface) is what lies
+/// right under a carried surface, `support_interface_layers` deep, and with
+/// `support_bottom_interface_layers` what lies that many layers above the
+/// model a support stands on. Tree supports (`support_style = tree`)
+/// replace the columns below the dense part by branches.
+// ponytail: the gaps are whole layers, counted with `layer_height`; with
+// adaptive layers they are as many layers as at the fixed height, so as
+// thin or thick as the layers there.
 fn support_areas(
     slices: &[Shapes],
     hanging: &[Shapes],
     cut_heights: &[f64],
     settings: &Settings,
 ) -> Vec<(Shapes, Shapes)> {
+    let top = gap_layers(settings.support_top_z_distance, settings.layer_height);
+    let bottom = gap_layers(settings.support_bottom_z_distance, settings.layer_height);
+    let xy = support_xy_distance(settings);
     // Where no support may be depends only on the model, so all cores work
     // on it; the supports themselves grow downwards layer by layer.
     let keep_out = parallel_map(slices.len(), |index| {
         let mut model = slices[index].clone();
-        if index > 0 {
-            model = polygon::union(&model, &slices[index - 1]);
+        for below in slices[..index].iter().rev().take(bottom) {
+            model = polygon::union(&model, below);
         }
-        polygon::offset(&model, settings.line_width)
+        polygon::offset(&model, xy)
+    });
+    // What hangs free `top` empty layers above every layer: where the
+    // supports start. Model in the gap below an overhang (other than in the
+    // empty layer right under it) leaves no room for a support.
+    let starts = parallel_map(slices.len(), |index| {
+        let Some(above) = hanging.get(index + 1 + top) else {
+            return Vec::new();
+        };
+        let mut start = above.clone();
+        for gap in &slices[index + 1..index + top] {
+            if start.is_empty() {
+                break;
+            }
+            start = polygon::difference(&start, gap);
+        }
+        start
     });
     let areas = match settings.support_style {
-        SupportStyle::Normal => column_areas(hanging, &keep_out),
-        SupportStyle::Tree => tree::areas(hanging, &keep_out, cut_heights, settings),
+        SupportStyle::Normal => column_areas(&starts, &keep_out),
+        SupportStyle::Tree => tree::areas(&starts, &keep_out, cut_heights, settings),
     };
     let dense_layers = settings.support_interface_layers as usize;
     let bottom_layers = settings.support_bottom_interface_layers as usize;
@@ -1834,13 +1900,13 @@ fn support_areas(
         let area = areas[index].clone();
         let mut carried = Vec::new();
         if !area.is_empty() {
-            for above in hanging.iter().skip(index + 2).take(dense_layers) {
+            for above in starts.iter().skip(index).take(dense_layers) {
                 carried = polygon::union(&carried, above);
             }
-            // A support stands on the model one empty layer above it, so
-            // the model two layers down and the layers below that mark
-            // where it stands.
-            let under = &slices[..index.saturating_sub(1)];
+            // A support stands on the model `bottom` empty layers above it,
+            // so the model that many layers and one more down and the
+            // layers below that mark where it stands.
+            let under = &slices[..index.saturating_sub(bottom)];
             for below in under.iter().rev().take(bottom_layers) {
                 carried = polygon::union(&carried, below);
             }
@@ -1850,12 +1916,38 @@ fn support_areas(
     })
 }
 
-/// Straight columns under everything that hangs free, down to the bed or to
-/// the model, clear of `keep_out`.
-fn column_areas(hanging: &[Shapes], keep_out: &[Shapes]) -> Vec<Shapes> {
-    let mut areas: Vec<Shapes> = vec![Vec::new(); hanging.len()];
-    for index in (0..hanging.len().saturating_sub(2)).rev() {
-        let above = polygon::union(&hanging[index + 2], &areas[index + 1]);
+/// How many empty layers a gap of `distance` millimetres between support
+/// and model leaves: one for 0, otherwise the distance in layers of
+/// `layer_height`, rounded, at least one.
+// ponytail: no gap at all (soluble supports) cannot be asked for.
+fn gap_layers(distance: f64, layer_height: f64) -> usize {
+    if distance <= 0.0 || layer_height <= 0.0 {
+        return 1;
+    }
+    // At most 10 mm over at least 0.02 mm (see `Settings::limits`).
+    ((distance / layer_height + 0.5).floor() as usize).max(1)
+}
+
+/// Distance between supports and the sides of the model:
+/// `support_xy_distance`, or one line width for 0.
+fn support_xy_distance(settings: &Settings) -> f64 {
+    if settings.support_xy_distance > 0.0 {
+        settings.support_xy_distance
+    } else {
+        settings.line_width
+    }
+}
+
+/// Straight columns under everything that hangs free, starting on the
+/// layers of `starts` and going down to the bed or to the model, clear of
+/// `keep_out`.
+fn column_areas(starts: &[Shapes], keep_out: &[Shapes]) -> Vec<Shapes> {
+    let mut areas: Vec<Shapes> = vec![Vec::new(); starts.len()];
+    for index in (0..starts.len()).rev() {
+        let above = match areas.get(index + 1) {
+            Some(upper) => polygon::union(&starts[index], upper),
+            None => starts[index].clone(),
+        };
         if above.is_empty() {
             continue;
         }
@@ -1945,7 +2037,12 @@ fn shared_work(
             0.5 * width,
         );
         work.push(Work::Lines(lines, PathKind::Support, 0.0));
-        interface_work(&polygon::intersection(&inner, dense), settings, &mut work);
+        interface_work(
+            &polygon::intersection(&inner, dense),
+            index,
+            settings,
+            &mut work,
+        );
     }
     work
 }
@@ -1953,11 +2050,15 @@ fn shared_work(
 /// The dense interface of a support in `area` (where the middles of its
 /// lines may go), in `support_interface_pattern`: close lines across the
 /// walls below carry the surface, concentric loops follow its outline, a
-/// grid crosses lines in both directions.
+/// grid crosses lines in both directions. Lines turn by 90 degrees from
+/// layer `index` to the next, so that every interface layer crosses the
+/// one below it.
 // ponytail: concentric loops leave out narrow tails of wider parts of the
 // interface (parts too narrow for any loop get lines instead), and the
-// loop around the whole support stays support.
-fn interface_work(area: &Shapes, settings: &Settings, work: &mut Vec<Work>) {
+// loop around the whole support stays support. The direction goes by the
+// number of the layer, so on every other layer the lowest interface layer
+// runs along the lines of the support below it instead of across them.
+fn interface_work(area: &Shapes, index: usize, settings: &Settings, work: &mut Vec<Work>) {
     let width = settings.line_width;
     let spacing = if settings.support_interface_spacing > 0.0 {
         settings.support_interface_spacing.max(width)
@@ -1978,10 +2079,15 @@ fn interface_work(area: &Shapes, settings: &Settings, work: &mut Vec<Work>) {
         narrow = rest;
         lined = &narrow;
     }
-    let lines = polygon::hatch(lined, spacing, HatchDirection::Diagonal135, 0.5 * width);
+    let (direction, across) = if index.is_multiple_of(2) {
+        (HatchDirection::Diagonal135, HatchDirection::Diagonal45)
+    } else {
+        (HatchDirection::Diagonal45, HatchDirection::Diagonal135)
+    };
+    let lines = polygon::hatch(lined, spacing, direction, 0.5 * width);
     work.push(Work::Lines(lines, kind, 0.0));
     if pattern == SupportInterfacePattern::Grid {
-        let lines = polygon::hatch(area, spacing, HatchDirection::Diagonal45, 0.5 * width);
+        let lines = polygon::hatch(area, spacing, across, 0.5 * width);
         work.push(Work::Lines(lines, kind, 0.0));
     }
 }
@@ -4705,6 +4811,265 @@ mod tests {
         }
         assert!(loops.iter().any(|p| p.points[0][0] < 105.0));
         assert!(loops.iter().any(|p| p.points[0][0] > 115.0));
+    }
+
+    /// The points of the paths of `kinds` on `layer`.
+    fn points_of(layer: &Layer, kinds: &[PathKind]) -> Vec<Point> {
+        layer
+            .paths
+            .iter()
+            .filter(|p| kinds.contains(&p.kind))
+            .flat_map(|p| p.points.iter().copied())
+            .collect()
+    }
+
+    /// Supports and their interfaces.
+    const SUPPORT_KINDS: [PathKind; 2] = [PathKind::Support, PathKind::SupportInterface];
+
+    /// The layers with support or interface paths.
+    fn support_layers(toolpaths: &Toolpaths) -> Vec<usize> {
+        (0..toolpaths.layers.len())
+            .filter(|&i| !points_of(&toolpaths.layers[i], &SUPPORT_KINDS).is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn support_gaps_can_be_chosen() {
+        let (t, h) = tee_models();
+        for style in [SupportStyle::Normal, SupportStyle::Tree] {
+            let settings = Settings {
+                supports: true,
+                support_style: style,
+                ..Settings::default()
+            };
+            // The defaults are one layer and one line width; asking for
+            // them gives the same paths.
+            let same = Settings {
+                support_top_z_distance: settings.layer_height,
+                support_bottom_z_distance: settings.layer_height,
+                support_xy_distance: settings.line_width,
+                ..settings.clone()
+            };
+            for model in [&t, &h] {
+                assert_eq!(
+                    generate(model, &same).unwrap(),
+                    generate(model, &settings).unwrap(),
+                    "{style:?}"
+                );
+            }
+
+            // Two layers under the plate (layer 50) stay empty with a gap
+            // of 0.4 mm, three with 0.5 mm (rounded), one with 0.1 mm (at
+            // least one); the interface moves down with the supports.
+            for (gap, last) in [(0.4, 47), (0.5, 46), (0.1, 48)] {
+                let gapped = Settings {
+                    support_top_z_distance: gap,
+                    ..settings.clone()
+                };
+                let toolpaths = generate(&t, &gapped).unwrap();
+                assert_eq!(
+                    support_layers(&toolpaths),
+                    (0..=last).collect::<Vec<usize>>(),
+                    "{style:?} {gap}"
+                );
+                assert_eq!(
+                    layers_with(&toolpaths, PathKind::SupportInterface),
+                    [last - 1, last],
+                    "{style:?} {gap}"
+                );
+            }
+
+            // Standing on the base (layers 0 to 9) with a gap of 0.6 mm:
+            // three empty layers above it instead of one.
+            let raised = Settings {
+                support_bottom_z_distance: 0.6,
+                support_bottom_interface_layers: 2,
+                ..settings.clone()
+            };
+            let toolpaths = generate(&h, &raised).unwrap();
+            assert_eq!(
+                support_layers(&toolpaths),
+                (13..59).collect::<Vec<usize>>(),
+                "{style:?}"
+            );
+            assert_eq!(
+                layers_with(&toolpaths, PathKind::SupportInterface),
+                [13, 14, 57, 58],
+                "{style:?}"
+            );
+
+            // A wider gap to the sides: the supports keep 1 mm from the
+            // column (x 105 to 115), measured to the middle of their
+            // outermost lines half a line width further.
+            let wide = Settings {
+                support_xy_distance: 1.0,
+                ..settings.clone()
+            };
+            let nearest = |settings: &Settings| -> f64 {
+                let toolpaths = generate(&t, settings).unwrap();
+                toolpaths.layers[..49]
+                    .iter()
+                    .flat_map(|layer| points_of(layer, &SUPPORT_KINDS))
+                    .map(|p| (105.0 - p[0]).max(p[0] - 115.0))
+                    .fold(f64::MAX, f64::min)
+            };
+            let (narrow, wide) = (nearest(&settings), nearest(&wide));
+            let half = 0.5 * settings.line_width;
+            assert!(narrow >= settings.line_width + half - 0.01, "{narrow}");
+            assert!(wide >= 1.0 + half - 0.01, "{style:?} {wide}");
+            if style == SupportStyle::Normal {
+                // Straight columns shrink by exactly the difference.
+                let shrunk = wide - narrow;
+                assert!(
+                    (shrunk - (1.0 - settings.line_width)).abs() < 0.02,
+                    "{shrunk}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn interface_lines_cross_from_layer_to_layer() {
+        let (t, _) = tee_models();
+        let settings = Settings {
+            supports: true,
+            support_interface_layers: 3,
+            ..Settings::default()
+        };
+        let toolpaths = generate(&t, &settings).unwrap();
+        // Whether the long segments of the interface lines rise to the
+        // right.
+        let rising = |index: usize| -> Vec<bool> {
+            toolpaths.layers[index]
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::SupportInterface && !p.closed)
+                .flat_map(|p| p.points.windows(2))
+                .filter(|w| distance(w[0], w[1]) > 1.0)
+                .map(|w| (w[1][0] - w[0][0]) * (w[1][1] - w[0][1]) > 0.0)
+                .collect()
+        };
+        let [a, b, c] = [46, 47, 48].map(rising);
+        assert!(!a.is_empty() && !b.is_empty() && !c.is_empty());
+        // Layer 48 (even) runs at 135 degrees as before, the layer below
+        // it at 45 degrees, the one below that at 135 again.
+        assert!(c.iter().all(|&up| !up));
+        assert!(b.iter().all(|&up| up));
+        assert!(a.iter().all(|&up| !up));
+    }
+
+    /// The T of `supports_stand_under_overhangs` with `volumes` (in the
+    /// coordinates of the model), centred on the bed.
+    fn tee_with(volumes: Vec<SupportVolume>, settings: &Settings) -> (Toolpaths, Diagnostics) {
+        let (t, _) = tee_models();
+        let mut warnings = Diagnostics::new();
+        let volumes = [volumes];
+        let own = OwnSettings {
+            support_volumes: &volumes,
+            ..OwnSettings::default()
+        };
+        let toolpaths = generate_plate_with_own_settings(
+            &[t],
+            own,
+            Placement::Centre,
+            settings,
+            &mut warnings,
+            &AtomicBool::new(false),
+            &Progress::new(),
+        )
+        .unwrap();
+        (toolpaths, warnings)
+    }
+
+    /// A box from `lo` to `hi`.
+    fn block(lo: [f64; 3], hi: [f64; 3]) -> Mesh {
+        let mut mesh = Mesh::cuboid(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+        mesh.translate(lo);
+        mesh
+    }
+
+    #[test]
+    fn blockers_and_enforcers_say_where_supports_go() {
+        // The plate of the T spans x 0 to 30 in the model (95 to 125 on
+        // the bed), its column 10 to 20; the overhangs left and right of
+        // it.
+        let on = Settings {
+            supports: true,
+            ..Settings::default()
+        };
+        let sides = |toolpaths: &Toolpaths| -> (bool, bool) {
+            let xs: Vec<f64> = toolpaths
+                .layers
+                .iter()
+                .flat_map(|layer| points_of(layer, &SUPPORT_KINDS))
+                .map(|p| p[0])
+                .collect();
+            (xs.iter().any(|&x| x < 105.0), xs.iter().any(|&x| x > 115.0))
+        };
+        let (plain, _) = tee_with(Vec::new(), &on);
+        assert_eq!(plain, generate(&tee_models().0, &on).unwrap());
+        assert_eq!(sides(&plain), (true, true));
+
+        // A blocker around the left overhang takes its support away.
+        let left = block([-1.0, -1.0, 9.0], [10.0, 11.0, 13.0]);
+        let (blocked, warnings) = tee_with(vec![SupportVolume::blocker(left.clone())], &on);
+        assert!(warnings.is_empty(), "{:?}", warnings.codes());
+        assert_eq!(sides(&blocked), (false, true));
+        assert_eq!(support_layers(&blocked), (0..49).collect::<Vec<usize>>());
+        // So does one on the bed below it: no support passes through it.
+        let low = block([2.0, 2.0, 0.0], [6.0, 8.0, 3.0]);
+        let (below, _) = tee_with(vec![SupportVolume::blocker(low)], &on);
+        // Whether a support line passes over it (x 97 to 101, y 107 to
+        // 113 on the bed), a line width inside.
+        let over_low = |toolpaths: &Toolpaths| {
+            toolpaths.layers.iter().any(|layer| {
+                layer
+                    .paths
+                    .iter()
+                    .filter(|p| SUPPORT_KINDS.contains(&p.kind))
+                    .flat_map(|p| p.points.windows(2))
+                    .any(|w| {
+                        (0..=20).any(|k| {
+                            let t = f64::from(k) / 20.0;
+                            let x = w[0][0] + t * (w[1][0] - w[0][0]);
+                            let y = w[0][1] + t * (w[1][1] - w[0][1]);
+                            (97.5..100.5).contains(&x) && (107.5..112.5).contains(&y)
+                        })
+                    })
+            })
+        };
+        assert!(over_low(&plain));
+        assert!(!over_low(&below));
+        assert_eq!(sides(&below), (true, true));
+
+        // Without supports an enforcer around the right overhang makes
+        // supports there; the left one is still warned about.
+        let off = Settings::default();
+        let right = block([20.0, -1.0, 9.0], [31.0, 11.0, 13.0]);
+        let (enforced, warnings) = tee_with(vec![SupportVolume::enforcer(right.clone())], &off);
+        assert_eq!(sides(&enforced), (false, true));
+        assert_eq!(support_layers(&enforced), (0..49).collect::<Vec<usize>>());
+        assert_eq!(warnings.codes(), ["slicing.unsupported_overhangs"]);
+        // Around both overhangs it supports what supports would, without
+        // a warning.
+        let both = block([-1.0, -1.0, 9.0], [31.0, 11.0, 13.0]);
+        let (everywhere, warnings) = tee_with(vec![SupportVolume::enforcer(both.clone())], &off);
+        assert!(warnings.is_empty(), "{:?}", warnings.codes());
+        assert_eq!(support_layers(&everywhere), support_layers(&plain));
+        assert_eq!(sides(&everywhere), (true, true));
+        // Where a blocker overlaps an enforcer, the blocker counts.
+        let (mixed, _) = tee_with(
+            vec![SupportVolume::enforcer(both), SupportVolume::blocker(left)],
+            &off,
+        );
+        assert_eq!(sides(&mixed), (false, true));
+        // Vase mode leaves them out.
+        let vase = Settings {
+            spiral_vase: true,
+            ..off.clone()
+        };
+        let (spiral, _) = tee_with(vec![SupportVolume::enforcer(right)], &vase);
+        assert!(support_layers(&spiral).is_empty());
     }
 
     #[test]

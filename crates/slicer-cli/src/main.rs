@@ -22,6 +22,8 @@ struct Cli {
     command: Command,
 }
 
+// The command line is parsed once; the size of the options does not matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Slice STL or 3MF models into G-code
@@ -82,6 +84,18 @@ enum Command {
         /// several times
         #[arg(long = "negative", value_name = "N:MESH")]
         negative: Vec<String>,
+        /// Support blocker of object N (1 is the first model file): MESH
+        /// (STL or 3MF, in the coordinates of the model file, moved with the
+        /// object) is not printed; overhangs inside it or above it get no
+        /// supports. May be given several times
+        #[arg(long = "support-blocker", value_name = "N:MESH")]
+        support_blocker: Vec<String>,
+        /// Support enforcer of object N, given like --support-blocker:
+        /// overhangs inside it get supports, even with supports off and
+        /// even short bridges. Where it overlaps a blocker, the blocker
+        /// counts. May be given several times
+        #[arg(long = "support-enforcer", value_name = "N:MESH")]
+        support_enforcer: Vec<String>,
         /// Use the print settings stored in project files of Orca Slicer or
         /// Bambu Studio (3MF): the project's settings below the -c files
         /// and --set overrides, the settings of single objects over the
@@ -274,6 +288,8 @@ fn main() -> ExitCode {
             range,
             modifier,
             negative,
+            support_blocker,
+            support_enforcer,
             project_settings,
             plate,
             svg,
@@ -296,6 +312,8 @@ fn main() -> ExitCode {
                             ranges: &range,
                             modifiers: &modifier,
                             negatives: &negative,
+                            blockers: &support_blocker,
+                            enforcers: &support_enforcer,
                             project: project_settings,
                         };
                         slice(&input, output, placement, &stored, plate, svg, send)
@@ -698,6 +716,62 @@ fn read_negative_files(
     Ok(())
 }
 
+/// The support blockers and enforcers of the `--support-blocker N:MESH`
+/// and `--support-enforcer N:MESH` arguments, for each of `count` model
+/// files; warnings about reading the meshes go to `warnings`.
+fn read_support_volumes(
+    count: usize,
+    blockers: &[String],
+    enforcers: &[String],
+    warnings: &mut Diagnostics,
+) -> Result<Vec<Vec<slicer_fdm::SupportVolume>>, Diagnostic> {
+    let total = blockers.len() + enforcers.len();
+    if total > slicer_fdm::MAX_SUPPORT_VOLUMES {
+        return Err(Diagnostic::error(
+            "settings.too_many_support_volumes",
+            format!(
+                "{total} support blockers and enforcers; at most {} are allowed",
+                slicer_fdm::MAX_SUPPORT_VOLUMES
+            ),
+        )
+        .with("support_volumes", total)
+        .with("max", slicer_fdm::MAX_SUPPORT_VOLUMES));
+    }
+    let mut volumes = vec![Vec::new(); count];
+    let all = blockers
+        .iter()
+        .map(|item| ("--support-blocker", item))
+        .chain(enforcers.iter().map(|item| ("--support-enforcer", item)));
+    for (option, item) in all {
+        let invalid = || {
+            Diagnostic::error(
+                "cli.invalid_support_volume",
+                format!(
+                    "{option} expects N:MESH with N from 1 to {count} and MESH an .stl or .3mf file, got '{item}'"
+                ),
+            )
+            .with("argument", item)
+        };
+        let (number, path) = item.split_once(':').ok_or_else(invalid)?;
+        let slot: &mut Vec<slicer_fdm::SupportVolume> = number
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|index| volumes.get_mut(index))
+            .ok_or_else(invalid)?;
+        let path = Path::new(path);
+        let bytes = fs::read(path).map_err(|e| io_error("io.read", path, &e))?;
+        let mesh = slicer_formats::parse_model(&bytes, None, warnings).map_err(in_file(path))?;
+        slot.push(if option == "--support-blocker" {
+            slicer_fdm::SupportVolume::blocker(mesh)
+        } else {
+            slicer_fdm::SupportVolume::enforcer(mesh)
+        });
+    }
+    Ok(volumes)
+}
+
 /// Settings from the files in `config`, layered in order over `base`, with
 /// the `--set` overrides on top.
 fn read_settings(
@@ -724,7 +798,8 @@ fn read_settings(
 /// `overrides`, for single objects the `objects` arguments, for height
 /// ranges of objects the `ranges` arguments and for modifiers the
 /// `modifiers` arguments; the negative volumes of objects come from the
-/// `negatives` arguments.
+/// `negatives` arguments, their support blockers and enforcers from the
+/// `blockers` and `enforcers` arguments.
 struct SettingsArgs<'a> {
     config: &'a [PathBuf],
     overrides: &'a [String],
@@ -732,6 +807,8 @@ struct SettingsArgs<'a> {
     ranges: &'a [String],
     modifiers: &'a [String],
     negatives: &'a [String],
+    blockers: &'a [String],
+    enforcers: &'a [String],
     project: bool,
 }
 
@@ -766,6 +843,8 @@ fn slice(
     read_range_files(&mut object_files, args.ranges, &settings)?;
     read_modifier_files(&mut object_files, args.modifiers, &settings, &mut warnings)?;
     read_negative_files(&mut object_files, args.negatives, &mut warnings)?;
+    let support_volumes =
+        read_support_volumes(inputs.len(), args.blockers, args.enforcers, &mut warnings)?;
     if files.is_empty() {
         for input in inputs {
             files.push(fs::read(input).map_err(|e| io_error("io.read", input, &e))?);
@@ -789,6 +868,7 @@ fn slice(
         plate,
         &mut warnings,
     )?;
+    objects.add_support_volumes(&support_volumes)?;
     let placement = objects.place(inputs.len(), placing, &settings);
     let stop = std::sync::atomic::AtomicBool::new(false);
     let own = slicer_fdm::OwnSettings {
@@ -796,6 +876,7 @@ fn slice(
         ranges: &objects.ranges,
         modifiers: &objects.modifiers,
         negatives: &objects.negatives,
+        support_volumes: &objects.support_volumes,
     };
     let toolpaths = slicer_fdm::generate_plate_with_own_settings(
         &objects.meshes,

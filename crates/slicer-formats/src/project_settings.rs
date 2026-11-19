@@ -102,6 +102,10 @@ pub struct ObjectSettings {
     pub modifiers: Vec<ModifierSettings>,
     /// Settings changed for ranges of its height, in the order of the file.
     pub ranges: Vec<RangeSettings>,
+    /// How many support blockers and enforcers (parts with
+    /// `subtype="support_blocker"` or `"support_enforcer"`) the object
+    /// has; `parse_3mf_plate_parts` gives their meshes.
+    pub support_parts: usize,
 }
 
 /// The print settings a project file stores.
@@ -173,6 +177,7 @@ fn object_settings(text: &str) -> Result<Vec<ObjectSettings>, ThreeMfError> {
                 "part" => {
                     in_part = true;
                     let [id, subtype] = attributes(&element, ["id", "subtype"]);
+                    count_support_part(current.as_mut(), subtype.as_deref());
                     modifier = id
                         .and_then(|id| id.trim().parse::<u32>().ok())
                         .filter(|_| subtype.as_deref() == Some("modifier_part"))
@@ -203,6 +208,11 @@ fn object_settings(text: &str) -> Result<Vec<ObjectSettings>, ThreeMfError> {
                 if let Some((_, value)) = option.as_mut() {
                     value.push_str(&text.xml_content(quick_xml::XmlVersion::Implicit1_0));
                 }
+            }
+            // A part written as an empty element has no settings.
+            Event::Empty(element) if element.local_name().into_inner() == "part" => {
+                let [subtype] = attributes(&element, ["subtype"]);
+                count_support_part(current.as_mut(), subtype.as_deref());
             }
             Event::Empty(element) if element.local_name().into_inner() == "metadata" => {
                 let Some(object) = current.as_mut() else {
@@ -238,7 +248,8 @@ fn object_settings(text: &str) -> Result<Vec<ObjectSettings>, ThreeMfError> {
                         && !(object.values.is_empty()
                             && object.part_keys.is_empty()
                             && object.modifiers.is_empty()
-                            && object.ranges.is_empty())
+                            && object.ranges.is_empty()
+                            && object.support_parts == 0)
                     {
                         objects.push(object);
                     }
@@ -268,6 +279,14 @@ fn object_settings(text: &str) -> Result<Vec<ObjectSettings>, ThreeMfError> {
         }
     }
     Ok(objects)
+}
+
+/// Counts a part of `subtype` for `object` if it is a support blocker or
+/// enforcer.
+fn count_support_part(object: Option<&mut ObjectSettings>, subtype: Option<&str>) {
+    if let (Some(object), Some("support_blocker" | "support_enforcer")) = (object, subtype) {
+        object.support_parts += 1;
+    }
 }
 
 #[cfg(test)]
@@ -360,6 +379,7 @@ mod tests {
                     values: vec![("wall_loops".into(), "5".into())],
                 }],
                 ranges: Vec::new(),
+                support_parts: 0,
             }]
         );
         assert_eq!(read.object(3).map(|o| o.values.len()), Some(2));
@@ -386,6 +406,24 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn objects_with_support_blockers_or_enforcers_are_kept() {
+        // Object 1 sets nothing but has a blocker and an enforcer, one of
+        // them written as an empty element; object 2 has a negative part.
+        let text = concat!(
+            "<config><object id=\"1\"><metadata key=\"name\" value=\"a\"/>",
+            "<part id=\"2\" subtype=\"support_blocker\"><metadata key=\"name\" value=\"b\"/></part>",
+            "<part id=\"3\" subtype=\"support_enforcer\"/>",
+            "</object><object id=\"4\"><part id=\"5\" subtype=\"negative_part\"/></object></config>"
+        );
+        let bytes = write_package(&[(PLATE_PART, text)]).unwrap();
+        let read = read_project_settings(&bytes).unwrap();
+        assert_eq!(read.objects.len(), 1);
+        assert_eq!(read.objects[0].id, 1);
+        assert_eq!(read.objects[0].support_parts, 2);
+        assert!(read.objects[0].values.is_empty());
     }
 
     #[test]

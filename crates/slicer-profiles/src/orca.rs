@@ -132,6 +132,23 @@ const MAPPING: &[(&str, &str, Kind)] = &[
     ("brim_width", "brim_width", Kind::Number),
     ("brim_type", "brim_width", Kind::BrimType),
     ("enable_support", "supports", Kind::Flag),
+    // ponytail: Orca's 0 (no gap, for soluble supports) becomes one layer
+    // here, since supports always keep at least one layer away.
+    (
+        "support_top_z_distance",
+        "support_top_z_distance",
+        Kind::Number,
+    ),
+    (
+        "support_bottom_z_distance",
+        "support_bottom_z_distance",
+        Kind::Number,
+    ),
+    (
+        "support_object_xy_distance",
+        "support_xy_distance",
+        Kind::Number,
+    ),
     ("outer_wall_speed", "outer_wall_speed", Kind::Number),
     ("inner_wall_speed", "inner_wall_speed", Kind::Number),
     ("sparse_infill_speed", "infill_speed", Kind::Number),
@@ -498,6 +515,15 @@ mod tests {
         assert_eq!(settings.support_speed, 70.0);
         assert_eq!(settings.support_interface_speed, 35.0);
         assert_eq!(settings.support_interface_fan_speed, -1.0);
+
+        // The gaps around supports.
+        let gaps = r#"{ "support_top_z_distance": "0.16", "support_bottom_z_distance": "0.2",
+            "support_object_xy_distance": "0.5" }"#;
+        let gaps = import_orca(gaps, &mut settings).unwrap();
+        assert!(gaps.skipped.is_empty());
+        assert_eq!(settings.support_top_z_distance, 0.16);
+        assert_eq!(settings.support_bottom_z_distance, 0.2);
+        assert_eq!(settings.support_xy_distance, 0.5);
     }
 
     #[test]
