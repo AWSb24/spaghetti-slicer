@@ -2,13 +2,17 @@
 //!
 //! Reads meshes, components, build items and their transforms. Of the
 //! production extension it follows component references into other model
-//! parts of the same package. Everything else (materials, colours, slices,
+//! parts of the same package. The materials of the triangles (base
+//! materials of the core specification and colour groups of the materials
+//! extension, through the `pid`, `pindex` and `p1` attributes) choose their
+//! extruders: every material in use gets one, in the order the triangles
+//! first use them (see [`parse_3mf`]). Everything else (textures, slices,
 //! vendor data) is ignored, with one exception: project files of Bambu
 //! Studio list which objects lie on which build plate, and the reader can
-//! pick one plate; they also name the extruder of each object, which the
-//! mesh keeps for the object's triangles.
+//! pick one plate; they also name the extruder of each object and of each
+//! of its parts, which the mesh keeps for their triangles.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{Cursor, Read, Write};
 
@@ -19,6 +23,9 @@ use slicer_core::{Diagnostic, Diagnostics, Mesh};
 
 pub(crate) const CORE_NS: &str = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02";
 const PRODUCTION_NS: &str = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06";
+/// Namespace of the materials and properties extension, whose colour
+/// groups are read.
+const MATERIAL_NS: &str = "http://schemas.microsoft.com/3dmanufacturing/material/2015/02";
 pub(crate) const MODEL_RELATIONSHIP: &str =
     "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel";
 pub(crate) const DEFAULT_MODEL_PART: &str = "3D/3dmodel.model";
@@ -29,6 +36,13 @@ const MAX_PART_BYTES: u64 = 1 << 30;
 const MAX_TRIANGLES: usize = 50_000_000;
 /// Deepest allowed nesting of components.
 const MAX_DEPTH: usize = 32;
+/// Most materials that get an extruder of their own; the triangles of
+/// further materials print with extruder 0 (`model.too_many_materials`).
+/// Materials beyond the printer's `extruder_count` fall back to extruder 0
+/// when slicing (`slicing.missing_extruder`).
+pub const MAX_MATERIALS: usize = 64;
+/// Longest material name kept for messages, in characters.
+const MAX_MATERIAL_NAME: usize = 64;
 
 /// Why a 3MF file could not be read or written.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,6 +232,11 @@ pub(crate) struct Reference {
     pub(crate) transform: Transform,
 }
 
+/// The property of a triangle as written: the property group (`pid`) and
+/// the index into it (`p1`), each `None` where the triangle leaves it to
+/// its object.
+type TriangleProperty = (Option<u32>, Option<u32>);
+
 #[derive(Default)]
 pub(crate) struct Object {
     /// The object's `name` attribute.
@@ -225,7 +244,40 @@ pub(crate) struct Object {
     printable: bool,
     vertices: Vec<[f64; 3]>,
     triangles: Vec<[u32; 3]>,
+    /// The property of every triangle, or empty if no triangle names one.
+    properties: Vec<TriangleProperty>,
+    /// The object's `pid` and `pindex`: the property of triangles that
+    /// name none.
+    pid: Option<u32>,
+    pindex: Option<u32>,
     components: Vec<Reference>,
+}
+
+/// One entry of a property group that stands for a material: a `<base>`
+/// of `<basematerials>` or a `<color>` of a `<colorgroup>`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Material {
+    /// The name of a base material, shortened to [`MAX_MATERIAL_NAME`].
+    name: Option<String>,
+    /// The colour in red, green and blue (without the alpha the file may
+    /// give), if it is well-formed.
+    colour: Option<[u8; 3]>,
+}
+
+impl Material {
+    /// How messages name the material: its name, its colour as `#RRGGBB`,
+    /// both or neither.
+    fn describe(&self) -> String {
+        let colour = self
+            .colour
+            .map(|[r, g, b]| format!("#{r:02X}{g:02X}{b:02X}"));
+        match (&self.name, colour) {
+            (Some(name), Some(colour)) if !name.is_empty() => format!("{name} ({colour})"),
+            (Some(name), None) if !name.is_empty() => name.clone(),
+            (_, Some(colour)) => colour,
+            _ => "unnamed".to_string(),
+        }
+    }
 }
 
 /// One parsed model part, already converted to millimetres.
@@ -233,7 +285,19 @@ pub(crate) struct Object {
 pub(crate) struct Part {
     pub(crate) objects: HashMap<u32, Object>,
     pub(crate) build: Vec<Reference>,
+    /// The property groups that stand for materials, by identifier.
+    materials: HashMap<u32, Vec<Material>>,
     extensions: Vec<String>,
+}
+
+/// Red, green and blue of a `#RRGGBB` or `#RRGGBBAA` colour of a 3MF file.
+fn colour(text: &str) -> Option<[u8; 3]> {
+    let hex = text.trim().strip_prefix('#')?;
+    if !(hex.len() == 6 || hex.len() == 8) || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let channel = |at: usize| u8::from_str_radix(hex.get(at..at + 2)?, 16).ok();
+    Some([channel(0)?, channel(2)?, channel(4)?])
 }
 
 /// Reads the attributes of one element into `slots`, matched by local name.
@@ -301,9 +365,12 @@ fn parse_part(name: &str, text: &str) -> Result<Part, ThreeMfError> {
         })
     };
 
+    let number = |value: Option<String>| value.and_then(|v| v.trim().parse::<u32>().ok());
     let mut part = Part::default();
     let mut scale = 1.0;
     let mut current: Option<(u32, Object)> = None;
+    // The property group being read: `<basematerials>` or `<colorgroup>`.
+    let mut group: Option<(u32, Vec<Material>)> = None;
     let mut reader = NsReader::from_str(text);
     loop {
         let (namespace, event) = reader
@@ -313,11 +380,59 @@ fn parse_part(name: &str, text: &str) -> Result<Part, ThreeMfError> {
                 message: e.to_string(),
             })?;
         let core = matches!(namespace, ResolveResult::Bound(Namespace(CORE_NS)));
+        let material = matches!(namespace, ResolveResult::Bound(Namespace(MATERIAL_NS)));
         match event {
             Event::Eof => break,
             Event::End(element) if core && element.local_name().into_inner() == "object" => {
                 if let Some((id, object)) = current.take() {
                     part.objects.insert(id, object);
+                }
+            }
+            Event::End(element)
+                if (core && element.local_name().into_inner() == "basematerials")
+                    || (material && element.local_name().into_inner() == "colorgroup") =>
+            {
+                if let Some((id, entries)) = group.take() {
+                    part.materials.insert(id, entries);
+                }
+            }
+            // An empty group has no end.
+            Event::Empty(element)
+                if (core && element.local_name().into_inner() == "basematerials")
+                    || (material && element.local_name().into_inner() == "colorgroup") =>
+            {
+                let [id] = attributes(&element, ["id"]);
+                if let Some(id) = number(id) {
+                    part.materials.insert(id, Vec::new());
+                }
+            }
+            Event::Start(element)
+                if (core && element.local_name().into_inner() == "basematerials")
+                    || (material && element.local_name().into_inner() == "colorgroup") =>
+            {
+                let [id] = attributes(&element, ["id"]);
+                group = number(id).map(|id| (id, Vec::new()));
+            }
+            Event::Start(element) | Event::Empty(element)
+                if material && element.local_name().into_inner() == "color" =>
+            {
+                if let Some((_, entries)) = &mut group {
+                    let [value] = attributes(&element, ["color"]);
+                    entries.push(Material {
+                        name: None,
+                        colour: value.as_deref().and_then(colour),
+                    });
+                }
+            }
+            Event::Start(element) | Event::Empty(element)
+                if core && element.local_name().into_inner() == "base" =>
+            {
+                if let Some((_, entries)) = &mut group {
+                    let [name, value] = attributes(&element, ["name", "displaycolor"]);
+                    entries.push(Material {
+                        name: name.map(|n| n.trim().chars().take(MAX_MATERIAL_NAME).collect()),
+                        colour: value.as_deref().and_then(colour),
+                    });
                 }
             }
             Event::Start(element) | Event::Empty(element) if core => {
@@ -336,19 +451,23 @@ fn parse_part(name: &str, text: &str) -> Result<Part, ThreeMfError> {
                             if prefix.is_some_and(|p| required.split_whitespace().any(|r| r == p))
                                 && attribute.value != CORE_NS
                                 && attribute.value != PRODUCTION_NS
+                                && attribute.value != MATERIAL_NS
                             {
                                 part.extensions.push(attribute.value.into_owned());
                             }
                         }
                     }
                     "object" => {
-                        let [id, kind, name] = attributes(&element, ["id", "type", "name"]);
+                        let [id, kind, name, pid, pindex] =
+                            attributes(&element, ["id", "type", "name", "pid", "pindex"]);
                         let id = id
                             .and_then(|v| v.trim().parse().ok())
                             .ok_or_else(|| invalid("object", "id"))?;
                         let object = Object {
                             name,
                             printable: kind.is_none_or(|k| k == "model"),
+                            pid: number(pid),
+                            pindex: number(pindex),
                             ..Object::default()
                         };
                         // Also covers an empty `<object/>`, which has no end tag.
@@ -373,13 +492,27 @@ fn parse_part(name: &str, text: &str) -> Result<Part, ThreeMfError> {
                     "triangle" => {
                         if let Some((_, object)) = &mut current {
                             let mut triangle = [0u32; 3];
-                            let values = attributes(&element, ["v1", "v2", "v3"]);
-                            for ((slot, value), corner) in
-                                triangle.iter_mut().zip(values).zip(["v1", "v2", "v3"])
+                            let [v1, v2, v3, pid, p1] =
+                                attributes(&element, ["v1", "v2", "v3", "pid", "p1"]);
+                            for ((slot, value), corner) in triangle
+                                .iter_mut()
+                                .zip([v1, v2, v3])
+                                .zip(["v1", "v2", "v3"])
                             {
                                 *slot = value
                                     .and_then(|v| v.trim().parse().ok())
                                     .ok_or_else(|| invalid("triangle", corner))?;
+                            }
+                            // ponytail: a triangle whose corners have
+                            // different properties (`p2`, `p3`) takes the
+                            // first corner's; colour gradients are not
+                            // printed.
+                            let property = (number(pid), number(p1));
+                            if property != (None, None) || !object.properties.is_empty() {
+                                object
+                                    .properties
+                                    .resize(object.triangles.len(), (None, None));
+                                object.properties.push(property);
                             }
                             object.triangles.push(triangle);
                         }
@@ -506,7 +639,8 @@ impl<'a> Package<'a> {
     }
 
     /// Appends the object `reference` points to, with all its components
-    /// except, at the top (`depth` 0), those of the objects in `leave_out`.
+    /// except those of the objects in `top.leave_out`, and gives the new
+    /// triangles their extruders as `top` says.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn emit(
         &mut self,
@@ -516,7 +650,7 @@ impl<'a> Package<'a> {
         depth: usize,
         skipped: &mut usize,
         mesh: &mut Mesh,
-        leave_out: &[u32],
+        mut top: Emit<'_>,
     ) -> Result<(), ThreeMfError> {
         if depth > MAX_DEPTH {
             return Err(ThreeMfError::ComponentCycle);
@@ -530,10 +664,10 @@ impl<'a> Package<'a> {
         let unknown = ThreeMfError::UnknownObject {
             object: reference.object,
         };
-        let object = self
-            .parts
-            .get(&part)
-            .and_then(|p| p.objects.get(&reference.object))
+        let holder = self.parts.get(&part).ok_or(unknown.clone())?;
+        let object = holder
+            .objects
+            .get(&reference.object)
             .ok_or(unknown.clone())?;
         if !object.printable {
             *skipped += 1;
@@ -553,7 +687,10 @@ impl<'a> Package<'a> {
             }
             mesh.vertices.push(moved);
         }
-        for &[a, b, c] in &object.triangles {
+        let first = mesh.triangles.len();
+        // The last material looked up, as most triangles in a row share one.
+        let mut last: Option<((u32, u32), Option<u32>)> = None;
+        for (index, &[a, b, c]) in object.triangles.iter().enumerate() {
             if a >= count || b >= count || c >= count {
                 return Err(ThreeMfError::InvalidIndex {
                     object: reference.object,
@@ -565,6 +702,36 @@ impl<'a> Package<'a> {
             // A mirroring transform turns the solid inside out.
             let (b, c) = if mirrored { (c, b) } else { (b, c) };
             mesh.triangles.push([a + offset, b + offset, c + offset]);
+            let Some(materials) = top.materials.as_deref_mut() else {
+                continue;
+            };
+            let (pid, pindex) = object.properties.get(index).copied().unwrap_or_default();
+            let Some(pid) = pid.or(object.pid) else {
+                continue;
+            };
+            let key = (pid, pindex.or(object.pindex).unwrap_or(0));
+            let extruder = match last {
+                Some((known, extruder)) if known == key => extruder,
+                _ => {
+                    let extruder = materials.extruder(&part, &holder.materials, key);
+                    last = Some((key, extruder));
+                    extruder
+                }
+            };
+            match extruder {
+                None => materials.unknown += 1,
+                Some(0) => {}
+                Some(extruder) => {
+                    mesh.extruders.resize(mesh.triangles.len() - 1, 0);
+                    mesh.extruders.push(extruder);
+                }
+            }
+        }
+        if !mesh.extruders.is_empty() {
+            mesh.extruders.resize(mesh.triangles.len(), 0);
+        }
+        if let Some(extruder) = top.extruder {
+            mesh.set_extruder(first, extruder);
         }
 
         // Components are indexed rather than borrowed, because loading the
@@ -582,12 +749,152 @@ impl<'a> Package<'a> {
                 object: component.object,
                 transform: component.transform,
             };
-            if depth == 0 && leave_out.contains(&component.object) {
+            if top.leave_out.contains(&component.object) {
                 continue;
             }
-            self.emit(&part, &component, &transform, depth + 1, skipped, mesh, &[])?;
+            let first = mesh.triangles.len();
+            let inner = Emit {
+                materials: top.materials.as_deref_mut(),
+                ..Emit::default()
+            };
+            self.emit(
+                &part,
+                &component,
+                &transform,
+                depth + 1,
+                skipped,
+                mesh,
+                inner,
+            )?;
+            let own = top.parts.iter().find(|(id, _)| *id == component.object);
+            if let Some(extruder) = own.map(|(_, extruder)| *extruder).or(top.extruder) {
+                mesh.set_extruder(first, extruder);
+            }
         }
         Ok(())
+    }
+}
+
+/// What [`Package::emit`] does with the object it appends besides placing
+/// it.
+#[derive(Default)]
+pub(crate) struct Emit<'a> {
+    /// Components of the object (by the identifier of the object they
+    /// refer to) that are left out.
+    pub(crate) leave_out: &'a [u32],
+    /// Extruder of the object, from 0, over those of its materials.
+    pub(crate) extruder: Option<u32>,
+    /// Extruders of components of the object (by the identifier of the
+    /// object they refer to), from 0, over the object's.
+    pub(crate) parts: &'a [(u32, u32)],
+    /// Gives the materials of the triangles their extruders; without it
+    /// they print with extruder 0.
+    pub(crate) materials: Option<&'a mut Materials>,
+}
+
+/// The materials of the triangles read so far, each with its extruder:
+/// a material gets the next extruder, from 0, when a triangle first uses
+/// it, up to [`MAX_MATERIALS`] materials. A material is an entry of a
+/// property group, so two entries of the same colour are two materials.
+#[derive(Default)]
+pub(crate) struct Materials {
+    /// The extruder of every material in use, by model part, property
+    /// group and index.
+    extruders: BTreeMap<String, BTreeMap<(u32, u32), u32>>,
+    /// The materials with extruders, in the order of their extruders.
+    used: Vec<Material>,
+    /// Materials in use beyond [`MAX_MATERIALS`], which print with
+    /// extruder 0.
+    beyond: usize,
+    /// Triangles whose property is not a material: an entry of a texture
+    /// or of another group that is not read, or one that does not exist.
+    unknown: usize,
+}
+
+impl Materials {
+    /// The extruder of entry `key.1` of property group `key.0` of the model
+    /// part `part`, whose material groups are `groups`; `None` if it is not
+    /// a material.
+    fn extruder(
+        &mut self,
+        part: &str,
+        groups: &HashMap<u32, Vec<Material>>,
+        key: (u32, u32),
+    ) -> Option<u32> {
+        // ponytail: composite materials and multiproperties are not traced
+        // back to their base materials, and textures not to a colour; their
+        // triangles print as if they had no material.
+        let material = groups.get(&key.0)?.get(key.1 as usize)?;
+        if let Some(&extruder) = self.extruders.get(part).and_then(|known| known.get(&key)) {
+            return Some(extruder);
+        }
+        let extruder = if self.used.len() < MAX_MATERIALS {
+            self.used.push(material.clone());
+            self.used.len() as u32 - 1
+        } else {
+            self.beyond += 1;
+            0
+        };
+        self.extruders
+            .entry(part.to_string())
+            .or_default()
+            .insert(key, extruder);
+        Some(extruder)
+    }
+
+    /// Says which extruder prints which material, if there are several,
+    /// and what was not given one.
+    fn report(&self, diagnostics: &mut Diagnostics) {
+        if self.used.len() > 1 {
+            let list: Vec<String> = (self.used.iter().enumerate())
+                .map(|(extruder, material)| format!("{} {}", extruder + 1, material.describe()))
+                .collect();
+            let colours: Vec<String> = (self.used.iter())
+                .map(|material| match material.colour {
+                    Some([r, g, b]) => format!("#{r:02X}{g:02X}{b:02X}"),
+                    None => "-".to_string(),
+                })
+                .collect();
+            diagnostics.push(
+                Diagnostic::warning(
+                    "model.materials",
+                    format!(
+                        "the model has {} materials; they print with extruders 1 to {} in the order the model first uses them ({}); the filament colours of the settings are not changed",
+                        self.used.len(),
+                        self.used.len(),
+                        list.join(", ")
+                    ),
+                )
+                .with("materials", self.used.len())
+                .with("colours", colours.join(" ")),
+            );
+        }
+        if self.beyond > 0 {
+            diagnostics.push(
+                Diagnostic::warning(
+                    "model.too_many_materials",
+                    format!(
+                        "the model has {} materials; the first {MAX_MATERIALS} get extruders of their own, the other {} print with extruder 1",
+                        self.used.len() + self.beyond,
+                        self.beyond
+                    ),
+                )
+                .with("materials", self.used.len() + self.beyond)
+                .with("limit", MAX_MATERIALS),
+            );
+        }
+        if self.unknown > 0 {
+            diagnostics.push(
+                Diagnostic::warning(
+                    "model.unsupported_properties",
+                    format!(
+                        "{} triangle(s) have a property that is not a base material or a colour (a texture, a composite material or a missing one); they print as if they had none",
+                        self.unknown
+                    ),
+                )
+                .with("triangles", self.unknown),
+            );
+        }
     }
 }
 
@@ -598,12 +905,15 @@ pub(crate) const PLATE_PART: &str = "Metadata/model_settings.config";
 type Plate = (u32, Vec<u32>);
 
 /// What a project file knows about the objects of its model: the build
-/// plates, the extruder of every object that names one (from 0), and the
-/// parts of every object that are not printed (see [`HiddenPart`]).
+/// plates, the extruder of every object that names one (from 0), the
+/// extruder of every part of an object that names one (by object, the
+/// identifier of the part and its extruder from 0), and the parts of every
+/// object that are not printed (see [`HiddenPart`]).
 #[derive(Default)]
 struct ProjectLayout {
     plates: Vec<Plate>,
     extruders: HashMap<u32, u32>,
+    part_extruders: HashMap<u32, Vec<(u32, u32)>>,
     hidden: HashMap<u32, Vec<HiddenPart>>,
 }
 
@@ -684,18 +994,22 @@ pub struct PlateObject {
 
 /// Reads the build plates of a Bambu Studio project, with the number of each
 /// plate and the identifiers of the objects on it, and the extruder of each
-/// object that names one, counted from 0 (the file counts from 1). The
-/// layout was worked out from project files; text that does not fit it
-/// yields no plates and no extruders.
-// ponytail: only the extruder of a whole object is read. Parts of an object
-// can name their own extruder (multi-colour models); they print with the
-// object's.
+/// object and of each of its parts that names one, counted from 0 (the file
+/// counts from 1, and 0 leaves a part to its object's). The layout was
+/// worked out from project files; text that does not fit it yields no
+/// plates and no extruders.
+// ponytail: the extruder of a part is read like that of its object, as a
+// `<metadata key="extruder">` entry of the `<part>`; none of the project
+// files seen so far gives a part an extruder of its own.
 fn project(text: &str) -> ProjectLayout {
     let mut plates: Vec<Plate> = Vec::new();
     let mut extruders = HashMap::new();
+    let mut part_extruders: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
     let mut hidden: HashMap<u32, Vec<HiddenPart>> = HashMap::new();
     let (mut in_plate, mut in_instance) = (false, false);
     let (mut object, mut in_part) = (None, false);
+    // The identifier of the part being read.
+    let mut part = None;
     let mut reader = quick_xml::Reader::from_str(text);
     loop {
         match reader.read_event() {
@@ -705,6 +1019,8 @@ fn project(text: &str) -> ProjectLayout {
             }
             Ok(Event::Start(element)) if element.local_name().into_inner() == "part" => {
                 in_part = true;
+                let [id] = attributes(&element, ["id"]);
+                part = id.and_then(|v| v.trim().parse::<u32>().ok());
                 hide_part(&element, object, &mut hidden);
             }
             // A part written as an empty element has no end.
@@ -718,7 +1034,19 @@ fn project(text: &str) -> ProjectLayout {
                         plates.push((0, Vec::new()));
                     }
                     "model_instance" => in_instance = true,
-                    "metadata" if object.is_some() && !in_part => {
+                    "metadata" if in_part => {
+                        let [key, value] = attributes(&element, ["key", "value"]);
+                        let value = value.and_then(|v| v.trim().parse::<u32>().ok());
+                        if let (Some(id), Some(part), Some("extruder"), Some(number @ 1..)) =
+                            (object, part, key.as_deref(), value)
+                        {
+                            part_extruders
+                                .entry(id)
+                                .or_default()
+                                .push((part, number - 1));
+                        }
+                    }
+                    "metadata" if object.is_some() => {
                         let [key, value] = attributes(&element, ["key", "value"]);
                         let value = value.and_then(|v| v.trim().parse::<u32>().ok());
                         if let (Some(id), Some("extruder"), Some(number @ 1..)) =
@@ -745,7 +1073,10 @@ fn project(text: &str) -> ProjectLayout {
                 "plate" => in_plate = false,
                 "model_instance" => in_instance = false,
                 "object" => object = None,
-                "part" => in_part = false,
+                "part" => {
+                    in_part = false;
+                    part = None;
+                }
                 _ => {}
             },
             Ok(Event::Eof) | Err(_) => break,
@@ -755,6 +1086,7 @@ fn project(text: &str) -> ProjectLayout {
     ProjectLayout {
         plates,
         extruders,
+        part_extruders,
         hidden,
     }
 }
@@ -763,6 +1095,17 @@ fn project(text: &str) -> ProjectLayout {
 ///
 /// All build items are placed as the file positions them and returned as one
 /// mesh. Extensions the reader does not understand are reported as warnings.
+///
+/// Every material in use (an entry of a `<basematerials>` or
+/// `<m:colorgroup>`, given to an object by `pid` and `pindex` or to a
+/// triangle by `pid` and `p1`) gets an extruder of its own, from 0, in the
+/// order the triangles of the printed build items first use them; triangles
+/// without a material keep extruder 0, and so do those of materials beyond
+/// [`MAX_MATERIALS`] (`model.too_many_materials`) or with a property that
+/// is no material (`model.unsupported_properties`). Several materials are
+/// reported as `model.materials` with their colours. The extruder a project
+/// of Bambu Studio names for an object goes over those of its materials,
+/// and the one it names for a part of the object over the object's.
 pub fn parse_3mf(bytes: &[u8], diagnostics: &mut Diagnostics) -> Result<Mesh, ThreeMfError> {
     parse_3mf_plate(bytes, None, diagnostics)
 }
@@ -842,6 +1185,7 @@ fn read_plate(
     let ProjectLayout {
         plates,
         extruders,
+        part_extruders,
         hidden,
     } = package
         .read(PLATE_PART)?
@@ -880,6 +1224,7 @@ fn read_plate(
 
     let mut mesh = Mesh::default();
     let mut objects = Vec::new();
+    let mut materials = Materials::default();
     let mut total = 0;
     let mut skipped = 0;
     // Negative volumes left out, and modifiers, support blockers and
@@ -898,19 +1243,17 @@ fn read_plate(
             object: item.object,
             transform: item.transform,
         };
-        let first = mesh.triangles.len();
         let parts = hidden.get(&item.object).map_or(&[][..], Vec::as_slice);
         let leave_out: Vec<u32> = parts.iter().map(|part| part.id).collect();
-        package.emit(
-            &root,
-            &item,
-            &IDENTITY,
-            0,
-            &mut skipped,
-            &mut mesh,
-            &leave_out,
-        )?;
-        mesh.set_extruder(first, extruders.get(&item.object).copied().unwrap_or(0));
+        let top = Emit {
+            leave_out: &leave_out,
+            extruder: extruders.get(&item.object).copied(),
+            parts: part_extruders
+                .get(&item.object)
+                .map_or(&[][..], Vec::as_slice),
+            materials: Some(&mut materials),
+        };
+        package.emit(&root, &item, &IDENTITY, 0, &mut skipped, &mut mesh, top)?;
         // The parts left out: modifiers, negative volumes, support blockers
         // and enforcers as meshes of their own, placed like the item, the
         // others only counted.
@@ -941,7 +1284,7 @@ fn read_plate(
                             1,
                             &mut skipped,
                             &mut volume,
-                            &[],
+                            Emit::default(),
                         )?;
                         total += volume.triangles.len();
                         if total > MAX_TRIANGLES {
@@ -964,7 +1307,7 @@ fn read_plate(
                         1,
                         &mut skipped,
                         &mut volume,
-                        &[],
+                        Emit::default(),
                     )?;
                     total += volume.triangles.len();
                     if total > MAX_TRIANGLES {
@@ -1008,6 +1351,7 @@ fn read_plate(
     if objects.is_empty() {
         return Err(ThreeMfError::NoTriangles);
     }
+    materials.report(diagnostics);
 
     let mut extensions: Vec<&str> = package
         .parts
@@ -1172,10 +1516,17 @@ mod tests {
     }
 
     #[test]
-    fn fuzz_seed_is_a_valid_model() {
+    fn fuzz_seeds_are_valid_models() {
         let seed = include_str!("../../../fuzz/seeds/threemf_model/tetrahedron.model");
         let (mesh, _) = parse(&[("3D/3dmodel.model", seed)]).unwrap();
         assert_eq!(mesh.triangles.len(), 4);
+        let seed = include_str!("../../../fuzz/seeds/threemf_model/materials.model");
+        let (mesh, diagnostics) = parse(&[("3D/3dmodel.model", seed)]).unwrap();
+        assert_eq!(extruders(&mesh), [0, 1, 2, 0]);
+        assert_eq!(
+            diagnostics.codes(),
+            ["model.materials", "model.unsupported_properties"]
+        );
     }
 
     #[test]
@@ -1266,16 +1617,19 @@ mod tests {
     #[test]
     fn damaged_files_never_panic() {
         let root = model(
-            &format!("unit=\"inch\" xmlns:p=\"{PRODUCTION_NS}\" requiredextensions=\"p\""),
             &format!(
-                "<resources><object id=\"1\">{TETRAHEDRON}</object><object id=\"2\"><components><component objectid=\"1\" transform=\"1 0 0 0 1 0 0 0 -1 5 0 0\"/><component p:path=\"/3D/other.model\" objectid=\"7\"/></components></object></resources><build><item objectid=\"1\"/><item objectid=\"2\" transform=\"0 1 0 -1 0 0 0 0 1 300 0 0\"/></build>"
+                "unit=\"inch\" xmlns:p=\"{PRODUCTION_NS}\" xmlns:m=\"{MATERIAL_NS}\" requiredextensions=\"p\""
+            ),
+            &format!(
+                "<resources><basematerials id=\"8\"><base name=\"a\" displaycolor=\"#FF0000\"/><base name=\"b\" displaycolor=\"#00FF00\"/></basematerials><m:colorgroup id=\"9\"><m:color color=\"#0000FF\"/></m:colorgroup><object id=\"1\" pid=\"8\" pindex=\"1\">{}</object><object id=\"2\"><components><component objectid=\"1\" transform=\"1 0 0 0 1 0 0 0 -1 5 0 0\"/><component p:path=\"/3D/other.model\" objectid=\"7\"/></components></object></resources><build><item objectid=\"1\"/><item objectid=\"2\" transform=\"0 1 0 -1 0 0 0 0 1 300 0 0\"/></build>",
+                tetrahedron_with(["", "p1=\"0\"", "pid=\"9\" p1=\"0\"", "pid=\"7\" p1=\"0\""])
             ),
         );
         let other = model(
             "",
             &format!("<resources><object id=\"7\">{TETRAHEDRON}</object></resources>"),
         );
-        let config = "<config><plate><metadata key=\"plater_id\" value=\"1\"/><model_instance><metadata key=\"object_id\" value=\"1\"/></model_instance></plate><plate><metadata key=\"plater_id\" value=\"2\"/><model_instance><metadata key=\"object_id\" value=\"2\"/></model_instance></plate></config>";
+        let config = "<config><plate><metadata key=\"plater_id\" value=\"1\"/><model_instance><metadata key=\"object_id\" value=\"1\"/></model_instance></plate><plate><metadata key=\"plater_id\" value=\"2\"/><model_instance><metadata key=\"object_id\" value=\"2\"/></model_instance></plate><object id=\"2\"><metadata key=\"extruder\" value=\"2\"/><part id=\"7\"><metadata key=\"extruder\" value=\"3\"/></part></object></config>";
         let parts = [root.as_str(), other.as_str(), config];
         let names = ["3D/3dmodel.model", "3D/other.model", PLATE_PART];
         let whole = package(&[
@@ -1308,6 +1662,8 @@ mod tests {
                 let count = mesh.vertices.len() as u32;
                 assert!(mesh.triangles.iter().flatten().all(|&v| v < count));
                 assert!(mesh.vertices.iter().flatten().all(|c| c.is_finite()));
+                let extruders = mesh.extruders.len();
+                assert!(extruders == 0 || extruders == mesh.triangles.len());
             }
         }
         assert!(accepted > 0);
@@ -1464,8 +1820,9 @@ mod tests {
                 "<resources><object id=\"1\">{TETRAHEDRON}</object><object id=\"2\">{TETRAHEDRON}</object><object id=\"3\">{TETRAHEDRON}</object></resources><build><item objectid=\"1\"/><item objectid=\"2\" transform=\"1 0 0 0 1 0 0 0 1 5 0 0\"/><item objectid=\"3\" transform=\"1 0 0 0 1 0 0 0 1 10 0 0\"/></build>"
             ),
         );
-        // Object 1 says extruder 2, its part says 3 (ignored), object 2 says
-        // nothing, object 3 says 1.
+        // Object 1 says extruder 2, its part says 3 (but object 1 has no
+        // components the part could be), object 2 says nothing, object 3
+        // says 1.
         let config = "<config><object id=\"1\"><metadata key=\"name\" value=\"a\"/><metadata key=\"extruder\" value=\"2\"/><part id=\"1\"><metadata key=\"extruder\" value=\"3\"/></part></object><object id=\"3\"><metadata key=\"extruder\" value=\"1\"/></object></config>";
         let mut diagnostics = Diagnostics::new();
         let bytes = package(&[("3D/3dmodel.model", &text), (PLATE_PART, config)]);
@@ -1489,6 +1846,185 @@ mod tests {
         assert_eq!(merged.triangles, mesh.triangles);
         assert_eq!(objects[0].1.used_extruders(), [1]);
         assert_eq!(objects[1].1.used_extruders(), [0]);
+    }
+
+    /// Extruders of the triangles of a mesh.
+    fn extruders(mesh: &Mesh) -> Vec<u32> {
+        (0..mesh.triangles.len())
+            .map(|t| mesh.extruder(t))
+            .collect()
+    }
+
+    #[test]
+    fn parts_of_a_project_keep_their_own_extruders() {
+        // Object 10 has three parts (objects 1 to 3) and a modifier
+        // (object 4).
+        let text = model(
+            "",
+            &format!(
+                "<resources><object id=\"1\">{TETRAHEDRON}</object><object id=\"2\">{TETRAHEDRON}</object><object id=\"3\">{TETRAHEDRON}</object><object id=\"4\">{TETRAHEDRON}</object><object id=\"10\"><components><component objectid=\"1\"/><component objectid=\"2\" transform=\"1 0 0 0 1 0 0 0 1 5 0 0\"/><component objectid=\"3\" transform=\"1 0 0 0 1 0 0 0 1 10 0 0\"/><component objectid=\"4\"/></components></object></resources><build><item objectid=\"10\"/></build>"
+            ),
+        );
+        let config = |object: &str| {
+            format!(
+                "<config><object id=\"10\"><metadata key=\"name\" value=\"Body\"/>{object}<part id=\"1\" subtype=\"normal_part\"><metadata key=\"name\" value=\"a\"/></part><part id=\"2\" subtype=\"normal_part\"><metadata key=\"extruder\" value=\"2\"/></part><part id=\"3\" subtype=\"normal_part\"><metadata key=\"extruder\" value=\"0\"/></part><part id=\"4\" subtype=\"modifier_part\"><metadata key=\"extruder\" value=\"4\"/></part></object></config>"
+            )
+        };
+        let read = |object: &str| {
+            let bytes = package(&[("3D/3dmodel.model", &text), (PLATE_PART, &config(object))]);
+            let mut diagnostics = Diagnostics::new();
+            let mesh = parse_3mf(&bytes, &mut diagnostics).unwrap();
+            let objects = parse_3mf_plate_parts(&bytes, None, &mut diagnostics).unwrap();
+            assert_eq!(objects.len(), 1);
+            assert_eq!(objects[0].mesh, mesh);
+            assert_eq!(objects[0].modifiers.len(), 1);
+            mesh
+        };
+        // Part 2 prints with extruder 2; the others, part 3 with 0 too,
+        // with their object's: the first by default, or the one it names.
+        let mesh = read("");
+        assert_eq!(mesh.triangles.len(), 12);
+        assert_eq!(extruders(&mesh), [[0; 4], [1; 4], [0; 4]].concat());
+        assert_eq!(mesh.used_extruders(), [0, 1]);
+        let mesh = read("<metadata key=\"extruder\" value=\"3\"/>");
+        assert_eq!(extruders(&mesh), [[2; 4], [1; 4], [2; 4]].concat());
+    }
+
+    /// A tetrahedron as in [`TETRAHEDRON`] whose triangles carry
+    /// `properties`, written into each `<triangle>` element.
+    fn tetrahedron_with(properties: [&str; 4]) -> String {
+        let corners = [[0, 2, 1], [0, 1, 3], [1, 2, 3], [2, 0, 3]];
+        let triangles: String = corners
+            .iter()
+            .zip(properties)
+            .map(|([a, b, c], p)| format!("<triangle v1=\"{a}\" v2=\"{b}\" v3=\"{c}\" {p}/>"))
+            .collect();
+        format!(
+            "<mesh><vertices><vertex x=\"0\" y=\"0\" z=\"0\"/><vertex x=\"1\" y=\"0\" z=\"0\"/><vertex x=\"0\" y=\"1\" z=\"0\"/><vertex x=\"0\" y=\"0\" z=\"1\"/></vertices><triangles>{triangles}</triangles></mesh>"
+        )
+    }
+
+    #[test]
+    fn materials_choose_extruders_in_the_order_of_first_use() {
+        // Object 1 is green by default; its second triangle is red, its
+        // third blue. Object 2 takes the second colour of a colour group,
+        // object 3 the first, which no triangle uses before.
+        let text = model(
+            &format!("xmlns:m=\"{MATERIAL_NS}\" requiredextensions=\"m\""),
+            &format!(
+                "<resources><basematerials id=\"5\"><base name=\"Red PLA\" displaycolor=\"#FF0000\"/><base name=\"Green PLA\" displaycolor=\"#00ff00FF\"/><base name=\"Blue PLA\" displaycolor=\"blue\"/></basematerials><m:colorgroup id=\"6\"><m:color color=\"#FFFFFF\"/><m:color color=\"#000000\"/></m:colorgroup><object id=\"1\" pid=\"5\" pindex=\"1\">{}</object><object id=\"2\" pid=\"6\" pindex=\"1\">{TETRAHEDRON}</object><object id=\"3\" pid=\"6\" pindex=\"0\">{TETRAHEDRON}</object></resources><build><item objectid=\"1\"/><item objectid=\"2\" transform=\"1 0 0 0 1 0 0 0 1 5 0 0\"/><item objectid=\"3\" transform=\"1 0 0 0 1 0 0 0 1 10 0 0\"/></build>",
+                tetrahedron_with([
+                    "",
+                    "pid=\"5\" p1=\"0\" p2=\"1\" p3=\"1\"",
+                    "p1=\"2\"",
+                    "pid=\"5\" p1=\"1\""
+                ])
+            ),
+        );
+        let (mesh, diagnostics) = parse(&[("3D/3dmodel.model", &text)]).unwrap();
+        assert_eq!(extruders(&mesh), [0, 1, 2, 0, 3, 3, 3, 3, 4, 4, 4, 4]);
+        // The material extension is understood, so not reported.
+        assert_eq!(diagnostics.codes(), ["model.materials"]);
+        let report = &diagnostics.as_slice()[0];
+        assert_eq!(report.context["materials"], "5");
+        assert_eq!(
+            report.context["colours"],
+            "#00FF00 #FF0000 - #000000 #FFFFFF"
+        );
+        assert!(
+            report
+                .message
+                .contains("1 Green PLA (#00FF00), 2 Red PLA (#FF0000), 3 Blue PLA, 4 #000000")
+        );
+
+        // Split, the objects keep the extruders of the whole.
+        let objects = parse_3mf_plate_objects(
+            &package(&[("3D/3dmodel.model", &text)]),
+            None,
+            &mut Diagnostics::new(),
+        )
+        .unwrap();
+        let split: Vec<Vec<u32>> = objects.iter().map(|(_, mesh)| extruders(mesh)).collect();
+        assert_eq!(split, [vec![0, 1, 2, 0], vec![3; 4], vec![4; 4]]);
+    }
+
+    #[test]
+    fn one_material_or_none_changes_nothing() {
+        // As some CAD programs write it: one colour for the whole object.
+        let text = model(
+            &format!("xmlns:m=\"{MATERIAL_NS}\""),
+            &format!(
+                "<resources><m:colorgroup id=\"2\"><m:color color=\"#F5F5F6FF\"/><m:color color=\"#F5F5F6FF\"/></m:colorgroup><m:colorgroup id=\"3\"/><object id=\"1\" pid=\"2\" pindex=\"1\">{TETRAHEDRON}</object></resources><build><item objectid=\"1\"/></build>"
+            ),
+        );
+        let plain = model(
+            "",
+            &format!(
+                "<resources><object id=\"1\">{TETRAHEDRON}</object></resources><build><item objectid=\"1\"/></build>"
+            ),
+        );
+        let (mesh, diagnostics) = parse(&[("3D/3dmodel.model", &text)]).unwrap();
+        let (without, _) = parse(&[("3D/3dmodel.model", &plain)]).unwrap();
+        assert_eq!(mesh, without);
+        assert!(mesh.extruders.is_empty());
+        assert!(diagnostics.is_empty(), "{:?}", diagnostics.codes());
+    }
+
+    #[test]
+    fn too_many_materials_fall_back_to_extruder_0() {
+        // 66 objects, each with a colour of its own.
+        let count = MAX_MATERIALS + 2;
+        let colours: String = (0..count)
+            .map(|i| format!("<m:color color=\"#{i:06X}\"/>"))
+            .collect();
+        let objects: String = (0..count)
+            .map(|i| {
+                format!(
+                    "<object id=\"{}\" pid=\"1\" pindex=\"{i}\">{TETRAHEDRON}</object>",
+                    i + 2
+                )
+            })
+            .collect();
+        let items: String = (0..count)
+            .map(|i| {
+                format!(
+                    "<item objectid=\"{}\" transform=\"1 0 0 0 1 0 0 0 1 {} 0 0\"/>",
+                    i + 2,
+                    2 * i
+                )
+            })
+            .collect();
+        // The second triangle of every object names a group that does not
+        // exist.
+        let objects = objects.replacen(
+            "<triangle v1=\"0\" v2=\"1\" v3=\"3\"/>",
+            "<triangle v1=\"0\" v2=\"1\" v3=\"3\" pid=\"99\" p1=\"0\"/>",
+            count,
+        );
+        let text = model(
+            &format!("xmlns:m=\"{MATERIAL_NS}\""),
+            &format!(
+                "<resources><m:colorgroup id=\"1\">{colours}</m:colorgroup>{objects}</resources><build>{items}</build>"
+            ),
+        );
+        let (mesh, diagnostics) = parse(&[("3D/3dmodel.model", &text)]).unwrap();
+        let per_object: Vec<u32> = (0..count).map(|o| mesh.extruder(4 * o)).collect();
+        let expected: Vec<u32> = (0..MAX_MATERIALS as u32).chain([0, 0]).collect();
+        assert_eq!(per_object, expected);
+        assert_eq!(mesh.extruder(1), 0);
+        assert_eq!(
+            diagnostics.codes(),
+            [
+                "model.materials",
+                "model.too_many_materials",
+                "model.unsupported_properties"
+            ]
+        );
+        assert_eq!(diagnostics.as_slice()[1].context["materials"], "66");
+        assert_eq!(
+            diagnostics.as_slice()[2].context["triangles"],
+            count.to_string()
+        );
     }
 
     #[test]

@@ -7,8 +7,8 @@
 use slicer_core::Mesh;
 
 use crate::threemf::{
-    CORE_NS, DEFAULT_MODEL_PART, IDENTITY, MODEL_RELATIONSHIP, Package, Reference, ThreeMfError,
-    push_mesh, write_binary_package,
+    CORE_NS, DEFAULT_MODEL_PART, Emit, IDENTITY, MODEL_RELATIONSHIP, Package, Reference,
+    ThreeMfError, push_mesh, write_binary_package,
 };
 
 /// Where a project keeps the picture of its plate.
@@ -171,7 +171,15 @@ pub fn read_project(bytes: &[u8], parts: &[&str]) -> Result<ProjectPackage, Thre
                 };
                 let mut mesh = Mesh::default();
                 let mut skipped = 0;
-                package.emit(&root, &local, &IDENTITY, 0, &mut skipped, &mut mesh, &[])?;
+                package.emit(
+                    &root,
+                    &local,
+                    &IDENTITY,
+                    0,
+                    &mut skipped,
+                    &mut mesh,
+                    Emit::default(),
+                )?;
                 let index = (!mesh.triangles.is_empty()).then(|| {
                     let name = package
                         .parts
