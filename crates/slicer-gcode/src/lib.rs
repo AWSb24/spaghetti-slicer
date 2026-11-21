@@ -4,6 +4,7 @@
 //! commands; the Bambu flavor does not exist yet.
 
 pub mod calibration;
+mod estimate;
 pub mod thumbnails;
 
 use std::collections::BTreeMap;
@@ -27,10 +28,20 @@ pub struct Stats {
     pub filament_volume_cm3: f64,
     /// Filament consumed, in grams.
     pub filament_weight_g: f64,
-    /// Estimated print time in seconds, with acceleration and slowing down
-    /// at corners. Ignores heating and everything the start and end G-code
-    /// do. Not yet compared with a real print.
+    /// Estimated print time in seconds: the moves of the layers with
+    /// acceleration and slowing down at corners (`times`), the start and
+    /// end G-code (`time_start_end_s`) and the waits for heaters
+    /// (`time_heating_s`). The G-code header and the `prediction` of a
+    /// `.gcode.3mf` give this figure. Not yet compared with a real print.
     pub print_time_s: f64,
+    /// Of `print_time_s`, the seconds the moves, dwells (`G4`) and homing
+    /// (`G28`, `homing_time`) of the start and end G-code take.
+    pub time_start_end_s: f64,
+    /// Of `print_time_s`, the seconds spent waiting for the nozzle and the
+    /// bed to reach their temperatures (`M109`, `M190`, `M116`), in the
+    /// start and end G-code, the tool change G-code and the layers; 0
+    /// without `nozzle_heat_rate` and `bed_heat_rate`.
+    pub time_heating_s: f64,
     /// The same figures for every extruder the print uses, with more than
     /// one extruder (`extruder_count`); empty otherwise.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -45,9 +56,16 @@ pub struct Stats {
     pub flush_weight_g: f64,
     /// Estimated seconds per line type, in the order the types first
     /// appear; travel, retraction and Z moves are under `None`. They add up
-    /// to `print_time_s`. Not written to the file or to JSON.
+    /// to `print_time_s` without `time_start_end_s` and `time_heating_s`.
+    /// Not written to the file or to JSON.
     #[serde(skip)]
     pub times: Vec<(Option<PathKind>, f64)>,
+    /// Which extruders the layers use, as runs of layers with the same
+    /// ones, for the layer list of a `.gcode.3mf`
+    /// ([`slicer_formats::PrintInfo::layer_filaments`]). Not written to the
+    /// file or to JSON.
+    #[serde(skip)]
+    pub layer_filaments: Vec<slicer_formats::LayerFilaments>,
 }
 
 /// Whether a figure is 0, to leave it out of JSON.
@@ -344,6 +362,10 @@ struct Writer<'a> {
     nozzle_z: Option<f64>,
     /// The points of the line printed last, up to the nozzle, for wiping.
     trail: Vec<Point>,
+    /// Temperature commands, tool selections and tool change G-code
+    /// written between the moves, with the number of moves before them,
+    /// for the estimate of heating.
+    commands: Vec<(usize, String)>,
 }
 
 /// How the filament is pulled back before a travel: the retraction, wipe
@@ -423,6 +445,16 @@ impl<'a> Writer<'a> {
             moves: Vec::new(),
             nozzle_z: self.nozzle_z,
             trail: self.trail.clone(),
+            commands: Vec::new(),
+        }
+    }
+
+    /// Writes `text`, G-code that may set temperatures or select a tool,
+    /// and keeps it for the estimate of heating.
+    fn command(&mut self, text: String) {
+        if !text.is_empty() {
+            self.out.push_str(&text);
+            self.commands.push((self.moves.len(), text));
         }
     }
 
@@ -845,12 +877,14 @@ fn write_layer(
         layer.z, layer.height
     );
     if index == 1 && !carry.later {
+        let mut temperatures = String::new();
         if settings.nozzle_temp != settings.nozzle_temp_first_layer {
-            let _ = writeln!(w.out, "M104 S{}", settings.nozzle_temp);
+            let _ = writeln!(temperatures, "M104 S{}", settings.nozzle_temp);
         }
         if settings.bed_temp != settings.bed_temp_first_layer {
-            let _ = writeln!(w.out, "M140 S{}", settings.bed_temp);
+            let _ = writeln!(temperatures, "M140 S{}", settings.bed_temp);
         }
+        w.command(temperatures);
     }
     if start_fan != carry.fan {
         carry.fan = start_fan;
@@ -900,9 +934,9 @@ fn write_layer(
             if let Some(previous) = carry.selected {
                 w.retract();
                 let values = toolchange_values(context.values, previous, next);
-                let block = expand(&settings.toolchange_gcode, "toolchange_gcode", &values)?;
-                w.out.push_str(&block);
-                let _ = writeln!(w.out, "T{next}");
+                let mut block = expand(&settings.toolchange_gcode, "toolchange_gcode", &values)?;
+                let _ = writeln!(block, "T{next}");
+                w.command(block);
                 if context.absolute {
                     w.out.push_str("G92 E0\n");
                     w.e = 0.0;
@@ -911,7 +945,7 @@ fn write_layer(
                 w.position = None;
                 carry.restore_z = true;
             } else {
-                let _ = writeln!(w.out, "T{next}");
+                w.command(format!("T{next}\n"));
             }
             carry.selected = Some(next);
             w.select(next as usize);
@@ -997,6 +1031,23 @@ fn write_layer(
         end_label(&mut w.out, settings, o);
     }
     Ok(())
+}
+
+/// The extruders `layer` uses, ascending: those of its paths with more
+/// than one extruder (`several`), otherwise the first.
+fn layer_extruders(layer: &Layer, several: bool) -> Vec<u32> {
+    if !several {
+        return vec![0];
+    }
+    let mut used: Vec<u32> = layer
+        .paths
+        .iter()
+        .filter(|p| !p.points.is_empty())
+        .map(|p| p.extruder)
+        .collect();
+    used.sort_unstable();
+    used.dedup();
+    used
 }
 
 /// Name of object `object` (counted from 0) in the labels of the G-code.
@@ -1242,6 +1293,7 @@ pub fn write_gcode_with_progress(
         moves: Vec::new(),
         nozzle_z: None,
         trail: Vec::new(),
+        commands: Vec::new(),
     };
     w.out.push_str(&start);
     let absolute = settings.extrusion_mode == ExtrusionMode::Absolute;
@@ -1325,17 +1377,40 @@ pub fn write_gcode_with_progress(
             None => by_kind.push((m.kind, time)),
         }
     }
+    // The start and end G-code, and the heaters through the whole print.
+    let mut estimate = estimate::Estimator::new(settings);
+    estimate.run(&start, true);
+    let mut before = 0;
+    for (at, text) in &w.commands {
+        estimate.pass(times[before..*at].iter().sum());
+        before = *at;
+        estimate.run(text, false);
+    }
+    estimate.pass(times[before..].iter().sum());
+    estimate.resume(w.position, w.z);
+    estimate.run(&end, true);
+    let layer_filaments = slicer_formats::layer_filament_ranges(
+        &toolpaths
+            .layers
+            .iter()
+            .map(|layer| layer_extruders(layer, several))
+            .collect::<Vec<_>>(),
+    );
     let total: f64 = used.iter().sum();
+    let moving: f64 = times.iter().sum();
     let stats = Stats {
         layers: toolpaths.layers.len(),
         filament_length_mm: total,
         filament_volume_cm3: volume(total),
         filament_weight_g: volume(total) * settings.filament_density,
-        print_time_s: times.iter().sum(),
+        print_time_s: moving + estimate.motion + estimate.heating,
+        time_start_end_s: estimate.motion,
+        time_heating_s: estimate.heating,
         extruders,
         flush_volume_cm3: volume(w.tower),
         flush_weight_g: volume(w.tower) * settings.filament_density,
         times: by_kind,
+        layer_filaments,
     };
 
     let flavor = match settings.flavor {
@@ -1363,8 +1438,8 @@ pub fn write_gcode_with_progress(
     let _ = writeln!(gcode, "; filament used [g]: {:.2}", stats.filament_weight_g);
     let _ = writeln!(
         gcode,
-        "; estimated printing time [s]: {:.0} (with acceleration, without heating)",
-        stats.print_time_s
+        "; estimated printing time [s]: {:.0} (with acceleration; of that start and end G-code {:.0} s, heating {:.0} s)",
+        stats.print_time_s, stats.time_start_end_s, stats.time_heating_s
     );
     for e in &stats.extruders {
         let _ = writeln!(
@@ -1397,7 +1472,8 @@ mod tests {
         let output = slice(&Mesh::cuboid(20.0, 20.0, 4.0), &Settings::default());
         let stats = &output.stats;
         let sum: f64 = stats.times.iter().map(|(_, t)| t).sum();
-        assert!((sum - stats.print_time_s).abs() < 1e-6, "{sum}");
+        let layers = stats.print_time_s - stats.time_start_end_s - stats.time_heating_s;
+        assert!((sum - layers).abs() < 1e-6, "{sum}");
         let kinds: Vec<Option<PathKind>> = stats.times.iter().map(|(k, _)| *k).collect();
         for kind in [
             None,
@@ -1935,6 +2011,106 @@ SET_PRESSURE_ADVANCE ADVANCE=0.04
     }
 
     /// Two 10 x 10 x 5 mm cubes 10 mm apart, the second one on extruder 2.
+    #[test]
+    fn start_and_end_gcode_take_their_time() {
+        let mut settings = Settings::default();
+        settings.start_gcode = String::new();
+        settings.end_gcode = String::new();
+        let mesh = Mesh::cuboid(10.0, 10.0, 2.0);
+        let bare = slice(&mesh, &settings).stats;
+        assert_eq!(bare.time_start_end_s, 0.0);
+        // 100 mm at 10 mm/s, speeding up and slowing down at 1000 mm/s²,
+        // and two seconds of waiting.
+        settings.start_gcode = "G1 X100 F600\nG4 P2000".into();
+        let with = slice(&mesh, &settings).stats;
+        let expected = 10.01 + 2.0;
+        assert!((with.time_start_end_s - expected).abs() < 1e-9);
+        assert!((with.print_time_s - bare.print_time_s - expected).abs() < 1e-9);
+        assert_eq!(with.times, bare.times);
+        // The end G-code starts where the print ended: up 10 mm at 10 mm/s.
+        settings.start_gcode = String::new();
+        settings.end_gcode = "G91\nG1 Z10 F600\nG28 X".into();
+        let end = slice(&mesh, &settings).stats;
+        let expected = 1.01 + settings.homing_time;
+        assert!((end.time_start_end_s - expected).abs() < 1e-9);
+        // The default start and end G-code home once and lift the nozzle.
+        let defaults = slice(&mesh, &Settings::default()).stats;
+        assert!((defaults.time_start_end_s - 11.01).abs() < 1e-9);
+        assert_eq!(defaults.time_heating_s, 0.0);
+        let output = slice(&mesh, &Settings::default());
+        assert!(output.gcode.contains(&format!(
+            "\n; estimated printing time [s]: {:.0} (with acceleration; of that start and end G-code 11 s, heating 0 s)\n",
+            output.stats.print_time_s
+        )));
+    }
+
+    #[test]
+    fn heating_counts_when_it_is_waited_for() {
+        let mesh = Mesh::cuboid(10.0, 10.0, 2.0);
+        let mut settings = Settings::default();
+        settings.start_gcode = "M190 S60".into();
+        // Without heat rates heating is left out.
+        assert_eq!(slice(&mesh, &settings).stats.time_heating_s, 0.0);
+        // From 25 to 60 °C at 1 °C/s.
+        settings.bed_heat_rate = 1.0;
+        let stats = slice(&mesh, &settings).stats;
+        assert!((stats.time_heating_s - 35.0).abs() < 1e-9);
+        let layers: f64 = stats.times.iter().map(|(_, t)| t).sum();
+        let total = layers + stats.time_start_end_s + stats.time_heating_s;
+        assert!((stats.print_time_s - total).abs() < 1e-9);
+        // The second layer sets the nozzle cooler without waiting.
+        settings.nozzle_heat_rate = 1.0;
+        settings.start_gcode = "M109 S{nozzle_temp_first_layer}".into();
+        let output = slice(&mesh, &settings);
+        assert!(output.gcode.contains("\nM104 S210\n"));
+        assert!((output.stats.time_heating_s - 190.0).abs() < 1e-9);
+
+        // A tool change waits for the next nozzle to heat: the first time
+        // from cold, later it is still warm.
+        let mut settings = Settings::default();
+        settings.extruder_count = 2;
+        settings.nozzle_heat_rate = 1.0;
+        settings.start_gcode = "M109 S200".into();
+        settings.toolchange_gcode = "M109 T{next_extruder} S200".into();
+        let stats = slice(&two_cubes(), &settings).stats;
+        assert!(
+            (stats.time_heating_s - 350.0).abs() < 1e-9,
+            "{}",
+            stats.time_heating_s
+        );
+        // Without waiting it takes no time.
+        settings.toolchange_gcode = "M104 T{next_extruder} S200".into();
+        let stats = slice(&two_cubes(), &settings).stats;
+        assert!((stats.time_heating_s - 175.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn layers_list_the_extruders_they_use() {
+        let run = |filaments: &[u32], first, last| slicer_formats::LayerFilaments {
+            filaments: filaments.to_vec(),
+            first,
+            last,
+        };
+        // One extruder: all layers with the first, as before.
+        let one = slice(&two_cubes(), &Settings::default()).stats;
+        assert_eq!(one.layer_filaments, [run(&[0], 0, 24)]);
+        // The second cube is lower: above it only the first extruder prints.
+        let mut settings = Settings::default();
+        settings.extruder_count = 2;
+        settings.skirt_loops = 0;
+        settings.prime_tower_width = 0.0;
+        let mut mesh = Mesh::cuboid(10.0, 10.0, 5.0);
+        let mut other = Mesh::cuboid(10.0, 10.0, 3.0);
+        other.translate([20.0, 0.0, 0.0]);
+        other.set_extruder(0, 1);
+        mesh.merge(&other);
+        let stats = slice(&mesh, &settings).stats;
+        assert_eq!(
+            stats.layer_filaments,
+            [run(&[0, 1], 0, 14), run(&[0], 15, 24)]
+        );
+    }
+
     fn two_cubes() -> Mesh {
         let mut mesh = Mesh::cuboid(10.0, 10.0, 5.0);
         let mut other = Mesh::cuboid(10.0, 10.0, 5.0);
@@ -1995,7 +2171,9 @@ SET_PRESSURE_ADVANCE ADVANCE=0.04
         let sum = first.filament_length_mm + second.filament_length_mm;
         assert!((sum - output.stats.filament_length_mm).abs() < 1e-6);
         let time = first.print_time_s + second.print_time_s;
-        assert!((time - output.stats.print_time_s).abs() < 1e-6);
+        let stats = &output.stats;
+        let layers = stats.print_time_s - stats.time_start_end_s - stats.time_heating_s;
+        assert!((time - layers).abs() < 1e-6);
         assert!(output.gcode.contains("\n; extruder T1: filament "));
 
         // The prime tower adds its volume on every layer, shared by both.
@@ -2484,7 +2662,8 @@ SET_PRESSURE_ADVANCE ADVANCE=0.04
         assert!((ratio - 1.0).abs() < 0.02, "{ratio}");
         assert!(one_by_one.print_time_s > 0.0);
         let sum: f64 = one_by_one.times.iter().map(|(_, t)| t).sum();
-        assert!((sum - one_by_one.print_time_s).abs() < 1e-6);
+        let layers = one_by_one.print_time_s - one_by_one.time_start_end_s;
+        assert!((sum - layers).abs() < 1e-6);
     }
 
     /// A house lying on its side, its smallest corner at `x`, 50 mm: the

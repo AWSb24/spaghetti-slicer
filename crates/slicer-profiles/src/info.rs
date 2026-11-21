@@ -38,7 +38,7 @@ pub struct SettingInfo {
 
 /// Every unit a setting can have; empty for none.
 pub const UNITS: &[&str] = &[
-    "", "mm", "mm/s", "mm/s²", "mm³", "%", "°C", "°", "s", "g/cm³", "px",
+    "", "mm", "mm/s", "mm/s²", "mm³", "%", "°C", "°C/s", "°", "s", "g/cm³", "px",
 ];
 
 /// Every setting in the order of [`Settings`](crate::Settings), generated
@@ -106,6 +106,8 @@ mod tests {
             let expected =
                 if text.contains("in percent") || key.contains("fan_") && key.ends_with("_speed") {
                     Some("%")
+                } else if text.contains("°C per second") {
+                    Some("°C/s")
                 } else if text.contains("mm/s²") {
                     Some("mm/s²")
                 } else if text.contains("in mm/s") || key.ends_with("_speed") {

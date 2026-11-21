@@ -176,6 +176,20 @@ fn stored_filament(value: &Value) -> Option<slicer_formats::Filament> {
     })
 }
 
+/// A run of layers with the same filaments as a job record keeps it.
+fn stored_layer_filaments(value: &Value) -> Option<slicer_formats::LayerFilaments> {
+    let filaments = value["filaments"]
+        .as_array()?
+        .iter()
+        .map(|f| u32::try_from(f.as_u64()?).ok())
+        .collect::<Option<Vec<u32>>>()?;
+    Some(slicer_formats::LayerFilaments {
+        filaments,
+        first: usize::try_from(value["first"].as_u64()?).ok()?,
+        last: usize::try_from(value["last"].as_u64()?).ok()?,
+    })
+}
+
 /// Seconds since 1970.
 fn unix_now() -> f64 {
     SystemTime::now()
@@ -296,6 +310,11 @@ impl Job {
                     "used_m": f.used_m,
                     "used_g": f.used_g,
                 })).collect::<Vec<_>>(),
+                "layer_filaments": info.layer_filaments.iter().map(|run| json!({
+                    "filaments": run.filaments,
+                    "first": run.first,
+                    "last": run.last,
+                })).collect::<Vec<_>>(),
             })
         });
         let record = json!({
@@ -344,6 +363,12 @@ impl Job {
                 filaments: info["filaments"]
                     .as_array()
                     .map(|list| list.iter().filter_map(stored_filament).collect())
+                    .unwrap_or_default(),
+                // Jobs of older versions have none: the first filament on
+                // every layer.
+                layer_filaments: info["layer_filaments"]
+                    .as_array()
+                    .map(|list| list.iter().filter_map(stored_layer_filaments).collect())
                     .unwrap_or_default(),
             };
             (Some(Arc::new(gcode)), Some(info))
@@ -708,7 +733,9 @@ pub fn openapi() -> Value {
                             "filament_length_mm": { "type": "number" },
                             "filament_volume_cm3": { "type": "number" },
                             "filament_weight_g": { "type": "number" },
-                            "print_time_s": { "type": "number" }
+                            "print_time_s": { "type": "number", "description": "Estimated seconds in all: moves of the layers, start and end G-code, waits for heating" },
+                            "time_start_end_s": { "type": "number", "description": "Of print_time_s, the moves, dwells and homing of the start and end G-code" },
+                            "time_heating_s": { "type": "number", "description": "Of print_time_s, the waits for the heaters; 0 without nozzle_heat_rate and bed_heat_rate" }
                         } },
                         "warnings": { "type": "array", "items": { "$ref": "#/components/schemas/Diagnostic" } },
                         "error": { "$ref": "#/components/schemas/Diagnostic" },
@@ -966,6 +993,7 @@ fn slice(
         thumbnail: pictures.next().unwrap_or_default(),
         thumbnail_small: pictures.next().unwrap_or_default(),
         filaments: slicer_gcode::filaments(&output.stats, settings),
+        layer_filaments: output.stats.layer_filaments.clone(),
     };
     Ok((output, warnings, info))
 }

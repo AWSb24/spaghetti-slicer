@@ -214,6 +214,7 @@ pub fn encode_output(
         layers: output.stats.layers,
         nozzle_diameter: settings.nozzle_diameter,
         filaments: slicer_gcode::filaments(&output.stats, settings),
+        layer_filaments: output.stats.layer_filaments.clone(),
         // ponytail: no picture of the plate here, the meshes are not at
         // hand; the command line tool and the server add one.
         ..slicer_formats::PrintInfo::default()

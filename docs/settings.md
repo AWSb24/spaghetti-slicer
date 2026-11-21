@@ -104,6 +104,10 @@ Numbers are in the unit of the Unit column (empty for counts and factors). A set
 | `travel_speed` | 150 | mm/s | 1 to 2000 | Speed of moves without extrusion. |
 | `acceleration` | 1000 | mm/s² | 10 to 100000 | Acceleration of the printer in mm/s². Only used to estimate the print time; it is not written to the G-code. |
 | `jerk` | 8 | mm/s | 0 to 1000 | Largest speed change in mm/s the printer makes at once, for example at a corner. Only used to estimate the print time. |
+| `homing_time` | 10 | s | 0 to 600 | Seconds one `G28` (homing) in the start and end G-code takes. Only used to estimate the print time. |
+| `nozzle_heat_rate` | 0 | °C/s | 0 to 100 | How fast the nozzle heats up (and cools down), in °C per second. Only used to estimate the print time: waits for the nozzle (`M109`, `M116`) count with this rate. 0 leaves heating the nozzle out of the estimate. |
+| `bed_heat_rate` | 0 | °C/s | 0 to 100 | How fast the bed heats up (and cools down), in °C per second. Only used to estimate the print time: waits for the bed (`M190`, `M116`) count with this rate. 0 leaves heating the bed out of the estimate. |
+| `ambient_temp` | 25 | °C | -20 to 80 | Temperature of the nozzle and the bed before the print, for the time estimate of heating. |
 | `retraction_length` | 0.8 | mm | 0 to 20 | Filament length pulled back before a travel move; 0 disables retraction. |
 | `retraction_speed` | 35 | mm/s | 1 to 200 | Speed of retraction and unretraction. |
 | `retraction_min_travel` | 1.5 | mm | 0 to 100 | Travel moves shorter than this do not retract. |

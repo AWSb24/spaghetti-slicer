@@ -7,7 +7,7 @@ use slicer_core::{Diagnose, Diagnostic, Mesh, Shapes, parallel_map, polygon};
 use slicer_profiles::{InfillPattern, Settings};
 
 use crate::plate::{self, Placement};
-use crate::{DEGENERATE_HEIGHT, MAX_HOLE_EDGES, ObjectRange};
+use crate::{DEGENERATE_HEIGHT, ObjectRange};
 
 /// Process settings that an object on the plate may set for itself,
 /// overriding the plate's: walls and their seam, top and bottom shells,
@@ -673,10 +673,9 @@ pub(crate) fn regions(
                 .filter(|&(_, &m)| m == group)
                 .map(|(object, _)| object.clone())
                 .collect();
+            // Repaired as the whole plate was, which reported it.
             let mut mesh = plate::merge(&members, placement);
-            mesh.orient();
-            mesh.remove_degenerate(DEGENERATE_HEIGHT);
-            mesh.close_holes(MAX_HOLE_EDGES);
+            mesh.repair(DEGENERATE_HEIGHT);
             if let Some(shift) = shift {
                 mesh.translate(shift);
             }
@@ -822,9 +821,7 @@ pub(crate) fn modifier_areas(
 ) {
     // Repaired, put on the bed with the object and cut, as the plate is.
     let cut = |mut mesh: Mesh, lift: f64| {
-        mesh.orient();
-        mesh.remove_degenerate(DEGENERATE_HEIGHT);
-        mesh.close_holes(MAX_HOLE_EDGES);
+        mesh.repair(DEGENERATE_HEIGHT);
         let [x, y, z] = shift.unwrap_or([0.0; 3]);
         mesh.translate([x, y, z - lift]);
         slice_mesh(&mesh, cut_heights)
@@ -1067,6 +1064,78 @@ mod tests {
             &settings,
         );
         assert_eq!(both, slice(&objects, &[], &dense).0);
+    }
+
+    #[test]
+    fn objects_with_own_settings_are_repaired_as_the_plate() {
+        let settings = Settings {
+            skirt_loops: 0,
+            ..Settings::default()
+        };
+        let solid = Settings {
+            infill_density: 100.0,
+            ..Settings::default()
+        };
+        // The second cube inside out, without its left side and with every
+        // other triangle twice: only removing the repeated triangles shows
+        // the hole that is to be closed.
+        let mut broken = cube(140.0);
+        let vertices = broken.vertices.clone();
+        broken
+            .triangles
+            .retain(|t| !t.iter().all(|&v| vertices[v as usize][0] == 140.0));
+        assert_eq!(broken.triangles.len(), 10);
+        for t in &mut broken.triangles {
+            t.swap(1, 2);
+        }
+        broken.triangles.extend(broken.triangles.clone());
+        let objects = [cube(20.0), broken];
+        let (plain, warnings) = slice(&objects, &[], &settings);
+        assert_eq!(warnings.codes(), ["mesh.repaired"]);
+        let (own, own_warnings) = slice(&objects, &[None, Some(solid)], &settings);
+        assert_eq!(own_warnings.codes(), warnings.codes());
+        // The object has the walls of the plate's repair (up to where they
+        // start and rounding: its region is cut out of the layer), and its
+        // settings on all of it.
+        let walls = |toolpaths: &Toolpaths| -> Vec<f64> {
+            toolpaths
+                .layers
+                .iter()
+                .map(|layer| {
+                    layer
+                        .paths
+                        .iter()
+                        .filter(|p| {
+                            p.points[0][0] > 100.0
+                                && matches!(p.kind, PathKind::OuterWall | PathKind::InnerWall)
+                        })
+                        .map(|p| {
+                            let mut length: f64 = p
+                                .points
+                                .windows(2)
+                                .map(|w| polygon::distance(w[0], w[1]))
+                                .sum();
+                            if p.closed {
+                                length +=
+                                    polygon::distance(p.points[0], p.points[p.points.len() - 1]);
+                            }
+                            length
+                        })
+                        .sum()
+                })
+                .collect()
+        };
+        let (own_walls, plain_walls) = (walls(&own), walls(&plain));
+        assert_eq!(own_walls.len(), plain_walls.len());
+        for (layer, (a, b)) in own_walls.iter().zip(&plain_walls).enumerate() {
+            assert!(*b > 0.0 && (a - b).abs() < 1e-3, "layer {layer}: {a} {b}");
+        }
+        use PathKind::*;
+        assert!(kinds(&plain.layers[50], false).contains(&SparseInfill));
+        assert_eq!(
+            kinds(&own.layers[50], false),
+            [OuterWall, InnerWall, SolidInfill]
+        );
     }
 
     #[test]

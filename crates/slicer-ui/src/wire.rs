@@ -362,10 +362,13 @@ fn write_stats(out: &mut Writer, stats: &Stats) {
         filament_volume_cm3,
         filament_weight_g,
         print_time_s,
+        time_start_end_s,
+        time_heating_s,
         extruders,
         flush_volume_cm3,
         flush_weight_g,
         times,
+        layer_filaments,
     } = stats;
     out.len(*layers);
     for value in [
@@ -373,6 +376,8 @@ fn write_stats(out: &mut Writer, stats: &Stats) {
         filament_volume_cm3,
         filament_weight_g,
         print_time_s,
+        time_start_end_s,
+        time_heating_s,
     ] {
         out.f64(*value);
     }
@@ -402,6 +407,15 @@ fn write_stats(out: &mut Writer, stats: &Stats) {
         out.u8(kind.map_or(NO_KIND, kind_code));
         out.f64(*seconds);
     }
+    out.len(layer_filaments.len());
+    for run in layer_filaments {
+        out.len(run.filaments.len());
+        for &filament in &run.filaments {
+            out.u32(filament);
+        }
+        out.len(run.first);
+        out.len(run.last);
+    }
 }
 
 fn read_stats(input: &mut Reader) -> Result<Stats, Malformed> {
@@ -411,6 +425,8 @@ fn read_stats(input: &mut Reader) -> Result<Stats, Malformed> {
         filament_volume_cm3: input.f64()?,
         filament_weight_g: input.f64()?,
         print_time_s: input.f64()?,
+        time_start_end_s: input.f64()?,
+        time_heating_s: input.f64()?,
         extruders: input.list(|input| {
             Ok(ExtruderStats {
                 extruder: input.u32()?,
@@ -428,6 +444,13 @@ fn read_stats(input: &mut Reader) -> Result<Stats, Malformed> {
                 code => Some(kind_from_code(code)?),
             };
             Ok((kind, input.f64()?))
+        })?,
+        layer_filaments: input.list(|input| {
+            Ok(slicer_formats::LayerFilaments {
+                filaments: input.list(Reader::u32)?,
+                first: input.len()?,
+                last: input.len()?,
+            })
         })?,
     })
 }
