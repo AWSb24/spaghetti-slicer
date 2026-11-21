@@ -36,6 +36,8 @@ pub const PROCESS_TABS: [ProcessTab; 5] = [
                     "adaptive_layers",
                     "min_layer_height",
                     "max_layer_height",
+                    "adaptive_layer_quality",
+                    "layer_height_max_change",
                 ],
             ),
             ("Line width", &["line_width"]),

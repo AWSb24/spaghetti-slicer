@@ -646,8 +646,10 @@ pub struct OwnSettings<'a> {
 /// equally thick, so a layer never crosses a bound; above the last bound
 /// the layers are as without ranges. Where the objects of a plate do not
 /// share the same ranges with layer heights, `slicing.range_layer_height_plate`
-/// says that they reach the other objects too; with adaptive layers the
-/// layer heights of ranges are ignored (`slicing.range_layer_height_adaptive`).
+/// says that they reach the other objects too. With adaptive layers the
+/// ranges keep their layer height and the layers outside them are
+/// adaptive; `layer_height_max_change` spreads changes of the layer height
+/// over several layers.
 ///
 /// Inside the modifiers `own.modifiers[i]` of object `i`, which are not
 /// printed, its layers print with the modifier's settings over those of
@@ -845,24 +847,22 @@ pub fn generate_plate_with_own_settings(
         mesh.translate(shift);
     }
 
-    if !layer_ranges.is_empty() {
-        if settings.adaptive_layers {
-            diagnostics.push(Diagnostic::warning(
-                "slicing.range_layer_height_adaptive",
-                "with adaptive layers (adaptive_layers) the layer heights of height ranges are ignored",
-            ));
-        } else if disagree {
-            diagnostics.push(Diagnostic::warning(
-                "slicing.range_layer_height_plate",
-                "the layer height of a height range sets the layers of the whole plate, so it reaches the other objects at that height too",
-            ));
-        }
+    if !layer_ranges.is_empty() && disagree {
+        diagnostics.push(Diagnostic::warning(
+            "slicing.range_layer_height_plate",
+            "the layer height of a height range sets the layers of the whole plate, so it reaches the other objects at that height too",
+        ));
     }
     // Without adaptive layers or layer heights of ranges layer i ends at
     // first_layer_height + i * layer_height. Every layer is cut at its
-    // mid-height.
-    let ranged = !layer_ranges.is_empty() && !settings.adaptive_layers;
-    let (tops, heights) = if settings.adaptive_layers {
+    // mid-height. Adaptive layers together with ranges, or either with a
+    // limit on the change from one layer to the next, take the smooth plan.
+    let ranged = !layer_ranges.is_empty();
+    let smooth = settings.adaptive_layers && ranged
+        || (settings.adaptive_layers || ranged) && settings.layer_height_max_change > 0.0;
+    let (tops, heights) = if smooth {
+        adaptive::smooth(&mesh, size[2], settings, &layer_ranges)
+    } else if settings.adaptive_layers {
         adaptive::plan(&mesh, size[2], settings)
     } else if ranged {
         adaptive::ranged(size[2], settings, &layer_ranges)
@@ -6034,6 +6034,34 @@ mod tests {
         assert!(
             solid_on_top > wanted - 1e-6 && solid_on_top < wanted + settings.max_layer_height,
             "{solid_on_top}"
+        );
+    }
+
+    #[test]
+    fn layer_height_change_limit_spreads_changes_over_layers() {
+        let mesh = slicer_core::primitives::sphere(15.0, 96);
+        let mut settings = adaptive();
+        settings.layer_height_max_change = 15.0;
+        let layers = generate(&mesh, &settings).unwrap().layers;
+        let (min, max) = (settings.min_layer_height, settings.max_layer_height);
+        for pair in layers[1..].windows(2) {
+            let (a, b) = (pair[0].height, pair[1].height);
+            assert!((a / b).max(b / a) < 1.15 + 1e-9, "{a} {b}");
+            assert!(b > min - 1e-9 && b < max + 1e-9, "{b}");
+        }
+        let height = mesh.bounds().unwrap().1[2] - mesh.bounds().unwrap().0[2];
+        let total: f64 = layers.iter().map(|l| l.height).sum();
+        assert!((total - height).abs() < 1e-9, "{total} {height}");
+        // Without adaptive layers or ranges the limit changes nothing.
+        let plain = Settings::default();
+        let limited = Settings {
+            layer_height_max_change: 15.0,
+            ..plain.clone()
+        };
+        let cube = Mesh::cuboid(10.0, 10.0, 5.0);
+        assert_eq!(
+            generate(&cube, &plain).unwrap(),
+            generate(&cube, &limited).unwrap()
         );
     }
 

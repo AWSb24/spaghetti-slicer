@@ -1576,15 +1576,26 @@ mod tests {
         assert!(first.iter().all(|l| (l.height - 0.2).abs() < 1e-9));
         assert!(second.iter().any(|l| (l.height - 0.1).abs() < 1e-9));
 
-        // Adaptive layers leave them out.
+        // With adaptive layers the range keeps its height and the layers
+        // below it stay adaptive (on vertical walls as thick as allowed).
         let adaptive = Settings {
             adaptive_layers: true,
             ..settings.clone()
         };
-        let (plain, _) = slice(&[cube(20.0)], &[], &adaptive);
+        let (plain, plain_warnings) = slice(&[cube(20.0)], &[], &adaptive);
         let (own, warnings) = slice_ranges(&[cube(20.0)], &[vec![thin]], &adaptive);
-        assert_eq!(own, plain);
-        assert_eq!(warnings.codes(), ["slicing.range_layer_height_adaptive"]);
+        assert_eq!(warnings.codes(), plain_warnings.codes());
+        let layers = &own.layers;
+        assert!((layers.last().unwrap().z - 20.0).abs() < 1e-9);
+        assert!(layers.iter().any(|l| (l.z - 10.0).abs() < 1e-9));
+        for layer in &layers[1..] {
+            if middle(layer) >= 10.0 {
+                assert!((layer.height - 0.1).abs() < 1e-9, "{}", layer.z);
+            } else {
+                assert!(layer.height > 0.29, "{}", layer.z);
+            }
+        }
+        assert!(layers.len() < plain.layers.len() + 100);
     }
 
     #[test]
