@@ -399,8 +399,8 @@ struct Context<'a> {
     filament_area: f64,
     several: bool,
     absolute: bool,
-    /// The print, for the speeds of its objects
-    /// ([`Toolpaths::settings_of`]).
+    /// The print, for the speeds of its objects and their height ranges
+    /// ([`Toolpaths::settings_on`]).
     toolpaths: &'a Toolpaths,
 }
 
@@ -835,7 +835,9 @@ fn write_layer(
         .paths
         .iter()
         .find(|p| !p.points.is_empty())
-        .map_or(settings, |p| context.toolpaths.settings_of(p, settings));
+        .map_or(settings, |p| {
+            context.toolpaths.settings_on(p, layer, settings)
+        });
     let start_fan = layer_fan(first, index, time);
     let _ = writeln!(
         w.out,
@@ -929,10 +931,11 @@ fn write_layer(
             w.move_z(layer.z);
             carry.restore_z = false;
         }
-        // Paths of an object print with its fan, flow, speeds and
-        // retraction, all others with the plate's; the travel after a path
-        // retracts as its object says.
-        let own = context.toolpaths.settings_of(path, settings);
+        // Paths of an object print with the fan, flow, speeds and
+        // retraction of the object and the height range of the layer, all
+        // others with the plate's; the travel after a path retracts as its
+        // object says.
+        let own = context.toolpaths.settings_on(path, layer, settings);
         w.retraction = Retraction::of(own);
         let bridge = path.kind == PathKind::Bridge;
         let wanted = match path.kind {
@@ -1088,7 +1091,7 @@ fn slowdown(
     let settings = w.settings;
     let goal = settings.min_layer_time;
     let fan_by_time = std::iter::once(settings)
-        .chain(&context.toolpaths.object_settings)
+        .chain(context.toolpaths.own_settings())
         .any(|s| s.fan_layer_time > 0.0);
     if goal <= 0.0 && !fan_by_time {
         return Ok((1.0, 0.0));
@@ -1161,7 +1164,10 @@ fn slowed(speed: f64, slow: f64, settings: &Settings) -> f64 {
 /// first layer), fan (`M106` only where the value changes) and flow ratio,
 /// and the travel after one of their paths retracts, wipes and lifts as
 /// its object says; the filament then goes forward again by as much and
-/// as fast as it was pulled back. Everything else prints with `settings`.
+/// as fast as it was pulled back. On the layers of a height range of an
+/// object with values of its own ([`Toolpaths::range_settings`]) those of
+/// the range count instead ([`Toolpaths::settings_on`]). Everything else
+/// prints with `settings`.
 // ponytail: the slowdown for `min_layer_time`, the shortest travel that
 // retracts, bridge and ironing flow and the speed of travel and wipe stay
 // the plate's; `fan_layer_time` of an object goes by the time of the whole
@@ -2662,6 +2668,158 @@ SET_PRESSURE_ADVANCE ADVANCE=0.04
             }
         }
         moves
+    }
+
+    /// Toolpaths of `objects` where they are, object `i` with the height
+    /// ranges `ranges[i]`.
+    fn plate_with_ranges(
+        objects: &[Mesh],
+        ranges: &[Vec<slicer_fdm::HeightRange>],
+        settings: &Settings,
+    ) -> Toolpaths {
+        let own = slicer_fdm::OwnSettings {
+            ranges,
+            ..slicer_fdm::OwnSettings::default()
+        };
+        slicer_fdm::generate_plate_with_own_settings(
+            objects,
+            own,
+            slicer_fdm::Placement::AsGiven,
+            settings,
+            &mut slicer_core::Diagnostics::new(),
+            &std::sync::atomic::AtomicBool::new(false),
+            &Progress::new(),
+        )
+        .unwrap()
+    }
+
+    /// For every layer above the first, whether its middle lies at least
+    /// 10 mm up, and the feed rates of its outer and inner walls with the
+    /// fan its other lines print with.
+    fn walls_and_fan(gcode: &str, first_layer: f64) -> Vec<(bool, Vec<f64>, Vec<f64>, String)> {
+        let mut layers: Vec<(bool, Vec<f64>, Vec<f64>, String)> = Vec::new();
+        let (mut z, mut kind, mut feed, mut fan) = (0.0, "", 0.0, String::new());
+        for line in gcode.lines() {
+            if let Some(height) = line.strip_prefix(";Z:") {
+                z = height.parse().unwrap();
+            }
+            if let Some(height) = line.strip_prefix(";HEIGHT:") {
+                let height: f64 = height.parse().unwrap();
+                if z > first_layer + 1e-6 {
+                    layers.push((
+                        z - height / 2.0 >= 10.0,
+                        Vec::new(),
+                        Vec::new(),
+                        String::new(),
+                    ));
+                }
+            }
+            if line.starts_with("M106") {
+                fan = line.to_owned();
+            }
+            if let Some(name) = line.strip_prefix(";TYPE:") {
+                kind = name;
+            }
+            if let Some(f) = word(line, 'F') {
+                feed = f;
+            }
+            let moving = word(line, 'X').is_some() || word(line, 'Y').is_some();
+            let extruding = moving && word(line, 'E').is_some_and(|e| e > 0.0);
+            let Some(layer) = layers
+                .last_mut()
+                .filter(|_| extruding && z > first_layer + 1e-6)
+            else {
+                continue;
+            };
+            match kind {
+                "Outer wall" => layer.1.push(feed),
+                "Inner wall" => layer.2.push(feed),
+                _ => {}
+            }
+            // Bridges and overhangs have fans of their own.
+            if ["Bridge", "Overhang wall"].contains(&kind) {
+                continue;
+            }
+            if layer.3.is_empty() {
+                layer.3.clone_from(&fan);
+            }
+            assert_eq!(layer.3, fan, "{line} at {z}");
+        }
+        layers
+    }
+
+    #[test]
+    fn height_ranges_print_at_their_own_speeds_and_fan() {
+        let mut cube = Mesh::cuboid(20.0, 20.0, 20.0);
+        cube.translate([90.0, 90.0, 0.0]);
+        let objects = [cube];
+        let settings = Settings {
+            min_layer_time: 0.0,
+            fan_layer_time: 0.0,
+            ..Settings::default()
+        };
+        let mut range = slicer_fdm::HeightRange::new(10.0, 20.0);
+        slicer_fdm::apply_range_toml(
+            &mut range,
+            &settings,
+            "outer_wall_speed = 15.0\nfan_speed = 30.0",
+        )
+        .unwrap();
+        let ranges = [vec![range]];
+        let plain = write_gcode(&plate(&objects, &[], &settings), &settings)
+            .unwrap()
+            .gcode;
+        // An object without ranges prints as before.
+        let without = plate_with_ranges(&objects, &[vec![]], &settings);
+        assert_eq!(write_gcode(&without, &settings).unwrap().gcode, plain);
+
+        let toolpaths = plate_with_ranges(&objects, &ranges, &settings);
+        let gcode = write_gcode(&toolpaths, &settings).unwrap().gcode;
+        let quiet = format!("M106 S{:.0}", 30.0 * 2.55);
+        let full = format!("M106 S{:.0}", settings.fan_speed * 2.55);
+        let layers = walls_and_fan(&gcode, settings.first_layer_height);
+        let inside = layers.iter().filter(|l| l.0).count();
+        assert!(inside > 40 && layers.len() - inside > 40, "{inside}");
+        for (inside, outer, inner, fan) in &layers {
+            let (speed, wanted_fan) = if *inside {
+                (15.0, &quiet)
+            } else {
+                (settings.outer_wall_speed, &full)
+            };
+            assert!(!outer.is_empty() && outer.iter().all(|&f| f == speed * 60.0));
+            assert!(inner.iter().all(|&f| f == settings.inner_wall_speed * 60.0));
+            assert_eq!(fan, wanted_fan);
+        }
+        // The lines are the same as without the range.
+        let moves = |gcode: &str| -> Vec<String> {
+            gcode
+                .lines()
+                .filter(|l| !l.starts_with(';') && !l.starts_with("M106"))
+                .map(|l| {
+                    let words = l.split_whitespace().filter(|w| !w.starts_with('F'));
+                    words.collect::<Vec<_>>().join(" ")
+                })
+                .filter(|l| l != "G1")
+                .collect()
+        };
+        assert_eq!(moves(&gcode), moves(&plain));
+
+        // The minimum layer time slows the walls of the range down like
+        // all others: outer and inner walls keep the ratio of their speeds.
+        let slow = Settings {
+            min_layer_time: 60.0,
+            min_print_speed: 1.0,
+            ..settings.clone()
+        };
+        let toolpaths = plate_with_ranges(&objects, &ranges, &slow);
+        let gcode = write_gcode(&toolpaths, &slow).unwrap().gcode;
+        for (inside, outer, inner, _) in walls_and_fan(&gcode, slow.first_layer_height) {
+            let speed = if inside { 15.0 } else { slow.outer_wall_speed };
+            let ratio = outer[0] / inner[0];
+            let expected = speed / slow.inner_wall_speed;
+            assert!((ratio - expected).abs() < 0.01, "{ratio} {expected}");
+            assert!(inner[0] < slow.inner_wall_speed * 60.0, "{}", inner[0]);
+        }
     }
 
     #[test]

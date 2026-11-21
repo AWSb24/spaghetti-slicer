@@ -7,7 +7,7 @@ use slicer_core::{Diagnose, Diagnostic, Mesh, Shapes, parallel_map, polygon};
 use slicer_profiles::{InfillPattern, Settings};
 
 use crate::plate::{self, Placement};
-use crate::{DEGENERATE_HEIGHT, MAX_HOLE_EDGES};
+use crate::{DEGENERATE_HEIGHT, MAX_HOLE_EDGES, ObjectRange};
 
 /// Process settings that an object on the plate may set for itself,
 /// overriding the plate's: walls and their seam, top and bottom shells,
@@ -50,13 +50,20 @@ pub const OBJECT_SETTINGS: &[&str] = &[
     "wipe_distance",
 ];
 
-/// Settings of [`OBJECT_SETTINGS`] that an object may also set for a range
-/// of its height (see [`HeightRange`]): walls and their seam, top and
-/// bottom shells, sparse infill and whether it gets supports. The speeds
-/// stay those of the whole object.
-// ponytail: speeds per height range would need the G-code writer to look
-// up the settings of a path by its layer as well as its object; the layer
-// height per range would need layers of different heights side by side.
+/// Settings that an object may also set for a range of its height (see
+/// [`HeightRange`]): all of [`OBJECT_SETTINGS`] (walls and their seam, top
+/// and bottom shells, sparse infill, whether it gets supports, and the
+/// speeds, fan, flow ratio and retraction that the G-code writer takes for
+/// every path by its object and layer, see [`crate::Toolpaths::settings_on`])
+/// and the layer height.
+///
+/// Layers are shared by the whole plate, so the layer height of a range
+/// sets the height of the layers of every object there (see
+/// [`crate::generate_plate_with_own_settings`]); with a single object, or
+/// objects printed one after the other, that is the object's own.
+// ponytail: layers of different heights side by side (a range of one
+// object with thinner layers than its neighbours) are not made; its layer
+// height reaches the whole plate.
 pub const RANGE_SETTINGS: &[&str] = &[
     "wall_loops",
     "wall_order",
@@ -69,6 +76,25 @@ pub const RANGE_SETTINGS: &[&str] = &[
     "infill_connect",
     "infill_overlap",
     "supports",
+    "outer_wall_speed",
+    "inner_wall_speed",
+    "infill_speed",
+    "bridge_speed",
+    "overhang_speed",
+    "overhang_speed_full",
+    "ironing_speed",
+    "fan_speed",
+    "bridge_fan_speed",
+    "overhang_fan_speed",
+    "fan_off_layers",
+    "fan_layer_time",
+    "fan_max_speed",
+    "flow_ratio",
+    "retraction_length",
+    "retraction_speed",
+    "z_hop",
+    "wipe_distance",
+    "layer_height",
 ];
 
 /// Settings of an object for a range of its height: every layer whose
@@ -447,17 +473,33 @@ pub fn object_settings(plate: &Settings, own: &Settings) -> Settings {
     with_writer_values(&merged, own)
 }
 
+/// `range`, the settings of a height range of an object whose settings
+/// are `object`, as the layout sees them: without the values only the
+/// G-code writer uses and without the layer height, which the layers of
+/// the whole plate follow (see [`layer_height_ranges`]).
+fn layout_values(range: &Settings, object: &Settings) -> Settings {
+    Settings {
+        layer_height: object.layer_height,
+        ..with_writer_values(range, object)
+    }
+}
+
 /// The settings of every object (`own[i]` over `plate` for object `i`, the
-/// plate's without) for [`crate::Toolpaths::object_settings`]; empty if
-/// every object prints with the plate's speeds, fan, flow and retraction,
-/// and in vase mode, which leaves the settings of objects out.
+/// plate's without) for [`crate::Toolpaths::object_settings`], and those
+/// of the height ranges `ranges[i]` of the objects whose speeds, fan, flow
+/// or retraction differ from those of their object, for
+/// [`crate::Toolpaths::range_settings`]. The table is empty if every object
+/// prints with the plate's speeds, fan, flow and retraction, the list if
+/// no range changes them; both are empty in vase mode, which leaves the
+/// settings of objects out.
 pub(crate) fn speed_table(
     count: usize,
     own: &[Option<Settings>],
+    ranges: &[Vec<HeightRange>],
     plate: &Settings,
-) -> Vec<Settings> {
+) -> (Vec<Settings>, Vec<ObjectRange>) {
     if plate.spiral_vase {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let table: Vec<Settings> = (0..count)
         .map(|index| match own.get(index) {
@@ -465,10 +507,56 @@ pub(crate) fn speed_table(
             _ => plate.clone(),
         })
         .collect();
-    if table.iter().all(|s| with_writer_values(s, plate) == *s) {
-        return Vec::new();
+    let mut found = Vec::new();
+    for (index, object) in table.iter().enumerate() {
+        for range in ranges.get(index).into_iter().flatten() {
+            let settings = with_writer_values(object, &range_settings(object, range));
+            if settings != *object {
+                found.push(ObjectRange {
+                    object: index as u32,
+                    from: range.from,
+                    to: range.to,
+                    settings,
+                });
+            }
+        }
     }
-    table
+    if table.iter().all(|s| with_writer_values(s, plate) == *s) {
+        return (Vec::new(), found);
+    }
+    (table, found)
+}
+
+/// The layer heights that the height ranges `ranges[i]` of the objects set
+/// (with `layer_height`, over `plate`'s), as (from, to, height) in the
+/// order of the objects and their ranges, so that later ones count where
+/// they overlap; and whether the objects disagree, that is whether some
+/// object gets a layer height of a range it does not have itself.
+pub(crate) fn layer_height_ranges(
+    count: usize,
+    ranges: &[Vec<HeightRange>],
+    plate: &Settings,
+) -> (Vec<(f64, f64, f64)>, bool) {
+    let of = |index: usize| -> Vec<(f64, f64, f64)> {
+        ranges
+            .get(index)
+            .into_iter()
+            .flatten()
+            .filter_map(|range| {
+                let (_, value) = range.values.iter().find(|(key, _)| key == "layer_height")?;
+                let mut settings = plate.clone();
+                settings.set("layer_height", value).ok()?;
+                Some((range.from, range.to, settings.layer_height))
+            })
+            .collect()
+    };
+    let own: Vec<Vec<(f64, f64, f64)>> = (0..count).map(of).collect();
+    let disagree = own.windows(2).any(|pair| pair[0] != pair[1]);
+    if disagree {
+        (own.into_iter().flatten().collect(), true)
+    } else {
+        (own.into_iter().next().unwrap_or_default(), false)
+    }
 }
 
 /// Layers a settings file in TOML form over `own`, the settings of one
@@ -518,9 +606,11 @@ pub fn apply_object_orca(own: &mut Settings, values: &[(String, String)]) -> Vec
 /// Object `i` has `own[i]` if given, otherwise the plate's, and the height
 /// ranges `ranges[i]` (none if the slice is shorter); ranges that change
 /// nothing are left out. Speeds, fan, flow and retraction do not count:
-/// every group has the plate's, and the G-code writer takes those of every
-/// object from [`speed_table`], so objects that differ only in them are
-/// laid out exactly as if they did not.
+/// every group and range has the plate's, and the G-code writer takes
+/// those of every object and range from [`speed_table`], so objects and
+/// ranges that differ only in them are laid out exactly as if they did
+/// not. Nor does the layer height of a range, which the layers of the
+/// whole plate follow ([`layer_height_ranges`]).
 pub(crate) fn groups(
     count: usize,
     own: &[Option<Settings>],
@@ -539,7 +629,7 @@ pub(crate) fn groups(
             .into_iter()
             .flatten()
             .filter_map(|range| {
-                let own = range_settings(&settings, range);
+                let own = layout_values(&range_settings(&settings, range), &settings);
                 (own != settings).then_some((range.from, range.to, own))
             })
             .collect();
@@ -1337,6 +1427,167 @@ mod tests {
     }
 
     #[test]
+    fn speeds_of_a_range_reach_only_the_writer() {
+        let settings = Settings {
+            skirt_loops: 0,
+            ..Settings::default()
+        };
+        let objects = [cube(20.0)];
+        let (plain, _) = slice(&objects, &[], &settings);
+        let fast = range(
+            10.0,
+            20.0,
+            &settings,
+            "outer_wall_speed = 15.0\nfan_speed = 30.0",
+        );
+        let (toolpaths, _) = slice_ranges(&objects, &[vec![fast.clone()]], &settings);
+        // The layers are the same; only the writer sees the range.
+        assert_eq!(toolpaths.layers, plain.layers);
+        assert!(toolpaths.object_settings.is_empty());
+        let [own] = toolpaths.range_settings.as_slice() else {
+            panic!("{:?}", toolpaths.range_settings);
+        };
+        assert_eq!((own.object, own.from, own.to), (0, 10.0, 20.0));
+        assert_eq!(
+            (own.settings.outer_wall_speed, own.settings.fan_speed),
+            (15.0, 30.0)
+        );
+        assert_eq!(own.settings.inner_wall_speed, settings.inner_wall_speed);
+        for layer in &toolpaths.layers {
+            let wall = layer.paths.iter().find(|p| p.kind == PathKind::OuterWall);
+            let wall = wall.unwrap();
+            assert_eq!(wall.object, 0);
+            let speed = toolpaths
+                .settings_on(wall, layer, &settings)
+                .outer_wall_speed;
+            let wanted = if middle(layer) >= 10.0 {
+                15.0
+            } else {
+                settings.outer_wall_speed
+            };
+            assert_eq!(speed, wanted, "{}", layer.z);
+            assert_eq!(toolpaths.settings_of(wall, &settings), &settings);
+        }
+
+        // Over the speeds of an object, on a plate of two: the other object
+        // keeps the plate's, the range starts from those of its object.
+        let objects = [cube(20.0), cube(140.0)];
+        let own = Settings {
+            inner_wall_speed: 20.0,
+            ..settings.clone()
+        };
+        let labelled = Settings {
+            label_objects: true,
+            ..settings.clone()
+        };
+        let (plain, _) = slice(&objects, &[], &labelled);
+        let mut diagnostics = Diagnostics::new();
+        let toolpaths = generate_plate_with_own_settings(
+            &objects,
+            OwnSettings {
+                objects: &[None, Some(own)],
+                ranges: &[vec![], vec![fast]],
+                ..OwnSettings::default()
+            },
+            Placement::AsGiven,
+            &settings,
+            &mut diagnostics,
+            &AtomicBool::new(false),
+            &Progress::new(),
+        )
+        .unwrap();
+        assert_eq!(toolpaths.layers, plain.layers);
+        assert_eq!(toolpaths.object_settings.len(), 2);
+        assert_eq!(toolpaths.range_settings.len(), 1);
+        let ranged = &toolpaths.range_settings[0];
+        assert_eq!(ranged.object, 1);
+        assert_eq!(
+            (
+                ranged.settings.outer_wall_speed,
+                ranged.settings.inner_wall_speed
+            ),
+            (15.0, 20.0)
+        );
+        let top = toolpaths.layers.last().unwrap();
+        for path in top.paths.iter().filter(|p| p.kind == PathKind::OuterWall) {
+            let speed = toolpaths.settings_on(path, top, &settings).outer_wall_speed;
+            let wanted = if path.object == 1 {
+                15.0
+            } else {
+                settings.outer_wall_speed
+            };
+            assert_eq!(speed, wanted);
+        }
+    }
+
+    #[test]
+    fn layer_heights_of_ranges_reach_the_whole_plate() {
+        let settings = Settings {
+            skirt_loops: 0,
+            ..Settings::default()
+        };
+        let objects = [cube(20.0)];
+        let (plain, plain_warnings) = slice(&objects, &[], &settings);
+        let thin = range(10.0, 20.0, &settings, "layer_height = 0.1");
+        let (toolpaths, warnings) = slice_ranges(&objects, &[vec![thin.clone()]], &settings);
+        assert_eq!(warnings.codes(), plain_warnings.codes());
+        let layers = &toolpaths.layers;
+        assert_eq!(layers.len(), 1 + 49 + 100);
+        for layer in &layers[1..] {
+            let wanted = if middle(layer) >= 10.0 { 0.1 } else { 0.2 };
+            assert!((layer.height - wanted).abs() < 1e-9, "{}", layer.z);
+        }
+        assert!((layers.last().unwrap().z - 20.0).abs() < 1e-9);
+        // Below the range the layers are as without it.
+        assert_eq!(layers[..50], plain.layers[..50]);
+        // The top shell keeps its thickness: five layers of 0.2 mm are ten
+        // of 0.1 mm.
+        let solid = |layer: &Layer| kinds(layer, true).contains(&PathKind::SolidInfill);
+        let count = layers.len();
+        assert!(layers[count - 10..].iter().all(solid));
+        assert!(kinds(&layers[count - 11], true).contains(&PathKind::SparseInfill));
+
+        // On a plate of two the range of one object reaches the other too,
+        // and says so; the same range on both does not.
+        let objects = [cube(20.0), cube(140.0)];
+        let (two, warnings) = slice_ranges(&objects, &[vec![], vec![thin.clone()]], &settings);
+        assert_eq!(two.layers.len(), layers.len());
+        assert!(
+            warnings
+                .codes()
+                .contains(&"slicing.range_layer_height_plate")
+        );
+        let both = [vec![thin.clone()], vec![thin.clone()]];
+        let (_, warnings) = slice_ranges(&objects, &both, &settings);
+        assert!(
+            !warnings
+                .codes()
+                .contains(&"slicing.range_layer_height_plate")
+        );
+        // Printed one after the other, every object has its own layers.
+        let sequential = Settings {
+            sequential_print: true,
+            ..settings.clone()
+        };
+        let (apart, warnings) = slice_ranges(&objects, &[vec![], vec![thin.clone()]], &sequential);
+        assert!(warnings.is_empty(), "{:?}", warnings.codes());
+        assert_eq!(apart.layers.len(), plain.layers.len() + layers.len());
+        let (first, second) = apart.layers.split_at(plain.layers.len());
+        assert!(first.iter().all(|l| (l.height - 0.2).abs() < 1e-9));
+        assert!(second.iter().any(|l| (l.height - 0.1).abs() < 1e-9));
+
+        // Adaptive layers leave them out.
+        let adaptive = Settings {
+            adaptive_layers: true,
+            ..settings.clone()
+        };
+        let (plain, _) = slice(&[cube(20.0)], &[], &adaptive);
+        let (own, warnings) = slice_ranges(&[cube(20.0)], &[vec![thin]], &adaptive);
+        assert_eq!(own, plain);
+        assert_eq!(warnings.codes(), ["slicing.range_layer_height_adaptive"]);
+    }
+
+    #[test]
     fn ranges_take_only_their_own_keys() {
         let object = Settings {
             wall_loops: 3,
@@ -1355,21 +1606,40 @@ mod tests {
         assert_eq!(layers.infill_density, 50.0);
         assert_eq!(layers.top_layers, 2);
         assert_eq!(layers.wall_loops, 3);
-        // Speeds and layer heights stay those of the object.
-        for text in ["infill_speed = 20.0", "layer_height = 0.1"] {
+        // Travel and line width stay those of the plate.
+        for text in ["travel_speed = 200.0", "line_width = 0.5"] {
             let error = apply_range_toml(&mut range, &object, text).unwrap_err();
             assert_eq!(error.code, "settings.not_per_range");
         }
         assert!(apply_range_toml(&mut range, &object, "wall_loops = -1").is_err());
         assert_eq!(range.values.len(), 2);
-        // Values set by hand outside the keys are ignored.
-        range.put("layer_height", "0.1".into());
+        // Speeds, fan, flow, retraction and the layer height may be set.
+        let text = "infill_speed = 20.0
+fan_speed = 30.0
+flow_ratio = 0.9
+layer_height = 0.1";
+        apply_range_toml(&mut range, &object, text).unwrap();
+        let layers = range_settings(&object, &range);
         assert_eq!(
-            range_settings(&object, &range).layer_height,
-            object.layer_height
+            (layers.infill_speed, layers.fan_speed, layers.flow_ratio),
+            (20.0, 30.0, 0.9)
         );
+        assert_eq!(layers.layer_height, 0.1);
+        // Values set by hand outside the keys are ignored.
+        range.put("travel_speed", "99".into());
+        assert_eq!(
+            range_settings(&object, &range).travel_speed,
+            object.travel_speed
+        );
+        // Every key of an object may be set per range, and the layer height.
         for key in RANGE_SETTINGS {
-            assert!(OBJECT_SETTINGS.contains(key), "{key}");
+            assert!(
+                OBJECT_SETTINGS.contains(key) || *key == "layer_height",
+                "{key}"
+            );
+        }
+        for key in OBJECT_SETTINGS {
+            assert!(RANGE_SETTINGS.contains(key), "{key}");
         }
         assert!(range.contains(10.0) && range.contains(19.99) && !range.contains(20.0));
     }
@@ -1383,6 +1653,8 @@ mod tests {
             ("wall_loops", "4"),
             ("layer_height", "0.1"),
             ("outer_wall_speed", "30"),
+            ("travel_speed", "300"),
+            ("line_width", "0.5"),
         ]
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1390,9 +1662,10 @@ mod tests {
         let skipped = apply_range_orca(&mut range, &object, &values);
         let layers = range_settings(&object, &range);
         assert_eq!((layers.infill_density, layers.wall_loops), (100.0, 4));
+        assert_eq!((layers.layer_height, layers.outer_wall_speed), (0.1, 30.0));
         let mut keys: Vec<&str> = skipped.iter().map(|(key, _)| key.as_str()).collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["layer_height", "outer_wall_speed"]);
+        assert_eq!(keys, ["line_width", "travel_speed"]);
         assert!(
             skipped
                 .iter()

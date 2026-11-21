@@ -482,6 +482,7 @@ mod tests {
                 },
             ],
             object_settings: Vec::new(),
+            range_settings: Vec::new(),
         };
         let by_kind = |path: &Path, _: usize, _: &Layer| path_color(path.kind);
         let strands = toolpath_strands(&toolpaths, 0.4, &[], by_kind);

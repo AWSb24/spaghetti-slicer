@@ -110,9 +110,12 @@ pub(crate) fn generate(
             layers.push(layer);
         }
     }
+    let (object_settings, range_settings) =
+        crate::objects::speed_table(objects.len(), own.objects, own.ranges, settings);
     Ok(Toolpaths {
         layers,
-        object_settings: crate::objects::speed_table(objects.len(), own.objects, settings),
+        object_settings,
+        range_settings,
     })
 }
 
