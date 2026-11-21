@@ -1465,3 +1465,83 @@ fn negative_volumes_cut_holes_into_their_objects() {
     assert!(!ok);
     assert_eq!(report["error"]["code"], "io.read");
 }
+
+#[test]
+fn parts_and_materials_print_with_their_own_extruders() {
+    let dir = workdir("part_extruders");
+    let cube = Mesh::cuboid(10.0, 10.0, 10.0);
+    let mut beside = cube.clone();
+    beside.translate([20.0, 0.0, 0.0]);
+    let slice = |input: &PathBuf, args: &[&str]| {
+        let output = dir.join("out.gcode");
+        let out = bin()
+            .arg("slice")
+            .arg(input)
+            .arg("-o")
+            .arg(&output)
+            .arg("--json")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let gcode = fs::read_to_string(&output).unwrap();
+        let changes = gcode.lines().filter(|l| *l == "T0" || *l == "T1").count();
+        let codes: Vec<String> = report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|w| w["code"].as_str().map(str::to_string))
+            .collect();
+        (changes, codes)
+    };
+
+    // A project with one object of two parts, the second on extruder 2.
+    let model = format!(
+        "<?xml version=\"1.0\"?><model unit=\"millimeter\" xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\"><resources><object id=\"1\" type=\"model\">{}</object><object id=\"2\" type=\"model\">{}</object><object id=\"3\" type=\"model\"><components><component objectid=\"1\"/><component objectid=\"2\"/></components></object></resources><build><item objectid=\"3\" transform=\"1 0 0 0 1 0 0 0 1 80 100 0\"/></build></model>",
+        mesh_element(&cube),
+        mesh_element(&beside)
+    );
+    let parts = |extruder: u32| {
+        format!(
+            "<config><object id=\"3\"><metadata key=\"name\" value=\"Two\"/><metadata key=\"extruder\" value=\"1\"/><part id=\"1\" subtype=\"normal_part\"/><part id=\"2\" subtype=\"normal_part\"><metadata key=\"extruder\" value=\"{extruder}\"/></part></object></config>"
+        )
+    };
+    let project = |extruder: u32| {
+        let path = dir.join(format!("parts{extruder}.3mf"));
+        let package = slicer_formats::write_package(&[
+            ("3D/3dmodel.model", &model),
+            ("Metadata/model_settings.config", &parts(extruder)),
+        ])
+        .unwrap();
+        fs::write(&path, package).unwrap();
+        path
+    };
+    let two = ["--set", "extruder_count=2"];
+    let (changes, codes) = slice(&project(2), &two);
+    assert!(changes >= 10, "{changes}");
+    assert!(codes.is_empty(), "{codes:?}");
+    // Only the first tool is selected when the part names extruder 1.
+    let (changes, _) = slice(&project(1), &two);
+    assert!(changes <= 1, "{changes}");
+
+    // A plain 3MF with two base materials on the triangles of one object.
+    let materials = format!(
+        "<?xml version=\"1.0\"?><model unit=\"millimeter\" xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\"><resources><basematerials id=\"1\"><base name=\"White\" displaycolor=\"#FFFFFF\"/><base name=\"Black\" displaycolor=\"#000000\"/></basematerials><object id=\"2\" type=\"model\" pid=\"1\" pindex=\"0\">{}</object><object id=\"3\" type=\"model\" pid=\"1\" pindex=\"1\">{}</object></resources><build><item objectid=\"2\"/><item objectid=\"3\"/></build></model>",
+        mesh_element(&cube),
+        mesh_element(&beside)
+    );
+    let path = dir.join("materials.3mf");
+    fs::write(
+        &path,
+        slicer_formats::write_package(&[("3D/3dmodel.model", &materials)]).unwrap(),
+    )
+    .unwrap();
+    let (changes, codes) = slice(&path, &two);
+    assert!(changes >= 10, "{changes}");
+    assert_eq!(codes, ["model.materials"]);
+    // With one extruder everything prints with it, as the warning says.
+    let (changes, codes) = slice(&path, &[]);
+    assert!(changes <= 1, "{changes}");
+    assert_eq!(codes, ["model.materials", "slicing.multiple_extruders"]);
+}
