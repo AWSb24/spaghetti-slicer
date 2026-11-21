@@ -133,7 +133,8 @@ const MAPPING: &[(&str, &str, Kind)] = &[
     ("brim_type", "brim_width", Kind::BrimType),
     ("enable_support", "supports", Kind::Flag),
     // ponytail: Orca's 0 (no gap, for soluble supports) becomes one layer
-    // here, since supports always keep at least one layer away.
+    // here unless `support_soluble` is set, which has no Orca key of its
+    // own (Orca marks the filament as soluble instead).
     (
         "support_top_z_distance",
         "support_top_z_distance",
@@ -147,6 +148,13 @@ const MAPPING: &[(&str, &str, Kind)] = &[
     (
         "support_object_xy_distance",
         "support_xy_distance",
+        Kind::Number,
+    ),
+    // Filaments counted from 1, 0 for the default, as our extruders.
+    ("support_filament", "support_extruder", Kind::Number),
+    (
+        "support_interface_filament",
+        "support_interface_extruder",
         Kind::Number,
     ),
     ("outer_wall_speed", "outer_wall_speed", Kind::Number),
@@ -524,6 +532,13 @@ mod tests {
         assert_eq!(settings.support_top_z_distance, 0.16);
         assert_eq!(settings.support_bottom_z_distance, 0.2);
         assert_eq!(settings.support_xy_distance, 0.5);
+
+        // The filaments of supports and their interface.
+        let filaments = r#"{ "support_filament": "2", "support_interface_filament": "0" }"#;
+        let filaments = import_orca(filaments, &mut settings).unwrap();
+        assert!(filaments.skipped.is_empty());
+        assert_eq!(settings.support_extruder, 2);
+        assert_eq!(settings.support_interface_extruder, 0);
     }
 
     #[test]

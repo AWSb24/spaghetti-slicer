@@ -225,14 +225,28 @@ fn contact_points(hanging: &Shapes, spacing: f64) -> Vec<(Point, f64)> {
 /// Where tree supports go on every layer: under every overhang, starting
 /// on the layers of `starts` (what hangs free the gap above them),
 /// `interface` layers of its own shape (the dense interface), below that
-/// the branches, all of it clear of `keep_out`.
+/// the branches, all of it clear of `keep_out`. The branches also keep out
+/// of `blockers` (support blockers, on every layer) as they keep out of the
+/// model, and are cut off where they cannot.
 pub(crate) fn areas(
     starts: &[Shapes],
     keep_out: &[Shapes],
+    blockers: Option<&[Shapes]>,
     cut_heights: &[f64],
     settings: &Settings,
 ) -> Vec<Shapes> {
-    let branches = branches(starts, keep_out, cut_heights, settings);
+    let avoid: Vec<Shapes>;
+    let clear = match blockers {
+        Some(blockers) => {
+            avoid = parallel_map(starts.len(), |index| match blockers.get(index) {
+                Some(blocker) if !blocker.is_empty() => polygon::union(&keep_out[index], blocker),
+                _ => keep_out[index].clone(),
+            });
+            avoid.as_slice()
+        }
+        None => keep_out,
+    };
+    let branches = branches(starts, clear, cut_heights, settings);
     let interface = settings.support_interface_layers as usize;
     let circle: Vec<(f64, f64)> = (0..CIRCLE_SEGMENTS)
         .map(|k| {
@@ -256,6 +270,12 @@ pub(crate) fn areas(
             })
             .collect();
         let mut area = polygon::from_oriented_loops(&circles);
+        if let Some(blocker) = blockers
+            .and_then(|blockers| blockers.get(index))
+            .filter(|blocker| !blocker.is_empty() && !area.is_empty())
+        {
+            area = polygon::difference(&area, blocker);
+        }
         for above in starts.iter().skip(index).take(interface) {
             area = polygon::union(&area, above);
         }

@@ -770,7 +770,8 @@ pub fn generate_plate_with_own_settings(
         used = mesh.used_extruders();
     }
     // With one extruder it prints everything, the lowest one the model asks
-    // for. Otherwise this one prints skirt, brim and supports.
+    // for. Otherwise this one prints skirt and brim, and supports unless
+    // `support_extruder` names another one.
     let extruder = used.first().copied().unwrap_or(0);
     if used.len() > 1 && count == 1 {
         let list: Vec<String> = used.iter().map(|e| (e + 1).to_string()).collect();
@@ -787,6 +788,37 @@ pub fn generate_plate_with_own_settings(
             .with("extruder", extruder + 1),
         );
     }
+    // The extruders of supports and of their interface.
+    let mut pick = |key: &str, setting: u32, fallback: u32| -> u32 {
+        if setting == 0 || !(any_supports || enforcing) {
+            return fallback;
+        }
+        if setting > count {
+            diagnostics.push(
+                Diagnostic::warning(
+                    "slicing.missing_support_extruder",
+                    format!(
+                        "{key} asks for extruder {setting}, but the printer has {count} (extruder_count); it is printed with extruder {}",
+                        fallback + 1
+                    ),
+                )
+                .with("key", key)
+                .with("extruder", setting)
+                .with("extruder_count", count),
+            );
+            return fallback;
+        }
+        if count > 1 { setting - 1 } else { fallback }
+    };
+    let support_tool = pick("support_extruder", settings.support_extruder, extruder);
+    let interface_tool = pick(
+        "support_interface_extruder",
+        settings.support_interface_extruder,
+        support_tool,
+    );
+    // Where another material touches the model, the loops around the
+    // supports there are interface too.
+    let interface_loops = settings.support_soluble || interface_tool != support_tool;
     let (min, max) = mesh.bounds().ok_or(FdmError::EmptyModel)?;
     let size = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
     let volume = [
@@ -974,7 +1006,15 @@ pub fn generate_plate_with_own_settings(
             }
             carried
         });
-        support_areas(&slices, &carried, &cut_heights, settings)
+        let blockers = masks.as_ref().and_then(|masks| masks.blockers());
+        support_areas(
+            &slices,
+            &carried,
+            &heights,
+            &cut_heights,
+            blockers,
+            settings,
+        )
     } else {
         Vec::new()
     };
@@ -1025,13 +1065,28 @@ pub fn generate_plate_with_own_settings(
         return Err(FdmError::Cancelled);
     }
     // What every extruder prints on a layer, in ascending order of the
-    // extruders; skirt, brim and supports go first with the lowest one.
+    // extruders; skirt and brim go first with the lowest one, supports and
+    // their interface with theirs.
     let geometry = parallel_map(slices.len(), |index| {
         if stopped() {
             return (Vec::new(), false);
         }
         progress.advance();
-        let mut groups = vec![(extruder, shared_work(&slices, &supports, index, settings))];
+        let shared = shared_work(&slices, &supports, index, settings, interface_loops);
+        let mut groups = vec![(extruder, shared.adhesion)];
+        if support_tool == extruder && interface_tool == extruder {
+            groups[0].1.extend(shared.support);
+            groups[0].1.extend(shared.interface);
+        } else {
+            // Nothing to print is no reason for a tool change.
+            for (e, work) in [
+                (support_tool, shared.support),
+                (interface_tool, shared.interface),
+            ] {
+                let work: Vec<Work> = work.into_iter().filter(|w| !w.is_empty()).collect();
+                add_work(&mut groups, e, work);
+            }
+        }
         // The settings of a group on this layer, by the height of its middle.
         let z = cut_heights[index];
         if regions.is_empty() {
@@ -1047,7 +1102,10 @@ pub fn generate_plate_with_own_settings(
                 layer_settings,
                 &inside,
             );
-            groups[0].1.extend(work);
+            add_work(&mut groups, extruder, work);
+            if groups.len() > 1 {
+                groups.retain(|(_, work)| !work.is_empty());
+            }
             return (groups, thin);
         }
         let mut thin = false;
@@ -1068,10 +1126,7 @@ pub fn generate_plate_with_own_settings(
                 &inside,
             );
             thin |= region_thin;
-            match groups.iter_mut().find(|(g, _)| g == e) {
-                Some(group) => group.1.extend(work),
-                None => groups.push((*e, work)),
-            }
+            add_work(&mut groups, *e, work);
         }
         groups.retain(|(_, work)| !work.is_empty());
         (groups, thin)
@@ -1921,47 +1976,71 @@ fn travels_inside(layer: &Layer, slice: &Shapes) -> Vec<bool> {
 /// right under a carried surface, `support_interface_layers` deep, and with
 /// `support_bottom_interface_layers` what lies that many layers above the
 /// model a support stands on. Tree supports (`support_style = tree`)
-/// replace the columns below the dense part by branches.
-// ponytail: the gaps are whole layers, counted with `layer_height`; with
-// adaptive layers or layer heights of height ranges they are as many
-// layers as at the fixed height, so as thin or thick as the layers there.
+/// replace the columns below the dense part by branches, which keep out of
+/// `blockers` (the support blockers on every layer, see
+/// [`support_volumes::SupportMasks::blockers`]) except straight below the
+/// overhangs they carry.
+// ponytail: straight columns do not avoid blockers; those under the
+// overhangs of other objects pass through them.
 fn support_areas(
     slices: &[Shapes],
     hanging: &[Shapes],
+    heights: &[f64],
     cut_heights: &[f64],
+    blockers: Option<&[Shapes]>,
     settings: &Settings,
 ) -> Vec<(Shapes, Shapes)> {
-    let top = gap_layers(settings.support_top_z_distance, settings.layer_height);
-    let bottom = gap_layers(settings.support_bottom_z_distance, settings.layer_height);
+    let top = gap_layers(settings.support_top_z_distance, heights, settings);
+    let bottom = gap_layers(settings.support_bottom_z_distance, heights, settings);
     let xy = support_xy_distance(settings);
     // Where no support may be depends only on the model, so all cores work
     // on it; the supports themselves grow downwards layer by layer.
     let keep_out = parallel_map(slices.len(), |index| {
         let mut model = slices[index].clone();
-        for below in slices[..index].iter().rev().take(bottom) {
+        for below in slices[..index].iter().rev().take(bottom[index]) {
             model = polygon::union(&model, below);
         }
-        polygon::offset(&model, xy)
+        if xy > 0.0 {
+            polygon::offset(&model, xy)
+        } else {
+            model
+        }
     });
-    // What hangs free `top` empty layers above every layer: where the
-    // supports start. Model in the gap below an overhang (other than in the
-    // empty layer right under it) leaves no room for a support.
+    // The overhangs whose supports end on every layer: those `top[j]`
+    // empty layers above it.
+    let mut ending: Vec<Vec<usize>> = vec![Vec::new(); slices.len()];
+    for (j, &gap) in top.iter().enumerate() {
+        if let Some(index) = j.checked_sub(gap + 1) {
+            ending[index].push(j);
+        }
+    }
+    // What hangs free that far above every layer: where the supports
+    // start. Model in the gap below an overhang (other than in the empty
+    // layer right under it) leaves no room for a support.
     let starts = parallel_map(slices.len(), |index| {
-        let Some(above) = hanging.get(index + 1 + top) else {
-            return Vec::new();
-        };
-        let mut start = above.clone();
-        for gap in &slices[index + 1..index + top] {
-            if start.is_empty() {
-                break;
+        let mut start: Shapes = Vec::new();
+        for &j in &ending[index] {
+            let mut part = hanging[j].clone();
+            for gap in slices.get(index + 1..j - 1).unwrap_or_default() {
+                if part.is_empty() {
+                    break;
+                }
+                part = polygon::difference(&part, gap);
             }
-            start = polygon::difference(&start, gap);
+            start = if start.is_empty() {
+                part
+            } else {
+                polygon::union(&start, &part)
+            };
         }
         start
     });
     let areas = match settings.support_style {
         SupportStyle::Normal => column_areas(&starts, &keep_out),
-        SupportStyle::Tree => tree::areas(&starts, &keep_out, cut_heights, settings),
+        SupportStyle::Tree => {
+            let clear = blockers.map(|blockers| clear_of_blockers(blockers, &starts));
+            tree::areas(&starts, &keep_out, clear.as_deref(), cut_heights, settings)
+        }
     };
     let dense_layers = settings.support_interface_layers as usize;
     let bottom_layers = settings.support_bottom_interface_layers as usize;
@@ -1975,7 +2054,7 @@ fn support_areas(
             // A support stands on the model `bottom` empty layers above it,
             // so the model that many layers and one more down and the
             // layers below that mark where it stands.
-            let under = &slices[..index.saturating_sub(bottom)];
+            let under = &slices[..index.saturating_sub(bottom[index])];
             for below in under.iter().rev().take(bottom_layers) {
                 carried = polygon::union(&carried, below);
             }
@@ -1985,22 +2064,78 @@ fn support_areas(
     })
 }
 
-/// How many empty layers a gap of `distance` millimetres between support
-/// and model leaves: one for 0, otherwise the distance in layers of
-/// `layer_height`, rounded, at least one.
-// ponytail: no gap at all (soluble supports) cannot be asked for.
-fn gap_layers(distance: f64, layer_height: f64) -> usize {
-    if distance <= 0.0 || layer_height <= 0.0 {
-        return 1;
+/// The support blockers `blockers` on every layer without what lies
+/// straight below the supported overhangs above it (`starts`, see
+/// [`support_areas`]): there the overhangs of other objects carry their
+/// supports through a blocker (only the overhangs of its own object are
+/// blocked), and everywhere else branches keep out of it.
+fn clear_of_blockers(blockers: &[Shapes], starts: &[Shapes]) -> Vec<Shapes> {
+    let footprint = blockers
+        .iter()
+        .filter(|area| !area.is_empty())
+        .fold(Vec::new(), |all, area| polygon::union(&all, area));
+    let mut shadow: Shapes = Vec::new();
+    let mut clear = vec![Vec::new(); blockers.len()];
+    for index in (0..blockers.len()).rev() {
+        if let Some(start) = starts.get(index).filter(|start| !start.is_empty()) {
+            let inside = polygon::intersection(start, &footprint);
+            if !inside.is_empty() {
+                shadow = polygon::union(&shadow, &inside);
+            }
+        }
+        clear[index] = if shadow.is_empty() || blockers[index].is_empty() {
+            blockers[index].clone()
+        } else {
+            polygon::difference(&blockers[index], &shadow)
+        };
     }
-    // At most 10 mm over at least 0.02 mm (see `Settings::limits`).
-    ((distance / layer_height + 0.5).floor() as usize).max(1)
+    clear
+}
+
+/// For every layer, how many empty layers right below it a gap of
+/// `distance` millimetres between support and model takes: one for 0
+/// (none with `support_soluble`), otherwise the distance in layers,
+/// rounded, at least one (or none with `support_soluble`). Where all
+/// layers above the first are `layer_height` thick, the distance is
+/// divided by it; otherwise the layers below are counted while the
+/// distance reaches at least to the middle of the next one, so that the
+/// gap comes as close to the distance as their heights allow.
+// ponytail: with layers of `layer_height` the first layer counts as one
+// layer whatever its thickness, as before.
+fn gap_layers(distance: f64, heights: &[f64], settings: &Settings) -> Vec<usize> {
+    let least = usize::from(!settings.support_soluble);
+    let layer_height = settings.layer_height;
+    if distance <= 0.0 || layer_height <= 0.0 {
+        return vec![least; heights.len()];
+    }
+    if heights.iter().skip(1).all(|&h| h == layer_height) {
+        // At most 10 mm over at least 0.02 mm (see `Settings::limits`).
+        let layers = ((distance / layer_height + 0.5).floor() as usize).max(least);
+        return vec![layers; heights.len()];
+    }
+    (0..heights.len())
+        .map(|index| {
+            let (mut sum, mut count) = (0.0, 0);
+            for &below in heights[..index].iter().rev() {
+                if sum + 0.5 * below > distance {
+                    break;
+                }
+                sum += below;
+                count += 1;
+            }
+            count.max(least)
+        })
+        .collect()
 }
 
 /// Distance between supports and the sides of the model:
-/// `support_xy_distance`, or one line width for 0.
+/// `support_xy_distance`, or for 0 one line width (none with
+/// `support_soluble`).
+// ponytail: even without a gap a support stays half a line width away
+// from a wall right below the surface it carries, since that much of the
+// surface counts as carried by the wall (see `hanging` in `generate`).
 fn support_xy_distance(settings: &Settings) -> f64 {
-    if settings.support_xy_distance > 0.0 {
+    if settings.support_xy_distance > 0.0 || settings.support_soluble {
         settings.support_xy_distance
     } else {
         settings.line_width
@@ -2042,6 +2177,20 @@ fn tidy_support(area: Shapes) -> Shapes {
         .collect()
 }
 
+/// Adds `work` to what extruder `e` prints in `groups`, which stay in
+/// ascending order of the extruders; nothing for no work.
+fn add_work(groups: &mut Vec<(u32, Vec<Work>)>, e: u32, work: Vec<Work>) {
+    if let Some(group) = groups.iter_mut().find(|(g, _)| *g == e) {
+        group.1.extend(work);
+    } else if !work.is_empty() {
+        let at = groups
+            .iter()
+            .position(|(g, _)| *g > e)
+            .unwrap_or(groups.len());
+        groups.insert(at, (e, work));
+    }
+}
+
 /// Geometry of one kind that still has to be put in printing order.
 enum Work {
     /// Closed loops, their kind, the shortest loop worth printing and
@@ -2060,39 +2209,88 @@ enum Work {
     Ordered(Vec<[Point; 2]>, PathKind),
 }
 
+impl Work {
+    /// Whether there is nothing to print.
+    fn is_empty(&self) -> bool {
+        match self {
+            Work::Loops(loops, ..) => loops.is_empty(),
+            Work::Lines(lines, ..) | Work::Ordered(lines, ..) => lines.is_empty(),
+            Work::Polylines(lines, ..) => lines.is_empty(),
+            Work::Centred(lines, ..) => lines.is_empty(),
+        }
+    }
+}
+
 /// A line along the middle of a region too narrow for a wall: its points,
 /// whether it returns to its first point, and the width it is extruded
 /// with.
 type CentreLine = (Vec<Point>, bool, f64);
 
+/// What a layer prints for the whole model, whatever extruder its parts
+/// take, kept apart by what may print with an extruder of its own.
+struct SharedWork {
+    /// Skirt and brim on the first layer.
+    adhesion: Vec<Work>,
+    /// The supports below their interface (`support_extruder`).
+    support: Vec<Work>,
+    /// The dense interface (`support_interface_extruder`).
+    interface: Vec<Work>,
+}
+
 /// Generates what a layer prints for the whole model, whatever extruder its
-/// parts take: skirt and brim on the first layer, and supports.
+/// parts take: skirt and brim on the first layer, and supports. With
+/// `interface_loops` the loop around a support piece that lies (nearly)
+/// all in the dense interface belongs to the interface too.
 fn shared_work(
     slices: &[Shapes],
     supports: &[(Shapes, Shapes)],
     index: usize,
     settings: &Settings,
-) -> Vec<Work> {
+    interface_loops: bool,
+) -> SharedWork {
     let width = settings.line_width;
-    let mut work = Vec::new();
+    let mut shared = SharedWork {
+        adhesion: Vec::new(),
+        support: Vec::new(),
+        interface: Vec::new(),
+    };
     let support = supports.get(index).filter(|(area, _)| !area.is_empty());
     if index == 0 {
         adhesion_work(
             &slices[0],
             support.map(|(area, _)| area),
             settings,
-            &mut work,
+            &mut shared.adhesion,
         );
     }
     if let Some((area, dense)) = support {
         // A loop around every support holds its lines together and makes
         // sure that a support too narrow for a line is printed at all.
         let inner = polygon::offset(area, -0.5 * width);
-        let loops = contours(&inner)
-            .iter()
-            .map(|contour| polygon::simplify(contour, PATH_RESOLUTION))
-            .collect();
-        work.push(Work::Loops(
+        let simplified = |shapes: &Shapes| -> Vec<Contour> {
+            contours(shapes)
+                .iter()
+                .map(|contour| polygon::simplify(contour, PATH_RESOLUTION))
+                .collect()
+        };
+        let loops = if interface_loops && !dense.is_empty() {
+            let (under, rest): (Shapes, Shapes) = inner
+                .iter()
+                .cloned()
+                .partition(|shape| lies_in(shape, dense));
+            if !under.is_empty() {
+                shared.interface.push(Work::Loops(
+                    simplified(&under),
+                    PathKind::SupportInterface,
+                    width,
+                    SeamPosition::Nearest,
+                ));
+            }
+            simplified(&rest)
+        } else {
+            simplified(&inner)
+        };
+        shared.support.push(Work::Loops(
             loops,
             PathKind::Support,
             width,
@@ -2105,15 +2303,24 @@ fn shared_work(
             HatchDirection::Diagonal45,
             0.5 * width,
         );
-        work.push(Work::Lines(lines, PathKind::Support, 0.0));
+        shared
+            .support
+            .push(Work::Lines(lines, PathKind::Support, 0.0));
         interface_work(
             &polygon::intersection(&inner, dense),
             index,
             settings,
-            &mut work,
+            &mut shared.interface,
         );
     }
-    work
+    shared
+}
+
+/// Whether at most a tenth of `shape` lies outside `area`.
+fn lies_in(shape: &polygon::Shape, area: &Shapes) -> bool {
+    let shape = vec![shape.clone()];
+    let outside = polygon::area(&polygon::difference(&shape, area));
+    outside <= 0.1 * polygon::area(&shape)
 }
 
 /// The dense interface of a support in `area` (where the middles of its
@@ -2124,7 +2331,10 @@ fn shared_work(
 /// one below it.
 // ponytail: concentric loops leave out narrow tails of wider parts of the
 // interface (parts too narrow for any loop get lines instead), and the
-// loop around the whole support stays support. The direction goes by the
+// loop around the whole support stays support unless the supports are
+// soluble or the interface has an extruder of its own (then the loops of
+// support pieces that lie nearly all in the interface are interface). The
+// direction goes by the
 // number of the layer, so on every other layer the lowest interface layer
 // runs along the lines of the support below it instead of across them.
 fn interface_work(area: &Shapes, index: usize, settings: &Settings, work: &mut Vec<Work>) {
@@ -5145,6 +5355,303 @@ mod tests {
         };
         let (spiral, _) = tee_with(vec![SupportVolume::enforcer(right)], &vase);
         assert!(support_layers(&spiral).is_empty());
+    }
+
+    #[test]
+    fn soluble_supports_touch_the_model() {
+        let (t, h) = tee_models();
+        for style in [SupportStyle::Normal, SupportStyle::Tree] {
+            let settings = Settings {
+                supports: true,
+                support_style: style,
+                support_soluble: true,
+                ..Settings::default()
+            };
+            // No empty layer under the plate (layer 50): the interface is
+            // right below it.
+            let toolpaths = generate(&t, &settings).unwrap();
+            assert_eq!(
+                support_layers(&toolpaths),
+                (0..50).collect::<Vec<usize>>(),
+                "{style:?}"
+            );
+            assert_eq!(
+                layers_with(&toolpaths, PathKind::SupportInterface),
+                [48, 49],
+                "{style:?}"
+            );
+            // The top layer is interface only, its loops included.
+            assert!(
+                toolpaths.layers[49]
+                    .paths
+                    .iter()
+                    .all(|p| p.kind != PathKind::Support),
+                "{style:?}"
+            );
+            // Nor any gap to the sides beyond what the column carries
+            // itself (half a line width): the outermost lines run a line
+            // width from the column (x 105 to 115).
+            let nearest = toolpaths.layers[..49]
+                .iter()
+                .flat_map(|layer| points_of(layer, &SUPPORT_KINDS))
+                .map(|p| (105.0 - p[0]).max(p[0] - 115.0))
+                .fold(f64::MAX, f64::min);
+            assert!(
+                (nearest - settings.line_width).abs() < 0.02,
+                "{style:?} {nearest}"
+            );
+            // Standing on the base (layers 0 to 9) right on top of it.
+            let toolpaths = generate(&h, &settings).unwrap();
+            assert_eq!(
+                support_layers(&toolpaths),
+                (10..60).collect::<Vec<usize>>(),
+                "{style:?}"
+            );
+            // A gap asked for is still kept, rounded down to none where
+            // it is less than half a layer.
+            let gapped = Settings {
+                support_top_z_distance: 0.4,
+                support_bottom_z_distance: 0.05,
+                ..settings.clone()
+            };
+            let toolpaths = generate(&h, &gapped).unwrap();
+            assert_eq!(
+                support_layers(&toolpaths),
+                (10..58).collect::<Vec<usize>>(),
+                "{style:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn supports_print_with_their_own_extruders() {
+        let (t, _) = tee_models();
+        let two = Settings {
+            supports: true,
+            support_soluble: true,
+            extruder_count: 2,
+            ..Settings::default()
+        };
+        // The extruders of every kind of path.
+        let tools = |toolpaths: &Toolpaths, kinds: &[PathKind]| -> Vec<u32> {
+            let mut tools: Vec<u32> = toolpaths
+                .layers
+                .iter()
+                .flat_map(|layer| &layer.paths)
+                .filter(|p| kinds.contains(&p.kind))
+                .map(|p| p.extruder)
+                .collect();
+            tools.sort_unstable();
+            tools.dedup();
+            tools
+        };
+        let walls = [PathKind::OuterWall, PathKind::InnerWall];
+        // By default everything prints with the first extruder and nothing
+        // primes.
+        let plain = generate(&t, &two).unwrap();
+        assert_eq!(tools(&plain, &SUPPORT_KINDS), [0]);
+        assert!(tools(&plain, &[PathKind::PrimeTower]).is_empty());
+
+        // Supports with the second: the layers with supports change tools
+        // and prime into the tower, up to the last one with supports.
+        let second = Settings {
+            support_extruder: 2,
+            ..two.clone()
+        };
+        let toolpaths = generate(&t, &second).unwrap();
+        assert_eq!(tools(&toolpaths, &SUPPORT_KINDS), [1]);
+        assert_eq!(tools(&toolpaths, &walls), [0]);
+        assert_eq!(support_layers(&toolpaths), support_layers(&plain));
+        let towers = layers_with(&toolpaths, PathKind::PrimeTower);
+        assert_eq!(towers, (0..50).collect::<Vec<usize>>());
+        // Only the interface with the second: the supports below it and
+        // the loops around them keep the first, the top layer has no
+        // support lines of the first extruder touching the plate.
+        let interface = Settings {
+            support_soluble: false,
+            support_interface_extruder: 2,
+            ..two.clone()
+        };
+        let toolpaths = generate(&t, &interface).unwrap();
+        assert_eq!(tools(&toolpaths, &[PathKind::Support]), [0]);
+        assert_eq!(tools(&toolpaths, &[PathKind::SupportInterface]), [1]);
+        let top = layers_with(&toolpaths, PathKind::SupportInterface);
+        assert_eq!(top, [47, 48]);
+        assert!(
+            toolpaths.layers[48]
+                .paths
+                .iter()
+                .all(|p| p.kind != PathKind::Support)
+        );
+        assert_eq!(
+            layers_with(&toolpaths, PathKind::PrimeTower),
+            (0..49).collect::<Vec<usize>>()
+        );
+
+        // An extruder the printer does not have is reported.
+        let missing = Settings {
+            support_extruder: 3,
+            ..two.clone()
+        };
+        let mut warnings = Diagnostics::new();
+        let toolpaths = generate_reporting(&t, &missing, &mut warnings).unwrap();
+        assert_eq!(warnings.codes(), ["slicing.missing_support_extruder"]);
+        assert_eq!(toolpaths, plain);
+        // With one extruder the setting changes nothing.
+        let one = Settings {
+            extruder_count: 1,
+            ..second
+        };
+        assert_eq!(
+            generate(&t, &one).unwrap(),
+            generate(
+                &t,
+                &Settings {
+                    extruder_count: 1,
+                    ..two
+                }
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn support_gaps_follow_varying_layer_heights() {
+        let (t, h) = tee_models();
+        // The empty space between the top of the supports and the bottom
+        // of the plate (at 10 mm), and between the base (2 mm) and the
+        // bottom of the supports, by the tops of the layers.
+        let gaps = |toolpaths: &Toolpaths, base: Option<f64>| -> (f64, f64) {
+            let layers = &toolpaths.layers;
+            let with = support_layers(toolpaths);
+            let (first, last) = (with[0], with[with.len() - 1]);
+            let plate = layers
+                .iter()
+                .position(|layer| layer.z - 0.5 * layer.height > 10.0 + base.unwrap_or(0.0))
+                .unwrap();
+            let top = layers[plate - 1].z - layers[last].z;
+            let bottom = match base {
+                Some(base) => layers[first].z - layers[first].height - base,
+                None => 0.0,
+            };
+            (top, bottom)
+        };
+        for style in [SupportStyle::Normal, SupportStyle::Tree] {
+            let settings = Settings {
+                supports: true,
+                support_style: style,
+                adaptive_layers: true,
+                min_layer_height: 0.07,
+                max_layer_height: 0.3,
+                support_top_z_distance: 0.6,
+                support_bottom_z_distance: 0.6,
+                ..Settings::default()
+            };
+            let toolpaths = generate(&t, &settings).unwrap();
+            // The layers vary in height.
+            let heights: Vec<f64> = toolpaths.layers.iter().map(|l| l.height).collect();
+            assert!(heights[1..].iter().any(|&x| x != settings.layer_height));
+            // As close as half the thickest layer allows.
+            let (top, _) = gaps(&toolpaths, None);
+            assert!((top - 0.6).abs() <= 0.151, "{style:?} top {top}");
+            let toolpaths = generate(&h, &settings).unwrap();
+            let (top, bottom) = gaps(&toolpaths, Some(2.0));
+            assert!((top - 0.6).abs() <= 0.151, "{style:?} top {top}");
+            // Branches may get past the base to the bed; columns stand on it.
+            if style == SupportStyle::Normal {
+                assert!((bottom - 0.6).abs() <= 0.151, "bottom {bottom}");
+            }
+        }
+    }
+
+    /// The T of `supports_stand_under_overhangs` twice, the second 40 mm
+    /// further back, with `volumes` of the first, centred on the bed: the
+    /// first at y 85 to 95, the second at y 125 to 135.
+    fn two_tees_with(volumes: Vec<SupportVolume>, settings: &Settings) -> Toolpaths {
+        let (t, _) = tee_models();
+        let mut back = t.clone();
+        back.translate([0.0, 40.0, 0.0]);
+        let volumes = [volumes, Vec::new()];
+        let own = OwnSettings {
+            support_volumes: &volumes,
+            ..OwnSettings::default()
+        };
+        generate_plate_with_own_settings(
+            &[t, back],
+            own,
+            Placement::Centre,
+            settings,
+            &mut Diagnostics::new(),
+            &AtomicBool::new(false),
+            &Progress::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn support_volumes_reach_only_their_own_object() {
+        // Which of the four overhangs (left and right of both Ts) have
+        // supports: front left, front right, back left, back right.
+        let sides = |toolpaths: &Toolpaths| -> [bool; 4] {
+            let points: Vec<Point> = toolpaths
+                .layers
+                .iter()
+                .flat_map(|layer| points_of(layer, &SUPPORT_KINDS))
+                .collect();
+            let any = |left: bool, front: bool| {
+                points.iter().any(|p| {
+                    let side = if left { p[0] < 105.0 } else { p[0] > 115.0 };
+                    side && (p[1] < 110.0) == front
+                })
+            };
+            [
+                any(true, true),
+                any(false, true),
+                any(true, false),
+                any(false, false),
+            ]
+        };
+        let on = Settings {
+            supports: true,
+            ..Settings::default()
+        };
+        assert_eq!(sides(&two_tees_with(Vec::new(), &on)), [true; 4]);
+        // A blocker of the front T over the left overhangs of both only
+        // takes away its own.
+        let left = block([-1.0, -1.0, 9.0], [10.0, 51.0, 13.0]);
+        let blocked = two_tees_with(vec![SupportVolume::blocker(left)], &on);
+        assert_eq!(sides(&blocked), [false, true, true, true]);
+        // An enforcer of the front T over the right overhangs of both,
+        // without supports, only supports its own.
+        let right = block([20.0, -1.0, 9.0], [31.0, 51.0, 13.0]);
+        let enforced = two_tees_with(vec![SupportVolume::enforcer(right)], &Settings::default());
+        assert_eq!(sides(&enforced), [false, true, false, false]);
+    }
+
+    #[test]
+    fn tree_branches_keep_out_of_blockers() {
+        // A blocker on the bed under the outer half of the left overhang
+        // (x 95 to 100 on the bed), up to 4 mm (layer 19): the overhang
+        // above it gets no support, the inner half does, and its branches
+        // get down to the bed around the blocker, not through it.
+        let tree = Settings {
+            supports: true,
+            support_style: SupportStyle::Tree,
+            ..Settings::default()
+        };
+        let low = block([-1.0, -1.0, 0.0], [5.0, 11.0, 4.0]);
+        let (toolpaths, _) = tee_with(vec![SupportVolume::blocker(low)], &tree);
+        let inside = |p: &Point| p[0] < 100.0 && (104.0..116.0).contains(&p[1]);
+        for (index, layer) in toolpaths.layers[..20].iter().enumerate() {
+            let points = points_of(layer, &SUPPORT_KINDS);
+            assert!(!points.iter().any(inside), "layer {index}");
+        }
+        let left = |index: usize| {
+            points_of(&toolpaths.layers[index], &SUPPORT_KINDS)
+                .iter()
+                .any(|p| p[0] < 105.0)
+        };
+        assert!(left(0) && left(30) && left(48));
     }
 
     #[test]
