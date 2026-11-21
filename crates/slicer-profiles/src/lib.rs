@@ -279,6 +279,21 @@ pub struct Settings {
     pub min_layer_height: f64,
     /// Thickest layer with adaptive layers, used where the walls are steep.
     pub max_layer_height: f64,
+    /// How closely adaptive layers follow a sloped surface, in percent:
+    /// 100 keeps the steps on a slope no higher than on a flat surface
+    /// printed at `min_layer_height`; 0 allows steps as high as
+    /// `max_layer_height`, so that layers only get thinner to end on flat
+    /// surfaces. In between, the allowed step height lies in proportion
+    /// between the two.
+    pub adaptive_layer_quality: f64,
+    /// Largest change of the layer height from one layer to the next with
+    /// adaptive layers or layer heights of height ranges, in percent of the
+    /// thinner of the two: at 20 a layer is at most 1.2 times as thick or
+    /// as thin as the one below, so that a change from thick to thin
+    /// layers is spread over several layers, which get thinner before
+    /// thin ones are needed, never thicker than asked for. 0 sets no limit.
+    /// The first layer keeps its own height and is not included.
+    pub layer_height_max_change: f64,
     /// Width of one extruded line.
     pub line_width: f64,
     /// Number of wall loops.
@@ -546,6 +561,8 @@ impl Default for Settings {
             adaptive_layers: false,
             min_layer_height: 0.1,
             max_layer_height: 0.3,
+            adaptive_layer_quality: 100.0,
+            layer_height_max_change: 0.0,
             line_width: 0.45,
             wall_loops: 2,
             wall_order: WallOrder::InnerOuter,
@@ -1143,6 +1160,18 @@ impl Settings {
                 self.max_layer_height,
             ),
             ("max_layer_height", self.max_layer_height, 0.02, tallest),
+            (
+                "adaptive_layer_quality",
+                self.adaptive_layer_quality,
+                0.0,
+                100.0,
+            ),
+            (
+                "layer_height_max_change",
+                self.layer_height_max_change,
+                0.0,
+                100.0,
+            ),
             (
                 "line_width",
                 self.line_width,

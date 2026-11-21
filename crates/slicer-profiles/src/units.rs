@@ -41,6 +41,8 @@
     ("adaptive_layers", ""),
     ("min_layer_height", "mm"),
     ("max_layer_height", "mm"),
+    ("adaptive_layer_quality", "%"),
+    ("layer_height_max_change", "%"),
     ("line_width", "mm"),
     ("wall_loops", ""),
     ("wall_order", ""),
