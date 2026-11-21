@@ -79,7 +79,7 @@ const SUPPORT_INTERFACE_SPACING: f64 = 2.0;
 const BRIDGE_ANCHOR: f64 = 2.0;
 
 /// Longest rim of a hole in the mesh that is closed before slicing.
-const MAX_HOLE_EDGES: usize = 64;
+const MAX_HOLE_EDGES: usize = slicer_core::repair::MAX_HOLE_EDGES;
 
 /// Triangles whose corners lie this close to a line (mm) count as having
 /// no area and are removed before slicing. A tenth of the 10 nm polygon
@@ -734,46 +734,12 @@ pub fn generate_plate_with_own_settings(
     let any_supports = objects::any_setting(&groups, &modifiers, |s| s.supports);
     // Enforcers make supports where the settings have none.
     let enforcing = support_volumes::any_of(support_volumes, SupportVolumeKind::Enforcer);
-    // Turning, removing degenerate triangles, closing holes, checking.
-    progress.start(Step::Preparing, 4);
+    // Turning triangles and shells, removing degenerate and repeated
+    // triangles, closing holes, and saying what is left.
+    progress.start(Step::Preparing, 1);
     plate::check(objects, placement, settings, diagnostics)?;
     let mut mesh = plate::merge(objects, placement);
-    let turned = mesh.orient();
-    if turned > 0 {
-        diagnostics.push(
-            Diagnostic::warning(
-                "mesh.reoriented",
-                format!(
-                    "{turned} triangle(s) of the mesh faced the wrong way and were turned around"
-                ),
-            )
-            .with("triangles", turned),
-        );
-    }
-    progress.advance();
-    let removed = mesh.remove_degenerate(DEGENERATE_HEIGHT);
-    if removed > 0 {
-        diagnostics.push(
-            Diagnostic::warning(
-                "mesh.degenerate_removed",
-                format!("{removed} triangle(s) of the mesh without area were removed"),
-            )
-            .with("triangles", removed),
-        );
-    }
-    progress.advance();
-    let closed = mesh.close_holes(MAX_HOLE_EDGES);
-    if closed > 0 {
-        diagnostics.push(
-            Diagnostic::warning(
-                "mesh.repaired",
-                format!("{closed} hole(s) in the surface of the mesh were closed"),
-            )
-            .with("holes", closed),
-        );
-    }
-    progress.advance();
-    mesh.check(diagnostics);
+    mesh.repair(DEGENERATE_HEIGHT).report(diagnostics);
     progress.advance();
     let count = settings.extruder_count;
     let mut used = mesh.used_extruders();

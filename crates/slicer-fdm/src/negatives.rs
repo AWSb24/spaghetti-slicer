@@ -8,8 +8,8 @@
 use slicer_core::slice::slice_mesh;
 use slicer_core::{Mesh, Shapes, parallel_map, polygon};
 
+use crate::DEGENERATE_HEIGHT;
 use crate::plate::Placement;
-use crate::{DEGENERATE_HEIGHT, MAX_HOLE_EDGES};
 
 /// Largest number of negative volumes of one object.
 pub const MAX_NEGATIVES: usize = 64;
@@ -41,9 +41,7 @@ pub(crate) fn cuts(
     }
     // Repaired, put on the bed with the object and cut, as the plate is.
     let cut = |mut mesh: Mesh, lift: f64| {
-        mesh.orient();
-        mesh.remove_degenerate(DEGENERATE_HEIGHT);
-        mesh.close_holes(MAX_HOLE_EDGES);
+        mesh.repair(DEGENERATE_HEIGHT);
         let [x, y, z] = shift.unwrap_or([0.0; 3]);
         mesh.translate([x, y, z - lift]);
         slice_mesh(&mesh, cut_heights)

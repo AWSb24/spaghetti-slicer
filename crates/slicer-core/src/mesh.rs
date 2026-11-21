@@ -294,137 +294,6 @@ impl Mesh {
         six_v / 6.0
     }
 
-    /// Closes holes in the surface whose rim has at most `max_edges` edges
-    /// and returns how many were closed. A hole is a closed chain of edges
-    /// that belong to one triangle only. Each rim is triangulated in the
-    /// plane that fits it best, so concave holes are covered without folds.
-    pub fn close_holes(&mut self, max_edges: usize) -> usize {
-        let mut uses: HashMap<(u32, u32), usize> = HashMap::new();
-        for t in &self.triangles {
-            for k in 0..3 {
-                let (a, b) = (t[k], t[(k + 1) % 3]);
-                *uses.entry((a.min(b), a.max(b))).or_default() += 1;
-            }
-        }
-        // The rim of a hole runs against the direction of the triangles
-        // next to it. Vertices where two rims meet are left alone. Each rim
-        // edge also remembers its triangle, whose extruder the patch takes.
-        let mut next: HashMap<u32, Option<(u32, usize)>> = HashMap::new();
-        for (index, t) in self.triangles.iter().enumerate() {
-            for k in 0..3 {
-                let (a, b) = (t[k], t[(k + 1) % 3]);
-                if uses[&(a.min(b), a.max(b))] == 1 {
-                    next.entry(b)
-                        .and_modify(|n| *n = None)
-                        .or_insert(Some((a, index)));
-                }
-            }
-        }
-        let mut starts: Vec<u32> = next.keys().copied().collect();
-        starts.sort_unstable();
-        let mut closed = 0;
-        for start in starts {
-            let mut rim = vec![start];
-            let neighbour = next.get(&start).copied().flatten().map_or(0, |(_, t)| t);
-            let complete = loop {
-                let Some(Some((to, _))) = next.get(&rim[rim.len() - 1]).copied() else {
-                    break false;
-                };
-                if to == start {
-                    break true;
-                }
-                if rim.len() >= max_edges || rim.contains(&to) {
-                    break false;
-                }
-                rim.push(to);
-            };
-            if !complete || rim.len() < 3 {
-                continue;
-            }
-            for vertex in &rim {
-                next.remove(vertex);
-            }
-            let first = self.triangles.len();
-            let fill = self.fill(&rim);
-            self.triangles.extend(fill);
-            let extruder = self.extruder(neighbour);
-            self.set_extruder(first, extruder);
-            closed += 1;
-        }
-        closed
-    }
-
-    /// Triangulates a closed rim, keeping its direction, by ear clipping
-    /// (Meisters' two-ears theorem) after projecting it onto the plane
-    /// through it whose normal comes from Newell's method.
-    // ponytail: a rim that crosses itself in that plane, such as one bent
-    // around a corner, gets stuck without an ear and falls back to a fan of
-    // triangles from its first vertex, which can fold over. O(n³) in the
-    // rim length, fine for the short rims `close_holes` accepts.
-    fn fill(&self, rim: &[u32]) -> Vec<[u32; 3]> {
-        let fan = || rim[1..].windows(2).map(|w| [rim[0], w[0], w[1]]).collect();
-        let origin = self.vertices[rim[0] as usize];
-        let at: Vec<[f64; 3]> = rim
-            .iter()
-            .map(|&i| sub(self.vertices[i as usize], origin))
-            .collect();
-        let mut normal = [0.0; 3];
-        for (k, a) in at.iter().enumerate() {
-            let b = at[(k + 1) % at.len()];
-            normal[0] += (a[1] - b[1]) * (a[2] + b[2]);
-            normal[1] += (a[2] - b[2]) * (a[0] + b[0]);
-            normal[2] += (a[0] - b[0]) * (a[1] + b[1]);
-        }
-        // Two axes in the plane with u × v pointing along the normal, so a
-        // rim that runs around the normal counter-clockwise does so in 2D.
-        let mut axis = [0.0; 3];
-        let smallest = (0..3).fold(0, |m, a| {
-            if normal[a].abs() < normal[m].abs() {
-                a
-            } else {
-                m
-            }
-        });
-        axis[smallest] = 1.0;
-        let u = cross(normal, axis);
-        let v = cross(normal, u);
-        let flat: Vec<[f64; 2]> = at.iter().map(|&p| [dot(p, u), dot(p, v)]).collect();
-        let turn = |a: usize, b: usize, c: usize| {
-            let (a, b, c) = (flat[a], flat[b], flat[c]);
-            (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
-        };
-
-        let mut left: Vec<usize> = (0..rim.len()).collect();
-        let mut triangles = Vec::with_capacity(rim.len() - 2);
-        while left.len() > 3 {
-            let n = left.len();
-            let ear = (0..n).find(|&i| {
-                let (a, b, c) = (left[(i + n - 1) % n], left[i], left[(i + 1) % n]);
-                // Convex, and no other rim vertex inside or on the triangle.
-                turn(a, b, c) > 0.0
-                    && left.iter().all(|&p| {
-                        p == a
-                            || p == b
-                            || p == c
-                            || turn(a, b, p) < 0.0
-                            || turn(b, c, p) < 0.0
-                            || turn(c, a, p) < 0.0
-                    })
-            });
-            let Some(i) = ear else {
-                return fan();
-            };
-            let (a, b, c) = (left[(i + n - 1) % n], left[i], left[(i + 1) % n]);
-            triangles.push([rim[a], rim[b], rim[c]]);
-            left.remove(i);
-        }
-        if turn(left[0], left[1], left[2]) <= 0.0 {
-            return fan();
-        }
-        triangles.push([rim[left[0]], rim[left[1]], rim[left[2]]]);
-        triangles
-    }
-
     /// Removes triangles without area and returns how many were removed. A
     /// triangle counts as degenerate when one corner lies within `tolerance`
     /// (mm) of the line through the other two. The surface stays closed:
@@ -546,7 +415,7 @@ impl Mesh {
 
     /// Counts triangle edges without a matching neighbour, and edges that
     /// more than two triangles share.
-    fn edge_defects(&self) -> (usize, usize) {
+    pub(crate) fn edge_defects(&self) -> (usize, usize) {
         // How often each edge is used in either direction.
         let mut uses: HashMap<(u32, u32), [usize; 2]> = HashMap::new();
         for t in &self.triangles {
@@ -565,15 +434,15 @@ impl Mesh {
     }
 }
 
-fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+pub(crate) fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+pub(crate) fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+pub(crate) fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [
         a[1] * b[2] - a[2] * b[1],
         a[2] * b[0] - a[0] * b[2],

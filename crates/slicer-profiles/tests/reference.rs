@@ -8,11 +8,18 @@ use std::path::Path;
 
 use slicer_profiles::Settings;
 
-/// Name and doc comment of every field of `Settings`, in source order.
-fn described_fields() -> Vec<(String, String)> {
+/// Name, doc comment and unit of every field of `Settings`, in source
+/// order.
+fn described_fields() -> Vec<(String, String, &'static str)> {
     slicer_profiles::SETTINGS_INFO
         .iter()
-        .map(|info| (info.key.to_string(), info.description.to_string()))
+        .map(|info| {
+            (
+                info.key.to_string(),
+                info.description.to_string(),
+                info.unit,
+            )
+        })
         .collect()
 }
 
@@ -24,15 +31,15 @@ fn settings_reference_is_current() {
     let fields = described_fields();
     for key in values.keys() {
         assert!(
-            fields.iter().any(|(name, _)| name == key),
+            fields.iter().any(|(name, ..)| name == key),
             "'{key}' was not found in the source"
         );
     }
 
     let mut text = String::from(
-        "# Settings\n\nGenerated from the code by `cargo test -p slicer-profiles --test reference`; do not edit by hand.\n\nLengths are in mm, speeds in mm/s, temperatures in °C. A settings file is TOML and only needs the keys it changes. Limits marked with * depend on other settings; the values shown hold for the defaults.\n\n| Key | Default | Allowed | Meaning |\n|---|---|---|---|\n",
+        "# Settings\n\nGenerated from the code by `cargo test -p slicer-profiles --test reference`; do not edit by hand.\n\nNumbers are in the unit of the Unit column (empty for counts and factors). A settings file is TOML and only needs the keys it changes. Limits marked with * depend on other settings; the values shown hold for the defaults.\n\n| Key | Default | Unit | Allowed | Meaning |\n|---|---|---|---|---|\n",
     );
-    for (name, description) in &fields {
+    for (name, description, unit) in &fields {
         assert!(!description.is_empty(), "'{name}' has no description");
         let default = values
             .get(name)
@@ -100,7 +107,7 @@ fn settings_reference_is_current() {
             },
         };
         text.push_str(&format!(
-            "| `{name}` | {default} | {allowed} | {description} |\n"
+            "| `{name}` | {default} | {unit} | {allowed} | {description} |\n"
         ));
     }
 

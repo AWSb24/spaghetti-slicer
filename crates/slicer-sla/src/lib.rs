@@ -112,6 +112,10 @@ impl Default for SlaSettings {
     }
 }
 
+/// Triangles whose corners lie this close to a line (mm) count as having
+/// no area and are removed before slicing, as for filament printers.
+const DEGENERATE_HEIGHT: f64 = 1e-6;
+
 /// Allowed range of every setting and whether it must be a whole number.
 /// `supports` is a switch: 0 or 1.
 const LIMITS: [(&str, f64, f64, bool); 24] = [
@@ -358,19 +362,8 @@ pub fn slice(
 ) -> Result<SlaPrint, SlaError> {
     settings.validate()?;
     let mut mesh = mesh.clone();
-    let turned = mesh.orient();
-    if turned > 0 {
-        diagnostics.push(
-            Diagnostic::warning(
-                "mesh.reoriented",
-                format!(
-                    "{turned} triangle(s) of the mesh faced the wrong way and were turned around"
-                ),
-            )
-            .with("triangles", turned),
-        );
-    }
-    mesh.check(diagnostics);
+    // The same repair as for filament printers, see `slicer_core::repair`.
+    mesh.repair(DEGENERATE_HEIGHT).report(diagnostics);
     let (min, max) = mesh.bounds().ok_or(SlaError::EmptyModel)?;
     // The model's lowest point sits this high above the build plate.
     let base = settings.raft_thickness + settings.elevation;

@@ -27,10 +27,19 @@ pub struct SettingInfo {
     pub kind: ValueKind,
     /// The allowed values of a [`ValueKind::Choice`]; empty otherwise.
     pub choices: &'static [&'static str],
+    /// Unit of the value, such as `mm`, `mm/s`, `%`, `°C`, `s` or `mm³`
+    /// (one of [`UNITS`]); empty for counts, factors, switches, choices and
+    /// text. Comes from `src/units.rs`.
+    pub unit: &'static str,
     /// What it does, from the documentation of the field of
     /// [`Settings`](crate::Settings).
     pub description: &'static str,
 }
+
+/// Every unit a setting can have; empty for none.
+pub const UNITS: &[&str] = &[
+    "", "mm", "mm/s", "mm/s²", "mm³", "%", "°C", "°", "s", "g/cm³", "px",
+];
 
 /// Every setting in the order of [`Settings`](crate::Settings), generated
 /// at build time from its fields and their doc comments. Allowed ranges of
@@ -78,6 +87,70 @@ mod tests {
                 "{key}"
             );
         }
+    }
+
+    #[test]
+    fn every_setting_has_a_unit_that_matches_its_description() {
+        for info in SETTINGS_INFO {
+            let (key, text, unit) = (info.key, info.description, info.unit);
+            assert!(UNITS.contains(&unit), "{key}: unknown unit {unit:?}");
+            if !matches!(info.kind, ValueKind::Number | ValueKind::Count) {
+                // Text with sizes in pixels or volumes is the exception.
+                assert!(
+                    unit.is_empty() || matches!(key, "thumbnails" | "flush_volumes"),
+                    "{key}"
+                );
+                continue;
+            }
+            // What the description or the name says decides.
+            let expected =
+                if text.contains("in percent") || key.contains("fan_") && key.ends_with("_speed") {
+                    Some("%")
+                } else if text.contains("mm/s²") {
+                    Some("mm/s²")
+                } else if text.contains("in mm/s") || key.ends_with("_speed") {
+                    Some("mm/s")
+                } else if text.contains("seconds") || key.ends_with("_time") {
+                    Some("s")
+                } else if text.contains("in degrees") || key.ends_with("_angle") {
+                    Some("°")
+                } else if key.ends_with("_temp") || key.contains("_temp_") {
+                    Some("°C")
+                } else if text.contains("in millimetres")
+                    || [
+                        "_height",
+                        "_width",
+                        "_distance",
+                        "_diameter",
+                        "_length",
+                        "_spacing",
+                    ]
+                    .iter()
+                    .any(|end| key.ends_with(end))
+                {
+                    Some("mm")
+                } else if text.starts_with("Number of")
+                    || text.starts_with("Multiplier")
+                    || text.starts_with("Factor")
+                {
+                    Some("")
+                } else {
+                    None
+                };
+            if let Some(expected) = expected {
+                assert_eq!(unit, expected, "{key}: {text}");
+            }
+        }
+        let unit = |key| setting_info(key).unwrap().unit;
+        assert_eq!(unit("fan_speed"), "%");
+        assert_eq!(unit("support_interface_fan_speed"), "%");
+        assert_eq!(unit("min_layer_time"), "s");
+        assert_eq!(unit("acceleration"), "mm/s²");
+        assert_eq!(unit("filament_density"), "g/cm³");
+        assert_eq!(unit("flush_volumes"), "mm³");
+        assert_eq!(unit("arc_tolerance"), "mm");
+        assert_eq!(unit("wall_loops"), "");
+        assert_eq!(unit("flow_ratio"), "");
     }
 
     #[test]

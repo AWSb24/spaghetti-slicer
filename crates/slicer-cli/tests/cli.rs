@@ -342,6 +342,28 @@ fn open_mesh_produces_a_warning() {
 }
 
 #[test]
+fn mesh_that_cannot_be_repaired_is_reported_and_still_sliced() {
+    let dir = workdir("not_repairable");
+    // Two cubes touching along one edge: four triangles share it.
+    let mut mesh = Mesh::cuboid(10.0, 10.0, 10.0);
+    let mut second = Mesh::cuboid(10.0, 10.0, 10.0);
+    second.translate([10.0, 10.0, 0.0]);
+    mesh.merge(&second);
+    let stl = dir.join("touching.stl");
+    fs::write(&stl, slicer_formats::write_stl_binary(&mesh)).unwrap();
+
+    let out = run(&["slice", stl.to_str().unwrap(), "--json"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let warning = &report["warnings"][0];
+    assert_eq!(warning["code"], "mesh.not_repairable");
+    assert_eq!(warning["severity"], "warning");
+    assert_eq!(warning["context"]["non_manifold_edges"], "1");
+    assert_eq!(warning["context"]["open_edges"], "0");
+    assert_eq!(warning["context"]["holes"], "0");
+}
+
+#[test]
 fn default_config_is_valid_toml_accepted_by_slice() {
     let dir = workdir("defaults");
     let out = run(&["default-config"]);
