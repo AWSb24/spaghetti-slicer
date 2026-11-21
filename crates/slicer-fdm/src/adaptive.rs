@@ -1,5 +1,6 @@
 //! Adaptive layer heights: thin layers where the surface is shallow, thick
-//! ones where it is steep.
+//! ones where it is steep; and layer heights set by height ranges
+//! ([`ranged`]).
 //!
 //! A layer of thickness `h` leaves a step on a surface whose normal makes the
 //! angle `θ` with the vertical; the height of that step measured along the
@@ -106,6 +107,112 @@ pub(crate) fn plan(mesh: &Mesh, height: f64, settings: &Settings) -> (Vec<f64>, 
     (tops, heights)
 }
 
+/// Top and thickness of every layer of a model standing on the bed and
+/// `height` tall, whose height ranges `ranges` (from, to, layer height in
+/// millimetres; later ones count where they overlap) set the layer height
+/// there. The first layer is `first_layer_height` thick. The bounds of the
+/// ranges split the height above it into stretches; every stretch gets the
+/// layer height of the range holding its middle (`layer_height` outside
+/// all of them) and as few layers as keep every one no thicker than that,
+/// all equally thick, so that no layer crosses a bound and the middle of
+/// every layer lies in the range it was made for. Above the last bound the
+/// layers are as thick as asked for up to the top, as without ranges: what
+/// is left above the last one is thinner than a layer.
+// ponytail: a stretch that is not a whole number of its layer height gets
+// slightly thinner layers throughout, and a stretch much shorter than its
+// layer height (a bound just above another or above the first layer) one
+// thin layer; no gradual transition from one height to the next.
+pub(crate) fn ranged(
+    height: f64,
+    settings: &Settings,
+    ranges: &[(f64, f64, f64)],
+) -> (Vec<f64>, Vec<f64>) {
+    let first = settings.first_layer_height;
+    if first > height + EPSILON {
+        return (Vec::new(), Vec::new());
+    }
+    let layer_at = |z: f64| {
+        ranges
+            .iter()
+            .rev()
+            .find(|(from, to, _)| *from <= z && z < *to)
+            .map_or(settings.layer_height, |range| range.2)
+    };
+    let mut bounds: Vec<f64> = ranges
+        .iter()
+        .flat_map(|&(from, to, _)| [from, to])
+        .filter(|&bound| bound > first + EPSILON && bound < height - EPSILON)
+        .collect();
+    bounds.sort_by(f64::total_cmp);
+    bounds.dedup_by(|later, earlier| *later - *earlier < EPSILON);
+    let (mut tops, mut heights) = (vec![first], vec![first]);
+    let mut z = first;
+    for end in bounds {
+        let wanted = layer_at((z + end) / 2.0);
+        let count = ((end - z) / wanted - EPSILON).ceil().max(1.0) as usize;
+        let each = (end - z) / count as f64;
+        for k in 1..count {
+            tops.push(z + k as f64 * each);
+            heights.push(each);
+        }
+        tops.push(end);
+        heights.push(each);
+        z = end;
+    }
+    let wanted = layer_at((z + height) / 2.0);
+    for k in 1.. {
+        let top = z + k as f64 * wanted;
+        if top > height + EPSILON {
+            break;
+        }
+        tops.push(top);
+        heights.push(wanted);
+    }
+    (tops, heights)
+}
+
 fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ranges_set_the_layer_height_between_their_bounds() {
+        let settings = Settings::default();
+        // Ranges above the model change nothing.
+        let (tops, heights) = ranged(3.0, &settings, &[(5.0, 6.0, 0.1)]);
+        let plain: Vec<f64> = (0..15).map(|i| 0.2 + i as f64 * 0.2).collect();
+        assert_eq!(tops, plain);
+        assert!(heights.iter().all(|&h| h == 0.2));
+        // A range that is not a whole number of its layers gets slightly
+        // thinner ones; a later range counts over an earlier one.
+        let ranges = [(1.0, 2.05, 0.1), (1.5, 1.7, 0.05)];
+        let (tops, heights) = ranged(3.0, &settings, &ranges);
+        assert_eq!(tops.len(), heights.len());
+        let mut bottom = 0.0;
+        for (&top, &height) in tops.iter().zip(&heights) {
+            assert!((top - bottom - height).abs() < 1e-9);
+            let middle = top - height / 2.0;
+            let wanted = match middle {
+                _ if bottom == 0.0 => 0.2,
+                m if (1.5..1.7).contains(&m) => 0.05,
+                m if (1.0..2.05).contains(&m) => 0.1,
+                _ => 0.2,
+            };
+            assert!(
+                height <= wanted + 1e-9 && height > wanted * 0.8,
+                "{top} {height}"
+            );
+            bottom = top;
+        }
+        for bound in [1.0, 1.5, 1.7, 2.05] {
+            assert!(tops.iter().any(|&t| (t - bound).abs() < 1e-9), "{bound}");
+        }
+        // Above the last bound, whole layers up to the top.
+        assert!((tops[tops.len() - 1] - 2.85).abs() < 1e-9);
+        assert!(ranged(0.1, &settings, &ranges).0.is_empty());
+    }
 }

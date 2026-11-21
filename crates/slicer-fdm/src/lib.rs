@@ -240,15 +240,77 @@ pub struct Toolpaths {
     /// every object prints with the plate's. Every path of an object then
     /// has its object set.
     pub object_settings: Vec<Settings>,
+    /// The settings of height ranges of objects (see [`HeightRange`]) whose
+    /// speeds, fan, flow ratio or retraction differ from those of their
+    /// object, in the order of the objects and their ranges; empty if no
+    /// range changes them. Every path of an object then has its object
+    /// set.
+    pub range_settings: Vec<ObjectRange>,
+}
+
+/// The settings that the layers of a height range of an object print with,
+/// for the G-code writer (see [`Toolpaths::range_settings`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectRange {
+    /// The object, counted like [`Path::object`].
+    pub object: u32,
+    /// Height above the bed where the range starts, in millimetres: the
+    /// range holds the layers whose middle lies at least this high.
+    pub from: f64,
+    /// Height above the bed where the range ends, in millimetres: the
+    /// range holds the layers whose middle lies lower.
+    pub to: f64,
+    /// The settings of the object with the speeds, fan, flow ratio and
+    /// retraction of the range.
+    pub settings: Settings,
 }
 
 impl Toolpaths {
-    /// The settings `path` prints with: those of its object from
-    /// [`Toolpaths::object_settings`], `plate` for paths of no object and
-    /// without settings of objects.
+    /// The settings `path` prints with by its object alone: those of its
+    /// object from [`Toolpaths::object_settings`], `plate` for paths of no
+    /// object and without settings of objects. Height ranges are left out;
+    /// [`Toolpaths::settings_on`] takes them into account.
     pub fn settings_of<'a>(&'a self, path: &Path, plate: &'a Settings) -> &'a Settings {
         settings_of(&self.object_settings, path, plate)
     }
+
+    /// The settings `path` on `layer` prints with: those of the last height
+    /// range of its object ([`Toolpaths::range_settings`]) that holds the
+    /// middle of the layer, otherwise as [`Toolpaths::settings_of`].
+    pub fn settings_on<'a>(
+        &'a self,
+        path: &Path,
+        layer: &Layer,
+        plate: &'a Settings,
+    ) -> &'a Settings {
+        let z = layer.z - layer.height / 2.0;
+        settings_at(&self.object_settings, &self.range_settings, path, z, plate)
+    }
+
+    /// Every set of settings that some path may print with besides
+    /// `plate`: those of the objects and of their height ranges.
+    pub fn own_settings(&self) -> impl Iterator<Item = &Settings> {
+        self.object_settings
+            .iter()
+            .chain(self.range_settings.iter().map(|r| &r.settings))
+    }
+}
+
+/// [`Toolpaths::settings_on`] with the settings of the objects `table` and
+/// of their height ranges `ranges`, for a layer whose middle lies `z` above
+/// the bed (where it was cut).
+fn settings_at<'a>(
+    table: &'a [Settings],
+    ranges: &'a [ObjectRange],
+    path: &Path,
+    z: f64,
+    plate: &'a Settings,
+) -> &'a Settings {
+    ranges
+        .iter()
+        .rev()
+        .find(|r| r.object == path.object && r.from <= z && z < r.to)
+        .map_or_else(|| settings_of(table, path, plate), |r| &r.settings)
 }
 
 /// [`Toolpaths::settings_of`] with the settings of the objects `table`.
@@ -569,10 +631,23 @@ pub struct OwnSettings<'a> {
 /// object (see [`range_settings`]; only the keys of [`RANGE_SETTINGS`]
 /// count). A height range belongs to the region of its object on every
 /// layer, so top and bottom shells are found across the borders of ranges
-/// as without them: a range does not start or end a surface. Objects
-/// without ranges, or with ranges that change nothing, print exactly as
-/// with [`generate_plate_with_object_settings`]. Vase mode leaves the
-/// ranges out like the settings of objects.
+/// as without them: a range does not start or end a surface. The speeds,
+/// fan, flow ratio and retraction of a range reach only the G-code writer
+/// ([`Toolpaths::range_settings`], looked up by object and layer with
+/// [`Toolpaths::settings_on`]). Objects without ranges, or with ranges that
+/// change nothing, print exactly as with
+/// [`generate_plate_with_object_settings`]. Vase mode leaves the ranges
+/// out like the settings of objects.
+///
+/// The layer height of a range (`layer_height`) sets the height of the
+/// layers of the whole plate between its bounds, since all objects share
+/// the layers: every stretch between the bounds of such ranges gets as few
+/// layers as are needed for none to be thicker than its layer height, all
+/// equally thick, so a layer never crosses a bound; above the last bound
+/// the layers are as without ranges. Where the objects of a plate do not
+/// share the same ranges with layer heights, `slicing.range_layer_height_plate`
+/// says that they reach the other objects too; with adaptive layers the
+/// layer heights of ranges are ignored (`slicing.range_layer_height_adaptive`).
 ///
 /// Inside the modifiers `own.modifiers[i]` of object `i`, which are not
 /// printed, its layers print with the modifier's settings over those of
@@ -643,8 +718,12 @@ pub fn generate_plate_with_own_settings(
     let (groups, membership) = objects::groups(objects.len(), own, ranges, settings);
     // The modifiers that change anything, cut once the layers are known.
     let mut modifiers = objects::modifier_groups(modifier_list, &groups, &membership);
-    // Speeds of objects only reach the writer, through this table.
-    let object_settings = objects::speed_table(objects.len(), own, settings);
+    // Speeds of objects and their ranges only reach the writer, through
+    // these tables.
+    let (object_settings, range_settings) =
+        objects::speed_table(objects.len(), own, ranges, settings);
+    // Layer heights of ranges reach the whole plate.
+    let (layer_ranges, disagree) = objects::layer_height_ranges(objects.len(), ranges, settings);
     let plate_settings = settings;
     let several = objects::Group::plain(settings.clone());
     let single = match groups.as_slice() {
@@ -768,10 +847,27 @@ pub fn generate_plate_with_own_settings(
         mesh.translate(shift);
     }
 
-    // Without adaptive layers layer i ends at first_layer_height + i *
-    // layer_height. Every layer is cut at its mid-height.
+    if !layer_ranges.is_empty() {
+        if settings.adaptive_layers {
+            diagnostics.push(Diagnostic::warning(
+                "slicing.range_layer_height_adaptive",
+                "with adaptive layers (adaptive_layers) the layer heights of height ranges are ignored",
+            ));
+        } else if disagree {
+            diagnostics.push(Diagnostic::warning(
+                "slicing.range_layer_height_plate",
+                "the layer height of a height range sets the layers of the whole plate, so it reaches the other objects at that height too",
+            ));
+        }
+    }
+    // Without adaptive layers or layer heights of ranges layer i ends at
+    // first_layer_height + i * layer_height. Every layer is cut at its
+    // mid-height.
+    let ranged = !layer_ranges.is_empty() && !settings.adaptive_layers;
     let (tops, heights) = if settings.adaptive_layers {
         adaptive::plan(&mesh, size[2], settings)
+    } else if ranged {
+        adaptive::ranged(size[2], settings, &layer_ranges)
     } else {
         let mut tops = Vec::new();
         loop {
@@ -877,7 +973,7 @@ pub fn generate_plate_with_own_settings(
             return Vec::new();
         }
         // The same angle reaches less far between slices closer together.
-        let reach = if settings.adaptive_layers {
+        let reach = if settings.adaptive_layers || ranged {
             reach * (cut_heights[index] - cut_heights[index - 1]) / settings.layer_height
         } else {
             reach
@@ -1116,15 +1212,21 @@ pub fn generate_plate_with_own_settings(
         placement,
         shift,
         &cut_heights,
-        settings.label_objects || !object_settings.is_empty(),
+        settings.label_objects || !object_settings.is_empty() || !range_settings.is_empty(),
     );
-    // Every wall is split with the overhang speeds of its object.
-    let overhangs = |path: &Path| {
-        let own = settings_of(&object_settings, path, plate_settings);
-        (own.overhang_speed > 0.0).then_some(own.overhang_speed_full > 0.0)
+    // Every wall is split with the overhang speeds of its object and the
+    // height range of its layer.
+    let overhangs = |index: usize| {
+        let z = cut_heights[index];
+        let (table, ranges) = (&object_settings, &range_settings);
+        move |path: &Path| {
+            let own = settings_at(table, ranges, path, z, plate_settings);
+            (own.overhang_speed > 0.0).then_some(own.overhang_speed_full > 0.0)
+        }
     };
     if std::iter::once(plate_settings)
         .chain(&object_settings)
+        .chain(range_settings.iter().map(|r| &r.settings))
         .any(|s| s.overhang_speed > 0.0)
     {
         let split = parallel_map(layers.len(), |index| match index {
@@ -1135,7 +1237,7 @@ pub fn generate_plate_with_own_settings(
                 &slices[index],
                 &slices[index - 1],
                 0.5 * settings.line_width,
-                overhangs,
+                overhangs(index),
             ),
         });
         for (layer, paths) in layers.iter_mut().zip(split) {
@@ -1232,6 +1334,7 @@ pub fn generate_plate_with_own_settings(
     Ok(Toolpaths {
         layers,
         object_settings,
+        range_settings,
     })
 }
 
@@ -1854,8 +1957,8 @@ fn travels_inside(layer: &Layer, slice: &Shapes) -> Vec<bool> {
 /// model a support stands on. Tree supports (`support_style = tree`)
 /// replace the columns below the dense part by branches.
 // ponytail: the gaps are whole layers, counted with `layer_height`; with
-// adaptive layers they are as many layers as at the fixed height, so as
-// thin or thick as the layers there.
+// adaptive layers or layer heights of height ranges they are as many
+// layers as at the fixed height, so as thin or thick as the layers there.
 fn support_areas(
     slices: &[Shapes],
     hanging: &[Shapes],
@@ -2618,13 +2721,19 @@ fn modifier_shells(
 
 /// How many layers below and above layer `index` form its bottom and top
 /// shell, or `None` when there are not enough of them and the layer is a
-/// surface itself. With adaptive layers the shells keep the thickness they
-/// have with constant layers, `bottom_layers` or `top_layers` times
-/// `layer_height`, however many layers that takes.
+/// surface itself. With adaptive layers, and where layer heights of height
+/// ranges make the layers around it thinner or thicker than
+/// `layer_height`, the shells keep the thickness they have with constant
+/// layers, `bottom_layers` or `top_layers` times `layer_height`, however
+/// many layers that takes.
 fn shell_layers(heights: &[f64], index: usize, settings: &Settings) -> Option<(usize, usize)> {
     let bottom = settings.bottom_layers as usize;
     let top = settings.top_layers as usize;
-    if !settings.adaptive_layers {
+    // The first layer has a height of its own either way.
+    let near = heights
+        .get(index.saturating_sub(bottom).max(1)..(index + top + 1).min(heights.len()))
+        .unwrap_or_default();
+    if !settings.adaptive_layers && near.iter().all(|&h| h == settings.layer_height) {
         let surface = (bottom > 0 && index < bottom) || (top > 0 && index + top >= heights.len());
         return (!surface).then_some((bottom, top));
     }

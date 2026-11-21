@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 use std::sync::{Mutex, PoisonError};
 
 use slicer_core::{Diagnose, Diagnostic, Mesh, Severity};
-use slicer_fdm::{Layer, Path, PathKind, Step, Toolpaths};
+use slicer_fdm::{Layer, ObjectRange, Path, PathKind, Step, Toolpaths};
 use slicer_gcode::{ExtruderStats, Output, Stats};
 use slicer_profiles::Settings;
 
@@ -241,9 +241,23 @@ fn write_toolpaths(out: &mut Writer, toolpaths: &Toolpaths) {
     let Toolpaths {
         layers,
         object_settings,
+        range_settings,
     } = toolpaths;
     out.len(object_settings.len());
     for settings in object_settings {
+        out.text(&settings.to_toml());
+    }
+    out.len(range_settings.len());
+    for range in range_settings {
+        let ObjectRange {
+            object,
+            from,
+            to,
+            settings,
+        } = range;
+        out.u32(*object);
+        out.f64(*from);
+        out.f64(*to);
         out.text(&settings.to_toml());
     }
     out.len(layers.len());
@@ -269,6 +283,14 @@ fn read_toolpaths(input: &mut Reader) -> Result<Toolpaths, Malformed> {
         let text = input.text()?;
         Settings::from_toml(&text).map_err(|_| Malformed)
     })?;
+    let range_settings = input.list(|input| {
+        Ok(ObjectRange {
+            object: input.u32()?,
+            from: input.f64()?,
+            to: input.f64()?,
+            settings: Settings::from_toml(&input.text()?).map_err(|_| Malformed)?,
+        })
+    })?;
     let layers = input.list(|input| {
         Ok(Layer {
             z: input.f64()?,
@@ -280,6 +302,7 @@ fn read_toolpaths(input: &mut Reader) -> Result<Toolpaths, Malformed> {
     Ok(Toolpaths {
         layers,
         object_settings,
+        range_settings,
     })
 }
 
@@ -621,6 +644,16 @@ mod tests {
                 .with("object", "cube"),
         );
         result.toolpaths.layers[0].paths[0].width = Some(0.37);
+        // The settings of height ranges travel along.
+        result.toolpaths.range_settings.push(ObjectRange {
+            object: 1,
+            from: 0.1 + 0.2,
+            to: 2.0,
+            settings: Settings {
+                outer_wall_speed: 15.0,
+                ..Settings::default()
+            },
+        });
         let outcome = Ok(result.clone());
         let bytes = encode_outcome(&outcome);
         let back = decode_outcome(&bytes).unwrap();

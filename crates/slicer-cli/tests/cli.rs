@@ -861,6 +861,10 @@ fn height_ranges_get_settings_of_their_own() {
     fs::write(&same, "infill_density = 15\n").unwrap();
     let layers = dir.join("layers.toml");
     fs::write(&layers, "layer_height = 0.1\n").unwrap();
+    let fast = dir.join("fast.toml");
+    fs::write(&fast, "outer_wall_speed = 15\nfan_speed = 30\n").unwrap();
+    let travel = dir.join("travel.toml");
+    fs::write(&travel, "travel_speed = 200\n").unwrap();
     let slice = |name: &str, ranges: &[String]| {
         let output = dir.join(name);
         let mut command = bin();
@@ -886,6 +890,27 @@ fn height_ranges_get_settings_of_their_own() {
     // A range with the object's own values prints as without it.
     let (_, unchanged) = slice("same.gcode", &[range("1:2-6:", &same)]);
     assert_eq!(plain, unchanged);
+    // Speeds and fan of a range reach only its layers of its object.
+    let (out, speeds) = slice("fast.gcode", &[range("2:4-8:", &fast)]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(speeds.contains(&format!("M106 S{:.0}\n", 30.0 * 2.55)));
+    assert!(speeds.contains(" F900\n"));
+    assert!(!plain.contains(&format!("M106 S{:.0}\n", 30.0 * 2.55)));
+    // The layer height of a range sets the layers of the whole plate,
+    // which a range of one object of several reports.
+    let (out, thin) = slice("thin.gcode", &[range("4-8:", &layers)]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(thin.contains(";HEIGHT:0.100") && !plain.contains(";HEIGHT:0.100"));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["warnings"].as_array().unwrap().len(), 0);
+    let (out, one_thin) = slice("one_thin.gcode", &[range("2:4-8:", &layers)]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(one_thin.contains(";HEIGHT:0.100"));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["warnings"][0]["code"],
+        "slicing.range_layer_height_plate"
+    );
 
     let error = |ranges: &[String]| {
         let (out, _) = slice("error.gcode", ranges);
@@ -893,9 +918,9 @@ fn height_ranges_get_settings_of_their_own() {
         let error: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
         error["error"].clone()
     };
-    let wrong = error(&[range("4-8:", &layers)]);
+    let wrong = error(&[range("4-8:", &travel)]);
     assert_eq!(wrong["code"], "settings.not_per_range");
-    assert_eq!(wrong["context"]["key"], "layer_height");
+    assert_eq!(wrong["context"]["key"], "travel_speed");
     for prefix in ["3:4-8:", "0:4-8:", "8-4:", "x:4-8:", "4:", "-1-4:"] {
         let wrong = error(&[range(prefix, &dense)]);
         assert_eq!(wrong["code"], "cli.invalid_range", "{prefix}");

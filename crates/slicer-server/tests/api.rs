@@ -417,12 +417,26 @@ async fn height_ranges_get_settings_of_their_own() {
     let same: &[u8] = b"infill_density = 15";
     let fields = [&two[..], &[("range_settings_1_0-1", same)]].concat();
     assert_eq!(plain, sliced(&router, &fields).await);
+    // Speeds, fan and the layer height may be set per range too.
+    let fast: &[u8] = b"outer_wall_speed = 15\nfan_speed = 30";
+    let fields = [&two[..], &[("range_settings_2_1-2", fast)]].concat();
+    let speeds = sliced(&router, &fields).await;
+    let quiet = format!("M106 S{:.0}\n", 30.0 * 2.55);
+    assert!(speeds.contains(&quiet) && !plain.contains(&quiet));
+    assert!(speeds.contains(" F900\n"));
+    let thin: &[u8] = b"layer_height = 0.1";
+    let thin = sliced(
+        &router,
+        &[&two[..], &[("range_settings_1-2", thin)]].concat(),
+    )
+    .await;
+    assert!(thin.contains(";HEIGHT:0.100") && !plain.contains(";HEIGHT:0.100"));
 
     let (status, body) = create(
         &router,
         &[
             ("model", &stl),
-            ("range_settings_0-1", b"layer_height = 0.1"),
+            ("range_settings_0-1", b"travel_speed = 200"),
         ],
     )
     .await;

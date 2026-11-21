@@ -1002,7 +1002,8 @@ mod tests {
             "<config><object id=\"1\"><metadata key=\"name\" value=\"Left\"/>",
             "<layer_config_ranges>",
             "<range min_z=\"2\" max_z=\"4\"><metadata key=\"sparse_infill_density\" value=\"100%\"/>",
-            "<metadata key=\"layer_height\" value=\"0.1\"/></range>",
+            "<metadata key=\"layer_height\" value=\"0.1\"/>",
+            "<metadata key=\"travel_speed\" value=\"300\"/></range>",
             "<range min_z=\"5\" max_z=\"1\"><metadata key=\"wall_loops\" value=\"4\"/></range>",
             "</layer_config_ranges></object></config>"
         );
@@ -1038,6 +1039,7 @@ mod tests {
         assert_eq!((first[0].from, first[0].to), (2.0, 4.0));
         let low = crate::range_settings(objects.settings[0].as_ref().unwrap(), &first[0]);
         assert_eq!((low.infill_density, low.wall_loops), (100.0, 4));
+        assert_eq!(low.layer_height, 0.1);
         // The caller's ranges go to every object of the model.
         assert_eq!(objects.ranges[1].len(), 2);
         assert_eq!(
@@ -1057,10 +1059,10 @@ mod tests {
                 "project.range_settings_skipped"
             ]
         );
-        assert_eq!(warnings.as_slice()[2].context["keys"], "layer_height");
+        assert_eq!(warnings.as_slice()[2].context["keys"], "travel_speed");
 
         // Settings that a range cannot have fail, naming their file.
-        let layers = vec![vec![layer("layer_height = 0.1", Some((1.0, 2.0)))]];
+        let layers = vec![vec![layer("travel_speed = 300.0", Some((1.0, 2.0)))]];
         let error =
             read_plate(&models, options, Ok, &layers, &[], &mut Diagnostics::new()).unwrap_err();
         assert_eq!(error.code, "settings.not_per_range");

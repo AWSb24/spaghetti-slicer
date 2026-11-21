@@ -1603,7 +1603,7 @@ impl App {
             settings.line_width,
             &self.hidden,
             |path, index, layer| {
-                let own = toolpaths.settings_of(path, settings);
+                let own = toolpaths.settings_on(path, layer, settings);
                 by.color(path, index, layer, own, range)
             },
         );
