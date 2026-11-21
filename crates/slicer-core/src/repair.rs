@@ -811,6 +811,23 @@ mod tests {
     }
 
     #[test]
+    fn a_repeated_triangle_at_the_rim_of_a_hole_goes_alone() {
+        // The second triangle has an edge on the rim of the open top; its
+        // copy shares that edge with nothing else and must not be taken for
+        // a neighbour, turned and then cancelled with the original.
+        let mut mesh = cube_with_open_top(4);
+        let rim = mesh.triangles[1];
+        mesh.triangles.push(rim);
+        let repair = mesh.repair(1e-6);
+        assert_eq!(repair.turned, 0);
+        assert_eq!(repair.duplicates, 1);
+        assert_eq!(repair.holes, 1);
+        assert!(repair.is_clean());
+        assert!(mesh.triangles.contains(&rim));
+        assert!((mesh.signed_volume() - 1000.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn a_curved_rim_is_filled_without_folds() {
         // A sphere with a cap cut off at a slant along its triangles: a
         // zig-zag rim of more than 64 edges that is not flat.

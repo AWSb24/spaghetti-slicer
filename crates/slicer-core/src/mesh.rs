@@ -185,7 +185,10 @@ impl Mesh {
     /// Turns triangles around until neighbours agree on which side is
     /// outside, and returns how many were turned. In every connected piece
     /// of the surface the smaller part gives way to the larger one. Edges
-    /// with more or fewer than two triangles do not connect.
+    /// with more or fewer than two triangles do not connect, and neither do
+    /// two copies of one triangle: at the rim of a hole they share an edge
+    /// with nothing else, and turning one of them would make the pair look
+    /// like two faces back to back.
     pub fn orient(&mut self) -> usize {
         let mut at: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
         for (i, t) in self.triangles.iter().enumerate() {
@@ -221,6 +224,9 @@ impl Mesh {
                     // Neighbours that agree run along their shared edge in
                     // opposite directions.
                     let u = self.triangles[j];
+                    if t.iter().all(|corner| u.contains(corner)) {
+                        continue;
+                    }
                     let same = (0..3).any(|m| u[m] == a && u[(m + 1) % 3] == b);
                     side[j] = if same { 3 - side[i] } else { side[i] };
                     piece.push(j);
