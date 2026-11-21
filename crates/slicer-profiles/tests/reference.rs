@@ -91,7 +91,8 @@ fn settings_reference_is_current() {
                 | "sequential_print"
                 | "arrange_outlines"
                 | "arrange_rotation"
-                | "flush_from_colours" => "`true`, `false`".to_string(),
+                | "flush_from_colours"
+                | "support_soluble" =>"`true`, `false`".to_string(),
                 "thumbnails" => "sizes like `48x48,300x300`, empty for none".to_string(),
                 "filament_colours" => {
                     "colours like `#FF8000,#202020`, one per extruder, empty for none".to_string()

@@ -1346,6 +1346,62 @@ fn settings_stored_in_a_project_file_are_used_on_request() {
 }
 
 #[test]
+fn soluble_supports_print_with_a_second_extruder() {
+    let dir = workdir("soluble_supports");
+    // A T: a column with a wide plate on top.
+    let mut t = Mesh::cuboid(10.0, 10.0, 10.0);
+    t.translate([10.0, 0.0, 0.0]);
+    let mut plate = Mesh::cuboid(30.0, 10.0, 2.0);
+    plate.translate([0.0, 0.0, 10.0]);
+    t.merge(&plate);
+    let model = dir.join("t.stl");
+    fs::write(&model, slicer_formats::write_stl_binary(&t)).unwrap();
+    let output = dir.join("t.gcode");
+    let out = run(&[
+        "slice",
+        model.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--json",
+        "--set",
+        "supports=true",
+        "--set",
+        "support_soluble=true",
+        "--set",
+        "extruder_count=2",
+        "--set",
+        "support_extruder=2",
+    ]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["warnings"].as_array().unwrap().len(), 0);
+    let extruders = report["stats"]["extruders"].as_array().unwrap();
+    assert_eq!(extruders.len(), 2, "{extruders:?}");
+    for e in extruders {
+        assert!(e["filament_length_mm"].as_f64().unwrap() > 100.0, "{e}");
+    }
+    // Every support and interface line prints with T1, everything else
+    // with T0; the 50 layers with supports change tools.
+    let gcode = fs::read_to_string(&output).unwrap();
+    let mut tool = "";
+    let mut changes = 0;
+    for line in gcode.lines() {
+        if line.starts_with('T') {
+            tool = line;
+            changes += 1;
+        } else if let Some(kind) = line.strip_prefix(";TYPE:") {
+            let support = kind.starts_with("Support");
+            let tower = kind.starts_with("Prime tower");
+            if !tower {
+                assert_eq!(tool, if support { "T1" } else { "T0" }, "{kind}");
+            }
+        }
+    }
+    assert!((50..=101).contains(&changes), "{changes}");
+    assert!(gcode.contains(";TYPE:Support interface"));
+}
+
+#[test]
 fn support_blockers_and_enforcers_move_supports() {
     let dir = workdir("support_volumes");
     // A T: a column with a wide plate on top.

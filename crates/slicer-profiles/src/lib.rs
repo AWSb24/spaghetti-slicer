@@ -374,16 +374,43 @@ pub struct Settings {
     /// every bridge.
     pub support_bridge_length: f64,
     /// Gap between the top of a support and the surface it carries, in
-    /// millimetres, rounded to whole layers of `layer_height`, at least one
-    /// layer; 0 means one layer, whatever its thickness.
+    /// millimetres, rounded to whole layers, at least one layer; 0 means
+    /// one layer, whatever its thickness. Where the layers differ in height
+    /// (`adaptive_layers`, layer heights of height ranges) the layers right
+    /// below the surface are counted until their heights add up to the
+    /// distance, otherwise layers of `layer_height`. With `support_soluble`
+    /// 0 means no gap and the distance may round to no layer at all.
     pub support_top_z_distance: f64,
     /// Gap between the model a support stands on and the support, in
-    /// millimetres, rounded to whole layers of `layer_height`, at least one
-    /// layer; 0 means one layer, whatever its thickness.
+    /// millimetres, rounded to whole layers like `support_top_z_distance`,
+    /// at least one layer; 0 means one layer, whatever its thickness. With
+    /// `support_soluble` 0 means no gap and the distance may round to no
+    /// layer at all.
     pub support_bottom_z_distance: f64,
     /// Distance between a support and the sides of the model, in
-    /// millimetres; 0 means one line width.
+    /// millimetres; 0 means one line width, or no gap with
+    /// `support_soluble`.
     pub support_xy_distance: f64,
+    /// Whether the supports are printed in a material that dissolves (or
+    /// otherwise comes off without a gap), so that they may touch the
+    /// model: 0 in `support_top_z_distance`, `support_bottom_z_distance`
+    /// and `support_xy_distance` then means no gap at all, and the dense
+    /// interface lies right under the surface it carries. The loop around
+    /// a support that lies under a surface is printed as interface too.
+    /// Usually goes with `support_extruder` or `support_interface_extruder`.
+    pub support_soluble: bool,
+    /// Extruder that prints the supports (counted from 1, like the
+    /// extruders of objects); 0 keeps the extruder that prints skirt and
+    /// brim, the lowest one the objects use. Only with more than one
+    /// extruder (`extruder_count`); a number above it is reported and
+    /// counts as 0.
+    pub support_extruder: u32,
+    /// Extruder that prints the dense support interface (counted from 1);
+    /// 0 takes the one of `support_extruder`. With an interface extruder of
+    /// its own, the loop around a support that lies under a surface is
+    /// printed as interface too, so that only the interface material
+    /// touches the model there.
+    pub support_interface_extruder: u32,
     /// Side of the square tower that every tool change primes the new
     /// extruder into, on every layer up to the last tool change; 0 disables
     /// it. Only used with more than one extruder.
@@ -583,6 +610,9 @@ impl Default for Settings {
             support_top_z_distance: 0.0,
             support_bottom_z_distance: 0.0,
             support_xy_distance: 0.0,
+            support_soluble: false,
+            support_extruder: 0,
+            support_interface_extruder: 0,
             prime_tower_width: 15.0,
             prime_tower_x: 190.0,
             prime_tower_y: 190.0,
@@ -1196,6 +1226,18 @@ impl Settings {
                 10.0,
             ),
             ("support_xy_distance", self.support_xy_distance, 0.0, 10.0),
+            (
+                "support_extruder",
+                f64::from(self.support_extruder),
+                0.0,
+                16.0,
+            ),
+            (
+                "support_interface_extruder",
+                f64::from(self.support_interface_extruder),
+                0.0,
+                16.0,
+            ),
             ("prime_tower_width", self.prime_tower_width, 0.0, 100.0),
             ("prime_tower_x", self.prime_tower_x, tower_x.0, tower_x.1),
             ("prime_tower_y", self.prime_tower_y, tower_y.0, tower_y.1),
