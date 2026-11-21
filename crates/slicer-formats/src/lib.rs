@@ -7,7 +7,8 @@ pub mod stl;
 pub mod threemf;
 
 pub use bambu::{
-    Filament, PLATE_THUMBNAIL_SIZE, PLATE_THUMBNAIL_SMALL_SIZE, PrintInfo, write_gcode_3mf,
+    Filament, LayerFilaments, PLATE_THUMBNAIL_SIZE, PLATE_THUMBNAIL_SMALL_SIZE, PrintInfo,
+    layer_filament_ranges, write_gcode_3mf,
 };
 pub use project::{
     ProjectItem, ProjectObject, ProjectPackage, read_part, read_project, write_project,

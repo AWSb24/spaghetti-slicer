@@ -78,9 +78,6 @@ const SUPPORT_INTERFACE_SPACING: f64 = 2.0;
 /// widths.
 const BRIDGE_ANCHOR: f64 = 2.0;
 
-/// Longest rim of a hole in the mesh that is closed before slicing.
-const MAX_HOLE_EDGES: usize = slicer_core::repair::MAX_HOLE_EDGES;
-
 /// Triangles whose corners lie this close to a line (mm) count as having
 /// no area and are removed before slicing. A tenth of the 10 nm polygon
 /// grid, so the surface moves by far less than the contours resolve.

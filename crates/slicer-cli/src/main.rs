@@ -940,6 +940,7 @@ fn slice(
             thumbnail: pictures.next().unwrap_or_default(),
             thumbnail_small: pictures.next().unwrap_or_default(),
             filaments: slicer_gcode::filaments(&result.stats, &settings),
+            layer_filaments: result.stats.layer_filaments.clone(),
         };
         slicer_formats::write_gcode_3mf(&result.gcode, &info).map_err(|e| e.diagnostic())?
     } else {
@@ -1116,10 +1117,15 @@ fn print_summary(result: &serde_json::Value) {
             );
         }
         println!(
-            "  time:      {}h {:02}m {:02}s (estimate with acceleration, without heating)",
+            "  time:      {}h {:02}m {:02}s (estimate with acceleration and start/end G-code, {})",
             seconds / 3600,
             seconds / 60 % 60,
-            seconds % 60
+            seconds % 60,
+            if number("time_heating_s") > 0.0 {
+                "with heating"
+            } else {
+                "without heating"
+            }
         );
     }
     let sent = &result["sent"];

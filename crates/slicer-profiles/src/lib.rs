@@ -523,6 +523,21 @@ pub struct Settings {
     /// Largest speed change in mm/s the printer makes at once, for example
     /// at a corner. Only used to estimate the print time.
     pub jerk: f64,
+    /// Seconds one `G28` (homing) in the start and end G-code takes. Only
+    /// used to estimate the print time.
+    pub homing_time: f64,
+    /// How fast the nozzle heats up (and cools down), in °C per second.
+    /// Only used to estimate the print time: waits for the nozzle (`M109`,
+    /// `M116`) count with this rate. 0 leaves heating the nozzle out of the
+    /// estimate.
+    pub nozzle_heat_rate: f64,
+    /// How fast the bed heats up (and cools down), in °C per second. Only
+    /// used to estimate the print time: waits for the bed (`M190`, `M116`)
+    /// count with this rate. 0 leaves heating the bed out of the estimate.
+    pub bed_heat_rate: f64,
+    /// Temperature of the nozzle and the bed before the print, for the
+    /// time estimate of heating.
+    pub ambient_temp: f64,
 
     // Retraction
     /// Filament length pulled back before a travel move; 0 disables retraction.
@@ -655,6 +670,10 @@ impl Default for Settings {
             travel_speed: 150.0,
             acceleration: 1000.0,
             jerk: 8.0,
+            homing_time: 10.0,
+            nozzle_heat_rate: 0.0,
+            bed_heat_rate: 0.0,
+            ambient_temp: 25.0,
             retraction_length: 0.8,
             retraction_speed: 35.0,
             retraction_min_travel: 1.5,
@@ -1286,6 +1305,10 @@ impl Settings {
             ("travel_speed", self.travel_speed, 1.0, 2000.0),
             ("acceleration", self.acceleration, 10.0, 100_000.0),
             ("jerk", self.jerk, 0.0, 1000.0),
+            ("homing_time", self.homing_time, 0.0, 600.0),
+            ("nozzle_heat_rate", self.nozzle_heat_rate, 0.0, 100.0),
+            ("bed_heat_rate", self.bed_heat_rate, 0.0, 100.0),
+            ("ambient_temp", self.ambient_temp, -20.0, 80.0),
             ("retraction_length", self.retraction_length, 0.0, 20.0),
             ("retraction_speed", self.retraction_speed, 1.0, 200.0),
             (

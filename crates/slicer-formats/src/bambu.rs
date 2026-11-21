@@ -40,6 +40,45 @@ pub struct PrintInfo {
     /// The filaments the print uses; empty for one white PLA filament with
     /// all of [`PrintInfo::filament_m`] and [`PrintInfo::weight_g`].
     pub filaments: Vec<Filament>,
+    /// Which filaments the layers use, as runs of layers
+    /// ([`layer_filament_ranges`]); empty for the first filament on every
+    /// layer.
+    pub layer_filaments: Vec<LayerFilaments>,
+}
+
+/// A run of layers that use the same filaments, one
+/// `<layer_filament_list>` of `Metadata/slice_info.config`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerFilaments {
+    /// The filaments, counted from 0 (extruder `T0` is 0), ascending.
+    pub filaments: Vec<u32>,
+    /// The first layer of the run, counted from 0.
+    pub first: usize,
+    /// The last layer of the run, counted from 0.
+    pub last: usize,
+}
+
+/// Runs of layers with the same filaments, from the filaments of every
+/// layer (`layers[i]` those of layer `i`, ascending). A layer that uses
+/// none belongs to the run before it (the first run for layers at the
+/// start), so the runs cover every layer without gaps.
+pub fn layer_filament_ranges(layers: &[Vec<u32>]) -> Vec<LayerFilaments> {
+    let mut runs: Vec<LayerFilaments> = Vec::new();
+    for (index, used) in layers.iter().enumerate() {
+        match runs.last_mut() {
+            Some(run) if used.is_empty() || *used == run.filaments => run.last = index,
+            _ if used.is_empty() => {}
+            _ => runs.push(LayerFilaments {
+                filaments: used.clone(),
+                first: index,
+                last: index,
+            }),
+        }
+    }
+    if let Some(run) = runs.first_mut() {
+        run.first = 0;
+    }
+    runs
 }
 
 /// One filament of a print, as the description files list it.
@@ -182,14 +221,36 @@ pub fn write_gcode_3mf(gcode: &str, info: &PrintInfo) -> Result<Vec<u8>, ThreeMf
             )
         })
         .collect();
-    // ponytail: every layer is listed with filament 0 as before; which
-    // filaments a layer uses is not known here.
+    // One list per run of layers with the same filaments: the filaments
+    // counted from 0, separated by spaces, and the first and last layer.
+    // ponytail: the shape follows the one list this writer always wrote; no
+    // saved `.gcode.3mf` with several filaments was at hand to compare, so
+    // a run that comes back later gets a list of its own instead of a
+    // second range in the same one.
+    let runs = if info.layer_filaments.is_empty() {
+        vec![LayerFilaments {
+            filaments: vec![0],
+            first: 0,
+            last: info.layers.saturating_sub(1),
+        }]
+    } else {
+        info.layer_filaments.clone()
+    };
+    let layer_lists: String = runs
+        .iter()
+        .map(|run| {
+            let list: Vec<String> = run.filaments.iter().map(u32::to_string).collect();
+            format!(
+                "      <layer_filament_list filament_list=\"{}\" layer_ranges=\"{} {}\" />\n",
+                list.join(" "),
+                run.first,
+                run.last
+            )
+        })
+        .collect();
     let slice_info = format!(
-        "{XML}<config>\n  <header>\n    <header_item key=\"X-BBL-Client-Type\" value=\"slicer\"/>\n    <header_item key=\"X-BBL-Client-Version\" value=\"\"/>\n  </header>\n  <plate>\n    <metadata key=\"index\" value=\"1\"/>\n    <metadata key=\"nozzle_diameters\" value=\"{}\"/>\n    <metadata key=\"prediction\" value=\"{:.0}\"/>\n    <metadata key=\"weight\" value=\"{:.2}\"/>\n    <metadata key=\"outside\" value=\"false\"/>\n    <metadata key=\"support_used\" value=\"false\"/>\n{filaments}    <layer_filament_lists>\n      <layer_filament_list filament_list=\"0\" layer_ranges=\"0 {}\" />\n    </layer_filament_lists>\n  </plate>\n</config>\n",
-        info.nozzle_diameter,
-        info.seconds,
-        info.weight_g,
-        info.layers.saturating_sub(1)
+        "{XML}<config>\n  <header>\n    <header_item key=\"X-BBL-Client-Type\" value=\"slicer\"/>\n    <header_item key=\"X-BBL-Client-Version\" value=\"\"/>\n  </header>\n  <plate>\n    <metadata key=\"index\" value=\"1\"/>\n    <metadata key=\"nozzle_diameters\" value=\"{}\"/>\n    <metadata key=\"prediction\" value=\"{:.0}\"/>\n    <metadata key=\"weight\" value=\"{:.2}\"/>\n    <metadata key=\"outside\" value=\"false\"/>\n    <metadata key=\"support_used\" value=\"false\"/>\n{filaments}    <layer_filament_lists>\n{layer_lists}    </layer_filament_lists>\n  </plate>\n</config>\n",
+        info.nozzle_diameter, info.seconds, info.weight_g,
     );
     let checksum = md5_hex(gcode.as_bytes());
     let mut parts: Vec<(&str, &[u8])> = vec![
@@ -304,6 +365,46 @@ mod tests {
             .unwrap();
         assert!(text.contains("    <filament id=\"1\" type=\"PLA\" color=\"#FF8000\" used_m=\"1.50\" used_g=\"4.50\"/>\n    <filament id=\"3\" type=\"PETG\" color=\"#202020\" used_m=\"0.25\" used_g=\"0.75\"/>\n    <layer_filament_lists>"), "{text}");
         assert_eq!(text.matches("<filament ").count(), 2);
+    }
+
+    #[test]
+    fn layers_are_listed_with_their_filaments() {
+        let runs = layer_filament_ranges(&[
+            vec![],
+            vec![0, 1],
+            vec![0, 1],
+            vec![1],
+            vec![],
+            vec![1],
+            vec![0],
+        ]);
+        let run = |filaments: &[u32], first, last| LayerFilaments {
+            filaments: filaments.to_vec(),
+            first,
+            last,
+        };
+        assert_eq!(runs, [run(&[0, 1], 0, 2), run(&[1], 3, 5), run(&[0], 6, 6)]);
+        assert!(layer_filament_ranges(&[vec![], vec![]]).is_empty());
+
+        let info = PrintInfo {
+            layers: 7,
+            layer_filaments: runs,
+            ..PrintInfo::default()
+        };
+        let bytes = write_gcode_3mf("G28\n", &info).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut text = String::new();
+        archive
+            .by_name("Metadata/slice_info.config")
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert!(
+            text.contains(
+                "    <layer_filament_lists>\n      <layer_filament_list filament_list=\"0 1\" layer_ranges=\"0 2\" />\n      <layer_filament_list filament_list=\"1\" layer_ranges=\"3 5\" />\n      <layer_filament_list filament_list=\"0\" layer_ranges=\"6 6\" />\n    </layer_filament_lists>\n"
+            ),
+            "{text}"
+        );
     }
 
     #[test]
