@@ -265,19 +265,9 @@ fn corpus() -> Vec<Model> {
             NONE,
             None,
         ),
-        model("inside_out", inverted, &["mesh.inside_out"], Some(0.03)),
-        model(
-            "duplicate_triangle",
-            with_junk,
-            &["mesh.non_manifold", "mesh.not_watertight"],
-            Some(0.03),
-        ),
-        model(
-            "sliver_triangle",
-            sliver,
-            &["mesh.degenerate_removed"],
-            Some(0.03),
-        ),
+        model("inside_out", inverted, REPAIRED, Some(0.03)),
+        model("duplicate_triangle", with_junk, REPAIRED, Some(0.03)),
+        model("sliver_triangle", sliver, REPAIRED, Some(0.03)),
         // The volume of the open mesh is not that of the box it encloses.
         model("open_top", open_top, REPAIRED, None),
         model("hole_in_side", hole_in_side, REPAIRED, Some(0.03)),
@@ -432,7 +422,7 @@ fn model_open_on_every_layer_is_an_error() {
     assert_eq!(error.code(), "slicing.nothing_to_print");
     assert_eq!(
         warnings.codes(),
-        ["mesh.not_watertight", "slicing.open_contours"]
+        ["mesh.not_repairable", "slicing.open_contours"]
     );
 }
 
@@ -578,11 +568,12 @@ fn real_world_models() {
         if name == "3dbenchy.stl" {
             // 48 mm tall, closed, and nothing in it is thinner than a line.
             // Its roof, windows and bow hang free; there are no supports.
-            // A dozen of its triangles have no area and are removed.
+            // A dozen of its triangles have no area and are removed, which
+            // counts as a repair.
             assert_eq!(toolpaths.layers.len(), 240);
             assert_eq!(
                 warnings.codes(),
-                ["mesh.degenerate_removed", "slicing.unsupported_overhangs"]
+                ["mesh.repaired", "slicing.unsupported_overhangs"]
             );
             let grams = output.stats.filament_weight_g;
             assert!((9.0..14.0).contains(&grams), "{grams} g");
@@ -676,6 +667,51 @@ fn thingi10k_models() {
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
     // Most of them must actually be sliced, or the test proves little.
     assert!(sliced >= 150, "only {sliced} models were sliced");
+}
+
+/// Repairs the 40 Thingi10K models that the dataset marks as open or not
+/// manifold (see `thingi10k_models`) and prints, for each, what the repair
+/// did, what is left and how long it took. Most must come out clean.
+#[test]
+#[ignore = "needs the models fetched by tools/fetch-thingi10k.py"]
+fn thingi10k_repair() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
+    let dir = root.join("thingi10k");
+    assert!(dir.is_dir(), "run `python tools/fetch-thingi10k.py` first");
+    let manifest = std::fs::read_to_string(root.join("thingi10k.tsv")).unwrap();
+    let broken: Vec<&str> = manifest
+        .lines()
+        .skip(1)
+        .filter(|line| line.split('\t').nth(5) != Some("clean"))
+        .filter_map(|line| line.split('\t').next())
+        .collect();
+    assert_eq!(broken.len(), 40);
+    let (mut clean, mut total) = (0, std::time::Duration::ZERO);
+    for id in &broken {
+        let path = dir.join(format!("{id}.stl"));
+        let mut mesh = slicer_formats::parse_stl(&std::fs::read(&path).unwrap()).unwrap();
+        let started = std::time::Instant::now();
+        let repair = mesh.repair(1e-6);
+        let took = started.elapsed();
+        total += took;
+        clean += usize::from(repair.is_clean());
+        println!(
+            "{id:>6} {:>6} tris {:>6.1} ms  {}  {repair:?}",
+            mesh.triangles.len(),
+            took.as_secs_f64() * 1000.0,
+            if repair.is_clean() {
+                "clean       "
+            } else {
+                "not repairable"
+            },
+        );
+    }
+    println!(
+        "{clean} of {} clean after repair, {:.1} ms in all",
+        broken.len(),
+        total.as_secs_f64() * 1000.0
+    );
+    assert!(clean >= 20, "only {clean} came out clean");
 }
 
 /// Fingerprints of the G-code of the reference models, compared with

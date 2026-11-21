@@ -121,38 +121,11 @@ pub const PROCESS_TABS: [ProcessTab; 5] = [
     ),
 ];
 
-/// The unit of a setting's value for the field, e.g. "mm/s"; empty for
-/// counts, switches and choices.
+/// The unit of a setting's value for the field, e.g. "mm/s", from the
+/// settings table ([`SettingInfo::unit`]); empty for counts, switches,
+/// choices and unknown keys.
 pub fn setting_unit(key: &str) -> &'static str {
-    match key {
-        "acceleration" => "mm/s²",
-        "jerk" => "mm/s",
-        "filament_density" => "g/cm³",
-        "flush_volumes" => "mm³",
-        "infill_density" | "infill_overlap" => "%",
-        _ if key.contains("fan_") && key.ends_with("_speed") => "%",
-        _ if key.ends_with("_speed") => "mm/s",
-        _ if key.ends_with("_angle") => "°",
-        _ if key.ends_with("_temp") || key.contains("_temp_") => "°C",
-        _ if [
-            "_height",
-            "_width",
-            "_distance",
-            "_length",
-            "_spacing",
-            "_diameter",
-            "_travel",
-        ]
-        .iter()
-        .any(|end| key.ends_with(end))
-            || key == "z_hop"
-            || key.starts_with("bed_size_")
-            || key.starts_with("prime_tower_") =>
-        {
-            "mm"
-        }
-        _ => "",
-    }
+    slicer_profiles::setting_info(key).map_or("", |info| info.unit)
 }
 
 /// A setting's name for people: `infill_density` becomes "Infill density".
@@ -511,6 +484,11 @@ mod tests {
             ("support_interface_speed", "mm/s"),
             ("support_interface_fan_speed", "%"),
             ("support_interface_spacing", "mm"),
+            ("min_layer_time", "s"),
+            ("fan_layer_time", "s"),
+            ("ironing_flow", "%"),
+            ("arc_tolerance", "mm"),
+            ("elephant_foot_compensation", "mm"),
             ("wall_loops", ""),
             ("supports", ""),
         ] {

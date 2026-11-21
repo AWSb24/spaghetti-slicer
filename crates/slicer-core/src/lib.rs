@@ -9,6 +9,7 @@ pub mod parallel;
 pub mod png;
 pub mod polygon;
 pub mod primitives;
+pub mod repair;
 pub mod slice;
 pub mod thumbnail;
 
@@ -16,3 +17,4 @@ pub use diagnostics::{Diagnose, Diagnostic, Diagnostics, Severity};
 pub use mesh::Mesh;
 pub use parallel::parallel_map;
 pub use polygon::{Contour, Point, Shape, Shapes};
+pub use repair::MeshRepair;

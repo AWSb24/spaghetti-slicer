@@ -1,18 +1,33 @@
 //! Generates the table of all settings (`SETTINGS_INFO`) from the fields of
 //! `Settings` in `src/lib.rs`: name, group, kind of value, the values of
-//! choices and the doc comment. The doc comments stay the only place where
-//! a setting is described, and programs get the descriptions without
-//! reading source files.
+//! choices and the doc comment, and the unit from `src/units.rs`. The doc
+//! comments stay the only place where a setting is described, and programs
+//! get the descriptions without reading source files.
 
 use std::fmt::Write;
 
 fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
+    println!("cargo:rerun-if-changed=src/units.rs");
+    let units: &[(&str, &str)] = include!("src/units.rs");
     let source = std::fs::read_to_string("src/lib.rs")
         .expect("src/lib.rs is readable")
         .replace("\r\n", "\n");
+    let fields = fields(&source);
+    for (key, _) in units {
+        assert!(
+            fields.iter().any(|field| field.name == *key),
+            "src/units.rs names `{key}`, which is no setting"
+        );
+    }
     let mut table = String::from("&[\n");
-    for field in fields(&source) {
+    for field in fields {
+        let Some((_, unit)) = units.iter().find(|(key, _)| *key == field.name) else {
+            panic!(
+                "the setting `{}` has no unit in src/units.rs (\"\" for none)",
+                field.name
+            );
+        };
         let choices = choices(&source, &field.ty);
         let kind = match field.ty.as_str() {
             "f64" | "f32" => "Number",
@@ -23,7 +38,7 @@ fn main() {
         };
         let _ = writeln!(
             table,
-            "    SettingInfo {{ key: {:?}, group: {:?}, kind: ValueKind::{kind}, choices: &{choices:?}, description: {:?} }},",
+            "    SettingInfo {{ key: {:?}, group: {:?}, kind: ValueKind::{kind}, choices: &{choices:?}, unit: {unit:?}, description: {:?} }},",
             field.name, field.group, field.description
         );
     }
