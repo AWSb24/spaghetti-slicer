@@ -733,9 +733,10 @@ pub fn openapi() -> Value {
                             "filament_length_mm": { "type": "number" },
                             "filament_volume_cm3": { "type": "number" },
                             "filament_weight_g": { "type": "number" },
-                            "print_time_s": { "type": "number", "description": "Estimated seconds in all: moves of the layers, start and end G-code, waits for heating" },
+                            "print_time_s": { "type": "number", "description": "Estimated seconds in all: moves of the layers, start, end and tool change G-code, waits for heating" },
                             "time_start_end_s": { "type": "number", "description": "Of print_time_s, the moves, dwells and homing of the start and end G-code" },
-                            "time_heating_s": { "type": "number", "description": "Of print_time_s, the waits for the heaters; 0 without nozzle_heat_rate and bed_heat_rate" }
+                            "time_heating_s": { "type": "number", "description": "Of print_time_s, the waits for the heaters; 0 without nozzle_heat_rate and bed_heat_rate" },
+                            "time_toolchange_s": { "type": "number", "description": "Of print_time_s, the moves and dwells of the tool change G-code; left out when 0" }
                         } },
                         "warnings": { "type": "array", "items": { "$ref": "#/components/schemas/Diagnostic" } },
                         "error": { "$ref": "#/components/schemas/Diagnostic" },

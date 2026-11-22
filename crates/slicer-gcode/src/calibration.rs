@@ -1482,6 +1482,7 @@ mod tests {
                 print_time_s: 0.0,
                 time_start_end_s: 0.0,
                 time_heating_s: 0.0,
+                time_toolchange_s: 0.0,
                 extruders: Vec::new(),
                 flush_volume_cm3: 0.0,
                 flush_weight_g: 0.0,

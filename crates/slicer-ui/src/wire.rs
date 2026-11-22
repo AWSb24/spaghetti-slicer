@@ -364,6 +364,7 @@ fn write_stats(out: &mut Writer, stats: &Stats) {
         print_time_s,
         time_start_end_s,
         time_heating_s,
+        time_toolchange_s,
         extruders,
         flush_volume_cm3,
         flush_weight_g,
@@ -378,6 +379,7 @@ fn write_stats(out: &mut Writer, stats: &Stats) {
         print_time_s,
         time_start_end_s,
         time_heating_s,
+        time_toolchange_s,
     ] {
         out.f64(*value);
     }
@@ -427,6 +429,7 @@ fn read_stats(input: &mut Reader) -> Result<Stats, Malformed> {
         print_time_s: input.f64()?,
         time_start_end_s: input.f64()?,
         time_heating_s: input.f64()?,
+        time_toolchange_s: input.f64()?,
         extruders: input.list(|input| {
             Ok(ExtruderStats {
                 extruder: input.u32()?,
