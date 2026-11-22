@@ -567,7 +567,8 @@ pub struct Settings {
     pub ambient_temp: f64,
     /// Highest speed of the X axis in mm/s (Marlin `M203 X`); 0 for no
     /// limit. The time estimate slows every move so that its share along X
-    /// stays within it.
+    /// stays within it. With Klipper the smaller of this and `max_speed_y`
+    /// is the speed limit of the nozzle in any direction (`max_velocity`).
     pub max_speed_x: f64,
     /// Highest speed of the Y axis in mm/s (`M203 Y`); 0 for no limit.
     pub max_speed_y: f64,
@@ -593,7 +594,9 @@ pub struct Settings {
     /// alone); 0 for no limit.
     pub max_accel_e: f64,
     /// Highest acceleration of moves that extrude, in mm/s² (`M204 P`); 0
-    /// for no limit beyond `acceleration`.
+    /// for no limit beyond `acceleration`. Klipper has one acceleration for
+    /// all moves, the smallest of `acceleration`, this and
+    /// `max_accel_travel`.
     pub max_accel_extruding: f64,
     /// Highest acceleration of moves without extrusion, in mm/s² (`M204
     /// T`); 0 for no limit beyond `acceleration`.
@@ -611,10 +614,14 @@ pub struct Settings {
     /// time estimate takes corners with it instead of `jerk`. 0 keeps
     /// `jerk`.
     pub junction_deviation: f64,
-    /// With `flavor = marlin`: writes the machine limits above
-    /// (`max_speed_*`, `max_accel_*`, `acceleration`, `jerk` or
-    /// `junction_deviation`) as `M201`, `M203`, `M204` and `M205` before
-    /// the start G-code, so the printer runs as the estimate assumes.
+    /// Writes the machine limits above before the start G-code, so the
+    /// printer runs as the estimate assumes: for Marlin `max_speed_*`,
+    /// `max_accel_*`, `acceleration`, `jerk` or `junction_deviation` as
+    /// `M201`, `M203`, `M204` and `M205`; for Klipper the speed limit of
+    /// the nozzle, the acceleration, `square_corner_velocity` and
+    /// `minimum_cruise_ratio` as `SET_VELOCITY_LIMIT` (the limits of Z and
+    /// of the filament stay those of `printer.cfg`). Limits that the start
+    /// G-code itself sets hold for the estimate from there on.
     pub emit_machine_limits: bool,
 
     // Retraction

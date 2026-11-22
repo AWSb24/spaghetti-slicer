@@ -118,7 +118,7 @@ Numbers are in the unit of the Unit column (empty for counts and factors). A set
 | `nozzle_heat_rate` | 0 | °C/s | 0 to 100 | How fast the nozzle heats up (and cools down), in °C per second. Only used to estimate the print time: waits for the nozzle (`M109`, `M116`) count with this rate. 0 leaves heating the nozzle out of the estimate. |
 | `bed_heat_rate` | 0 | °C/s | 0 to 100 | How fast the bed heats up (and cools down), in °C per second. Only used to estimate the print time: waits for the bed (`M190`, `M116`) count with this rate. 0 leaves heating the bed out of the estimate. |
 | `ambient_temp` | 25 | °C | -20 to 80 | Temperature of the nozzle and the bed before the print, for the time estimate of heating. |
-| `max_speed_x` | 0 | mm/s | 0 to 2000 | Highest speed of the X axis in mm/s (Marlin `M203 X`); 0 for no limit. The time estimate slows every move so that its share along X stays within it. |
+| `max_speed_x` | 0 | mm/s | 0 to 2000 | Highest speed of the X axis in mm/s (Marlin `M203 X`); 0 for no limit. The time estimate slows every move so that its share along X stays within it. With Klipper the smaller of this and `max_speed_y` is the speed limit of the nozzle in any direction (`max_velocity`). |
 | `max_speed_y` | 0 | mm/s | 0 to 2000 | Highest speed of the Y axis in mm/s (`M203 Y`); 0 for no limit. |
 | `max_speed_z` | 0 | mm/s | 0 to 2000 | Highest speed of the Z axis in mm/s (`M203 Z`, Klipper `max_z_velocity`); 0 for no limit. |
 | `max_speed_e` | 0 | mm/s | 0 to 2000 | Highest speed of the filament in mm/s (`M203 E`, Klipper `max_extrude_only_velocity`, there only for moves of the filament alone); 0 for no limit. |
@@ -126,12 +126,12 @@ Numbers are in the unit of the Unit column (empty for counts and factors). A set
 | `max_accel_y` | 0 | mm/s² | 0 to 100000 | Highest acceleration of the Y axis in mm/s² (`M201 Y`); 0 for no limit. |
 | `max_accel_z` | 0 | mm/s² | 0 to 100000 | Highest acceleration of the Z axis in mm/s² (`M201 Z`, Klipper `max_z_accel`); 0 for no limit. |
 | `max_accel_e` | 0 | mm/s² | 0 to 100000 | Highest acceleration of the filament in mm/s² (`M201 E`, Klipper `max_extrude_only_accel`, there only for moves of the filament alone); 0 for no limit. |
-| `max_accel_extruding` | 0 | mm/s² | 0 to 100000 | Highest acceleration of moves that extrude, in mm/s² (`M204 P`); 0 for no limit beyond `acceleration`. |
+| `max_accel_extruding` | 0 | mm/s² | 0 to 100000 | Highest acceleration of moves that extrude, in mm/s² (`M204 P`); 0 for no limit beyond `acceleration`. Klipper has one acceleration for all moves, the smallest of `acceleration`, this and `max_accel_travel`. |
 | `max_accel_travel` | 0 | mm/s² | 0 to 100000 | Highest acceleration of moves without extrusion, in mm/s² (`M204 T`); 0 for no limit beyond `acceleration`. |
 | `square_corner_velocity` | 5 | mm/s | 0 to 100 | With `flavor = klipper`: the speed in mm/s at which the printer takes a 90° corner at `acceleration` (Klipper's `square_corner_velocity`); the time estimate takes the corners of Klipper with it instead of `jerk`. |
 | `minimum_cruise_ratio` | 0.5 |  | 0 to 0.99 | With `flavor = klipper`: the share of every move that is at least travelled at its top speed (Klipper's `minimum_cruise_ratio`); short moves reach a lower top speed. 0 turns it off. |
 | `junction_deviation` | 0 | mm | 0 to 1 | With `flavor = marlin`: the junction deviation in mm (`M205 J`); the time estimate takes corners with it instead of `jerk`. 0 keeps `jerk`. |
-| `emit_machine_limits` | false |  | `true`, `false` | With `flavor = marlin`: writes the machine limits above (`max_speed_*`, `max_accel_*`, `acceleration`, `jerk` or `junction_deviation`) as `M201`, `M203`, `M204` and `M205` before the start G-code, so the printer runs as the estimate assumes. |
+| `emit_machine_limits` | false |  | `true`, `false` | Writes the machine limits above before the start G-code, so the printer runs as the estimate assumes: for Marlin `max_speed_*`, `max_accel_*`, `acceleration`, `jerk` or `junction_deviation` as `M201`, `M203`, `M204` and `M205`; for Klipper the speed limit of the nozzle, the acceleration, `square_corner_velocity` and `minimum_cruise_ratio` as `SET_VELOCITY_LIMIT` (the limits of Z and of the filament stay those of `printer.cfg`). Limits that the start G-code itself sets hold for the estimate from there on. |
 | `retraction_length` | 0.8 | mm | 0 to 20 | Filament length pulled back before a travel move; 0 disables retraction. |
 | `retraction_speed` | 35 | mm/s | 1 to 200 | Speed of retraction and unretraction. |
 | `retraction_min_travel` | 1.5 | mm | 0 to 100 | Travel moves shorter than this do not retract. |
