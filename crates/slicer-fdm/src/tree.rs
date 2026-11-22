@@ -11,7 +11,9 @@
 //! next few layers and out of the model itself, and merges branches that
 //! touch. Branches start `tree_contact_spacing` apart as thin as
 //! `tree_tip_diameter` and thicken gradually on the way down with the area
-//! they carry, up to `tree_branch_diameter`.
+//! they carry, up to `tree_branch_diameter`. A branch that never merges
+//! with another one widens below its tip like a slim cone instead of
+//! standing as a needle.
 
 use slicer_core::polygon::{self, distance, sin_cos_degrees};
 use slicer_core::{Contour, Point, Shapes, parallel_map};
@@ -30,8 +32,16 @@ const CIRCLE_SEGMENTS: u32 = 32;
 const LEAN: f64 = 0.8;
 
 /// Branches lean only towards neighbours closer than this, in multiples of
-/// `tree_contact_spacing`; farther ones grow straight down.
+/// `tree_contact_spacing`; a branch without one leans towards a farther
+/// neighbour only if it can get there on the upper half of its way down to
+/// the bed (see [`branches`]), else it grows straight down.
 const ATTRACTION: f64 = 4.0;
+
+/// How much thicker a branch that never merges with another one gets per
+/// millimetre below its tip, in millimetres of radius: from its tip down
+/// to where it stands, it is a slim cone instead of a needle as thin as
+/// its tip (a 1 mm wider diameter every 10 mm).
+const LONE_TAPER: f64 = 0.05;
 
 /// Smallest radius of a branch, and that of a tip without
 /// `tree_tip_diameter`, in line widths: the support loop around it, half a
@@ -330,20 +340,21 @@ pub(crate) fn tip_radius(settings: &Settings) -> f64 {
     (0.5 * settings.tree_tip_diameter).max(TIP_RADIUS * settings.line_width)
 }
 
+/// The branch nearest to branch `k`, at most `limit` away.
+fn nearest(nodes: &[Node], k: usize, limit: f64) -> Option<usize> {
+    let mut neighbour: Option<(usize, f64)> = None;
+    for (m, other) in nodes.iter().enumerate() {
+        let d = distance(nodes[k].at, other.at);
+        if m != k && d <= limit && neighbour.is_none_or(|(_, best)| d < best) {
+            neighbour = Some((m, d));
+        }
+    }
+    neighbour.map(|(m, _)| m)
+}
+
 /// For every branch the nearest other one at most `limit` away.
 fn nearest_neighbours(nodes: &[Node], limit: f64) -> Vec<Option<usize>> {
-    (0..nodes.len())
-        .map(|k| {
-            let mut neighbour: Option<(usize, f64)> = None;
-            for (m, other) in nodes.iter().enumerate() {
-                let d = distance(nodes[k].at, other.at);
-                if m != k && d <= limit && neighbour.is_none_or(|(_, best)| d < best) {
-                    neighbour = Some((m, d));
-                }
-            }
-            neighbour.map(|(m, _)| m)
-        })
-        .collect()
+    (0..nodes.len()).map(|k| nearest(nodes, k, limit)).collect()
 }
 
 /// For every branch the one it leans towards: branches pair up, closest
@@ -444,11 +455,16 @@ fn branches(
             let reach = reach.max(step / LEAN);
             let mut grown = Vec::with_capacity(nodes.len());
             let partner = partners(&nodes, ATTRACTION * contact);
+            // A branch without a neighbour close by leans towards a farther
+            // one that it reaches on the upper half of its way down to the
+            // bed, instead of running down alone.
+            let far = 0.5 * slope * cut_heights[index];
             for (k, node) in nodes.iter().enumerate() {
                 let r = node
                     .radius
                     .max(target(node.load).min(node.radius + GROWTH * reach));
-                let neighbour = partner[k].map(|m| (nodes[m].at, distance(node.at, nodes[m].at)));
+                let toward = partner[k].or_else(|| nearest(&nodes, k, far));
+                let neighbour = toward.map(|m| (nodes[m].at, distance(node.at, nodes[m].at)));
                 let attracted = match neighbour {
                     Some((other, d)) if d > 0.0 => towards(node.at, other, step.min(0.5 * d)),
                     _ => node.at,
@@ -537,7 +553,58 @@ fn branches(
         }
         layers[index].clone_from(&nodes);
     }
+    taper_lone(&mut layers, cut_heights, tip, thickest);
     layers
+}
+
+/// Thickens the branches that run from their tip down to where they stand
+/// without ever merging with another one: a branch that carries little
+/// stays as thin as its tip, a needle that wobbles and is printed as a tiny
+/// ring on every layer. Such a branch becomes a slim cone instead,
+/// [`LONE_TAPER`] wider per millimetre below its tip (and at most
+/// `thickest`); branches that merge thicken with their load anyway.
+// ponytail: thickened after the branches have been placed, so a thicker
+// branch is only clipped where it reaches into the model, not moved out of
+// its way.
+fn taper_lone(layers: &mut [Vec<Node>], cut_heights: &[f64], tip: f64, thickest: f64) {
+    let count = layers.len();
+    // For every branch the height of its tip, if it continues a single tip
+    // that has not taken up any other branch (so still carries the same).
+    let mut tips: Vec<Vec<Option<f64>>> = vec![Vec::new(); count];
+    for index in (0..count).rev() {
+        tips[index] = layers[index]
+            .iter()
+            .map(|node| match node.from.as_slice() {
+                [] => Some(cut_heights[index]),
+                &[k] if layers[index + 1][k].load == node.load => tips[index + 1][k],
+                _ => None,
+            })
+            .collect();
+    }
+    // From the bottom up: a branch stays alone if it ends here or the
+    // branch continuing it does.
+    let mut alone: Vec<Vec<bool>> = vec![Vec::new(); count];
+    for index in 0..count {
+        let mut below = vec![None; layers[index].len()];
+        if index > 0 {
+            for (m, node) in layers[index - 1].iter().enumerate() {
+                for &k in &node.from {
+                    below[k] = Some(m);
+                }
+            }
+        }
+        alone[index] = (0..layers[index].len())
+            .map(|k| tips[index][k].is_some() && below[k].is_none_or(|m| alone[index - 1][m]))
+            .collect();
+    }
+    for index in 0..count {
+        for (k, node) in layers[index].iter_mut().enumerate() {
+            if let (true, Some(top)) = (alone[index][k], tips[index][k]) {
+                let tapered = tip + LONE_TAPER * (top - cut_heights[index]);
+                node.radius = node.radius.max(tapered.min(thickest));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -569,12 +636,22 @@ mod tests {
         model: impl Fn(usize) -> Shapes,
         settings: &Settings,
     ) -> (Vec<Vec<Node>>, Vec<Shapes>, Settings) {
+        grow_under(&rect(0.0, 0.0, 30.0, 10.0), 50, model, settings)
+    }
+
+    /// Branches under `plate`, two layers thick from layer `top` up, on
+    /// layers of 0.2 mm, like [`grow_with`].
+    fn grow_under(
+        plate: &Shapes,
+        top: usize,
+        model: impl Fn(usize) -> Shapes,
+        settings: &Settings,
+    ) -> (Vec<Vec<Node>>, Vec<Shapes>, Settings) {
         let settings = settings.clone();
-        let count = 60;
-        let plate = rect(0.0, 0.0, 30.0, 10.0);
+        let count = top + 10;
         let slices: Vec<Shapes> = (0..count)
             .map(|i| {
-                if (50..52).contains(&i) {
+                if (top..top + 2).contains(&i) {
                     plate.clone()
                 } else {
                     model(i)
@@ -584,7 +661,7 @@ mod tests {
         // The supports start one empty layer below the plate.
         let starts: Vec<Shapes> = (0..count)
             .map(|i| match i {
-                48 => polygon::difference(&plate, &slices[49]),
+                _ if i + 2 == top => polygon::difference(plate, &slices[top - 1]),
                 _ => Vec::new(),
             })
             .collect();
@@ -737,6 +814,49 @@ mod tests {
         };
         let (tips, _) = radii(&settings);
         assert!(tips.iter().all(|&r| (r - 0.45).abs() < 1e-9), "{tips:?}");
+    }
+
+    #[test]
+    fn a_lone_branch_tapers_down_to_the_bed() {
+        // A 2 mm square on layer 50 with nothing around it: a single tip
+        // that carries little, so it would stay as thin as the tip all the
+        // way down to the bed.
+        let square = rect(1.5, 1.5, 3.5, 3.5);
+        let settings = Settings::default();
+        let (branches, _, _) = grow_under(&square, 50, |_| Vec::new(), &settings);
+        let tip = tip_radius(&settings);
+        assert_eq!(branches[46].len(), 1);
+        assert!((branches[46][0].radius - tip).abs() < 1e-9);
+        // It gets thicker below its tip and stands on the bed as a cone:
+        // 1 mm wider across for every 10 mm below the tip.
+        assert_eq!(branches[0].len(), 1);
+        let height = 0.2 * 46.0;
+        let base = branches[0][0].radius;
+        assert!((base - (tip + LONE_TAPER * height)).abs() < 1e-9, "{base}");
+        for index in 0..46 {
+            assert!(branches[index][0].radius >= branches[index + 1][0].radius);
+        }
+    }
+
+    #[test]
+    fn lone_branches_lean_towards_far_neighbours() {
+        // Two 2 mm squares 25 mm apart on layer 300 (60 mm up), farther
+        // apart than branches lean towards each other by default (four
+        // contact spacings, 20 mm). As they have the height to meet on the
+        // way down, they lean towards each other and stand on the bed as
+        // one instead of two needles.
+        let mut squares = rect(1.5, 1.5, 3.5, 3.5);
+        squares.extend(rect(26.5, 1.5, 28.5, 3.5));
+        let settings = Settings::default();
+        let (branches, _, _) = grow_under(&squares, 300, |_| Vec::new(), &settings);
+        assert_eq!(branches[296].len(), 2);
+        assert_eq!(branches[0].len(), 1);
+        // They meet on the upper half of the way down.
+        assert_eq!(branches[150].len(), 1);
+        // Too low to meet, they grow straight down.
+        let (low, _, _) = grow_under(&squares, 50, |_| Vec::new(), &settings);
+        assert_eq!(low[0].len(), 2);
+        assert!((low[0][1].at[0] - low[46][1].at[0]).abs() < 1e-9);
     }
 
     #[test]

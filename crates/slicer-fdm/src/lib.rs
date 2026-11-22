@@ -1311,12 +1311,17 @@ pub fn generate_plate_with_own_settings(
     // Which travel moves stay over the part depends only on the finished
     // order of a layer, so all cores can work on it again.
     let inside = parallel_map(layers.len(), |index| {
-        // Supports travel between the pieces of a branch or column without
-        // retraction (see `travels_inside`).
-        let support = supports.get(index).map(|(area, _)| area);
+        // Supports travel between the pieces of a branch or column, and
+        // from one to the next over supports and model, without retraction
+        // (see `travels_inside`).
+        let support = supports
+            .get(index)
+            .filter(|(area, _)| !area.is_empty())
+            .map(|(area, _)| support_travel_area(area, &slices[index], settings));
+        let support = support.as_ref();
         let flags = travels_inside(&layers[index], &slices[index], support);
         let routes = if settings.avoid_crossing_walls {
-            combed(&layers[index], &slices[index], &flags, settings)
+            combed(&layers[index], &slices[index], support, &flags, settings)
         } else {
             Vec::new()
         };
@@ -1865,10 +1870,13 @@ fn purge_fill(
 /// For every path of a layer whose travel would leave the part, the way
 /// round inside it (see [`comb::route`]), if there is one; `None` where the
 /// travel stays straight. The way keeps a quarter line width inside the
-/// outline, over the outer wall at most.
+/// outline, over the outer wall at most. With `support` (see
+/// [`support_travel_area`]) a travel from one support piece to another
+/// goes round inside that instead.
 fn combed(
     layer: &Layer,
     slice: &Shapes,
+    support: Option<&Shapes>,
     inside: &[bool],
     settings: &Settings,
 ) -> Vec<Option<Vec<Point>>> {
@@ -1885,7 +1893,11 @@ fn combed(
             (Some(&from), Some(&to))
                 if !inside[index + 1] && previous.extruder == path.extruder =>
             {
-                comb::route(&region, from, to)
+                let pieces = previous.kind == PathKind::Support && path.kind == PathKind::Support;
+                match support {
+                    Some(area) if pieces => comb::route(area, from, to),
+                    _ => comb::route(&region, from, to),
+                }
             }
             _ => None,
         };
@@ -2045,12 +2057,13 @@ fn even_out(flags: &mut [bool], lengths: &[f64], hangs: bool) {
 
 /// Which paths of `layer` are reached by a travel that stays over the part
 /// (`slice`), where retraction is skipped: those inside the part other than
-/// its outer wall. With `support` (the support area of the layer) also
-/// support lines reached without leaving the support, such as the lines
-/// inside the loop of a branch or column.
-// ponytail: a support travel is checked as a straight line, not routed
-// along the support; one across the waist of two branches that just
-// merged retracts.
+/// its outer wall. With `support` (where support travels may go, see
+/// [`support_travel_area`]) also support paths reached without leaving the
+/// supports and the model, such as the lines inside the loop of a branch or
+/// column, or the next branch beyond the model.
+// ponytail: without `avoid_crossing_walls` a support travel is checked as
+// a straight line, not routed along the supports; one across the waist of
+// two branches that just merged, or round a hole, retracts.
 fn travels_inside(layer: &Layer, slice: &Shapes, support: Option<&Shapes>) -> Vec<bool> {
     // The first path of a layer is reached from the layer below.
     let mut flags = vec![false];
@@ -2445,6 +2458,21 @@ fn shared_work(
         );
     }
     shared
+}
+
+/// Where a travel from one support piece of a layer to another needs no
+/// retraction: over the supports (`support`) or the model (`slice`) of the
+/// layer, joined across the gap kept between them (`support_xy_distance`,
+/// up to half a line width more), so that the nozzle does not leave
+/// printed material on the way from one branch or column to the next one
+/// beside or beyond the model.
+// ponytail: the model of the layer counts even where it hangs free on
+// supports printed later; a travel over a gap no wider than the side
+// distance plus half a line width does not retract.
+fn support_travel_area(support: &Shapes, slice: &Shapes, settings: &Settings) -> Shapes {
+    let gap = 0.5 * (support_xy_distance(settings) + 0.5 * settings.line_width);
+    let joined = polygon::offset(&polygon::union(support, slice), gap);
+    polygon::offset(&joined, -gap)
 }
 
 /// Whether at most a tenth of `shape` lies outside `area`.
@@ -5075,7 +5103,7 @@ mod tests {
         // and the branches (one loop each) on them.
         let count = |settings: &Settings| {
             let toolpaths = generate(&t, settings).unwrap();
-            let (mut retracted, mut branches, mut inside) = (0, 0, 0);
+            let (mut retracted, mut branches, mut inside) = (0_usize, 0, 0);
             for layer in &toolpaths.layers[..47] {
                 for path in layer.paths.iter().filter(|p| p.kind == PathKind::Support) {
                     if path.travel_inside {
@@ -5095,10 +5123,12 @@ mod tests {
         };
         // Every branch is entered once, its loop first; its lines follow
         // without leaving it, but for a few where two branches that just
-        // touch form a waist that the way to the next line crosses.
+        // touch form a waist that the way to the next line crosses. (Some
+        // branches beside the column are entered from the other side of it
+        // without retraction.)
         let (retracted, branches, inside) = count(&tree);
         assert!(
-            inside > 10 * (retracted - branches),
+            inside > 10 * retracted.saturating_sub(branches),
             "{inside} {retracted} {branches}"
         );
         assert!(
@@ -5121,6 +5151,63 @@ mod tests {
         let (retracted, columns, inside) = count(&normal);
         assert!(inside > retracted, "{inside} {retracted}");
         assert!(retracted <= columns + columns / 20, "{retracted} {columns}");
+    }
+
+    #[test]
+    fn support_travels_over_the_model_do_not_retract() {
+        // Below the T's plate the supports stand on both sides of the
+        // column. A travel from a support on one side to one on
+        // the other crosses the column, which is printed on the same layer,
+        // and needs no retraction; one through the air between two branches
+        // on the same side still retracts.
+        let (t, _) = tee_models();
+        let travels = |settings: &Settings| {
+            let toolpaths = generate(&t, settings).unwrap();
+            let (mut across, mut across_inside, mut beside) = (0, 0, 0);
+            for layer in &toolpaths.layers[..47] {
+                for pair in layer.paths.windows(2) {
+                    let (previous, path) = (&pair[0], &pair[1]);
+                    if previous.kind != PathKind::Support || path.kind != PathKind::Support {
+                        continue;
+                    }
+                    let from = if previous.closed {
+                        previous.points[0]
+                    } else {
+                        previous.points[previous.points.len() - 1]
+                    };
+                    let to = path.points[0];
+                    // The T stands in the middle of the bed, its column
+                    // from x 105 to 115.
+                    if (from[0] < 110.0) != (to[0] < 110.0) {
+                        across += 1;
+                        across_inside += usize::from(path.travel_inside);
+                    } else if path.closed && !path.travel_inside {
+                        beside += 1;
+                    }
+                }
+            }
+            (across, across_inside, beside)
+        };
+        let tree = Settings {
+            supports: true,
+            support_style: SupportStyle::Tree,
+            ..Settings::default()
+        };
+        // Grid supports are one piece on each side, close to the column:
+        // every travel across it stays over material.
+        let grid = Settings {
+            support_style: SupportStyle::Normal,
+            ..tree.clone()
+        };
+        let (across, inside, _) = travels(&grid);
+        assert!(across >= 40, "{across}");
+        assert_eq!(inside, across);
+        // Tree branches cross over where they stand right beside the
+        // column; separate branches on one side are still reached with a
+        // retraction.
+        let (across, inside, beside) = travels(&tree);
+        assert!(across > 0 && inside > 0, "{across} {inside}");
+        assert!(beside > 0, "{beside}");
     }
 
     /// The T of `supports_stand_under_overhangs`, and the same with a base

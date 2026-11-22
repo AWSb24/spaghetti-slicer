@@ -9,7 +9,14 @@
 //! writer); `G4` waits `P` milliseconds or `S` seconds, `G28` takes
 //! `homing_time`. The printer comes to rest before every `G4`, `G28` and
 //! wait for a heater. Tool change G-code starts where the writer left the
-//! nozzle.
+//! nozzle, and the travel of the writer back to the print counts with it.
+//!
+//! Machine limits that the G-code sets take effect from there on, for the
+//! moves of the estimate and, read from the start G-code
+//! ([`machine_after`]), for the layers: `M201`, `M203`, `M204` and `M205`
+//! as the Marlin documentation describes them, with Klipper `M204` and
+//! `SET_VELOCITY_LIMIT` as the Klipper documentation does (see
+//! [`Machine::limit_command`] and [`Machine::set_velocity_limit`]).
 //!
 //! Heaters follow their targets at `nozzle_heat_rate` and `bed_heat_rate`
 //! (°C per second, the same up and down) from `ambient_temp`, also while
@@ -168,18 +175,36 @@ impl<'a> Estimator<'a> {
         self.relative = false;
     }
 
+    /// The travel of the writer after tool change G-code, from wherever
+    /// that left the nozzle to `to` at `travel_speed`, then down or up to
+    /// `z`; counted in [`Estimator::toolchange`].
+    pub(crate) fn travel_back(&mut self, to: Point, z: f64) {
+        self.part = Part::ToolChange;
+        let feed = self.feed;
+        self.feed = self.settings.travel_speed;
+        self.push([to[0], to[1], self.position[2]], 0.0);
+        self.push([to[0], to[1], z], 0.0);
+        self.feed = feed;
+        self.rest();
+    }
+
     /// Reads G-code `text` of `part`. Its moves, dwells and homing take
     /// time ([`Estimator::motion`], [`Estimator::toolchange`]) unless it is
-    /// [`Part::Silent`]; temperature commands and tool selections always
-    /// count.
-    // ponytail: the travel of the writer back from where the tool change
-    // G-code left the nozzle is not timed (the writer does not know where
-    // that is).
+    /// [`Part::Silent`]; temperature commands, tool selections and machine
+    /// limits always count.
     pub(crate) fn run(&mut self, text: &str, part: Part) {
         self.part = part;
         let count = part != Part::Silent;
         for line in text.lines() {
             let code = line.split(';').next().unwrap_or_default().trim();
+            if let Some(parameters) = extended(code, "SET_VELOCITY_LIMIT") {
+                // ponytail: the printer comes to rest at every change of
+                // its limits.
+                self.rest();
+                self.machine
+                    .set_velocity_limit(&|key| parameter(parameters, key));
+                continue;
+            }
             let mut words = code.split_whitespace().filter_map(word);
             let Some((letter, number)) = words.next() else {
                 continue;
@@ -218,6 +243,10 @@ impl<'a> Estimator<'a> {
                             self.position[axis] = 0.0;
                         }
                     }
+                }
+                'M' if is(201.0) || is(203.0) || is(204.0) || is(205.0) => {
+                    self.rest();
+                    self.machine.limit_command(number as u32, &value);
                 }
                 'G' if is(90.0) => self.relative = false,
                 'G' if is(91.0) => self.relative = true,
@@ -455,6 +484,33 @@ fn arc_middle(a: Point, b: Point, radius: f64, counter: bool) -> Point {
     }
 }
 
+/// The printer as `start` (start G-code) leaves it: the machine of the
+/// settings with the limits the G-code sets.
+pub(crate) fn machine_after(start: &str, settings: &Settings) -> Machine {
+    let mut estimate = Estimator::new(settings);
+    estimate.run(start, Part::Silent);
+    estimate.machine
+}
+
+/// The parameters of the extended G-code command `name` (Klipper's
+/// `NAME KEY=VALUE ...`, the name in any case) if `code` is that command.
+fn extended<'a>(code: &'a str, name: &str) -> Option<&'a str> {
+    let (first, rest) = code.split_once(char::is_whitespace).unwrap_or((code, ""));
+    first.eq_ignore_ascii_case(name).then_some(rest)
+}
+
+/// The number of parameter `key` (any case) in `KEY=VALUE` pairs.
+fn parameter(parameters: &str, key: &str) -> Option<f64> {
+    parameters.split_whitespace().find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        if k.eq_ignore_ascii_case(key) {
+            v.parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
 /// A word of G-code such as `X12.5`: its letter in upper case and number.
 fn word(text: &str) -> Option<(char, f64)> {
     let mut chars = text.chars();
@@ -500,6 +556,28 @@ mod tests {
         // Comments, unknown commands and lower case.
         let (motion, _) = time("; G1 X100\nM117 hello\ng1 x30 f600 ; go", &settings);
         assert!((motion - 3.0).abs() < 1e-3, "{motion}");
+    }
+
+    #[test]
+    fn limits_take_effect_from_where_they_are_set() {
+        let settings = settings();
+        // 60 mm at 100 mm/s, then the same at 10 mm/s.
+        let (motion, _) = time("G1 X60 F6000\nM203 X10\nG1 X0", &settings);
+        assert!((motion - 0.6 - 6.0).abs() < 1e-3, "{motion}");
+        // Klipper's limit of the nozzle; Marlin ignores it.
+        let limit = "SET_VELOCITY_LIMIT VELOCITY=10\nG1 X60 F6000";
+        let (motion, _) = time(limit, &settings);
+        assert!((motion - 0.6).abs() < 1e-3, "{motion}");
+        let klipper = Settings {
+            flavor: slicer_profiles::Flavor::Klipper,
+            ..settings.clone()
+        };
+        let (motion, _) = time(limit, &klipper);
+        assert!((motion - 6.0).abs() < 1e-3, "{motion}");
+        // What the start G-code leaves holds for the layers.
+        let machine = machine_after("M204 P500 T700\nM205 J0.05", &settings);
+        assert_eq!((machine.extruding, machine.travel), (500.0, 700.0));
+        assert_eq!(machine.corners, crate::Corners::Deviation(0.05));
     }
 
     #[test]
