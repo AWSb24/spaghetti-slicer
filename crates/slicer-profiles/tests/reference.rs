@@ -91,6 +91,7 @@ fn settings_reference_is_current() {
                 | "sequential_print"
                 | "arrange_outlines"
                 | "arrange_rotation"
+                | "arrange_nonconvex"
                 | "flush_from_colours"
                 | "support_soluble" =>"`true`, `false`".to_string(),
                 "thumbnails" => "sizes like `48x48,300x300`, empty for none".to_string(),

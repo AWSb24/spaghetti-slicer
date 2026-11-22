@@ -734,13 +734,23 @@ impl Objects {
         if crate::arranges_outlines(settings) {
             // The outline of every file's objects together, arranged as one
             // and turned together.
-            let mut points: Vec<Vec<[f64; 2]>> = vec![Vec::new(); files];
-            for (mesh, &file) in meshes.iter().zip(&self.model) {
-                if let Some(slot) = points.get_mut(file) {
-                    slot.extend(crate::footprint(mesh));
+            let spots = if settings.arrange_nonconvex {
+                let mut shapes: Vec<slicer_core::Shapes> = vec![Vec::new(); files];
+                for (mesh, &file) in meshes.iter().zip(&self.model) {
+                    if let Some(slot) = shapes.get_mut(file) {
+                        slot.extend(crate::top_view(mesh));
+                    }
                 }
-            }
-            let spots = crate::arrange_outlines(&points, settings, placing.gap);
+                crate::arrange_footprints(&shapes, settings, placing.gap)
+            } else {
+                let mut points: Vec<Vec<[f64; 2]>> = vec![Vec::new(); files];
+                for (mesh, &file) in meshes.iter().zip(&self.model) {
+                    if let Some(slot) = points.get_mut(file) {
+                        slot.extend(crate::footprint(mesh));
+                    }
+                }
+                crate::arrange_outlines(&points, settings, placing.gap)
+            };
             for (object, (mesh, &file)) in meshes.iter_mut().zip(&self.model).enumerate() {
                 if let Some(spot) = spots.get(file) {
                     spot.apply(mesh);

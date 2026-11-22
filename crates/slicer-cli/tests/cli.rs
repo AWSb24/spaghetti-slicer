@@ -789,6 +789,57 @@ fn outlines_and_turns_arrange_closer() {
 }
 
 #[test]
+fn real_outlines_nest() {
+    let dir = workdir("arrange_nonconvex");
+    let ell = slicer_core::primitives::extrude(
+        &[
+            [0.0, 0.0],
+            [60.0, 0.0],
+            [60.0, 15.0],
+            [15.0, 15.0],
+            [15.0, 60.0],
+            [0.0, 60.0],
+        ],
+        [7.0, 7.0],
+        5.0,
+        1,
+        0.0,
+    );
+    let (a, b) = (dir.join("ell.stl"), dir.join("cube.stl"));
+    fs::write(&a, slicer_formats::write_stl_binary(&ell)).unwrap();
+    fs::write(
+        &b,
+        slicer_formats::write_stl_binary(&Mesh::cuboid(25.0, 25.0, 5.0)),
+    )
+    .unwrap();
+    let slice = |setting: &str| {
+        bin()
+            .args([
+                "slice",
+                "--json",
+                "-s",
+                "bed_size_x=64",
+                "-s",
+                "bed_size_y=64",
+            ])
+            .args(["-s", setting])
+            .args([&a, &b])
+            .arg("-o")
+            .arg(dir.join("plate.gcode"))
+            .output()
+            .unwrap()
+    };
+    // By convex outlines the cube does not fit beside the L.
+    let out = slice("arrange_outlines=true");
+    assert!(!out.status.success());
+    // In its corner it does, and nothing is reported as overlapping.
+    let out = slice("arrange_nonconvex=true");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["warnings"].as_array().unwrap().len(), 0);
+}
+
+#[test]
 fn an_object_gets_settings_of_its_own() {
     let dir = workdir("object_settings");
     let cube = slicer_formats::write_stl_binary(&Mesh::cuboid(10.0, 10.0, 4.0));

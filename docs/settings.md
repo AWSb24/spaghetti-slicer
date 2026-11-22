@@ -95,6 +95,7 @@ Numbers are in the unit of the Unit column (empty for counts and factors). A set
 | `gantry_height` | 20 | mm | 0 to 2000 | With `sequential_print`: height of the lowest part of the gantry (the X axis) above the tip of the nozzle; every object but the last one printed must be lower. |
 | `arrange_outlines` | false |  | `true`, `false` | Whether arranging packs the objects by their convex outlines seen from above instead of their bounding rectangles, so round, slanted and triangular objects stand closer together. Off, arranging fills rows of rectangles as before. |
 | `arrange_rotation` | false |  | `true`, `false` | Whether arranging may also turn objects about Z in steps of 45° where that packs them closer; the slicer turns the models it arranges, the desktop app adds the turn to their rotation. Packs by outlines even without `arrange_outlines`. |
+| `arrange_nonconvex` | false |  | `true`, `false` | Whether arranging packs the objects by their real outlines seen from above, not their convex ones, so that L- and U-shapes reach into each other and small objects stand in the hollow of large ones; the overlap warning then compares the real outlines as well. Packs by outlines even without `arrange_outlines`. With `sequential_print` the convex outlines stay, as the print head needs its clearance around them. |
 | `outer_wall_speed` | 40 | mm/s | 1 to 1000 | Speed of the outermost wall. |
 | `inner_wall_speed` | 60 | mm/s | 1 to 1000 | Speed of inner walls. |
 | `infill_speed` | 80 | mm/s | 1 to 1000 | Speed of solid and sparse infill. |

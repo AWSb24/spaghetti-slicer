@@ -126,7 +126,10 @@ pub(crate) fn generate(
 /// taller than `gantry_height`.
 // ponytail: convex outlines without the brim, and a single number for the
 // print head. Shapes of the print head per side and a brim-aware distance
-// are the upgrade.
+// are the upgrade. The outlines stay convex with `arrange_nonconvex` too:
+// the print head around the nozzle is round and wider than any notch it
+// could reach into, and arranging keeps to convex outlines with
+// `sequential_print`.
 fn order(objects: &[Mesh], settings: &Settings) -> Result<Vec<usize>, FdmError> {
     let reach = settings.extruder_clearance_radius / 2.0;
     let grown: Vec<_> = objects
@@ -318,5 +321,44 @@ mod tests {
             error.to_string().starts_with("object 2 (22.0 mm)"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn the_clearance_stays_convex_with_real_outlines() {
+        // A cube 40 mm from both arms of a large L, but inside its convex
+        // outline: real outlines do not overlap, yet the print head would
+        // hit the L.
+        let ell = slicer_core::primitives::extrude(
+            &[
+                [0.0, 0.0],
+                [100.0, 0.0],
+                [100.0, 10.0],
+                [10.0, 10.0],
+                [10.0, 100.0],
+                [0.0, 100.0],
+            ],
+            [5.0, 5.0],
+            1.0,
+            1,
+            0.0,
+        );
+        let mut cube = Mesh::cuboid(10.0, 10.0, 1.0);
+        cube.translate([50.0, 50.0, 0.0]);
+        let objects = [ell, cube];
+        let settings = Settings {
+            arrange_nonconvex: true,
+            ..Settings::default()
+        };
+        let mut diagnostics = Diagnostics::new();
+        plate::check(&objects, Placement::AsGiven, &settings, &mut diagnostics).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let sequential = Settings {
+            sequential_print: true,
+            ..settings
+        };
+        assert!(matches!(
+            order(&objects, &sequential),
+            Err(FdmError::ObjectsTooClose { .. })
+        ));
     }
 }

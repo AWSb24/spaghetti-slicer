@@ -643,7 +643,8 @@ impl Plate {
     /// Places all models side by side without overlap (see
     /// [`slicer_fdm::arrange`]); rotation and scale stay. With
     /// `arrange_outlines` or `arrange_rotation` it packs their outlines
-    /// instead ([`slicer_fdm::arrange_outlines`]), and with
+    /// instead ([`slicer_fdm::arrange_outlines`]), with `arrange_nonconvex`
+    /// their real outlines ([`slicer_fdm::arrange_footprints`]), and with
     /// `arrange_rotation` adds the turns it chose to their rotation.
     pub fn arrange(&mut self, settings: &Settings) {
         if slicer_fdm::arranges_outlines(settings) {
@@ -652,7 +653,17 @@ impl Plate {
                 .iter()
                 .map(|item| placed_outline(&item.model, &item.placement))
                 .collect();
-            let spots = slicer_fdm::arrange_outlines(&outlines, settings, slicer_fdm::ARRANGE_GAP);
+            let gap = slicer_fdm::ARRANGE_GAP;
+            let spots = if settings.arrange_nonconvex {
+                let footprints: Vec<slicer_core::Shapes> = self
+                    .items
+                    .iter()
+                    .map(|item| slicer_fdm::top_view(&placed_mesh(&item.model, &item.placement)))
+                    .collect();
+                slicer_fdm::arrange_footprints(&footprints, settings, gap)
+            } else {
+                slicer_fdm::arrange_outlines(&outlines, settings, gap)
+            };
             for ((item, outline), spot) in self.items.iter_mut().zip(&outlines).zip(spots) {
                 // The centre of the bounding box of the outline as placed,
                 // which is what the placement keeps.
@@ -1233,6 +1244,58 @@ mod tests {
             (turns[0] - turns[1]).rem_euclid(360.0) == 180.0,
             "{turns:?}"
         );
+        let mut diagnostics = Diagnostics::new();
+        slicer_fdm::generate_plate(
+            &plate.meshes(),
+            slicer_fdm::Placement::AsGiven,
+            &settings,
+            &mut diagnostics,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn arranging_nests_models_with_arrange_nonconvex() {
+        let settings = Settings {
+            bed_size_x: 82.0,
+            bed_size_y: 82.0,
+            arrange_nonconvex: true,
+            ..Settings::default()
+        };
+        // An L turned a quarter on the plate and a cube that fits into
+        // its corner.
+        let ell = slicer_core::primitives::extrude(
+            &[
+                [0.0, 0.0],
+                [80.0, 0.0],
+                [80.0, 15.0],
+                [15.0, 15.0],
+                [15.0, 80.0],
+                [0.0, 80.0],
+            ],
+            [7.0, 7.0],
+            5.0,
+            1,
+            0.0,
+        );
+        let mut plate = Plate::default();
+        plate.add(Model::from_mesh("ell", ell).unwrap(), &settings);
+        plate.add(
+            Model::from_mesh("cube", Mesh::cuboid(35.0, 35.0, 5.0)).unwrap(),
+            &settings,
+        );
+        plate.items[0].placement.rotation_deg = 90.0;
+        // By convex outlines the cube does not fit beside the L.
+        plate.arrange(&Settings {
+            arrange_nonconvex: false,
+            arrange_outlines: true,
+            ..settings.clone()
+        });
+        assert!(plate.check(&settings).is_err());
+        plate.arrange(&settings);
+        assert!(plate.check(&settings).is_ok());
         let mut diagnostics = Diagnostics::new();
         slicer_fdm::generate_plate(
             &plate.meshes(),
