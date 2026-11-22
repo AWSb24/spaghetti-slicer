@@ -82,7 +82,7 @@ More print options, all off by default (see `docs/settings.md`):
 - `min_layer_time = 8` slows extrusion on small layers so that each takes at least 8 seconds to cool, but not below `min_print_speed`.
 - `pressure_advance = 0.04` writes `M900 K0.04` (Marlin) or `SET_PRESSURE_ADVANCE ADVANCE=0.04` (Klipper) at the start.
 - `elephant_foot_compensation = 0.15` prints the first layer that much smaller all round.
-- `spiral_vase = true` prints the outer wall alone above the solid bottom, as one line rising continuously, without seams.
+- `spiral_vase = true` prints the outer wall alone above the solid bottom, as one line rising continuously, without seams. With several islands on a layer (two vases on the plate, or a model that branches) every island rises as a spiral of its own: its loop climbs from the height of the layer below to that of its layer, then the nozzle retracts (and lifts with `z_hop`), travels to the next island and comes down there to climb along that one. Every island starts next to where it started on the layer below (islands are matched from layer to layer by the largest overlap, otherwise by the nearest centre), and every layer starts with the island the layer below ended with. Holes in the outline are left out (warning `slicing.vase_holes`), so a model that already has a wall of its own prints with its outside only. A layer that also has parts too narrow for a wall loop prints flat, one path after the other (warning `slicing.vase_islands`). The time estimate and the preview follow the rising loops.
 - `top_surface_pattern = "monotonic"` prints the lines of top surfaces all in the same direction, each beside the one before, for an even sheen; `"concentric"` prints loops following the outline instead. `bottom_surface_pattern` does the same for the first layer. Other solid infill and bridges keep their lines.
 - `ironing = true` passes over every top surface once more with 10 % of the material (`ironing_flow`), lines `ironing_spacing` apart at `ironing_speed`; with `ironing_type = top` only the topmost surface of every part, the top of its last layer.
 - `avoid_crossing_walls = true` sends travel moves round holes and notches inside the part instead of over open air, which also saves their retraction.
@@ -217,6 +217,8 @@ Errors go to stderr with exit code 1. With `--json`, errors and warnings are obj
 | `send.invalid_target`, `send.connection`, `send.unauthorized`, `send.too_large`, `send.rejected` | A printer address is malformed, the printer cannot be reached, refused the API key, refused the file as too large, or refused the upload otherwise |
 | `send.not_started` (warning) | The file was uploaded but the printer did not start it |
 | `slicing.thin_regions` (warning) | Some layers have parts narrower than half a line width that are not printed (parts between half and one line width get a single line of their own width) |
+| `slicing.vase_islands` (warning) | In vase mode some layers have lines along parts too narrow for a wall loop besides the outer walls of their islands; they print flat. Context: `layers`, `first_layer`, `last_layer` |
+| `slicing.vase_holes` (warning) | In vase mode the outline of some layers has holes; only the outer outline of every island is printed. Context: `layers`, `first_layer`, `last_layer` |
 
 ## Desktop app (preview)
 

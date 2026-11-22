@@ -13,6 +13,7 @@ pub mod preview;
 mod sequential;
 mod support_volumes;
 mod tree;
+mod vase;
 
 pub use arrange::{Spot, arrange_outlines, arranges_outlines};
 pub use negatives::MAX_NEGATIVES;
@@ -219,9 +220,21 @@ pub struct Layer {
     pub height: f64,
     /// Paths in printing order.
     pub paths: Vec<Path>,
-    /// Vase mode: the layer's one outer wall rises from the height of the
-    /// layer below to `z` as it goes round (see `Settings::spiral_vase`).
+    /// Vase mode: the outer wall of every island rises from the height of
+    /// the layer below to `z` as it goes round (see `Settings::spiral_vase`
+    /// and [`Layer::rises`]). Cleared on layers of vase mode that print
+    /// flat, because they hold more than closed outer walls.
     pub spiral: bool,
+}
+
+impl Layer {
+    /// Whether the G-code writer prints this layer rising: a layer of vase
+    /// mode whose paths are all closed outer walls, one loop for every
+    /// island. Each of them rises from the height of the layer below to
+    /// `z`; between them the nozzle travels and goes down again.
+    pub fn rises(&self) -> bool {
+        self.spiral && vase::loops_only(&self.paths)
+    }
 }
 
 /// The complete print, layer by layer from the bed up.
@@ -1180,6 +1193,11 @@ pub fn generate_plate_with_own_settings(
     progress.start(Step::Ordering, 2 * slices.len());
     let mut position: Point = [0.0, 0.0];
     let mut thin_layers = Vec::new();
+    // Vase mode: the closed outer walls of the layer before, which the
+    // islands of a spiral layer continue.
+    let mut below: Vec<Contour> = Vec::new();
+    // Vase mode: the spiral layers whose holes were left out.
+    let mut holed = Vec::new();
     let mut layers: Vec<Layer> = geometry
         .into_iter()
         .zip(orders)
@@ -1189,6 +1207,7 @@ pub fn generate_plate_with_own_settings(
             if stopped() {
                 groups.clear();
             }
+            let entry = position;
             for e in order {
                 let Some(at) = groups.iter().position(|(g, _)| *g == e) else {
                     continue;
@@ -1205,6 +1224,17 @@ pub fn generate_plate_with_own_settings(
                     path.extruder = e;
                 }
             }
+            let spiral = settings.spiral_vase && index >= settings.bottom_layers as usize;
+            if settings.spiral_vase {
+                if spiral && vase::drop_holes(&mut paths) {
+                    holed.push(index);
+                    position = vase::end_of(&paths).unwrap_or(entry);
+                }
+                if spiral && let Some(end) = vase::follow(&mut paths, &below, entry) {
+                    position = end;
+                }
+                below = vase::outer_loops(&paths);
+            }
             // A layer with material but without any outer wall prints nothing.
             if !slices[index].is_empty() && paths.iter().all(|p| p.kind != PathKind::OuterWall) {
                 thin = true;
@@ -1216,7 +1246,7 @@ pub fn generate_plate_with_own_settings(
             Layer {
                 z: tops[index],
                 height: heights[index],
-                spiral: settings.spiral_vase && index >= settings.bottom_layers as usize,
+                spiral,
                 paths,
             }
         })
@@ -1261,6 +1291,20 @@ pub fn generate_plate_with_own_settings(
         for (layer, paths) in layers.iter_mut().zip(split) {
             if let Some(paths) = paths {
                 layer.paths = paths;
+            }
+        }
+    }
+    // Vase mode prints a layer flat that holds more than closed outer
+    // walls: lines along parts too narrow for a wall loop, or the prime
+    // tower.
+    // ponytail: the whole layer, even where only one of its islands has
+    // such a line; the others could still rise.
+    let mut flat_layers = Vec::new();
+    for (index, layer) in layers.iter_mut().enumerate() {
+        if layer.spiral && !layer.rises() {
+            layer.spiral = false;
+            if !layer.paths.is_empty() {
+                flat_layers.push(index);
             }
         }
     }
@@ -1347,6 +1391,38 @@ pub fn generate_plate_with_own_settings(
             )
             .with("layers", thin_layers.len())
             .with("first_layer", first + 1),
+        );
+    }
+    if let (Some(first), Some(last)) = (flat_layers.first(), flat_layers.last()) {
+        diagnostics.push(
+            Diagnostic::warning(
+                "slicing.vase_islands",
+                format!(
+                    "vase mode prints {} layer(s) between layer {} and {} flat, one path after the other: besides the outer walls of their islands they have lines along parts too narrow for a wall loop",
+                    flat_layers.len(),
+                    first + 1,
+                    last + 1
+                ),
+            )
+            .with("layers", flat_layers.len())
+            .with("first_layer", first + 1)
+            .with("last_layer", last + 1),
+        );
+    }
+    if let (Some(first), Some(last)) = (holed.first(), holed.last()) {
+        diagnostics.push(
+            Diagnostic::warning(
+                "slicing.vase_holes",
+                format!(
+                    "{} layer(s) between layer {} and {} have holes in their outline; vase mode prints the outer outline of every island only and leaves the holes out",
+                    holed.len(),
+                    first + 1,
+                    last + 1
+                ),
+            )
+            .with("layers", holed.len())
+            .with("first_layer", first + 1)
+            .with("last_layer", last + 1),
         );
     }
     Ok(Toolpaths {
@@ -6234,5 +6310,61 @@ mod tests {
                 false, true, true, true, true, true, false, false, false, false, false, false
             ]
         );
+    }
+
+    #[test]
+    fn vase_mode_leaves_out_the_walls_of_holes() {
+        let tube = slicer_core::primitives::tube(12.0, 9.0, 5.0, 64);
+        let settings = Settings {
+            spiral_vase: true,
+            ..Settings::default()
+        };
+        let mut warnings = Diagnostics::new();
+        let toolpaths = generate_reporting(&tube, &settings, &mut warnings).unwrap();
+        let bottom = settings.bottom_layers as usize;
+        let walls = |layer: &Layer| {
+            (layer.paths.iter())
+                .filter(|p| p.kind == PathKind::OuterWall)
+                .count()
+        };
+        assert_eq!(
+            walls(&toolpaths.layers[bottom - 1]),
+            2,
+            "the bottom keeps them"
+        );
+        for layer in &toolpaths.layers[bottom..] {
+            assert!(layer.rises());
+            assert_eq!(layer.paths.len(), 1);
+            assert!(polygon::signed_area(&layer.paths[0].points) > 0.0);
+        }
+        assert_eq!(warnings.codes(), ["slicing.vase_holes"]);
+    }
+
+    #[test]
+    fn vase_mode_prints_layers_with_narrow_parts_flat() {
+        // A block and, apart from it, a fin too narrow for a wall loop.
+        let mut mesh = Mesh::cuboid(10.0, 10.0, 3.0);
+        let mut fin = Mesh::cuboid(0.35, 10.0, 3.0);
+        fin.translate([15.0, 0.0, 0.0]);
+        mesh.merge(&fin);
+        let settings = Settings {
+            spiral_vase: true,
+            ..Settings::default()
+        };
+        let mut warnings = Diagnostics::new();
+        let toolpaths = generate_reporting(&mesh, &settings, &mut warnings).unwrap();
+        let bottom = settings.bottom_layers as usize;
+        for layer in &toolpaths.layers[bottom..] {
+            assert!(!layer.spiral && !layer.rises());
+            assert!(layer.paths.iter().any(|p| !p.closed));
+        }
+        assert!(
+            warnings.has("slicing.vase_islands"),
+            "{:?}",
+            warnings.codes()
+        );
+        // The plain block rises.
+        let block = generate(&Mesh::cuboid(10.0, 10.0, 3.0), &settings).unwrap();
+        assert!(block.layers[bottom..].iter().all(Layer::rises));
     }
 }

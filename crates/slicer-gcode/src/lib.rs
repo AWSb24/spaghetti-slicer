@@ -360,6 +360,9 @@ struct Writer<'a> {
     moves: Vec<Move>,
     /// Height of the nozzle; unknown before the first Z move.
     nozzle_z: Option<f64>,
+    /// Where a lifted travel comes down instead of `z`: the start of the
+    /// next rising loop in vase mode.
+    land: Option<f64>,
     /// The points of the line printed last, up to the nozzle, for wiping.
     trail: Vec<Point>,
     /// Temperature commands, tool selections and tool change G-code
@@ -444,6 +447,7 @@ impl<'a> Writer<'a> {
             e: self.e,
             moves: Vec::new(),
             nozzle_z: self.nozzle_z,
+            land: self.land,
             trail: self.trail.clone(),
             commands: Vec::new(),
         }
@@ -579,7 +583,7 @@ impl<'a> Writer<'a> {
             self.record(direction, length, self.settings.travel_speed, None);
         }
         if hop {
-            self.move_z(self.z);
+            self.move_z(self.land.unwrap_or(self.z));
         }
         self.position = Some(to);
     }
@@ -608,6 +612,7 @@ impl<'a> Writer<'a> {
         self.record(direction, length, speed, Some(kind));
         self.position = Some(to);
         self.nozzle_z = Some(z);
+        self.extend_trail(from, to);
     }
 
     /// Counts `e` mm of filament extruded for a line of `kind`.
@@ -895,11 +900,9 @@ fn write_layer(
         w.out.push_str("G92 E0\n");
         w.e = 0.0;
     }
-    // In vase mode the one wall rises from where the layer below ended;
-    // a layer that has more to print is printed flat.
-    let spiral = layer.spiral
-        && matches!(layer.paths.as_slice(), [only] if only.closed && only.kind == PathKind::OuterWall);
-    let rise_from = w.nozzle_z.filter(|_| spiral);
+    // In vase mode the outer wall of every island rises from where the
+    // layer below ended; a layer that has more to print is printed flat.
+    let rise_from = w.nozzle_z.filter(|_| layer.rises());
     // The first layer of the next object of a sequential print: up above
     // everything printed so far, across to where the layer starts, and down.
     if index == 0 && carry.top > 0.0 {
@@ -960,10 +963,21 @@ fn write_layer(
             }
             open = object;
         }
+        // The loops of further islands start down where the first one
+        // started; a lifted travel comes down there.
+        w.land = rise_from;
         w.travel(&path.travel, first, path.travel_inside);
+        w.land = None;
         if carry.restore_z {
             w.move_z(layer.z);
             carry.restore_z = false;
+        }
+        // ponytail: the nozzle comes straight down by a layer height onto
+        // the start of the next island instead of ramping into it.
+        if let Some(from) = rise_from
+            && w.nozzle_z != Some(from)
+        {
+            w.move_z(from);
         }
         // Paths of an object print with the fan, flow, speeds and
         // retraction of the object and the height range of the layer, all
@@ -1210,6 +1224,14 @@ fn slowed(speed: f64, slow: f64, settings: &Settings) -> f64 {
 /// follows, then `T<n>`, the travel to the next path and the move back to
 /// the height of the layer (the custom G-code may have moved the nozzle).
 ///
+/// On the layers of vase mode that rise ([`Layer::rises`]) the outer wall
+/// of every island climbs from the height where the layer below ended to
+/// that of its own layer, in proportion to the length gone round, without
+/// a move of Z alone. With several islands the nozzle travels to the next
+/// one as between any two paths (retracting and lifting as the settings
+/// say), comes down to that starting height again there and climbs along
+/// that loop as well.
+///
 /// The paths of objects with settings of their own
 /// ([`Toolpaths::object_settings`]) print with their speeds (except on the
 /// first layer), fan (`M106` only where the value changes) and flow ratio,
@@ -1292,6 +1314,7 @@ pub fn write_gcode_with_progress(
         e: 0.0,
         moves: Vec::new(),
         nozzle_z: None,
+        land: None,
         trail: Vec::new(),
         commands: Vec::new(),
     };
@@ -1639,6 +1662,227 @@ SET_PRESSURE_ADVANCE ADVANCE=0.04
         // Four sides a layer, each climbing on its way.
         assert_eq!(rising, 4 * (toolpaths.layers.len() - bottom));
         assert!((z - 5.0).abs() < 1e-6, "{z}");
+    }
+
+    /// One loop of vase mode in the G-code: where the nozzle was before its
+    /// first rising move, how high it was then, and the height of every
+    /// rising move.
+    struct Rising {
+        start: Point,
+        before: f64,
+        heights: Vec<f64>,
+    }
+
+    /// The rising loops of every layer of `gcode` and the number of moves
+    /// of Z alone on it.
+    fn rising_loops(gcode: &str) -> Vec<(Vec<Rising>, usize)> {
+        let mut layers: Vec<(Vec<Rising>, usize)> = Vec::new();
+        let (mut at, mut z, mut rising) = ([0.0, 0.0], 0.0, false);
+        for line in gcode.lines() {
+            if line.starts_with(";LAYER_CHANGE") {
+                layers.push((Vec::new(), 0));
+                rising = false;
+                continue;
+            }
+            if !(line.starts_with("G0") || line.starts_with("G1")) {
+                continue;
+            }
+            let (x, y, to) = (word(line, 'X'), word(line, 'Y'), word(line, 'Z'));
+            let climbs = x.is_some() && to.is_some() && word(line, 'E').is_some();
+            if let Some(layer) = layers.last_mut() {
+                if climbs && !rising {
+                    layer.0.push(Rising {
+                        start: at,
+                        before: z,
+                        heights: Vec::new(),
+                    });
+                }
+                if let (true, Some(to), Some(last)) = (climbs, to, layer.0.last_mut()) {
+                    last.heights.push(to);
+                }
+                if x.is_none() && to.is_some() {
+                    layer.1 += 1;
+                }
+            }
+            rising = climbs;
+            at = [x.unwrap_or(at[0]), y.unwrap_or(at[1])];
+            z = to.unwrap_or(z);
+        }
+        layers
+    }
+
+    /// Checks that every rising loop of the layers of `toolpaths` from
+    /// `first` on climbs steadily from the height of the layer below to its
+    /// own, and returns the starts of the loops of every such layer.
+    fn check_rising(gcode: &str, toolpaths: &Toolpaths, first: usize) -> Vec<Vec<Point>> {
+        let layers = rising_loops(gcode);
+        assert_eq!(layers.len(), toolpaths.layers.len());
+        let mut starts = Vec::new();
+        for (index, (loops, _)) in layers.iter().enumerate().skip(first) {
+            let (z, below) = (toolpaths.layers[index].z, toolpaths.layers[index - 1].z);
+            assert_eq!(loops.len(), toolpaths.layers[index].paths.len(), "{index}");
+            for l in loops {
+                assert!(
+                    (l.before - below).abs() < 1e-6,
+                    "{index}: from {}",
+                    l.before
+                );
+                assert!(l.heights[0] > below && l.heights[0] < z, "{index}");
+                assert!(l.heights.windows(2).all(|w| w[1] >= w[0]), "{index}");
+                let top = l.heights[l.heights.len() - 1];
+                assert!((top - z).abs() < 1e-6, "{index}: to {top}");
+            }
+            starts.push(loops.iter().map(|l| l.start).collect());
+        }
+        starts
+    }
+
+    /// Two cylinders 16 mm across, 6 mm high, side by side.
+    fn two_cylinders() -> [Mesh; 2] {
+        [80.0, 110.0].map(|x| {
+            let mut mesh = slicer_core::primitives::cylinder(8.0, 6.0, 64);
+            mesh.translate([x, 100.0, 0.0]);
+            mesh
+        })
+    }
+
+    #[test]
+    fn vase_mode_spirals_every_island() {
+        let settings = Settings {
+            spiral_vase: true,
+            ..Settings::default()
+        };
+        let toolpaths = plate(&two_cylinders(), &[], &settings);
+        let bottom = settings.bottom_layers as usize;
+        for layer in &toolpaths.layers[bottom..] {
+            assert!(layer.rises());
+            assert_eq!(layer.paths.len(), 2);
+        }
+        let gcode = write_gcode(&toolpaths, &settings).unwrap().gcode;
+        let starts = check_rising(&gcode, &toolpaths, bottom);
+        // Every island goes on where it started on the layer below, and the
+        // layer starts with the island the layer below ended with.
+        let mut last: [Option<Point>; 2] = [None, None];
+        let mut end: Option<Point> = None;
+        for (layer, loops) in starts.iter().enumerate() {
+            assert_eq!(loops.len(), 2);
+            if let Some(end) = end {
+                assert!(distance(end, loops[0]) < 0.5, "{layer}: {end:?} {loops:?}");
+            }
+            assert!(distance(loops[0], loops[1]) > 20.0, "a travel between them");
+            for &start in loops {
+                let island = usize::from(start[0] > 100.0);
+                if let Some(before) = last[island] {
+                    assert!(
+                        distance(before, start) < 0.5,
+                        "{layer}: {before:?} {start:?}"
+                    );
+                }
+                last[island] = Some(start);
+            }
+            assert!(last.iter().all(Option::is_some));
+            end = Some(loops[1]);
+        }
+        // Between them the nozzle retracts, travels and goes down again:
+        // one move of Z alone a layer.
+        let body =
+            |gcode: &str| gcode[..gcode.rfind(settings.end_gcode.as_str()).unwrap()].to_string();
+        let layers = rising_loops(&body(&gcode));
+        assert!(layers[bottom..].iter().all(|(_, z_moves)| *z_moves == 1));
+        let retractions: Vec<usize> = body(&gcode)
+            .split(";LAYER_CHANGE")
+            .skip(bottom + 1)
+            .map(|layer| layer.lines().filter(|l| l.starts_with("G1 E-")).count())
+            .collect();
+        // The first spiral layer also comes from the infill of the bottom,
+        // the last retracts at the end.
+        let inner = &retractions[1..retractions.len() - 1];
+        assert!(inner.iter().all(|&count| count == 1), "{retractions:?}");
+        // With a lift the travel comes down where the next loop starts.
+        let lifted = Settings {
+            z_hop: 0.4,
+            ..settings.clone()
+        };
+        let toolpaths = plate(&two_cylinders(), &[], &lifted);
+        let gcode = write_gcode(&toolpaths, &lifted).unwrap().gcode;
+        check_rising(&gcode, &toolpaths, bottom);
+        let layers = rising_loops(&body(&gcode));
+        let moves: Vec<usize> = layers.iter().map(|(_, z_moves)| *z_moves).collect();
+        assert!(moves[bottom + 1..].iter().all(|&n| n == 2), "{moves:?}");
+    }
+
+    #[test]
+    fn vase_mode_follows_a_model_into_two_branches() {
+        // A block 3 mm high with two legs on it, 10 mm apart.
+        let mut mesh = Mesh::cuboid(30.0, 10.0, 3.0);
+        for x in [0.0, 20.0] {
+            let mut leg = Mesh::cuboid(10.0, 10.0, 3.0);
+            leg.translate([x, 0.0, 3.0]);
+            mesh.merge(&leg);
+        }
+        let settings = Settings {
+            spiral_vase: true,
+            ..Settings::default()
+        };
+        let toolpaths = slicer_fdm::generate(&mesh, &settings).unwrap();
+        let bottom = settings.bottom_layers as usize;
+        let counts: Vec<usize> = toolpaths.layers[bottom..]
+            .iter()
+            .map(|layer| {
+                assert!(layer.rises());
+                layer.paths.len()
+            })
+            .collect();
+        let split = counts.iter().position(|&n| n == 2).unwrap();
+        assert!(split > 0);
+        assert!(counts[..split].iter().all(|&n| n == 1));
+        assert!(counts[split..].iter().all(|&n| n == 2));
+        let gcode = write_gcode(&toolpaths, &settings).unwrap().gcode;
+        let starts = check_rising(&gcode, &toolpaths, bottom);
+        // The first layer of the legs goes on where the block ended, and
+        // every leg where it started on the layer below.
+        let end = starts[split - 1][0];
+        assert!(distance(end, starts[split][0]) < 0.5, "{end:?}");
+        let right = (toolpaths.layers[bottom].paths[0].points.iter())
+            .map(|p| p[0])
+            .fold(0.0, f64::max);
+        let mut last: [Option<Point>; 2] = [None, None];
+        for loops in &starts[split..] {
+            for &start in loops {
+                let leg = usize::from(start[0] > right - 15.0);
+                if let Some(before) = last[leg] {
+                    assert!(distance(before, start) < 0.5, "{before:?} {start:?}");
+                }
+                last[leg] = Some(start);
+            }
+        }
+        assert!(last.iter().all(Option::is_some));
+    }
+
+    #[test]
+    fn vase_islands_slow_down_to_the_minimum_layer_time() {
+        let settings = Settings {
+            spiral_vase: true,
+            bottom_layers: 1,
+            ..Settings::default()
+        };
+        let slow = Settings {
+            min_layer_time: 6.0,
+            ..settings.clone()
+        };
+        let layers_time = |settings: &Settings| {
+            let toolpaths = plate(&two_cylinders(), &[], settings);
+            let stats = write_gcode(&toolpaths, settings).unwrap().stats;
+            (
+                stats.print_time_s - stats.time_start_end_s,
+                stats.layers as f64,
+            )
+        };
+        let (fast, layers) = layers_time(&settings);
+        let (time, _) = layers_time(&slow);
+        // Both islands and the travel between them make up the layer time.
+        assert!(fast < 0.85 * 6.0 * layers, "{fast}");
+        assert!(time > 0.85 * 6.0 * layers, "{time}");
     }
 
     #[test]

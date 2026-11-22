@@ -56,7 +56,7 @@ Numbers are in the unit of the Unit column (empty for counts and factors). A set
 | `bottom_layers` | 4 |  | 0 to 1000 | Number of solid layers at the bottom. |
 | `top_surface_pattern` | rectilinear |  | `rectilinear`, `monotonic`, `concentric` | Pattern of the solid infill of top surfaces: the parts of a layer with nothing above them. Other solid infill and bridges keep rectilinear lines. |
 | `bottom_surface_pattern` | rectilinear |  | `rectilinear`, `monotonic`, `concentric` | Pattern of the solid infill of the first layer, the bottom surface on the bed. |
-| `spiral_vase` | false |  | `true`, `false` | Vase mode: above the solid bottom layers, the outer wall alone is printed as one line rising continuously, without seams, infill or top layers. One wall loop, no supports. |
+| `spiral_vase` | false |  | `true`, `false` | Vase mode: above the solid bottom layers, the outer wall alone is printed as one line rising continuously, without seams, infill or top layers. With several islands each one rises as a spiral of its own, with a travel between them; holes of the outline are left out. One wall loop, no supports. |
 | `infill_density` | 15 | % | 0 to 100 | Sparse infill density in percent. |
 | `infill_pattern` | grid |  | `rectilinear`, `grid`, `triangles`, `gyroid`, `honeycomb`, `cubic`, `concentric`, `lightning` | Sparse infill pattern. |
 | `infill_angle` | 45 | ° | 0 to 180 | Direction of the infill lines in degrees from the X axis; every other layer is turned by 90 degrees. Triangles, the gyroid, honeycomb and cubic keep it on every layer; concentric loops and lightning have no direction. |

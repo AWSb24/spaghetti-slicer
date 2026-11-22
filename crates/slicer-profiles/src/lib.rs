@@ -327,7 +327,9 @@ pub struct Settings {
     pub bottom_surface_pattern: SurfacePattern,
     /// Vase mode: above the solid bottom layers, the outer wall alone is
     /// printed as one line rising continuously, without seams, infill or
-    /// top layers. One wall loop, no supports.
+    /// top layers. With several islands each one rises as a spiral of its
+    /// own, with a travel between them; holes of the outline are left out.
+    /// One wall loop, no supports.
     pub spiral_vase: bool,
     /// Sparse infill density in percent.
     pub infill_density: f64,
