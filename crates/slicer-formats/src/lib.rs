@@ -11,7 +11,8 @@ pub use bambu::{
     layer_filament_ranges, write_gcode_3mf,
 };
 pub use project::{
-    ProjectItem, ProjectObject, ProjectPackage, read_part, read_project, write_project,
+    MAX_FILE_BYTES, ProjectItem, ProjectObject, ProjectPackage, read_file, read_part, read_project,
+    write_project,
 };
 pub use project_settings::{
     ModifierSettings, ObjectSettings, ProjectSettings, RangeSettings, read_project_settings,

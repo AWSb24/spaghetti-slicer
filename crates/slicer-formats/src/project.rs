@@ -14,6 +14,9 @@ use crate::threemf::{
 /// Where a project keeps the picture of its plate.
 pub const THUMBNAIL_PART: &str = "Metadata/thumbnail.png";
 
+/// Largest extra file read back from a project, in bytes.
+pub const MAX_FILE_BYTES: u64 = 512 << 20;
+
 /// An object of a project: a mesh in its own coordinates.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProjectObject {
@@ -43,6 +46,10 @@ pub struct ProjectPackage {
     /// Further text parts by name inside the package, such as
     /// `Metadata/app.toml`.
     pub parts: Vec<(String, String)>,
+    /// Further files by name that are not text, such as meshes of an
+    /// application's own (binary STL). Written as they are and read back
+    /// with [`read_file`].
+    pub files: Vec<(String, Vec<u8>)>,
     /// Picture of the plate as PNG, written to [`THUMBNAIL_PART`] and
     /// named the package thumbnail (3MF core specification, OPC), which
     /// file managers and other programs show; empty for none. Not read
@@ -56,7 +63,9 @@ fn content_type(name: &str) -> &'static str {
         Some("toml") => "application/toml",
         Some("json") => "application/json",
         Some("xml") => "application/xml",
-        _ => "text/plain",
+        Some("png") => "image/png",
+        Some("stl") => "model/stl",
+        _ => "application/octet-stream",
     }
 }
 
@@ -98,7 +107,12 @@ pub fn write_project(project: &ProjectPackage) -> Result<Vec<u8>, ThreeMfError> 
     if !project.thumbnail.is_empty() {
         content_types.push_str(" <Default Extension=\"png\" ContentType=\"image/png\"/>\n");
     }
-    for (name, _) in &project.parts {
+    for name in project
+        .parts
+        .iter()
+        .map(|(name, _)| name)
+        .chain(project.files.iter().map(|(name, _)| name))
+    {
         content_types.push_str(&format!(
             " <Override PartName=\"/{}\" ContentType=\"{}\"/>\n",
             quick_xml::escape::escape(name.as_str()),
@@ -127,6 +141,12 @@ pub fn write_project(project: &ProjectPackage) -> Result<Vec<u8>, ThreeMfError> 
             .iter()
             .map(|(name, text)| (name.as_str(), text.as_bytes())),
     );
+    parts.extend(
+        project
+            .files
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice())),
+    );
     if !project.thumbnail.is_empty() {
         parts.push((THUMBNAIL_PART, &project.thumbnail));
     }
@@ -139,6 +159,15 @@ pub fn read_part(bytes: &[u8], name: &str) -> Result<Option<String>, ThreeMfErro
     let archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| ThreeMfError::Archive(e.to_string()))?;
     Package::from_archive(archive).read(name)
+}
+
+/// Reads one extra file of a 3MF package as bytes, written with
+/// [`ProjectPackage::files`]; `None` if the package has no part of that
+/// name, and [`ThreeMfError::TooLarge`] for one over [`MAX_FILE_BYTES`].
+pub fn read_file(bytes: &[u8], name: &str) -> Result<Option<Vec<u8>>, ThreeMfError> {
+    let archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|e| ThreeMfError::Archive(e.to_string()))?;
+    Package::from_archive(archive).read_bytes(name, MAX_FILE_BYTES)
 }
 
 /// Reads a 3MF package as a project: every object that a build item
@@ -265,6 +294,7 @@ mod tests {
                 "Metadata/test.toml".into(),
                 "version = 1\nname = \"ä\"\n".into(),
             )],
+            files: Vec::new(),
             thumbnail: Vec::new(),
         }
     }
@@ -340,6 +370,25 @@ mod tests {
             read_project(&bytes, &["Metadata/test.toml"]).unwrap(),
             sample()
         );
+    }
+
+    #[test]
+    fn extra_files_come_back_as_bytes() {
+        let mesh = tetrahedron(3.0);
+        let stl = crate::write_stl_binary(&mesh);
+        let project = ProjectPackage {
+            files: vec![("Metadata/volumes/1.stl".into(), stl.clone())],
+            ..sample()
+        };
+        let bytes = write_project(&project).unwrap();
+        assert_eq!(
+            read_file(&bytes, "Metadata/volumes/1.stl").unwrap(),
+            Some(stl.clone())
+        );
+        assert_eq!(read_file(&bytes, "Metadata/volumes/2.stl").unwrap(), None);
+        // Other programs read the placed objects and skip the file.
+        let read = parse_3mf(&bytes, &mut Diagnostics::new()).unwrap();
+        assert_eq!(read.triangles.len(), 12);
     }
 
     #[test]

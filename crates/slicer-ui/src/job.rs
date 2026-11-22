@@ -15,7 +15,7 @@ use slicer_fdm::{Progress, Step, Toolpaths};
 use slicer_gcode::Output;
 use slicer_profiles::Settings;
 
-use crate::plate::toolpath_bounds;
+use crate::plate::{PlateOwnSettings, toolpath_bounds};
 
 /// Everything a slice needs. Owned, so it can move to another thread.
 #[derive(Debug, Clone)]
@@ -24,10 +24,10 @@ pub struct SliceRequest {
     pub objects: Vec<Mesh>,
     /// Settings to slice with.
     pub settings: Settings,
-    /// The settings of every object of its own, in the order of `objects`
-    /// (see [`crate::plate::Plate::object_settings`]); `None` or missing:
-    /// the object prints with `settings`.
-    pub object_settings: Vec<Option<Settings>>,
+    /// The settings, height ranges, modifiers, negative volumes and
+    /// support volumes of every object of its own, in the order of
+    /// `objects` (see [`crate::plate::Plate::own_settings`]).
+    pub own: PlateOwnSettings,
 }
 
 /// A finished slice.
@@ -51,9 +51,9 @@ pub fn slice(
 ) -> Result<SliceResult, Diagnostic> {
     let settings = &request.settings;
     let mut warnings = Diagnostics::new();
-    let toolpaths = slicer_fdm::generate_plate_with_object_settings(
+    let toolpaths = slicer_fdm::generate_plate_with_own_settings(
         &request.objects,
-        &request.object_settings,
+        request.own.borrowed(),
         slicer_fdm::Placement::AsGiven,
         settings,
         &mut warnings,
@@ -198,26 +198,41 @@ pub fn is_gcode_3mf(name: &str) -> bool {
 }
 
 /// The file content to save for `name`: plain G-code, or the G-code in a
-/// `.gcode.3mf` container if the name ends that way.
+/// `.gcode.3mf` container if the name ends that way. `objects` are the
+/// meshes the slice was made from, for the pictures of the plate in the
+/// container.
 pub fn encode_output(
     output: &Output,
     settings: &Settings,
+    objects: &[Mesh],
     name: &str,
 ) -> Result<Vec<u8>, Diagnostic> {
     if !is_gcode_3mf(name) {
         return Ok(output.gcode.clone().into_bytes());
     }
+    let [large, small] = [
+        slicer_formats::PLATE_THUMBNAIL_SIZE,
+        slicer_formats::PLATE_THUMBNAIL_SMALL_SIZE,
+    ];
+    let mut pictures = slicer_gcode::thumbnails::render_thumbnails(
+        objects,
+        slicer_fdm::Placement::AsGiven,
+        &[[large, large], [small, small]],
+        settings,
+    )
+    .map_err(|e| Diagnostic::error("thumbnail.encode", e.to_string()))?
+    .into_iter()
+    .map(|picture| picture.png);
     let info = slicer_formats::PrintInfo {
         seconds: output.stats.print_time_s,
         weight_g: output.stats.filament_weight_g,
         filament_m: output.stats.filament_length_mm / 1000.0,
         layers: output.stats.layers,
         nozzle_diameter: settings.nozzle_diameter,
+        thumbnail: pictures.next().unwrap_or_default(),
+        thumbnail_small: pictures.next().unwrap_or_default(),
         filaments: slicer_gcode::filaments(&output.stats, settings),
         layer_filaments: output.stats.layer_filaments.clone(),
-        // ponytail: no picture of the plate here, the meshes are not at
-        // hand; the command line tool and the server add one.
-        ..slicer_formats::PrintInfo::default()
     };
     slicer_formats::write_gcode_3mf(&output.gcode, &info).map_err(|e| e.diagnostic())
 }
@@ -277,7 +292,7 @@ mod tests {
         SliceRequest {
             objects: vec![cube_at([60.0, 130.0])],
             settings: Settings::default(),
-            object_settings: Vec::new(),
+            own: PlateOwnSettings::default(),
         }
     }
 
@@ -345,7 +360,7 @@ mod tests {
             infill_density: 100.0,
             ..Settings::default()
         };
-        two.object_settings = vec![None, Some(solid)];
+        two.own.object_settings = vec![None, Some(solid)];
         let own = SliceJob::start(two, || {}).wait().unwrap();
         let sparse = |result: &SliceResult, x: std::ops::Range<f64>| {
             result.toolpaths.layers.iter().any(|layer| {
@@ -394,13 +409,67 @@ mod tests {
     }
 
     #[test]
+    fn a_modifier_changes_the_infill_of_its_object() {
+        use crate::plate::{Model, Plate, VolumeKind};
+
+        let settings = Settings::default();
+        let mut plate = Plate::default();
+        plate.add(
+            Model::from_mesh("cube", Mesh::cuboid(20.0, 20.0, 4.0)).unwrap(),
+            &settings,
+        );
+        plate.items[0].placement.center = [110.0, 110.0];
+        let request = |plate: &Plate| SliceRequest {
+            objects: plate.meshes(),
+            settings: settings.clone(),
+            own: plate.own_settings(&settings).unwrap(),
+        };
+        let plain = SliceJob::start(request(&plate), || {}).wait().unwrap();
+        let mut solid = Mesh::cuboid(40.0, 40.0, 10.0);
+        solid.translate([-20.0, -20.0, -1.0]);
+        assert!(plate.add_volume(0, VolumeKind::Modifier, "solid", solid));
+        assert!(
+            plate
+                .set_volume_values(
+                    0,
+                    0,
+                    vec![("infill_density".to_owned(), "100".to_owned())],
+                    &settings,
+                )
+                .unwrap()
+        );
+        let filled = SliceJob::start(request(&plate), || {}).wait().unwrap();
+        let sparse = |result: &SliceResult| {
+            result
+                .toolpaths
+                .layers
+                .iter()
+                .flat_map(|layer| &layer.paths)
+                .filter(|path| path.kind == slicer_fdm::PathKind::SparseInfill)
+                .count()
+        };
+        assert!(sparse(&plain) > 0);
+        assert_eq!(sparse(&filled), 0);
+    }
+
+    #[test]
     fn output_formats() {
         let settings = Settings::default();
         let result = SliceJob::start(request(), || {}).wait().unwrap();
-        let plain = encode_output(&result.output, &settings, "cube.gcode").unwrap();
+        let objects = vec![cube_at([60.0, 130.0])];
+        let plain = encode_output(&result.output, &settings, &objects, "cube.gcode").unwrap();
         assert_eq!(plain, result.output.gcode.as_bytes());
-        let container = encode_output(&result.output, &settings, "Cube.GCODE.3MF").unwrap();
+        let container =
+            encode_output(&result.output, &settings, &objects, "Cube.GCODE.3MF").unwrap();
         assert!(container.starts_with(b"PK"));
+        let png = |name: &str| {
+            let file = slicer_formats::read_file(&container, name)
+                .unwrap()
+                .unwrap();
+            assert!(file.starts_with(b"\x89PNG"), "{name} is not a PNG");
+        };
+        png("Metadata/plate_1.png");
+        png("Metadata/plate_1_small.png");
         assert!(is_gcode_3mf("a.gcode.3mf") && !is_gcode_3mf("a.3mf"));
     }
 

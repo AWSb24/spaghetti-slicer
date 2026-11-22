@@ -48,6 +48,11 @@ web-time = "1.1.0"
 
 # The browser build (`tools/build-web.sh`): eframe's web runner, files read
 # and saved through the browser.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Uploads the current G-code to Moonraker or OctoPrint. The browser has no
+# threads or raw sockets for this; the Device tab says so there.
+slicer-send.workspace = true
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2.130"
 wasm-bindgen-futures = "0.4.80"

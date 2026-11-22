@@ -8,6 +8,7 @@
 
 pub mod calibration;
 pub mod camera;
+pub mod filaments;
 pub mod job;
 pub mod plate;
 pub mod plates;

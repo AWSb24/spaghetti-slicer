@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use eframe::egui::{self, RichText};
 use slicer_fdm::Step;
 use slicer_profiles::{SETTINGS_INFO, Settings, ValueKind};
+use slicer_ui::filaments::{self, MAX_SLOTS};
 #[cfg(not(target_arch = "wasm32"))]
 use slicer_ui::profiles::import_orca_files;
 use slicer_ui::profiles::{ProfileSet, find_profiles_dir, profile_name};
@@ -419,6 +420,426 @@ pub fn object_settings(
     });
     let after = editor.build(plate, &common, "").ok()?;
     (after != before).then(|| changed_overrides(overrides, plate, &before, &after))
+}
+
+/// The settings of a modifier or of a height range as rows of setting,
+/// value and a button to remove it, with a list to add a setting.
+///
+/// `allowed` are the settings that may be set there, `values` those set
+/// now, `defaults` the values the plate's settings have (used for a setting
+/// that is added) and `drafts` the text being typed, by setting name.
+/// Returns the new values after a change.
+pub fn values_editor(
+    ui: &mut egui::Ui,
+    id: &str,
+    allowed: &[&str],
+    values: &[(String, String)],
+    defaults: &BTreeMap<String, String>,
+    drafts: &mut BTreeMap<String, String>,
+    new_key: &mut String,
+) -> Option<Vec<(String, String)>> {
+    let mut result = None;
+    let mut remove = None;
+    for (index, (key, value)) in values.iter().enumerate() {
+        let draft = drafts.entry(key.clone()).or_insert_with(|| value.clone());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(setting_label(key)).small())
+                .on_hover_text(format!("{key} ({})", setting_unit(key)));
+            if ui
+                .add(egui::TextEdit::singleline(draft).desired_width(78.0))
+                .changed()
+                && draft != value
+            {
+                let mut next = values.to_vec();
+                next[index].1 = draft.clone();
+                result = Some(next);
+            }
+            if ui.small_button("×").on_hover_text("Remove").clicked() {
+                remove = Some(index);
+            }
+        });
+    }
+    if let Some(index) = remove {
+        let mut next = values.to_vec();
+        let (key, _) = next.remove(index);
+        drafts.remove(&key);
+        return Some(next);
+    }
+    let missing: Vec<&str> = allowed
+        .iter()
+        .copied()
+        .filter(|key| !values.iter().any(|(used, _)| used == key))
+        .collect();
+    if !missing.is_empty() {
+        ui.horizontal(|ui| {
+            let shown = if new_key.is_empty() {
+                "Add setting".to_owned()
+            } else {
+                setting_label(new_key)
+            };
+            egui::ComboBox::from_id_salt((id, "new_setting"))
+                .selected_text(RichText::new(shown).small())
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    for key in &missing {
+                        ui.selectable_value(new_key, (*key).to_owned(), setting_label(key));
+                    }
+                });
+            if !new_key.is_empty() && ui.small_button("Add").clicked() {
+                let key = std::mem::take(new_key);
+                let value = defaults.get(&key).cloned().unwrap_or_default();
+                drafts.insert(key.clone(), value.clone());
+                let mut next = values.to_vec();
+                next.push((key, value));
+                result = Some(next);
+            }
+        });
+    }
+    result
+}
+
+/// A small square in the colour of filament slot `extruder`, with its
+/// number `T1`, `T2` and so on; hovering says kind and use. The response
+/// is clickable, for opening the filament window.
+pub fn slot_button(
+    ui: &mut egui::Ui,
+    settings: &Settings,
+    extruder: usize,
+    usage: usize,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(22.0), egui::Sense::click());
+    let colour = filaments::slot_colour(settings, extruder);
+    let fill = egui::Color32::from_rgb(colour[0], colour[1], colour[2]);
+    ui.painter().rect_filled(rect, 3.0, fill);
+    ui.painter().rect_stroke(
+        rect,
+        3.0,
+        egui::Stroke::new(1.0, theme::LINE),
+        egui::StrokeKind::Inside,
+    );
+    // Light colours get dark text.
+    let lightness = (0.2126 * f32::from(colour[0])
+        + 0.7152 * f32::from(colour[1])
+        + 0.0722 * f32::from(colour[2]))
+        / 255.0;
+    let text = if lightness > 0.6 {
+        egui::Color32::BLACK
+    } else {
+        egui::Color32::WHITE
+    };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        format!("T{}", extruder + 1),
+        egui::FontId::proportional(11.0),
+        text,
+    );
+    let slot = filaments::slots(settings).get(extruder).cloned();
+    let kind = slot.map_or_else(|| "PLA".to_owned(), |slot| slot.kind_label().to_owned());
+    let used = match usage {
+        0 => "unused".to_owned(),
+        1 => "1 part".to_owned(),
+        n => format!("{n} parts"),
+    };
+    response.on_hover_text(format!(
+        "Filament {}: {kind}, {used}\nClick to change the filaments and the flush volumes",
+        extruder + 1
+    ))
+}
+
+/// The name of filament slot `extruder` (from 0) for menus: `T2 · PETG`.
+pub fn slot_label(settings: &Settings, extruder: usize) -> String {
+    let kind = filaments::slots(settings)
+        .get(extruder)
+        .map_or_else(|| "PLA".to_owned(), |slot| slot.kind_label().to_owned());
+    format!("T{} · {kind}", extruder + 1)
+}
+
+/// The window with the filament slots of the plate, their colours, kinds
+/// and use, and the purge volumes between them.
+///
+/// The values are settings (`extruder_count`, `filament_colours`,
+/// `filament_type`, `flush_volumes`, `flush_multiplier`, and
+/// `flush_from_colours`), changed through `editor`, so they are checked
+/// like every other setting and saved with the project. `usage` counts
+/// the parts that print with each slot, `drafts` keeps what is typed into
+/// the kind fields.
+#[allow(clippy::too_many_arguments)]
+pub fn filament_window(
+    ctx: &egui::Context,
+    open: &mut bool,
+    editor: &mut SettingsEditor,
+    base: &Settings,
+    common: &mut CommonSettings,
+    overrides: &str,
+    current: Option<&Settings>,
+    usage: &[usize],
+    drafts: &mut BTreeMap<usize, String>,
+) {
+    if !*open {
+        return;
+    }
+    let mut still_open = true;
+    egui::Window::new("Filaments and flush volumes")
+        .id(egui::Id::unique("filament_window"))
+        .open(&mut still_open)
+        .default_size([590.0, 620.0])
+        .vscroll(true)
+        .show(ctx, |ui| {
+            let Some(current) = current else {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    "The settings are invalid; fix the message in the side panel.",
+                );
+                return;
+            };
+            let count = filaments::count(current);
+            drafts.retain(|&slot, _| slot < count);
+
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Filament slots").strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(count < MAX_SLOTS as usize, egui::Button::new("+"))
+                        .on_hover_text("Add a filament slot")
+                        .clicked()
+                    {
+                        let plan = filaments::resize_plan(current, count as u32 + 1);
+                        apply_plan(editor, base, common, overrides, plan);
+                    }
+                    ui.label(format!("{count} of {MAX_SLOTS}"));
+                    if ui
+                        .add_enabled(count > 1, egui::Button::new("−"))
+                        .on_hover_text("Remove the last filament slot")
+                        .clicked()
+                    {
+                        let plan = filaments::resize_plan(current, count as u32 - 1);
+                        apply_plan(editor, base, common, overrides, plan);
+                    }
+                });
+            });
+            ui.label(
+                RichText::new(
+                    "One slot per extruder (extruder_count). Colours and kinds go into the \
+                     G-code container; objects and parts print with the slot they name. \
+                     Temperatures, flow and density come from the material profile and are \
+                     the same for all slots.",
+                )
+                .small()
+                .color(theme::TEXT_WEAK),
+            );
+            ui.add_space(4.0);
+
+            egui::Grid::new("filament_slots")
+                .num_columns(4)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    for (name, width) in [
+                        ("Slot", 36.0),
+                        ("Colour", 60.0),
+                        ("Kind", 120.0),
+                        ("Used by", 70.0),
+                    ] {
+                        ui.add_sized(
+                            [width, 14.0],
+                            egui::Label::new(RichText::new(name).small().color(theme::TEXT_WEAK)),
+                        );
+                    }
+                    ui.end_row();
+                    for index in 0..count {
+                        slot_button(ui, current, index, usage.get(index).copied().unwrap_or(0));
+                        let mut rgb = filaments::slot_colour(current, index);
+                        if ui.color_edit_button_srgb(&mut rgb).changed() {
+                            let text = filaments::set_slot_colour(current, index, rgb);
+                            let _ = editor.edit(base, common, overrides, "filament_colours", &text);
+                        }
+                        let mut kind = drafts.get(&index).cloned().unwrap_or_else(|| {
+                            filaments::slots(current).get(index).map_or_else(
+                                || "PLA".to_owned(),
+                                |slot| slot.kind_label().to_owned(),
+                            )
+                        });
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut kind)
+                                .desired_width(112.0)
+                                .hint_text("PLA"),
+                        );
+                        if response.changed() {
+                            drafts.insert(index, kind.clone());
+                        }
+                        if response.lost_focus() && drafts.contains_key(&index) {
+                            let text = filaments::set_slot_type(current, index, &kind);
+                            if editor
+                                .edit(base, common, overrides, "filament_type", &text)
+                                .is_ok()
+                            {
+                                drafts.remove(&index);
+                            }
+                        }
+                        let used = match usage.get(index).copied().unwrap_or(0) {
+                            0 => "unused".to_owned(),
+                            1 => "1 part".to_owned(),
+                            n => format!("{n} parts"),
+                        };
+                        ui.label(RichText::new(used).small().color(theme::TEXT_WEAK));
+                        ui.end_row();
+                    }
+                });
+            for key in ["extruder_count", "filament_colours", "filament_type"] {
+                if let Some(error) = editor.errors.get(key) {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+            }
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Flush volumes").strong());
+                ui.label(
+                    RichText::new("mm³ before the multiplier, from the row's slot to the column's")
+                        .small()
+                        .color(theme::TEXT_WEAK),
+                );
+            });
+            if count < 2 {
+                ui.label(
+                    RichText::new(
+                        "A tool change only purges with more than one filament slot; the \
+                         \".gcode.3mf\" container still names one filament.",
+                    )
+                    .small()
+                    .color(theme::TEXT_WEAK),
+                );
+            } else {
+                let mut derive = current.flush_from_colours;
+                if ui
+                    .checkbox(&mut derive, "Derive from the filament colours")
+                    .on_hover_text(
+                        "While no volumes are given: a dark colour shows through a light one, \
+                         so the change to a lighter colour purges more",
+                    )
+                    .changed()
+                {
+                    let _ = editor.edit(
+                        base,
+                        common,
+                        overrides,
+                        "flush_from_colours",
+                        if derive { "true" } else { "false" },
+                    );
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Multiplier");
+                    let mut multiplier = current.flush_multiplier;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut multiplier)
+                                .speed(0.1)
+                                .range(0.0..=10.0),
+                        )
+                        .on_hover_text("Factor on every purge volume")
+                        .changed()
+                    {
+                        let _ = editor.edit(
+                            base,
+                            common,
+                            overrides,
+                            "flush_multiplier",
+                            &multiplier.to_string(),
+                        );
+                    }
+                    if ui
+                        .button("Clear")
+                        .on_hover_text(
+                            "No purge volumes; every tool change shares the solid tower layer",
+                        )
+                        .clicked()
+                    {
+                        let _ = editor.edit(base, common, overrides, "flush_volumes", "");
+                    }
+                });
+                let mut table = filaments::flush_table(current);
+                egui::Grid::new("flush_volumes")
+                    .num_columns(count + 1)
+                    .spacing([6.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("");
+                        for to in 0..count {
+                            ui.label(
+                                RichText::new(format!("T{}", to + 1))
+                                    .small()
+                                    .color(theme::TEXT_WEAK),
+                            );
+                        }
+                        ui.end_row();
+                        for from in 0..count {
+                            ui.label(RichText::new(format!("T{}", from + 1)).small());
+                            for to in 0..count {
+                                if from == to {
+                                    ui.weak("–");
+                                    continue;
+                                }
+                                let mut value = table[from][to];
+                                let response = ui.add_sized(
+                                    [54.0, 18.0],
+                                    egui::DragValue::new(&mut value)
+                                        .speed(5.0)
+                                        .range(0.0..=1000.0),
+                                );
+                                if response.changed() {
+                                    // An explicit table replaces the one
+                                    // derived from the colours.
+                                    if current.flush_volumes.trim().is_empty()
+                                        && current.flush_from_colours
+                                    {
+                                        let _ = editor.edit(
+                                            base,
+                                            common,
+                                            overrides,
+                                            "flush_from_colours",
+                                            "false",
+                                        );
+                                    }
+                                    table[from][to] = value;
+                                    let text = filaments::flush_text(&table);
+                                    let _ = editor.edit(
+                                        base,
+                                        common,
+                                        overrides,
+                                        "flush_volumes",
+                                        &text,
+                                    );
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+            }
+            for key in ["flush_volumes", "flush_multiplier", "flush_from_colours"] {
+                if let Some(error) = editor.errors.get(key) {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+            }
+        });
+    if !still_open {
+        *open = false;
+    }
+}
+
+/// Applies the settings of a [`filaments::resize_plan`] in order; the
+/// first one that is not valid stays in `editor.errors`.
+fn apply_plan(
+    editor: &mut SettingsEditor,
+    base: &Settings,
+    common: &mut CommonSettings,
+    overrides: &str,
+    plan: Vec<(&'static str, String)>,
+) {
+    for (key, value) in plan {
+        if editor.edit(base, common, overrides, key, &value).is_err() {
+            break;
+        }
+    }
 }
 
 /// The title of a group of settings: a small mark, the name in bold and a

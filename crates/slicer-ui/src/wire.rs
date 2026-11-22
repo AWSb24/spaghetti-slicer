@@ -14,11 +14,12 @@ use std::collections::BTreeSet;
 use std::sync::{Mutex, PoisonError};
 
 use slicer_core::{Diagnose, Diagnostic, Mesh, Severity};
-use slicer_fdm::{Layer, ObjectRange, Path, PathKind, Step, Toolpaths};
+use slicer_fdm::{Layer, ObjectRange, Path, PathKind, Step, SupportVolumeKind, Toolpaths};
 use slicer_gcode::{ExtruderStats, Output, Stats};
 use slicer_profiles::Settings;
 
 use crate::job::{SliceRequest, SliceResult};
+use crate::plate::PlateOwnSettings;
 
 /// The bytes do not hold what they should.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +38,7 @@ pub fn encode_request(request: &SliceRequest) -> Vec<u8> {
     let SliceRequest {
         objects,
         settings,
-        object_settings,
+        own,
     } = request;
     let mut out = Writer::default();
     out.text(&settings.to_toml());
@@ -45,16 +46,7 @@ pub fn encode_request(request: &SliceRequest) -> Vec<u8> {
     for mesh in objects {
         write_mesh(&mut out, mesh);
     }
-    out.len(object_settings.len());
-    for own in object_settings {
-        match own {
-            Some(own) => {
-                out.u8(1);
-                out.text(&own.to_toml());
-            }
-            None => out.u8(0),
-        }
-    }
+    write_own(&mut out, own);
     out.0
 }
 
@@ -69,20 +61,13 @@ pub fn decode_request(bytes: &[u8]) -> Result<SliceRequest, Diagnostic> {
     }
     let settings = Settings::from_toml(&text).map_err(|e| e.diagnostic())?;
     let objects = input.list(read_mesh).map_err(|_| malformed())?;
-    let object_settings = input
-        .list(|input| match input.u8()? {
-            0 => Ok(None),
-            _ => {
-                let text = input.text()?;
-                Settings::from_toml(&text).map(Some).map_err(|_| Malformed)
-            }
-        })
+    let own = read_own(&mut input)
         .and_then(|own| input.end().map(|()| own))
         .map_err(|_| malformed())?;
     Ok(SliceRequest {
         objects,
         settings,
-        object_settings,
+        own,
     })
 }
 
@@ -210,6 +195,119 @@ fn kind_from_code(code: u8) -> Result<PathKind, Malformed> {
 
 /// Stands for "no kind" in the times of the statistics.
 const NO_KIND: u8 = u8::MAX;
+
+fn write_values(out: &mut Writer, values: &[(String, String)]) {
+    out.len(values.len());
+    for (key, value) in values {
+        out.text(key);
+        out.text(value);
+    }
+}
+
+fn read_values(input: &mut Reader) -> Result<Vec<(String, String)>, Malformed> {
+    input.list(|input| Ok((input.text()?, input.text()?)))
+}
+
+fn write_settings_list(out: &mut Writer, list: &[Option<Settings>]) {
+    out.len(list.len());
+    for own in list {
+        match own {
+            Some(own) => {
+                out.u8(1);
+                out.text(&own.to_toml());
+            }
+            None => out.u8(0),
+        }
+    }
+}
+
+fn read_settings_list(input: &mut Reader) -> Result<Vec<Option<Settings>>, Malformed> {
+    input.list(|input| match input.u8()? {
+        0 => Ok(None),
+        _ => {
+            let text = input.text()?;
+            Settings::from_toml(&text).map(Some).map_err(|_| Malformed)
+        }
+    })
+}
+
+/// Writes the settings, ranges and volumes of every object of a request.
+fn write_own(out: &mut Writer, own: &PlateOwnSettings) {
+    write_settings_list(out, &own.object_settings);
+    out.len(own.ranges.len());
+    for ranges in &own.ranges {
+        out.len(ranges.len());
+        for range in ranges {
+            out.f64(range.from);
+            out.f64(range.to);
+            write_values(out, &range.values);
+        }
+    }
+    out.len(own.modifiers.len());
+    for modifiers in &own.modifiers {
+        out.len(modifiers.len());
+        for modifier in modifiers {
+            write_mesh(out, &modifier.mesh);
+            write_values(out, &modifier.values);
+        }
+    }
+    out.len(own.negatives.len());
+    for negatives in &own.negatives {
+        out.len(negatives.len());
+        for mesh in negatives {
+            write_mesh(out, mesh);
+        }
+    }
+    out.len(own.support_volumes.len());
+    for volumes in &own.support_volumes {
+        out.len(volumes.len());
+        for volume in volumes {
+            out.u8(match volume.kind {
+                SupportVolumeKind::Blocker => 0,
+                SupportVolumeKind::Enforcer => 1,
+            });
+            write_mesh(out, &volume.mesh);
+        }
+    }
+}
+
+/// Reads what [`write_own`] wrote.
+fn read_own(input: &mut Reader) -> Result<PlateOwnSettings, Malformed> {
+    Ok(PlateOwnSettings {
+        object_settings: read_settings_list(input)?,
+        ranges: input.list(|input| {
+            input.list(|input| {
+                Ok(slicer_fdm::HeightRange {
+                    from: input.f64()?,
+                    to: input.f64()?,
+                    values: read_values(input)?,
+                })
+            })
+        })?,
+        modifiers: input.list(|input| {
+            input.list(|input| {
+                Ok(slicer_fdm::Modifier {
+                    mesh: read_mesh(input)?,
+                    values: read_values(input)?,
+                })
+            })
+        })?,
+        negatives: input.list(|input| input.list(read_mesh))?,
+        support_volumes: input.list(|input| {
+            input.list(|input| {
+                let kind = match input.u8()? {
+                    0 => SupportVolumeKind::Blocker,
+                    1 => SupportVolumeKind::Enforcer,
+                    _ => return Err(Malformed),
+                };
+                Ok(slicer_fdm::SupportVolume {
+                    kind,
+                    mesh: read_mesh(input)?,
+                })
+            })
+        })?,
+    })
+}
 
 fn write_mesh(out: &mut Writer, mesh: &Mesh) {
     let Mesh {
@@ -637,7 +735,32 @@ mod tests {
         SliceRequest {
             objects: vec![cube, second],
             settings,
-            object_settings: vec![None, Some(own)],
+            own: PlateOwnSettings {
+                object_settings: vec![None, Some(own)],
+                ranges: vec![
+                    vec![slicer_fdm::HeightRange {
+                        from: 0.5,
+                        to: 2.0,
+                        values: vec![("wall_loops".into(), "3".into())],
+                    }],
+                    Vec::new(),
+                ],
+                modifiers: vec![
+                    Vec::new(),
+                    vec![slicer_fdm::Modifier {
+                        mesh: Mesh::cuboid(2.0, 2.0, 2.0),
+                        values: vec![("infill_density".into(), "100".into())],
+                    }],
+                ],
+                negatives: vec![Vec::new(), vec![Mesh::cuboid(1.0, 1.0, 1.0)]],
+                support_volumes: vec![
+                    Vec::new(),
+                    vec![
+                        slicer_fdm::SupportVolume::blocker(Mesh::cuboid(3.0, 3.0, 1.0)),
+                        slicer_fdm::SupportVolume::enforcer(Mesh::cuboid(1.0, 1.0, 1.0)),
+                    ],
+                ],
+            },
         }
     }
 
@@ -648,7 +771,7 @@ mod tests {
         let back = decode_request(&bytes).unwrap();
         assert_eq!(back.objects, request.objects);
         assert_eq!(back.settings, request.settings);
-        assert_eq!(back.object_settings, request.object_settings);
+        assert_eq!(back.own, request.own);
         // Cut short or with bytes left over, it is rejected.
         assert!(decode_request(&bytes[..bytes.len() - 1]).is_err());
         let mut longer = bytes.clone();

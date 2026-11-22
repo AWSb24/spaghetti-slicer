@@ -8,7 +8,7 @@ use slicer_core::Mesh;
 use slicer_fdm::{Layer, Path, PathKind, Toolpaths};
 
 use crate::camera::Mat4;
-use crate::plate::{Model, Placement, bounds_2d};
+use crate::plate::{MeshTransform, Model, Placement, bounds_2d};
 
 /// Grid spacing on the bed in millimetres.
 const GRID_STEP: f64 = 10.0;
@@ -210,6 +210,36 @@ pub fn model_matrix(model: &Model, placement: &Placement) -> Mat4 {
     ]
 }
 
+/// Maps a mesh to the object's coordinates for a part or volume transform:
+/// scaled and turned around the centre of its bounding box, then moved by
+/// the transform's offset. This is the matrix form of
+/// [`MeshTransform::applied`].
+pub fn mesh_matrix(transform: &MeshTransform, mesh: &Mesh) -> Mat4 {
+    let center = mesh.bounds().map_or([0.0; 3], |(lo, hi)| {
+        [0, 1, 2].map(|axis| (lo[axis] + hi[axis]) / 2.0)
+    });
+    let rotation = transform.rotation();
+    let translation = transform.translation(center);
+    [
+        rotation[0][0] as f32,
+        rotation[1][0] as f32,
+        rotation[2][0] as f32,
+        0.0,
+        rotation[0][1] as f32,
+        rotation[1][1] as f32,
+        rotation[2][1] as f32,
+        0.0,
+        rotation[0][2] as f32,
+        rotation[1][2] as f32,
+        rotation[2][2] as f32,
+        0.0,
+        translation[0] as f32,
+        translation[1] as f32,
+        translation[2] as f32,
+        1.0,
+    ]
+}
+
 /// The first model that a ray from `origin` in direction `dir` hits, and
 /// how far along the ray: `models` are each model's matrix (see
 /// [`model_matrix`]) and mesh.
@@ -376,6 +406,27 @@ mod tests {
     use crate::camera::transform_point;
     use crate::plate::placed_outline;
     use crate::view::path_color;
+
+    #[test]
+    fn mesh_matrix_matches_the_transformed_mesh() {
+        let mesh = Mesh::cuboid(10.0, 4.0, 6.0);
+        let transform = MeshTransform {
+            offset: [3.0, -2.0, 5.0],
+            rotation_deg: [10.0, 20.0, 30.0],
+            scale: 1.5,
+        };
+        let matrix = mesh_matrix(&transform, &mesh);
+        let applied = transform.applied(&mesh);
+        for (corner, expected) in mesh.vertices.iter().zip(&applied.vertices) {
+            let point = transform_point(&matrix, corner.map(|value| value as f32)).unwrap();
+            for axis in 0..3 {
+                assert!(
+                    (point[axis] - expected[axis] as f32).abs() < 1e-4,
+                    "{point:?} {expected:?}"
+                );
+            }
+        }
+    }
 
     fn path(kind: PathKind, points: Vec<[f64; 2]>, closed: bool) -> Path {
         Path {

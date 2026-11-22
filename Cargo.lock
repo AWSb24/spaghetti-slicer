@@ -2704,6 +2704,7 @@ dependencies = [
  "slicer-formats",
  "slicer-gcode",
  "slicer-profiles",
+ "slicer-send",
  "toml",
  "wasm-bindgen",
  "wasm-bindgen-futures",

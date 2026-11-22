@@ -5,8 +5,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use slicer_core::{Diagnose, Diagnostic, Diagnostics, Mesh};
-use slicer_fdm::Toolpaths;
+use slicer_fdm::{MAX_NEGATIVES, MAX_SUPPORT_VOLUMES, Modifier, SupportVolume, Toolpaths};
 use slicer_profiles::Settings;
+
+pub use slicer_fdm::HeightRange;
 
 /// Steps that can be undone.
 const UNDO_STEPS: usize = 100;
@@ -213,6 +215,16 @@ fn det(m: Mat3) -> f64 {
     dot3(m[0], cross3(m[1], m[2]))
 }
 
+fn rotation_x(angle: f64) -> Mat3 {
+    let (sin, cos) = angle.sin_cos();
+    [[1.0, 0.0, 0.0], [0.0, cos, -sin], [0.0, sin, cos]]
+}
+
+fn rotation_y(angle: f64) -> Mat3 {
+    let (sin, cos) = angle.sin_cos();
+    [[cos, 0.0, sin], [0.0, 1.0, 0.0], [-sin, 0.0, cos]]
+}
+
 fn rotation_z(angle: f64) -> Mat3 {
     let (sin, cos) = angle.sin_cos();
     [[cos, -sin, 0.0], [sin, cos, 0.0], [0.0, 0.0, 1.0]]
@@ -284,6 +296,16 @@ pub fn load_model(name: &str, bytes: &[u8]) -> Result<(Model, Diagnostics), Diag
     Ok((Model::from_mesh(name, mesh)?, warnings))
 }
 
+/// Reads an STL or 3MF file for a part, modifier, negative volume or
+/// support volume of an object, as it is: such a mesh is in the object's
+/// coordinates and must not be moved to the middle of the bed. Returns the
+/// mesh and the warnings the reader reported.
+pub fn load_volume(bytes: &[u8]) -> Result<(Mesh, Diagnostics), Diagnostic> {
+    let mut warnings = Diagnostics::new();
+    let mesh = slicer_formats::parse_model(bytes, None, &mut warnings)?;
+    Ok((mesh, warnings))
+}
+
 /// Where and how the model sits on the plate.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Placement {
@@ -295,6 +317,108 @@ pub struct Placement {
     pub rotation_deg: f64,
     /// Uniform scale factor; 1 keeps the size from the file.
     pub scale: f64,
+}
+
+/// How a part or a volume is moved, turned and scaled inside its object.
+///
+/// The mesh is transformed around the centre of its own bounding box, then
+/// moved by [`MeshTransform::offset`]. Offsets are in the object's
+/// coordinates (millimetres), before the object's placement on the bed is
+/// applied. The rotation is applied around X, then Y, then Z.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeshTransform {
+    /// Movement after turning and scaling, in the object's coordinates.
+    pub offset: [f64; 3],
+    /// Rotation around X, Y and Z in degrees.
+    pub rotation_deg: [f64; 3],
+    /// Uniform scale factor; 1 keeps the size from the file.
+    pub scale: f64,
+}
+
+impl Default for MeshTransform {
+    fn default() -> Self {
+        Self {
+            offset: [0.0; 3],
+            rotation_deg: [0.0; 3],
+            scale: 1.0,
+        }
+    }
+}
+
+impl MeshTransform {
+    /// Whether the mesh is left as it is.
+    pub fn is_identity(&self) -> bool {
+        self.offset == [0.0; 3]
+            && self.rotation_deg == [0.0; 3]
+            && (self.scale - 1.0).abs() < f64::EPSILON
+    }
+
+    /// The rotation and scaling as a matrix, by rows.
+    pub fn rotation(&self) -> Mat3 {
+        let [x, y, z] = self.rotation_deg.map(f64::to_radians);
+        let m = mul(rotation_z(z), mul(rotation_y(y), rotation_x(x)));
+        m.map(|row| row.map(|value| value * self.scale))
+    }
+
+    /// Where the centre of the mesh's bounding box lands.
+    pub fn translation(&self, center: [f64; 3]) -> [f64; 3] {
+        let turned = apply(self.rotation(), center);
+        [0, 1, 2].map(|axis| center[axis] + self.offset[axis] - turned[axis])
+    }
+
+    /// The rotation and scaling that undo [`MeshTransform::rotation`], by
+    /// rows.
+    fn inverse_rotation(&self) -> Mat3 {
+        let [x, y, z] = self.rotation_deg.map(f64::to_radians);
+        let m = mul(rotation_x(-x), mul(rotation_y(-y), rotation_z(-z)));
+        let inverse = 1.0 / self.scale;
+        m.map(|row| row.map(|value| value * inverse))
+    }
+
+    /// `mesh` with this transform undone: the geometry before [`Self::applied`].
+    pub fn inverse_applied(&self, mesh: &Mesh) -> Mesh {
+        if self.is_identity() {
+            return mesh.clone();
+        }
+        let Some((lo, hi)) = mesh.bounds() else {
+            return mesh.clone();
+        };
+        // The centre of the transformed mesh is the old centre moved by the
+        // offset; turning and scaling keep the centre.
+        let center = [0, 1, 2].map(|axis| (lo[axis] + hi[axis]) / 2.0);
+        let origin = [0, 1, 2].map(|axis| center[axis] - self.offset[axis]);
+        let rotation = self.inverse_rotation();
+        let mut transformed = mesh.clone();
+        for vertex in &mut transformed.vertices {
+            let relative = [0, 1, 2].map(|axis| vertex[axis] - center[axis]);
+            let placed = apply(rotation, relative);
+            for (axis, value) in vertex.iter_mut().enumerate() {
+                *value = placed[axis] + origin[axis];
+            }
+        }
+        transformed
+    }
+
+    /// `mesh` turned and scaled around its centre and moved by the offset.
+    pub fn applied(&self, mesh: &Mesh) -> Mesh {
+        if self.is_identity() {
+            return mesh.clone();
+        }
+        let Some((lo, hi)) = mesh.bounds() else {
+            return mesh.clone();
+        };
+        let center = [0, 1, 2].map(|axis| (lo[axis] + hi[axis]) / 2.0);
+        let rotation = self.rotation();
+        let translation = self.translation(center);
+        let mut transformed = mesh.clone();
+        for vertex in &mut transformed.vertices {
+            let placed = apply(rotation, *vertex);
+            for (axis, value) in vertex.iter_mut().enumerate() {
+                *value = placed[axis] + translation[axis];
+            }
+        }
+        transformed
+    }
 }
 
 impl Placement {
@@ -383,6 +507,33 @@ pub fn placed_mesh(model: &Model, placement: &Placement) -> Mesh {
     mesh
 }
 
+/// A mesh that belongs to `model` (a part, modifier, negative volume or
+/// support volume), turned, scaled and moved with it onto the bed.
+pub fn placed_with(mesh: &Mesh, model: &Model, placement: &Placement) -> Mesh {
+    let mut placed = mesh.clone();
+    placed.rotate_z(placement.rotation_deg.to_radians());
+    for v in &mut placed.vertices {
+        for c in v.iter_mut() {
+            *c *= placement.scale;
+        }
+    }
+    let mut boxed = model.mesh.clone();
+    boxed.rotate_z(placement.rotation_deg.to_radians());
+    for v in &mut boxed.vertices {
+        for c in v.iter_mut() {
+            *c *= placement.scale;
+        }
+    }
+    if let Some((lo, hi)) = boxed.bounds() {
+        placed.translate([
+            placement.center[0] - (lo[0] + hi[0]) / 2.0,
+            placement.center[1] - (lo[1] + hi[1]) / 2.0,
+            0.0,
+        ]);
+    }
+    placed
+}
+
 /// Checks that the placed model can be sliced: a sensible scale, inside the
 /// bed and not taller than the printer allows.
 pub fn check_placement(
@@ -426,10 +577,108 @@ pub fn check_placement(
     Ok(())
 }
 
+/// What a [`Volume`] of an object does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeKind {
+    /// The object prints with settings of its own inside it.
+    Modifier,
+    /// Its volume is cut out of the object.
+    Negative,
+    /// Overhangs inside it get no support.
+    SupportBlocker,
+    /// Overhangs inside it get support.
+    SupportEnforcer,
+}
+
+impl VolumeKind {
+    /// The name for people, as the object tree shows it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Modifier => "Modifier",
+            Self::Negative => "Negative volume",
+            Self::SupportBlocker => "Support blocker",
+            Self::SupportEnforcer => "Support enforcer",
+        }
+    }
+
+    /// The settings it may set for its part of the object, in the form
+    /// [`Settings::set`] takes; none for kinds that change no setting.
+    pub fn settings(self) -> &'static [&'static str] {
+        match self {
+            Self::Modifier => slicer_fdm::MODIFIER_SETTINGS,
+            _ => &[],
+        }
+    }
+
+    /// Largest number of volumes of this kind one object may have; the
+    /// slicer takes no more.
+    pub fn limit(self) -> usize {
+        match self {
+            Self::Modifier => slicer_fdm::MAX_MODIFIERS,
+            Self::Negative => MAX_NEGATIVES,
+            Self::SupportBlocker | Self::SupportEnforcer => MAX_SUPPORT_VOLUMES,
+        }
+    }
+}
+
+/// A mesh of an object that is not printed: a modifier, a negative volume,
+/// a support blocker or enforcer (see [`VolumeKind`]). The mesh is in the
+/// same coordinates as the object's, so it moves and turns with it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Volume {
+    /// The name for people; unique among the volumes of its object.
+    pub name: String,
+    /// What it does.
+    pub kind: VolumeKind,
+    /// The geometry, in the object's coordinates.
+    pub mesh: Mesh,
+    /// How it is moved, turned and scaled inside the object.
+    pub transform: MeshTransform,
+    /// Settings by name with their values as text, in the form
+    /// [`Settings::set`] takes; only the keys of [`VolumeKind::settings`]
+    /// count. Empty for kinds that change no setting.
+    pub values: Vec<(String, String)>,
+}
+
+impl Volume {
+    /// A volume of `kind` that changes nothing yet.
+    pub fn new(name: impl Into<String>, kind: VolumeKind, mesh: Mesh) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+            mesh,
+            transform: MeshTransform::default(),
+            values: Vec::new(),
+        }
+    }
+
+    /// The mesh as it sits in the object: turned, scaled and moved by its
+    /// transform.
+    pub fn transformed_mesh(&self) -> Mesh {
+        self.transform.applied(&self.mesh)
+    }
+}
+
+/// A part of an object: a mesh in the object's own coordinates. The object
+/// is printed as all its parts together.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Part {
+    /// The name for people; unique among the parts of its object.
+    pub name: String,
+    /// The geometry, in the object's coordinates.
+    pub mesh: Arc<Mesh>,
+    /// How it is moved, turned and scaled inside the object.
+    pub transform: MeshTransform,
+    /// The extruder that prints the whole part, counted from 0; `None`
+    /// keeps the extruders the mesh came with.
+    pub extruder: Option<u32>,
+}
+
 /// A model and where it sits.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Item {
-    /// The model as loaded; copies share it.
+    /// The model as loaded; copies share it. With parts of its own this is
+    /// all of them together.
     pub model: Arc<Model>,
     /// Its position, rotation and scale.
     pub placement: Placement,
@@ -437,15 +686,341 @@ pub struct Item {
     /// text; only keys of [`slicer_fdm::OBJECT_SETTINGS`]. Empty: the
     /// plate's settings.
     pub overrides: BTreeMap<String, String>,
+    /// The filament slot that prints the whole object, counted from 0;
+    /// `None` keeps the extruders the parts and the mesh came with. A part
+    /// with an extruder of its own keeps it.
+    pub extruder: Option<u32>,
+    /// The parts the object is made of, in the model's coordinates. Empty:
+    /// the model is its only part.
+    pub parts: Vec<Part>,
+    /// Modifiers, negative volumes and support volumes of the object, in
+    /// the model's coordinates.
+    pub volumes: Vec<Volume>,
+    /// Ranges of height above the bed that print with settings of their
+    /// own (see [`slicer_fdm::HeightRange`]).
+    pub ranges: Vec<HeightRange>,
 }
 
-/// The models on the build plate and which one is selected.
+impl Item {
+    /// A model without parts, volumes or ranges of its own.
+    pub fn new(model: Model, placement: Placement) -> Self {
+        Self {
+            model: Arc::new(model),
+            placement,
+            overrides: BTreeMap::new(),
+            extruder: None,
+            parts: Vec::new(),
+            volumes: Vec::new(),
+            ranges: Vec::new(),
+        }
+    }
+
+    /// How many parts the object has; one while it is only its model.
+    pub fn part_count(&self) -> usize {
+        self.parts.len().max(1)
+    }
+
+    /// The name of part `index`, or `None` past the last one.
+    pub fn part_name(&self, index: usize) -> Option<&str> {
+        match self.parts.get(index) {
+            Some(part) => Some(&part.name),
+            None if index == 0 && self.parts.is_empty() => Some(&self.model.name),
+            None => None,
+        }
+    }
+
+    /// The extruder part `index` prints with: its own, else the object's,
+    /// else the one of its mesh if all triangles agree.
+    pub fn part_extruder(&self, index: usize) -> Option<u32> {
+        match self.parts.get(index) {
+            Some(part) => part
+                .extruder
+                .or(self.extruder)
+                .or_else(|| uniform_extruder(&part.mesh)),
+            None if index == 0 && self.parts.is_empty() => {
+                self.extruder.or_else(|| uniform_extruder(&self.model.mesh))
+            }
+            None => None,
+        }
+    }
+
+    /// Makes the model a part of its own, so that its parts can change.
+    fn materialize_parts(&mut self) {
+        if self.parts.is_empty() {
+            self.parts.push(Part {
+                name: self.model.name.clone(),
+                mesh: Arc::new(self.model.mesh.clone()),
+                transform: MeshTransform::default(),
+                // The object's extruder (if any) and the mesh's own apply.
+                extruder: None,
+            });
+        }
+    }
+
+    /// Builds the model from the parts again, each with its extruder; the
+    /// parts stand on the bed with the box of all of them centred on the Z
+    /// axis.
+    pub fn rebuild(&mut self) {
+        if self.parts.is_empty() {
+            return;
+        }
+        let mut merged = Mesh::default();
+        for part in &self.parts {
+            let mut mesh = part.transform.applied(&part.mesh);
+            if let Some(extruder) = part.extruder.or(self.extruder) {
+                mesh.set_extruder(0, extruder);
+            }
+            merged.merge(&mesh);
+        }
+        if let Ok(model) = Model::from_mesh(self.model.name.clone(), merged) {
+            self.model = Arc::new(model);
+        }
+    }
+
+    /// Adds `mesh` as a part of this object, in the object's coordinates
+    /// (for example as a CAD program exported it with the object); the
+    /// name gets a number if it is taken already.
+    pub fn add_part(&mut self, name: &str, mesh: Mesh) {
+        self.materialize_parts();
+        let taken: Vec<String> = self.parts.iter().map(|p| p.name.clone()).collect();
+        let name = unique_name(taken.iter().map(String::as_str), name);
+        self.parts.push(Part {
+            name,
+            mesh: Arc::new(mesh),
+            transform: MeshTransform::default(),
+            extruder: None,
+        });
+        self.rebuild();
+    }
+
+    /// Removes part `index`, unless it is the object's only part.
+    pub fn remove_part(&mut self, index: usize) -> bool {
+        self.materialize_parts();
+        if index >= self.parts.len() || self.parts.len() < 2 {
+            return false;
+        }
+        self.parts.remove(index);
+        self.rebuild();
+        true
+    }
+
+    /// Gives part `index` the extruder `extruder` (from 0), or its mesh's
+    /// own extruders back with `None`.
+    pub fn set_part_extruder(&mut self, index: usize, extruder: Option<u32>) -> bool {
+        self.materialize_parts();
+        let Some(part) = self.parts.get_mut(index) else {
+            return false;
+        };
+        if part.extruder == extruder {
+            return false;
+        }
+        part.extruder = extruder;
+        self.rebuild();
+        true
+    }
+
+    /// How part `index` is moved, turned and scaled inside the object; the
+    /// identity for an object that is only its model.
+    pub fn part_transform(&self, index: usize) -> Option<MeshTransform> {
+        match self.parts.get(index) {
+            Some(part) => Some(part.transform),
+            None if index == 0 && self.parts.is_empty() => Some(MeshTransform::default()),
+            None => None,
+        }
+    }
+
+    /// Moves, turns and scales part `index` inside the object (see
+    /// [`MeshTransform`]); the object is built from its parts again.
+    pub fn set_part_transform(&mut self, index: usize, transform: MeshTransform) -> bool {
+        if index >= self.part_count() {
+            return false;
+        }
+        self.materialize_parts();
+        let Some(part) = self.parts.get_mut(index) else {
+            return false;
+        };
+        if part.transform == transform {
+            return false;
+        }
+        part.transform = transform;
+        self.rebuild();
+        true
+    }
+
+    /// Gives the whole object the filament slot `extruder` (from 0), or
+    /// its parts' and mesh's own extruders back with `None`. Parts with an
+    /// extruder of their own keep it. Returns whether the object changed.
+    pub fn set_object_extruder(&mut self, extruder: Option<u32>) -> bool {
+        let changed = self.extruder != extruder;
+        self.extruder = extruder;
+        if !self.parts.is_empty() || extruder.is_some() {
+            self.materialize_parts();
+            self.rebuild();
+        }
+        changed
+    }
+
+    /// Adds a volume of `kind`. Fails if the object has as many volumes of
+    /// that kind as the slicer takes (see [`VolumeKind::limit`]).
+    pub fn add_volume(&mut self, kind: VolumeKind, name: &str, mesh: Mesh) -> bool {
+        let count = self.volumes.iter().filter(|v| v.kind == kind).count();
+        if count >= kind.limit() {
+            return false;
+        }
+        let taken: Vec<String> = self.volumes.iter().map(|v| v.name.clone()).collect();
+        let name = unique_name(taken.iter().map(String::as_str), name);
+        self.volumes.push(Volume::new(name, kind, mesh));
+        true
+    }
+
+    /// Removes volume `index`.
+    pub fn remove_volume(&mut self, index: usize) -> bool {
+        if index >= self.volumes.len() {
+            return false;
+        }
+        self.volumes.remove(index);
+        true
+    }
+
+    /// Moves, turns and scales volume `index` inside the object (see
+    /// [`MeshTransform`]).
+    pub fn set_volume_transform(&mut self, index: usize, transform: MeshTransform) -> bool {
+        let Some(volume) = self.volumes.get_mut(index) else {
+            return false;
+        };
+        if volume.transform == transform {
+            return false;
+        }
+        volume.transform = transform;
+        true
+    }
+
+    /// The modifiers of this object, as slicing takes them: their meshes
+    /// turned, scaled and moved with the object.
+    pub fn modifiers(&self) -> Vec<Modifier> {
+        self.volumes
+            .iter()
+            .filter(|v| v.kind == VolumeKind::Modifier)
+            .map(|v| Modifier {
+                mesh: placed_with(&v.transformed_mesh(), &self.model, &self.placement),
+                values: v.values.clone(),
+            })
+            .collect()
+    }
+
+    /// The meshes cut out of this object, as slicing takes them: turned,
+    /// scaled and moved with the object.
+    pub fn negatives(&self) -> Vec<Mesh> {
+        self.volumes
+            .iter()
+            .filter(|v| v.kind == VolumeKind::Negative)
+            .map(|v| placed_with(&v.transformed_mesh(), &self.model, &self.placement))
+            .collect()
+    }
+
+    /// The support blockers and enforcers of this object, as slicing takes
+    /// them: turned, scaled and moved with the object.
+    pub fn support_volumes(&self) -> Vec<SupportVolume> {
+        self.volumes
+            .iter()
+            .filter_map(|v| {
+                let mesh = placed_with(&v.transformed_mesh(), &self.model, &self.placement);
+                match v.kind {
+                    VolumeKind::SupportBlocker => Some(SupportVolume::blocker(mesh)),
+                    VolumeKind::SupportEnforcer => Some(SupportVolume::enforcer(mesh)),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+}
+
+/// The extruder of `mesh` if every triangle agrees on one; `None` for a
+/// mesh without triangles or with several.
+fn uniform_extruder(mesh: &Mesh) -> Option<u32> {
+    let mut used = mesh.used_extruders();
+    (used.len() == 1).then(|| used.remove(0))
+}
+
+/// `name`, with a number in brackets if it is in `taken` already.
+fn unique_name<'a>(taken: impl IntoIterator<Item = &'a str>, name: &str) -> String {
+    let taken: Vec<&str> = taken.into_iter().collect();
+    if !taken.contains(&name) {
+        return name.to_owned();
+    }
+    (2..)
+        .map(|n| format!("{name} ({n})"))
+        .find(|candidate| !taken.contains(&candidate.as_str()))
+        .unwrap_or_else(|| name.to_owned())
+}
+
+/// The settings, ranges and volumes of every object of a plate, as slicing
+/// takes them (see [`slicer_fdm::OwnSettings`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PlateOwnSettings {
+    /// The settings of every object of its own, in the order of the
+    /// objects; `None` where it prints with the plate's.
+    pub object_settings: Vec<Option<Settings>>,
+    /// The height ranges of every object.
+    pub ranges: Vec<Vec<HeightRange>>,
+    /// The modifiers of every object.
+    pub modifiers: Vec<Vec<Modifier>>,
+    /// The negative volumes of every object.
+    pub negatives: Vec<Vec<Mesh>>,
+    /// The support blockers and enforcers of every object.
+    pub support_volumes: Vec<Vec<SupportVolume>>,
+}
+
+impl PlateOwnSettings {
+    /// These settings for [`slicer_fdm::generate_plate_with_own_settings`].
+    pub fn borrowed(&self) -> slicer_fdm::OwnSettings<'_> {
+        slicer_fdm::OwnSettings {
+            objects: &self.object_settings,
+            ranges: &self.ranges,
+            modifiers: &self.modifiers,
+            negatives: &self.negatives,
+            support_volumes: &self.support_volumes,
+        }
+    }
+}
+
+/// Checks that `values` only name settings of `allowed` and that each fits
+/// `settings`; `what` names the volume or range in the message.
+fn check_values(
+    settings: &Settings,
+    allowed: &[&str],
+    values: &[(String, String)],
+    what: &str,
+) -> Result<(), Diagnostic> {
+    for (key, value) in values {
+        if !allowed.contains(&key.as_str()) {
+            return Err(Diagnostic::error(
+                "ui.setting_not_allowed",
+                format!("{what}: '{key}' cannot be set there"),
+            )
+            .with("key", key)
+            .with("allowed", allowed.join(", ")));
+        }
+        settings.clone().set(key, value).map_err(|e| {
+            let mut error = e.diagnostic().with("where", what);
+            error.message = format!("{what}: {}", error.message);
+            error
+        })?;
+    }
+    Ok(())
+}
+
+/// The models on the build plate and which are selected.
 #[derive(Debug, Clone, Default)]
 pub struct Plate {
     /// The models in the order they were added.
     pub items: Vec<Item>,
-    /// Index of the selected model, which the side panel edits.
+    /// Index of the selected model, which the side panel edits; with
+    /// several selected, the last one chosen.
     pub selected: Option<usize>,
+    /// Every selected model, in the order they were chosen. Empty while the
+    /// selection was set through [`Plate::selected`] alone.
+    pub multi: Vec<usize>,
     /// Counts models added and removed, to tell whether a slice shows the
     /// current plate.
     pub serial: u64,
@@ -454,12 +1029,9 @@ pub struct Plate {
 impl Plate {
     /// Puts a model in the middle of the bed and selects it.
     pub fn add(&mut self, model: Model, settings: &Settings) {
-        self.items.push(Item {
-            model: Arc::new(model),
-            placement: Placement::centered(settings),
-            overrides: BTreeMap::new(),
-        });
-        self.selected = Some(self.items.len() - 1);
+        self.items
+            .push(Item::new(model, Placement::centered(settings)));
+        self.select_only(self.items.len() - 1);
         self.serial += 1;
     }
 
@@ -475,12 +1047,10 @@ impl Plate {
         } else {
             (placement.center[0] - step).max(width / 2.0)
         };
-        self.items.push(Item {
-            model: Arc::clone(&item.model),
-            placement,
-            overrides: item.overrides.clone(),
-        });
-        self.selected = Some(self.items.len() - 1);
+        let mut copy = item.clone();
+        copy.placement = placement;
+        self.items.push(copy);
+        self.select_only(self.items.len() - 1);
         self.serial += 1;
     }
 
@@ -492,7 +1062,70 @@ impl Plate {
                 Arc::ptr_eq(&a.model, &b.model)
                     && a.placement == b.placement
                     && a.overrides == b.overrides
+                    && a.extruder == b.extruder
+                    && a.ranges == b.ranges
+                    && same_parts(a, b)
+                    && same_volumes(a, b)
             })
+    }
+
+    /// Selects model `index` alone.
+    pub fn select_only(&mut self, index: usize) {
+        if index < self.items.len() {
+            self.selected = Some(index);
+            self.multi = vec![index];
+        }
+    }
+
+    /// Adds model `index` to the selection, or takes it out.
+    pub fn toggle_selected(&mut self, index: usize) {
+        if index >= self.items.len() {
+            return;
+        }
+        if self.is_selected(index) {
+            self.multi.retain(|&i| i != index);
+            if self.selected == Some(index) {
+                self.selected = self.multi.last().copied();
+            }
+        } else {
+            self.multi.push(index);
+            self.selected = Some(index);
+        }
+    }
+
+    /// Selects the models from `from` to `to`, in their order on the plate.
+    pub fn select_range(&mut self, from: usize, to: usize) {
+        if from >= self.items.len() || to >= self.items.len() {
+            return;
+        }
+        let (lo, hi) = (from.min(to), from.max(to));
+        self.multi = (lo..=hi).collect();
+        self.selected = Some(to);
+    }
+
+    /// Whether model `index` is selected, alone or together with others.
+    pub fn is_selected(&self, index: usize) -> bool {
+        self.selected == Some(index) || self.multi.contains(&index)
+    }
+
+    /// Every selected model, in the order of the plate.
+    pub fn selected_indices(&self) -> Vec<usize> {
+        let mut indices = self.multi.clone();
+        if let Some(index) = self.selected
+            && !indices.contains(&index)
+        {
+            indices.push(index);
+        }
+        indices.retain(|&i| i < self.items.len());
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    }
+
+    /// Selects nothing.
+    pub fn clear_selection(&mut self) {
+        self.selected = None;
+        self.multi.clear();
     }
 
     /// Gives model `index` the settings `overrides` of its own (see
@@ -504,6 +1137,119 @@ impl Plate {
             item.overrides = overrides;
             self.serial += 1;
         }
+    }
+
+    /// Adds a volume of `kind` to model `index`; false if it has as many
+    /// of that kind as the slicer takes.
+    pub fn add_volume(&mut self, index: usize, kind: VolumeKind, name: &str, mesh: Mesh) -> bool {
+        let Some(item) = self.items.get_mut(index) else {
+            return false;
+        };
+        if !item.add_volume(kind, name, mesh) {
+            return false;
+        }
+        self.serial += 1;
+        true
+    }
+
+    /// Removes volume `volume` of model `index`.
+    pub fn remove_volume(&mut self, index: usize, volume: usize) -> bool {
+        let Some(item) = self.items.get_mut(index) else {
+            return false;
+        };
+        if !item.remove_volume(volume) {
+            return false;
+        }
+        self.serial += 1;
+        true
+    }
+
+    /// Sets the settings of volume `volume` of model `index`; fails if
+    /// they are not valid for its kind.
+    pub fn set_volume_values(
+        &mut self,
+        index: usize,
+        volume: usize,
+        values: Vec<(String, String)>,
+        settings: &Settings,
+    ) -> Result<bool, Diagnostic> {
+        let Some(item) = self.items.get_mut(index) else {
+            return Ok(false);
+        };
+        let Some(entry) = item.volumes.get(volume) else {
+            return Ok(false);
+        };
+        check_values(settings, entry.kind.settings(), &values, &entry.name)?;
+        if entry.values == values {
+            return Ok(false);
+        }
+        item.volumes[volume].values = values;
+        self.serial += 1;
+        Ok(true)
+    }
+
+    /// Adds a height range to model `index`.
+    pub fn add_range(&mut self, index: usize, range: HeightRange) -> bool {
+        let Some(item) = self.items.get_mut(index) else {
+            return false;
+        };
+        item.ranges.push(range);
+        self.serial += 1;
+        true
+    }
+
+    /// Removes height range `range` of model `index`.
+    pub fn remove_range(&mut self, index: usize, range: usize) -> bool {
+        let Some(item) = self.items.get_mut(index) else {
+            return false;
+        };
+        if range >= item.ranges.len() {
+            return false;
+        }
+        item.ranges.remove(range);
+        self.serial += 1;
+        true
+    }
+
+    /// Sets height range `range` of model `index` to `from` to `to`
+    /// millimetres with `values`; fails if the bounds or values are not
+    /// valid.
+    pub fn set_range(
+        &mut self,
+        index: usize,
+        range: usize,
+        from: f64,
+        to: f64,
+        values: Vec<(String, String)>,
+        settings: &Settings,
+    ) -> Result<bool, Diagnostic> {
+        let Some(item) = self.items.get_mut(index) else {
+            return Ok(false);
+        };
+        let Some(entry) = item.ranges.get(range) else {
+            return Ok(false);
+        };
+        if !(from.is_finite() && to.is_finite() && from < to) {
+            return Err(Diagnostic::error(
+                "ui.invalid_range",
+                format!("the height range must start below where it ends ({from} to {to} mm)"),
+            ));
+        }
+        check_values(
+            settings,
+            slicer_fdm::RANGE_SETTINGS,
+            &values,
+            "height range",
+        )?;
+        if entry.from == from && entry.to == to && entry.values == values {
+            return Ok(false);
+        }
+        let entry = &mut item.ranges[range];
+        entry.from = from;
+        entry.to = to;
+        entry.values = values;
+        self.serial += 1;
+        Ok(true)
     }
 
     /// The settings of every model of its own, in order: `settings` with
@@ -534,21 +1280,149 @@ impl Plate {
             .collect()
     }
 
-    /// Removes the selected model; nothing is selected afterwards.
+    /// Removes the selected model alone; nothing is selected afterwards.
     pub fn remove_selected(&mut self) {
-        if let Some(index) = self.selected.take().filter(|&i| i < self.items.len()) {
+        let indices: Vec<usize> = self.selected.into_iter().collect();
+        self.remove_indices(indices);
+    }
+
+    /// Removes every selected model; nothing is selected afterwards.
+    pub fn remove_selected_all(&mut self) {
+        let indices = self.selected_indices();
+        self.remove_indices(indices);
+    }
+
+    /// Removes the models at `indices`; nothing is selected afterwards.
+    pub fn remove_indices(&mut self, indices: impl IntoIterator<Item = usize>) {
+        let mut indices: Vec<usize> = indices
+            .into_iter()
+            .filter(|&index| index < self.items.len())
+            .collect();
+        indices.sort_unstable();
+        indices.dedup();
+        if indices.is_empty() {
+            return;
+        }
+        for index in indices.into_iter().rev() {
             self.items.remove(index);
+        }
+        self.clear_selection();
+        self.serial += 1;
+    }
+
+    /// Puts `model` in place of the model at `index` (for example turned
+    /// or mirrored); copies that shared the old model keep it. Parts and
+    /// volumes were placed against the old geometry and are dropped; the
+    /// height ranges stay.
+    pub fn set_model(&mut self, index: usize, model: Model) {
+        if let Some(item) = self.items.get_mut(index) {
+            item.model = Arc::new(model);
+            item.parts.clear();
+            item.volumes.clear();
             self.serial += 1;
         }
     }
 
-    /// Puts `model` in place of the model at `index` (for example turned
-    /// or mirrored); copies that shared the old model keep it.
-    pub fn set_model(&mut self, index: usize, model: Model) {
-        if let Some(item) = self.items.get_mut(index) {
-            item.model = Arc::new(model);
-            self.serial += 1;
+    /// Adds `mesh` as another part of model `index`, in the object's
+    /// coordinates (see [`Item::add_part`]).
+    pub fn add_part(&mut self, index: usize, name: &str, mesh: Mesh) -> bool {
+        let Some(item) = self.items.get_mut(index) else {
+            return false;
+        };
+        item.add_part(name, mesh);
+        self.serial += 1;
+        true
+    }
+
+    /// Removes part `part` of model `index`, unless it is its only part.
+    pub fn remove_part(&mut self, index: usize, part: usize) -> bool {
+        let Some(item) = self.items.get_mut(index) else {
+            return false;
+        };
+        if !item.remove_part(part) {
+            return false;
         }
+        self.serial += 1;
+        true
+    }
+
+    /// Gives part `part` of model `index` the extruder `extruder` (from 0),
+    /// or its mesh's own back with `None`.
+    pub fn set_part_extruder(&mut self, index: usize, part: usize, extruder: Option<u32>) -> bool {
+        let Some(item) = self.items.get_mut(index) else {
+            return false;
+        };
+        if !item.set_part_extruder(part, extruder) {
+            return false;
+        }
+        self.serial += 1;
+        true
+    }
+
+    /// Moves, turns and scales part `part` of model `index` inside the
+    /// object (see [`MeshTransform`]).
+    pub fn set_part_transform(
+        &mut self,
+        index: usize,
+        part: usize,
+        transform: MeshTransform,
+    ) -> bool {
+        let Some(item) = self.items.get_mut(index) else {
+            return false;
+        };
+        if !item.set_part_transform(part, transform) {
+            return false;
+        }
+        self.serial += 1;
+        true
+    }
+
+    /// Moves, turns and scales volume `volume` of model `index` inside the
+    /// object (see [`MeshTransform`]).
+    pub fn set_volume_transform(
+        &mut self,
+        index: usize,
+        volume: usize,
+        transform: MeshTransform,
+    ) -> bool {
+        let Some(item) = self.items.get_mut(index) else {
+            return false;
+        };
+        if !item.set_volume_transform(volume, transform) {
+            return false;
+        }
+        self.serial += 1;
+        true
+    }
+
+    /// Gives model `index` the filament slot `extruder` (from 0) for its
+    /// whole object, or its parts' and mesh's own back with `None`.
+    pub fn set_object_extruder(&mut self, index: usize, extruder: Option<u32>) -> bool {
+        let Some(item) = self.items.get_mut(index) else {
+            return false;
+        };
+        if !item.set_object_extruder(extruder) {
+            return false;
+        }
+        self.serial += 1;
+        true
+    }
+
+    /// How many parts print with each extruder, counted from 0; a model
+    /// that is its only part counts once. The list ends with the last
+    /// extruder used.
+    pub fn extruder_usage(&self) -> Vec<usize> {
+        let mut usage: Vec<usize> = Vec::new();
+        for item in &self.items {
+            for part in 0..item.part_count() {
+                let extruder = item.part_extruder(part).unwrap_or(0) as usize;
+                if usage.len() <= extruder {
+                    usage.resize(extruder + 1, 0);
+                }
+                usage[extruder] += 1;
+            }
+        }
+        usage
     }
 
     /// Cuts model `index` at `height` millimetres above the bed. `keep`
@@ -590,11 +1464,10 @@ impl Plate {
                 placement.center[0] + offset[0],
                 placement.center[1] + offset[1],
             ];
-            Some(Item {
-                model: Arc::new(model),
-                placement: at,
-                overrides: item.overrides.clone(),
-            })
+            let mut new = Item::new(model, at);
+            new.overrides = item.overrides.clone();
+            new.extruder = item.extruder;
+            Some(new)
         });
         let width = |item: &Item| {
             bounds_2d(placed_outline(&item.model, &item.placement))
@@ -618,7 +1491,7 @@ impl Plate {
                 self.items.push(upper);
             }
         }
-        self.selected = Some(index);
+        self.select_only(index);
         self.serial += 1;
         true
     }
@@ -691,6 +1564,65 @@ impl Plate {
         }
     }
 
+    /// The settings, ranges and volumes of every object, for slicing.
+    /// Fails, naming the object, if a value there is not valid.
+    pub fn own_settings(&self, settings: &Settings) -> Result<PlateOwnSettings, Diagnostic> {
+        let own = PlateOwnSettings {
+            object_settings: self.object_settings(settings)?,
+            ranges: self.items.iter().map(|item| item.ranges.clone()).collect(),
+            modifiers: self.items.iter().map(Item::modifiers).collect(),
+            negatives: self.items.iter().map(Item::negatives).collect(),
+            support_volumes: self.items.iter().map(Item::support_volumes).collect(),
+        };
+        for (item, ranges) in self.items.iter().zip(&own.ranges) {
+            for range in ranges {
+                if !(range.from.is_finite() && range.to.is_finite() && range.from < range.to) {
+                    return Err(Diagnostic::error(
+                        "ui.invalid_range",
+                        format!(
+                            "{}: the height range from {} to {} mm does not end above where it starts",
+                            item.model.name, range.from, range.to
+                        ),
+                    ));
+                }
+                check_values(
+                    settings,
+                    slicer_fdm::RANGE_SETTINGS,
+                    &range.values,
+                    "height range",
+                )
+                .map_err(|error| named(error, &item.model.name))?;
+            }
+            for volume in &item.volumes {
+                let count = item
+                    .volumes
+                    .iter()
+                    .filter(|v| v.kind == volume.kind)
+                    .count();
+                if count > volume.kind.limit() {
+                    return Err(Diagnostic::error(
+                        "ui.too_many_volumes",
+                        format!(
+                            "{}: {} {} volumes, but the slicer takes {}",
+                            item.model.name,
+                            count,
+                            volume.kind.label().to_lowercase(),
+                            volume.kind.limit()
+                        ),
+                    ));
+                }
+                check_values(
+                    settings,
+                    volume.kind.settings(),
+                    &volume.values,
+                    &volume.name,
+                )
+                .map_err(|error| named(error, &item.model.name))?;
+            }
+        }
+        Ok(own)
+    }
+
     /// Checks every model with [`check_placement`], and its own settings;
     /// the message names the model when there are several.
     pub fn check(&self, settings: &Settings) -> Result<(), Diagnostic> {
@@ -705,7 +1637,7 @@ impl Plate {
                 error
             })?;
         }
-        self.object_settings(settings).map(|_| ())
+        self.own_settings(settings).map(|_| ())
     }
 
     /// The meshes to slice, each where it is placed.
@@ -715,6 +1647,34 @@ impl Plate {
             .map(|item| placed_mesh(&item.model, &item.placement))
             .collect()
     }
+}
+
+/// Whether two objects have the same parts, judged by their names,
+/// extruders and transforms; a change of geometry always comes with another
+/// model.
+fn same_parts(a: &Item, b: &Item) -> bool {
+    a.parts.len() == b.parts.len()
+        && a.parts.iter().zip(&b.parts).all(|(x, y)| {
+            x.name == y.name && x.extruder == y.extruder && x.transform == y.transform
+        })
+}
+
+/// Whether two objects have the same volumes, judged by their names, kinds,
+/// transforms and values; their meshes never change in place.
+fn same_volumes(a: &Item, b: &Item) -> bool {
+    a.volumes.len() == b.volumes.len()
+        && a.volumes.iter().zip(&b.volumes).all(|(x, y)| {
+            x.name == y.name
+                && x.kind == y.kind
+                && x.transform == y.transform
+                && x.values == y.values
+        })
+}
+
+/// `error` with the name of `object` in front of its message.
+fn named(mut error: Diagnostic, object: &str) -> Diagnostic {
+    error.message = format!("{object}: {}", error.message);
+    error
 }
 
 /// The states of the plate that can be undone and redone. Changes are
@@ -775,8 +1735,12 @@ impl History {
         let serial = plate.serial + 1;
         *plate = self.current.clone();
         plate.serial = serial;
+        plate.multi.retain(|&i| i < plate.items.len());
         if plate.selected.is_some_and(|i| i >= plate.items.len()) {
-            plate.selected = None;
+            plate.selected = plate.multi.last().copied();
+        }
+        if plate.selected.is_none() {
+            plate.multi.clear();
         }
     }
 }
@@ -839,6 +1803,95 @@ mod tests {
         // Somewhere off the origin, as models in files often are.
         mesh.translate([37.0, -12.0, 5.0]);
         Model::from_mesh("cube", mesh).unwrap()
+    }
+
+    #[test]
+    fn mesh_transforms_turn_and_scale_around_the_mesh_centre() {
+        let mesh = Mesh::cuboid(2.0, 4.0, 6.0);
+        let (lo, hi) = mesh.bounds().unwrap();
+        let center = [0, 1, 2].map(|axis| (lo[axis] + hi[axis]) / 2.0);
+        let transform = MeshTransform {
+            offset: [10.0, 20.0, 30.0],
+            rotation_deg: [0.0, 0.0, 90.0],
+            scale: 2.0,
+        };
+        let moved = transform.applied(&mesh);
+        let (lo, hi) = moved.bounds().unwrap();
+        // 2 × 2 mm across becomes 8 × 4 mm after scaling and a quarter turn.
+        let expected_center = [center[0] + 10.0, center[1] + 20.0, center[2] + 30.0];
+        for axis in 0..3 {
+            assert!(((lo[axis] + hi[axis]) / 2.0 - expected_center[axis]).abs() < 1e-9);
+        }
+        assert!((hi[0] - lo[0] - 8.0).abs() < 1e-9, "{lo:?} {hi:?}");
+        assert!((hi[1] - lo[1] - 4.0).abs() < 1e-9);
+        assert!((hi[2] - lo[2] - 12.0).abs() < 1e-9);
+        let back = transform.inverse_applied(&moved);
+        for (original, recovered) in mesh.vertices.iter().zip(&back.vertices) {
+            for axis in 0..3 {
+                assert!((original[axis] - recovered[axis]).abs() < 1e-9);
+            }
+        }
+
+        // The identity leaves the mesh alone.
+        let same = MeshTransform::default().applied(&mesh);
+        assert_eq!(same.vertices, mesh.vertices);
+        assert_eq!(same.triangles, mesh.triangles);
+    }
+
+    #[test]
+    fn part_and_volume_transforms_change_what_is_sliced() {
+        let settings = Settings::default();
+        let mut item = Item::new(
+            cube_model(10.0, 10.0, 10.0),
+            Placement::centered(&settings),
+        );
+        item.add_part("second", Mesh::cuboid(10.0, 10.0, 10.0));
+        let before = item.model.size[0];
+        assert!(item.set_part_transform(
+            1,
+            MeshTransform {
+                offset: [30.0, 0.0, 0.0],
+                ..MeshTransform::default()
+            }
+        ));
+        assert!(item.model.size[0] > before + 20.0);
+
+        assert!(item.add_volume(
+            VolumeKind::Modifier,
+            "modifier",
+            Mesh::cuboid(2.0, 2.0, 2.0)
+        ));
+        assert!(item.set_volume_transform(
+            0,
+            MeshTransform {
+                offset: [50.0, 0.0, 1.0],
+                ..MeshTransform::default()
+            }
+        ));
+        let modifier = &item.modifiers()[0].mesh;
+        let (lo, hi) = modifier.bounds().unwrap();
+        assert!((lo[2] + hi[2]) / 2.0 > 1.0);
+        assert!(lo[0] > 140.0, "{lo:?}");
+
+        // The transforms count as changes that can be undone.
+        let mut plate = Plate {
+            items: vec![item],
+            ..Plate::default()
+        };
+        let mut history = History::default();
+        history.settle(&plate);
+        plate.set_volume_transform(
+            0,
+            0,
+            MeshTransform {
+                offset: [0.0, 0.0, 0.0],
+                ..MeshTransform::default()
+            },
+        );
+        history.settle(&plate);
+        assert!(history.can_undo());
+        history.undo(&mut plate);
+        assert!(plate.items[0].volumes[0].transform.offset[0] > 40.0);
     }
 
     #[test]
@@ -1317,5 +2370,163 @@ mod tests {
         assert_eq!(model.name, "cube.stl");
         assert_eq!(model.size, [10.0, 10.0, 10.0]);
         assert!(warnings.is_empty());
+    }
+    #[test]
+    fn models_are_selected_together() {
+        let settings = Settings::default();
+        let mut plate = Plate::default();
+        for _ in 0..3 {
+            plate.add(cube_model(10.0, 10.0, 10.0), &settings);
+        }
+        assert!(plate.is_selected(2) && !plate.is_selected(0));
+        plate.toggle_selected(0);
+        assert!(plate.is_selected(0) && plate.is_selected(2));
+        assert_eq!(plate.selected_indices(), vec![0, 2]);
+        plate.select_range(0, 2);
+        assert_eq!(plate.selected_indices(), vec![0, 1, 2]);
+        plate.remove_selected_all();
+        assert!(plate.items.is_empty());
+        assert!(plate.selected.is_none() && plate.multi.is_empty());
+    }
+
+    #[test]
+    fn parts_are_merged_and_keep_their_extruder() {
+        let settings = Settings::default();
+        let mut plate = Plate::default();
+        plate.add(cube_model(10.0, 10.0, 10.0), &settings);
+        let triangles = plate.items[0].model.mesh.triangles.len();
+        assert_eq!(plate.items[0].part_count(), 1);
+
+        // A 5 mm cube on top of the first, in the object's coordinates.
+        let mut second = Mesh::cuboid(5.0, 5.0, 5.0);
+        second.translate([-2.5, -2.5, 10.0]);
+        assert!(plate.add_part(0, "cube", second));
+        let item = &plate.items[0];
+        assert_eq!(item.part_count(), 2);
+        assert_eq!(item.parts[1].name, "cube (2)");
+        assert_eq!(item.model.mesh.triangles.len(), triangles * 2);
+        assert!((item.model.size[2] - 15.0).abs() < 1e-9);
+        assert_eq!(item.model.name, "cube");
+
+        // The second part prints with the second extruder.
+        assert!(plate.set_part_extruder(0, 1, Some(1)));
+        let item = &plate.items[0];
+        let second_triangles = item.parts[1].mesh.triangles.len();
+        assert_eq!(
+            item.model
+                .mesh
+                .extruders
+                .iter()
+                .filter(|&&e| e == 1)
+                .count(),
+            second_triangles
+        );
+
+        assert!(plate.remove_part(0, 1));
+        assert_eq!(plate.items[0].part_count(), 1);
+        assert_eq!(plate.items[0].model.mesh.triangles.len(), triangles);
+        // The only part stays.
+        assert!(!plate.remove_part(0, 0));
+    }
+
+    #[test]
+    fn an_object_extruder_applies_to_the_parts_without_one() {
+        let settings = Settings::default();
+        let mut plate = Plate::default();
+        plate.add(cube_model(10.0, 10.0, 10.0), &settings);
+        let mut second = Mesh::cuboid(5.0, 5.0, 5.0);
+        second.translate([-2.5, -2.5, 10.0]);
+        assert!(plate.add_part(0, "cap", second));
+        assert_eq!(plate.extruder_usage(), vec![2]);
+
+        // The object's filament prints both parts.
+        assert!(plate.set_object_extruder(0, Some(1)));
+        let item = &plate.items[0];
+        assert_eq!(item.extruder, Some(1));
+        assert!(item.part_extruder(0).is_some_and(|extruder| extruder == 1));
+        assert!(
+            item.model
+                .mesh
+                .extruders
+                .iter()
+                .all(|&extruder| extruder == 1)
+        );
+        assert_eq!(plate.extruder_usage(), vec![0, 2]);
+
+        // A part of its own keeps its extruder.
+        assert!(plate.set_part_extruder(0, 1, Some(0)));
+        assert_eq!(plate.items[0].part_extruder(1), Some(0));
+        assert_eq!(plate.extruder_usage(), vec![1, 1]);
+
+        // Back to the parts and the mesh.
+        assert!(plate.set_object_extruder(0, None));
+        assert_eq!(plate.items[0].extruder, None);
+        assert_eq!(plate.extruder_usage()[0], 2);
+    }
+
+    #[test]
+    fn volumes_and_ranges_reach_the_slicer() {
+        let settings = Settings::default();
+        let mut plate = Plate::default();
+        plate.add(cube_model(20.0, 20.0, 20.0), &settings);
+        let mesh = Mesh::cuboid(5.0, 5.0, 5.0);
+        assert!(plate.add_volume(0, VolumeKind::Modifier, "dense", mesh.clone()));
+        let values = vec![("infill_density".to_owned(), "100".to_owned())];
+        assert!(
+            plate
+                .set_volume_values(0, 0, values.clone(), &settings)
+                .unwrap()
+        );
+        assert!(plate.add_volume(0, VolumeKind::Negative, "hole", mesh.clone()));
+        assert!(plate.add_volume(0, VolumeKind::SupportBlocker, "block", mesh.clone()));
+        assert!(plate.add_volume(0, VolumeKind::SupportEnforcer, "force", mesh));
+        assert!(plate.add_range(0, HeightRange::new(1.0, 2.0)));
+        assert!(
+            plate
+                .set_range(
+                    0,
+                    0,
+                    1.0,
+                    2.0,
+                    vec![("wall_loops".to_owned(), "1".to_owned())],
+                    &settings,
+                )
+                .unwrap()
+        );
+
+        let own = plate.own_settings(&settings).unwrap();
+        assert_eq!(own.modifiers[0].len(), 1);
+        assert_eq!(own.modifiers[0][0].values, values);
+        assert_eq!(own.negatives[0].len(), 1);
+        assert_eq!(own.support_volumes[0].len(), 2);
+        assert_eq!(own.ranges[0][0].to, 2.0);
+        assert_eq!(own.ranges[0][0].values[0].0, "wall_loops");
+
+        // Settings that cannot be set there are refused, as are bounds
+        // that do not end above where they start.
+        let error = plate
+            .set_volume_values(
+                0,
+                0,
+                vec![("layer_height".to_owned(), "0.1".to_owned())],
+                &settings,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "ui.setting_not_allowed");
+        let error = plate
+            .set_range(0, 0, 3.0, 2.0, Vec::new(), &settings)
+            .unwrap_err();
+        assert_eq!(error.code, "ui.invalid_range");
+
+        // The slicer takes only so many volumes of a kind.
+        for _ in 0..slicer_fdm::MAX_NEGATIVES {
+            plate.add_volume(0, VolumeKind::Negative, "hole", Mesh::cuboid(1.0, 1.0, 1.0));
+        }
+        let negatives = plate.items[0]
+            .volumes
+            .iter()
+            .filter(|volume| volume.kind == VolumeKind::Negative)
+            .count();
+        assert_eq!(negatives, slicer_fdm::MAX_NEGATIVES);
     }
 }

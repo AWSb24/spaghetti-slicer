@@ -5,19 +5,22 @@
 //! the preview a layer slider on the right and a legend of the line types.
 //! Messages show at the bottom right of the plate.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Layout, Pos2, Rect, RichText, Sense, Stroke, Vec2,
 };
-use slicer_core::{Diagnostic, Severity};
+use slicer_core::{Diagnostic, Mesh, Severity};
 use slicer_fdm::PathKind;
 use slicer_profiles::Settings;
+use slicer_ui::filaments;
 use slicer_ui::job::{
     SliceJob, SliceRequest, SliceResult, encode_output, format_duration, with_output_extension,
 };
 use slicer_ui::plate::{
-    Item, Placement, Plate, SCALE_RANGE, bed_center, check_placement, face_normal, load_model,
+    HeightRange, Item, MeshTransform, Placement, Plate, SCALE_RANGE, VolumeKind, bed_center,
+    check_placement, face_normal, load_model, load_volume,
 };
 use slicer_ui::plates::{self, Plates};
 use slicer_ui::profiles::{
@@ -25,9 +28,10 @@ use slicer_ui::profiles::{
     standard_process,
 };
 use slicer_ui::project::{
-    ProjectSettings, is_project, load_project, project_file_name, save_project,
-    with_project_extension,
+    ProjectSettings, is_orca_project, is_project, load_orca_project, load_project,
+    project_file_name, save_project, with_project_extension,
 };
+use slicer_ui::scene::mesh_matrix;
 use slicer_ui::settings::{CommonSettings, SettingsFile, load_settings};
 use slicer_ui::settings_list::{PROCESS_TABS, SettingsEditor};
 use slicer_ui::view::{
@@ -37,14 +41,15 @@ use slicer_ui::view::{
 use crate::icons::{self, Icon};
 use crate::platform;
 use crate::settings_ui::{
-    ProfileAction, ProfileKind, Profiles, process_tabs, profile_window, progress_bar,
-    settings_window,
+    ProfileAction, ProfileKind, Profiles, filament_window, process_tabs, profile_window,
+    progress_bar, settings_window, slot_button, slot_label, values_editor,
 };
 use crate::theme;
 use crate::view3d::{Event, Scene, View3d};
 use crate::wizard::{Wizard, WizardEnd};
 
 mod calibrate;
+mod device;
 
 /// How serious a message in the side panel is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +89,7 @@ const INFO_SECONDS: f64 = 6.0;
 enum Tab {
     Plate,
     Preview,
+    Device,
 }
 
 /// A finished slice and what it was made from.
@@ -111,6 +117,95 @@ struct CutDialog {
     flip: bool,
 }
 
+/// What the object tree has selected for editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeChoice {
+    /// A part of an object.
+    Part {
+        /// The object on the plate.
+        object: usize,
+        /// The part of it.
+        part: usize,
+    },
+    /// A modifier, negative volume, support blocker or enforcer.
+    Volume {
+        /// The object on the plate.
+        object: usize,
+        /// The volume of it.
+        volume: usize,
+    },
+    /// A range of height with settings of its own.
+    Range {
+        /// The object on the plate.
+        object: usize,
+        /// The range of it.
+        range: usize,
+    },
+}
+
+impl TreeChoice {
+    /// The object the choice belongs to.
+    fn object(self) -> usize {
+        match self {
+            Self::Part { object, .. }
+            | Self::Volume { object, .. }
+            | Self::Range { object, .. } => object,
+        }
+    }
+}
+
+/// What a click or a button in the object tree asks the window to do.
+#[derive(Debug, Clone, Copy)]
+enum TreeAction {
+    /// An object row was clicked; `command` is Ctrl or Cmd, `shift` Shift.
+    Click {
+        /// The object clicked.
+        index: usize,
+        /// Select it together with the others.
+        command: bool,
+        /// Select every object from the last click to this one.
+        shift: bool,
+    },
+    /// Show the editor of a part, volume or range.
+    Edit(TreeChoice),
+    /// Give an object (or every selected object) a filament slot.
+    SetExtruder {
+        /// The object whose menu was used.
+        object: usize,
+        /// The slot counted from 0, or `None` for the parts' and file's own.
+        extruder: Option<u32>,
+    },
+    /// Add a part from a file.
+    AddPart(usize),
+    /// Add a volume from a file.
+    AddVolume(usize, VolumeKind),
+    /// Add a box as a volume.
+    AddBox(usize, VolumeKind),
+    /// Add a height range, halfway up.
+    AddRange(usize),
+    /// Remove a part.
+    RemovePart {
+        /// The object on the plate.
+        object: usize,
+        /// The part of it.
+        part: usize,
+    },
+    /// Remove a volume.
+    RemoveVolume {
+        /// The object on the plate.
+        object: usize,
+        /// The volume of it.
+        volume: usize,
+    },
+    /// Remove a height range.
+    RemoveRange {
+        /// The object on the plate.
+        object: usize,
+        /// The range of it.
+        range: usize,
+    },
+}
+
 /// The application state.
 pub struct App {
     /// The plate shown; [`App::plates`] holds the others.
@@ -127,6 +222,9 @@ pub struct App {
     current: Result<Settings, Diagnostic>,
     job: Option<SliceJob>,
     sliced: Option<Sliced>,
+    /// The project file last opened or saved; Ctrl+S writes there without
+    /// asking again.
+    project_path: Option<PathBuf>,
     /// Shown layer, counted from 0.
     layer: usize,
     tab: Tab,
@@ -155,6 +253,10 @@ pub struct App {
     clipboard: Option<Item>,
     /// The printer or filament dialog, if open.
     profile_dialog: Option<ProfileKind>,
+    /// Whether the filament slots and flush volumes are open.
+    filament_window: bool,
+    /// What is typed into the kind fields of the filament window, by slot.
+    filament_drafts: BTreeMap<usize, String>,
     /// The built-in printers and materials chosen in the setup assistant.
     setup: Setup,
     /// The setup assistant, if open.
@@ -170,6 +272,21 @@ pub struct App {
     /// What is typed into the settings of the selected object, and which
     /// object that is.
     object_editor: (Option<usize>, SettingsEditor),
+    /// The part, volume or height range the object tree edits, if any.
+    tree: Option<TreeChoice>,
+    /// The object row clicked last, for selecting a range with Shift.
+    last_row: Option<usize>,
+    /// What is typed into the settings of the volume or range being
+    /// edited, by setting name.
+    drafts: BTreeMap<String, String>,
+    /// The choice `drafts` belong to; they start afresh when it changes.
+    draft_for: Option<TreeChoice>,
+    /// The setting chosen to add to the volume or range being edited.
+    new_key: String,
+    /// Why the last change in the object tree failed.
+    tree_error: Option<String>,
+    /// The Device tab: printer address, key and the upload in progress.
+    device: device::Device,
 }
 
 impl App {
@@ -194,6 +311,7 @@ impl App {
             overrides: String::new(),
             job: None,
             sliced: None,
+            project_path: None,
             layer: 0,
             tab: Tab::Plate,
             notes: Vec::new(),
@@ -209,12 +327,25 @@ impl App {
             color_by: ColorBy::LineType,
             clipboard: None,
             profile_dialog: None,
+            filament_window: false,
+            filament_drafts: BTreeMap::new(),
             wizard: (!setup.done).then(|| Wizard::new(&setup)),
             face_mode: false,
             cut: None,
             gcode_open: true,
             calibrate: Default::default(),
             object_editor: (None, SettingsEditor::default()),
+            tree: None,
+            last_row: None,
+            drafts: BTreeMap::new(),
+            draft_for: None,
+            new_key: String::new(),
+            tree_error: None,
+            device: device::Device::new(
+                stored("device_target").unwrap_or_default(),
+                stored("device_key").unwrap_or_default(),
+                stored("device_start").is_none_or(|start| start == "true"),
+            ),
             setup,
         };
         app.refresh_builtin();
@@ -282,6 +413,10 @@ impl App {
             .map(|(path, _)| path.to_string_lossy().into_owned())
             .collect();
         storage.set_string("files", files.join("\n"));
+        let (address, key, start) = self.device.stored();
+        storage.set_string("device_target", address.to_owned());
+        storage.set_string("device_key", key.to_owned());
+        storage.set_string("device_start", start.to_string());
     }
 
     fn note(&mut self, level: Level, text: impl Into<String>) {
@@ -321,7 +456,11 @@ impl App {
             Err(e) => return self.note(Level::Error, format!("{}: {e}", path.display())),
         };
         if is_project(&bytes) {
-            self.open_project(&name, &bytes);
+            self.open_project(path, &name, &bytes, true);
+            return;
+        }
+        if is_orca_project(&bytes) {
+            self.open_project(path, &name, &bytes, false);
             return;
         }
         let loaded = load_model(&name, &bytes).map_err(|e| format!("{name}: {}", e.message));
@@ -345,8 +484,15 @@ impl App {
 
     /// Replaces the plate and the settings with those of a project file.
     /// If its settings files cannot be used, the settings stay as they are.
-    fn open_project(&mut self, name: &str, bytes: &[u8]) {
-        let (project, warnings) = match load_project(bytes) {
+    /// `own` is false for a project of Orca Slicer or Bambu Studio, whose
+    /// file is not overwritten by Ctrl+S.
+    fn open_project(&mut self, path: &Path, name: &str, bytes: &[u8], own: bool) {
+        let loaded = if own {
+            load_project(bytes)
+        } else {
+            load_orca_project(bytes)
+        };
+        let (project, warnings) = match loaded {
             Ok(loaded) => loaded,
             Err(error) => return self.note(Level::Error, format!("{name}: {}", error.message)),
         };
@@ -370,36 +516,75 @@ impl App {
         self.cut = None;
         self.face_mode = false;
         self.tab = Tab::Plate;
+        self.project_path = own.then(|| path.to_path_buf());
         let count: usize = self.plates.model_counts(&self.plate).iter().sum();
         let plates = self.plates.count();
-        self.note(
-            Level::Info,
-            format!("Opened project {name} ({count} model(s) on {plates} plate(s))"),
-        );
+        let kind = if own { "project" } else { "Orca/Bambu project" };
+        let note = if own {
+            format!("Opened {kind} {name} ({count} model(s) on {plates} plate(s))")
+        } else {
+            format!(
+                "Opened {kind} {name} ({count} model(s) on {plates} plate(s)); its print settings were imported. Use Save project as… under another name to keep it"
+            )
+        };
+        self.note(Level::Info, note);
         self.notes
             .extend(warnings.as_slice().iter().map(Note::from));
     }
 
-    /// Asks where to save the plate and the settings as a project file.
-    fn save_project_as(&mut self) {
-        let settings = ProjectSettings {
+    /// The project settings as the window keeps them.
+    fn project_settings(&self) -> ProjectSettings {
+        ProjectSettings {
             files: self.files.clone(),
             common: self.common,
             edits: self.editor.edits().clone(),
             overrides: self.overrides.clone(),
-        };
+        }
+    }
+
+    /// The settings the project is sliced with, for its picture; the defaults
+    /// when the current ones do not build.
+    fn thumbnail_settings(&self) -> Settings {
+        self.current
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|_| self.base.clone())
+    }
+
+    /// Asks where to save the plate and the settings as a project file.
+    fn save_project_as(&mut self) {
         let model_name = self.plate.items.first().map_or("", |i| &i.model.name);
         let Some(path) = platform::save_path(&project_file_name(model_name), "3MF project", "3mf")
         else {
             return;
         };
         let path = PathBuf::from(with_project_extension(&path.to_string_lossy()));
+        self.write_project(&path);
+    }
+
+    /// Writes the project to the file it was opened from or saved to last;
+    /// asks where the first time.
+    fn save_project_now(&mut self) {
+        match self.project_path.clone() {
+            Some(path) => self.write_project(&path),
+            None => self.save_project_as(),
+        }
+    }
+
+    /// Writes the plate and the settings to `path`, and remembers it for
+    /// Ctrl+S.
+    fn write_project(&mut self, path: &Path) {
+        let settings = self.project_settings();
+        let current = self.thumbnail_settings();
         let name = path.to_string_lossy().into_owned();
-        let written = save_project(&self.plates.all(&self.plate), &settings)
+        let written = save_project(&self.plates.all(&self.plate), &settings, &current)
             .map_err(|e| e.message)
-            .and_then(|bytes| platform::write(&path, &bytes).map_err(|e| format!("{name}: {e}")));
+            .and_then(|bytes| platform::write(path, &bytes).map_err(|e| format!("{name}: {e}")));
         match written {
-            Ok(()) => self.note(Level::Info, format!("Saved project {name}")),
+            Ok(()) => {
+                self.project_path = Some(path.to_path_buf());
+                self.note(Level::Info, format!("Saved project {name}"));
+            }
             Err(text) => self.note(Level::Error, text),
         }
     }
@@ -486,13 +671,17 @@ impl App {
         let Ok(settings) = &self.current else {
             return;
         };
-        let Ok(object_settings) = self.plate.object_settings(settings) else {
-            return;
+        let own = match self.plate.own_settings(settings) {
+            Ok(own) => own,
+            Err(error) => {
+                self.note(Level::Error, error.message);
+                return;
+            }
         };
         let request = SliceRequest {
             objects: self.plate.meshes(),
             settings: settings.clone(),
-            object_settings,
+            own,
         };
         let request = self.calibrated(request);
         let ctx = ctx.clone();
@@ -570,7 +759,8 @@ impl App {
         };
         let path = PathBuf::from(with_output_extension(&path.to_string_lossy(), gcode_3mf));
         let name = path.to_string_lossy().into_owned();
-        let written = encode_output(&sliced.result.output, &sliced.settings, &name)
+        let objects = self.plate.meshes();
+        let written = encode_output(&sliced.result.output, &sliced.settings, &objects, &name)
             .map_err(|e| e.message)
             .and_then(|bytes| platform::write(&path, &bytes).map_err(|e| format!("{name}: {e}")));
         match written {
@@ -637,15 +827,6 @@ impl App {
 
         Self::section_head(ui, Icon::Filament, "Filament");
         ui.horizontal(|ui| {
-            let (mark, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
-            ui.painter().rect_filled(mark, 2.0, theme::ACCENT);
-            ui.painter().text(
-                mark.center(),
-                Align2::CENTER_CENTER,
-                "1",
-                FontId::proportional(12.0),
-                Color32::WHITE,
-            );
             if let Some(chosen) = self.profiles.combo(ui, &paths, 1, 32.0) {
                 action = Some(chosen);
             }
@@ -653,6 +834,33 @@ impl App {
                 self.profile_dialog = Some(ProfileKind::Filament);
             }
         });
+        let settings = self.current.clone().unwrap_or_else(|_| self.base.clone());
+        let usage = self.plate.extruder_usage();
+        ui.horizontal_wrapped(|ui| {
+            for index in 0..filaments::count(&settings) {
+                let used = usage.get(index).copied().unwrap_or(0);
+                if slot_button(ui, &settings, index, used).clicked() {
+                    self.filament_window = true;
+                }
+            }
+            if ui
+                .small_button("Filaments…")
+                .on_hover_text("Colours, kinds, filament slots and flush volumes")
+                .clicked()
+            {
+                self.filament_window = true;
+            }
+        });
+        let slots = filaments::count(&settings);
+        ui.label(
+            RichText::new(if slots == 1 {
+                "1 filament slot · flush volumes only with several".to_owned()
+            } else {
+                format!("{slots} filament slots · flush volumes between them")
+            })
+            .small()
+            .color(theme::TEXT_WEAK),
+        );
         ui.add_space(6.0);
 
         Self::section_head(ui, Icon::Objects, "Objects");
@@ -758,6 +966,22 @@ impl App {
         }
     }
 
+    /// Says that a change of the model merges its parts and drops its
+    /// volumes, which were placed against the old shape.
+    fn note_shape_change(&mut self, index: usize) {
+        let (parts, volumes) = self.plate.items.get(index).map_or((0, 0), |item| {
+            (item.parts.len().saturating_sub(1), item.volumes.len())
+        });
+        if parts > 0 || volumes > 0 {
+            self.note(
+                Level::Warning,
+                format!(
+                    "Changing the shape merged the object's parts and removed its volumes, which were placed against the old shape (parts merged: {parts}, volumes removed: {volumes})"
+                ),
+            );
+        }
+    }
+
     /// Mirrors the selected model along axis 0 (X), 1 (Y) or 2 (Z) of the
     /// bed.
     fn mirror_selected(&mut self, axis: usize) {
@@ -765,6 +989,7 @@ impl App {
             && let Some(item) = self.plate.items.get(index)
         {
             let model = item.model.mirrored(axis, item.placement.rotation_deg);
+            self.note_shape_change(index);
             self.plate.set_model(index, model);
         }
     }
@@ -776,6 +1001,7 @@ impl App {
             && let Some(item) = self.plate.items.get(index)
         {
             let model = item.model.laid_on(item.model.best_down());
+            self.note_shape_change(index);
             self.plate.set_model(index, model);
             self.note(Level::Info, "Turned the model for the least overhang");
         }
@@ -847,6 +1073,7 @@ impl App {
         self.cut = Some(dialog);
         if apply {
             let settings = self.current.as_ref().unwrap_or(&self.base).clone();
+            self.note_shape_change(dialog.index);
             if self.plate.cut(
                 dialog.index,
                 dialog.height,
@@ -933,11 +1160,12 @@ impl App {
     /// Lays model `index` on its triangle `triangle`.
     fn lay_on_face(&mut self, index: usize, triangle: usize) {
         self.face_mode = false;
-        self.plate.selected = Some(index);
+        self.plate.select_only(index);
         if let Some(item) = self.plate.items.get(index)
             && let Some(normal) = face_normal(&item.model.mesh, triangle)
         {
             let model = item.model.laid_on(normal);
+            self.note_shape_change(index);
             self.plate.set_model(index, model);
         }
     }
@@ -978,7 +1206,9 @@ impl App {
         }
     }
 
-    /// The models on the plate and the placement of the selected one.
+    /// The models on the plate with their parts, volumes and height
+    /// ranges, and the placement of the selected one. Clicking selects,
+    /// Ctrl-click adds or removes, Shift-click selects a range.
     fn objects(&mut self, ui: &mut egui::Ui) {
         if self.plate.items.is_empty() {
             ui.label(
@@ -988,8 +1218,14 @@ impl App {
             );
             return;
         }
+        let settings = self.current.clone().unwrap_or_else(|_| self.base.clone());
         let bed = self.bed();
-        let mut clicked = None;
+        let (mut command, mut shift) = (false, false);
+        ui.input(|i| {
+            command = i.modifiers.command || i.modifiers.ctrl;
+            shift = i.modifiers.shift;
+        });
+        let mut action = None;
         let mut rows = Vec::new();
         for (index, item) in self.plate.items.iter().enumerate() {
             let (s, size) = (item.placement.scale, item.model.size);
@@ -1003,24 +1239,211 @@ impl App {
             // Models with settings of their own are marked.
             let own = !item.overrides.is_empty();
             let text = if own { format!("{text}   ✱") } else { text };
-            let row = ui.selectable_label(self.plate.selected == Some(index), text);
-            let row = if own {
-                row.on_hover_text("Has settings of its own")
-            } else {
-                row
-            };
-            if row.clicked() || row.secondary_clicked() {
-                clicked = Some(index);
+            let id = ui.make_persistent_id(("object", index));
+            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                id,
+                self.plate.is_selected(index),
+            );
+            if self.plate.is_selected(index) && !state.is_open() {
+                state.set_open(true);
             }
-            rows.push(row);
-        }
-        if clicked.is_some() {
-            self.plate.selected = clicked;
+            let header = state.show_header(ui, |ui| {
+                let row = ui.selectable_label(self.plate.is_selected(index), &text);
+                let row = if own {
+                    row.on_hover_text("Has settings of its own")
+                } else {
+                    row
+                };
+                if row.clicked() {
+                    action = Some(TreeAction::Click {
+                        index,
+                        command,
+                        shift,
+                    });
+                }
+                if row.secondary_clicked() {
+                    action = Some(TreeAction::Click {
+                        index,
+                        command: false,
+                        shift: false,
+                    });
+                }
+                let count = settings.extruder_count.max(1);
+                let shown = item
+                    .extruder
+                    .map_or_else(|| "auto".to_owned(), |slot| format!("T{}", slot + 1));
+                egui::ComboBox::from_id_salt(("object_filament", index))
+                    .width(58.0)
+                    .selected_text(RichText::new(shown).small())
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(item.extruder.is_none(), "From parts or file")
+                            .clicked()
+                            && item.extruder.is_some()
+                        {
+                            action = Some(TreeAction::SetExtruder {
+                                object: index,
+                                extruder: None,
+                            });
+                        }
+                        for slot in 0..count {
+                            if ui
+                                .selectable_label(
+                                    item.extruder == Some(slot),
+                                    slot_label(&settings, slot as usize),
+                                )
+                                .clicked()
+                                && item.extruder != Some(slot)
+                            {
+                                action = Some(TreeAction::SetExtruder {
+                                    object: index,
+                                    extruder: Some(slot),
+                                });
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("Filament for the whole object; parts can differ");
+                row
+            });
+            let (_toggle, response, _body) = header.body(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Parts").small().color(theme::TEXT_WEAK));
+                    if ui
+                        .small_button("+")
+                        .on_hover_text("Add a part from a file")
+                        .clicked()
+                    {
+                        action = Some(TreeAction::AddPart(index));
+                    }
+                });
+                for part in 0..item.part_count() {
+                    let chosen = self.tree
+                        == Some(TreeChoice::Part {
+                            object: index,
+                            part,
+                        });
+                    let extruder = item
+                        .part_extruder(part)
+                        .map_or_else(|| "auto".to_owned(), |e| format!("T{}", e + 1));
+                    let text = format!("{}   ({extruder})", item.part_name(part).unwrap_or("Part"));
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(chosen, text).clicked() {
+                            action = Some(TreeAction::Edit(TreeChoice::Part {
+                                object: index,
+                                part,
+                            }));
+                        }
+                        if item.part_count() > 1
+                            && ui.small_button("×").on_hover_text("Remove").clicked()
+                        {
+                            action = Some(TreeAction::RemovePart {
+                                object: index,
+                                part,
+                            });
+                        }
+                    });
+                }
+                for kind in [
+                    VolumeKind::Modifier,
+                    VolumeKind::Negative,
+                    VolumeKind::SupportBlocker,
+                    VolumeKind::SupportEnforcer,
+                ] {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(kind.label()).small().color(theme::TEXT_WEAK));
+                        if ui
+                            .small_button("+")
+                            .on_hover_text(format!(
+                                "Add a {} from a file",
+                                kind.label().to_lowercase()
+                            ))
+                            .clicked()
+                        {
+                            action = Some(TreeAction::AddVolume(index, kind));
+                        }
+                        if ui.small_button("▭").on_hover_text("Add a box").clicked() {
+                            action = Some(TreeAction::AddBox(index, kind));
+                        }
+                    });
+                    for (volume, entry) in item.volumes.iter().enumerate() {
+                        if entry.kind != kind {
+                            continue;
+                        }
+                        ui.horizontal(|ui| {
+                            let chosen = self.tree
+                                == Some(TreeChoice::Volume {
+                                    object: index,
+                                    volume,
+                                });
+                            if ui.selectable_label(chosen, &entry.name).clicked() {
+                                action = Some(TreeAction::Edit(TreeChoice::Volume {
+                                    object: index,
+                                    volume,
+                                }));
+                            }
+                            if ui.small_button("×").on_hover_text("Remove").clicked() {
+                                action = Some(TreeAction::RemoveVolume {
+                                    object: index,
+                                    volume,
+                                });
+                            }
+                        });
+                    }
+                }
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Height ranges")
+                            .small()
+                            .color(theme::TEXT_WEAK),
+                    );
+                    if ui
+                        .small_button("+")
+                        .on_hover_text("Add a range from half the height up")
+                        .clicked()
+                    {
+                        action = Some(TreeAction::AddRange(index));
+                    }
+                });
+                for (range, entry) in item.ranges.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let chosen = self.tree
+                            == Some(TreeChoice::Range {
+                                object: index,
+                                range,
+                            });
+                        let mark = if entry.values.is_empty() {
+                            ""
+                        } else {
+                            "   ✱"
+                        };
+                        let text = format!("{:.1} – {:.1} mm{mark}", entry.from, entry.to);
+                        if ui.selectable_label(chosen, text).clicked() {
+                            action = Some(TreeAction::Edit(TreeChoice::Range {
+                                object: index,
+                                range,
+                            }));
+                        }
+                        if ui.small_button("×").on_hover_text("Remove").clicked() {
+                            action = Some(TreeAction::RemoveRange {
+                                object: index,
+                                range,
+                            });
+                        }
+                    });
+                }
+                ui.add_space(2.0);
+            });
+            rows.push(response.inner);
         }
         for (index, row) in rows.into_iter().enumerate() {
-            if self.plate.selected == Some(index) {
+            if self.plate.is_selected(index) {
                 row.context_menu(|ui| self.object_menu(ui));
             }
+        }
+        if let Some(action) = action {
+            self.tree_action(action, ui.ctx());
         }
         let (mut mirror, mut orient) = (None, false);
         let Some(item) = self.plate.selected_mut() else {
@@ -1110,11 +1533,409 @@ impl App {
         if orient {
             self.orient_selected();
         }
+        self.child_editor(ui, &settings);
         self.object_settings(ui);
+    }
+
+    /// Carries out what the object tree asked for.
+    fn tree_action(&mut self, action: TreeAction, ctx: &egui::Context) {
+        match action {
+            TreeAction::Click {
+                index,
+                command,
+                shift,
+            } => {
+                if command {
+                    self.plate.toggle_selected(index);
+                } else if shift {
+                    match self.last_row {
+                        Some(from) => self.plate.select_range(from, index),
+                        None => self.plate.select_only(index),
+                    }
+                } else {
+                    self.plate.select_only(index);
+                }
+                self.last_row = Some(index);
+                self.tree = None;
+                self.reset_drafts(None);
+            }
+            TreeAction::Edit(choice) => {
+                self.tree = Some(choice);
+                self.reset_drafts(Some(choice));
+            }
+            TreeAction::SetExtruder { object, extruder } => {
+                // Changing one object of a selection changes them all.
+                let targets = if self.plate.is_selected(object) {
+                    self.plate.selected_indices()
+                } else {
+                    vec![object]
+                };
+                let mut changed = false;
+                for index in targets {
+                    changed |= self.plate.set_object_extruder(index, extruder);
+                }
+                if changed {
+                    self.sliced = None;
+                    let used = match extruder {
+                        Some(slot) => format!("filament {}", slot + 1),
+                        None => "its parts' and file's filaments".to_owned(),
+                    };
+                    self.note(Level::Info, format!("Objects print with {used}"));
+                }
+            }
+            TreeAction::AddPart(index) => {
+                for (name, mesh) in self.load_meshes(ctx) {
+                    if self.plate.add_part(index, &name, mesh) {
+                        self.sliced = None;
+                        self.note(Level::Info, "Added the part to the object".to_owned());
+                    }
+                }
+            }
+            TreeAction::AddVolume(index, kind) | TreeAction::AddBox(index, kind) => {
+                let name = kind.label().to_lowercase();
+                let boxed = matches!(action, TreeAction::AddBox(..));
+                let mut added = false;
+                if boxed {
+                    let mesh = Mesh::cuboid(10.0, 10.0, 10.0);
+                    added = self.plate.add_volume(index, kind, &name, mesh);
+                } else {
+                    for (name, mesh) in self.load_meshes(ctx) {
+                        added |= self.plate.add_volume(index, kind, &name, mesh);
+                    }
+                }
+                if added {
+                    self.sliced = None;
+                } else if !boxed {
+                    self.tree_error = Some(format!(
+                        "The object takes no more {}s (at most {}).",
+                        name,
+                        kind.limit()
+                    ));
+                }
+            }
+            TreeAction::AddRange(index) => {
+                let Some(item) = self.plate.items.get(index) else {
+                    return;
+                };
+                let height = item.model.size[2] * item.placement.scale;
+                let range = HeightRange::new(height / 2.0, height.max(0.2));
+                if self.plate.add_range(index, range) {
+                    let range = self.plate.items[index].ranges.len() - 1;
+                    self.tree = Some(TreeChoice::Range {
+                        object: index,
+                        range,
+                    });
+                    self.reset_drafts(self.tree);
+                    self.sliced = None;
+                }
+            }
+            TreeAction::RemovePart { object, part } => {
+                if self.plate.remove_part(object, part) {
+                    self.sliced = None;
+                }
+                self.tree = None;
+                self.reset_drafts(None);
+            }
+            TreeAction::RemoveVolume { object, volume } => {
+                if self.plate.remove_volume(object, volume) {
+                    self.sliced = None;
+                }
+                self.tree = None;
+                self.reset_drafts(None);
+            }
+            TreeAction::RemoveRange { object, range } => {
+                if self.plate.remove_range(object, range) {
+                    self.sliced = None;
+                }
+                self.tree = None;
+                self.reset_drafts(None);
+            }
+        }
+    }
+
+    /// Reads the meshes chosen in a file dialog, in their own coordinates;
+    /// empty if none is chosen.
+    fn load_meshes(&mut self, ctx: &egui::Context) -> Vec<(String, Mesh)> {
+        let mut meshes = Vec::new();
+        for path in platform::pick_files(ctx, "Models", &["stl", "3mf"], true) {
+            let name = file_name(&path);
+            let bytes = match platform::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    self.note(Level::Error, format!("{}: {e}", path.display()));
+                    continue;
+                }
+            };
+            match load_volume(&bytes) {
+                Ok((mesh, warnings)) => {
+                    self.notes
+                        .extend(warnings.as_slice().iter().map(Note::from));
+                    meshes.push((name, mesh));
+                }
+                Err(error) => self.note(Level::Error, format!("{name}: {}", error.message)),
+            }
+        }
+        meshes
+    }
+
+    /// Clears what is typed and starts afresh for `choice`.
+    fn reset_drafts(&mut self, choice: Option<TreeChoice>) {
+        self.drafts.clear();
+        self.new_key.clear();
+        self.draft_for = choice;
+        self.tree_error = None;
+    }
+
+    /// The editor of the part, volume or range the tree has selected.
+    fn child_editor(&mut self, ui: &mut egui::Ui, settings: &Settings) {
+        let Some(choice) = self.tree else {
+            return;
+        };
+        if self.draft_for != Some(choice) {
+            self.reset_drafts(Some(choice));
+        }
+        let object = choice.object();
+        if object >= self.plate.items.len() {
+            self.tree = None;
+            return;
+        }
+        ui.separator();
+        match choice {
+            TreeChoice::Part { part, .. } => self.part_editor(ui, object, part, settings),
+            TreeChoice::Volume { volume, .. } => self.volume_editor(ui, object, volume, settings),
+            TreeChoice::Range { range, .. } => self.range_editor(ui, object, range, settings),
+        }
+        if let Some(error) = self.tree_error.clone() {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
     }
 
     /// The settings the selected model sets for itself, folded away until
     /// opened.
+    /// The extruder and size of a part, and its button to remove it.
+    fn part_editor(&mut self, ui: &mut egui::Ui, object: usize, part: usize, settings: &Settings) {
+        let Some((name, extruder, triangles, last, object_slot, mut transform)) = self
+            .plate
+            .items
+            .get(object)
+            .and_then(|item| {
+                let name = item.part_name(part)?.to_owned();
+                // Only the part's own slot; without one it follows the
+                // object and the mesh, which the menu names as "Object's or
+                // the file's".
+                Some((
+                    name,
+                    item.parts.get(part).and_then(|part| part.extruder),
+                    item.parts
+                        .get(part)
+                        .map_or(item.model.mesh.triangles.len(), |p| p.mesh.triangles.len()),
+                    item.part_count() < 2,
+                    item.extruder,
+                    item.part_transform(part).unwrap_or_default(),
+                ))
+            })
+        else {
+            self.tree = None;
+            return;
+        };
+        ui.label(RichText::new(format!("Part: {name}")).strong());
+        let count = settings.extruder_count.max(1);
+        ui.horizontal(|ui| {
+            ui.label("Prints with");
+            let shown = extruder.map_or_else(
+                || "Object's or the file's".to_owned(),
+                |slot| slot_label(settings, slot as usize),
+            );
+            egui::ComboBox::from_id_salt("part_extruder")
+                .selected_text(shown)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(extruder.is_none(), "Object's or the file's filament")
+                        .clicked()
+                        && extruder.is_some()
+                    {
+                        self.plate.set_part_extruder(object, part, None);
+                    }
+                    for slot in 0..count {
+                        if ui
+                            .selectable_label(
+                                extruder == Some(slot),
+                                slot_label(settings, slot as usize),
+                            )
+                            .clicked()
+                            && extruder != Some(slot)
+                        {
+                            self.plate.set_part_extruder(object, part, Some(slot));
+                        }
+                    }
+                });
+            if let Some(slot) = object_slot {
+                ui.weak(format!("object: T{}", slot + 1));
+            }
+        });
+        ui.label(
+            RichText::new(format!("{triangles} triangles"))
+                .small()
+                .color(theme::TEXT_WEAK),
+        );
+        ui.separator();
+        if transform_editor(ui, "part_transform", &mut transform) {
+            self.plate.set_part_transform(object, part, transform);
+        }
+        if !last
+            && ui
+                .button("Remove part")
+                .on_hover_text("Removes its triangles from the object")
+                .clicked()
+        {
+            self.plate.remove_part(object, part);
+            self.tree = None;
+            self.reset_drafts(None);
+        }
+    }
+
+    /// The settings inside a modifier, and its button to remove it.
+    fn volume_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        object: usize,
+        volume: usize,
+        settings: &Settings,
+    ) {
+        let Some(entry) = self
+            .plate
+            .items
+            .get(object)
+            .and_then(|item| item.volumes.get(volume))
+        else {
+            self.tree = None;
+            return;
+        };
+        let (name, kind, values, mut transform) = (
+            entry.name.clone(),
+            entry.kind,
+            entry.values.clone(),
+            entry.transform,
+        );
+        ui.label(RichText::new(format!("{}: {name}", kind.label())).strong());
+        ui.separator();
+        if transform_editor(ui, "volume_transform", &mut transform) {
+            self.plate.set_volume_transform(object, volume, transform);
+        }
+        ui.separator();
+        if kind.settings().is_empty() {
+            ui.label(
+                RichText::new(
+                    "Its volume is taken out of the object, or keeps supports away from it.",
+                )
+                .small()
+                .color(theme::TEXT_WEAK),
+            );
+        } else {
+            let defaults = settings.values();
+            if let Some(next) = values_editor(
+                ui,
+                "volume",
+                kind.settings(),
+                &values,
+                &defaults,
+                &mut self.drafts,
+                &mut self.new_key,
+            ) {
+                match self.plate.set_volume_values(object, volume, next, settings) {
+                    Ok(_) => self.tree_error = None,
+                    Err(error) => self.tree_error = Some(error.message),
+                }
+            }
+        }
+        if ui
+            .button("Remove volume")
+            .on_hover_text("The object is printed without it")
+            .clicked()
+        {
+            self.plate.remove_volume(object, volume);
+            self.tree = None;
+            self.reset_drafts(None);
+        }
+    }
+
+    /// The bounds and settings of a height range, and its button to remove
+    /// it.
+    fn range_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        object: usize,
+        range: usize,
+        settings: &Settings,
+    ) {
+        let Some(entry) = self
+            .plate
+            .items
+            .get(object)
+            .and_then(|item| item.ranges.get(range))
+        else {
+            self.tree = None;
+            return;
+        };
+        let height = self
+            .plate
+            .items
+            .get(object)
+            .map_or(0.0, |item| item.model.size[2] * item.placement.scale);
+        let (mut from, mut to, values) = (entry.from, entry.to, entry.values.clone());
+        ui.label(RichText::new("Height range").strong());
+        let mut moved = false;
+        ui.horizontal(|ui| {
+            ui.label("From");
+            moved |= ui
+                .add(
+                    egui::DragValue::new(&mut from)
+                        .speed(0.1)
+                        .range(0.0..=height)
+                        .suffix(" mm"),
+                )
+                .changed();
+            ui.label("To");
+            moved |= ui
+                .add(
+                    egui::DragValue::new(&mut to)
+                        .speed(0.1)
+                        .range(0.0..=height)
+                        .suffix(" mm"),
+                )
+                .changed();
+        });
+        let defaults = settings.values();
+        let edited = values_editor(
+            ui,
+            "range",
+            slicer_fdm::RANGE_SETTINGS,
+            &values,
+            &defaults,
+            &mut self.drafts,
+            &mut self.new_key,
+        );
+        if moved || edited.is_some() {
+            let next = edited.unwrap_or(values);
+            match self
+                .plate
+                .set_range(object, range, from, to, next, settings)
+            {
+                Ok(_) => self.tree_error = None,
+                Err(error) => self.tree_error = Some(error.message),
+            }
+        }
+        if ui
+            .button("Remove range")
+            .on_hover_text("Its layers print with the object's settings")
+            .clicked()
+        {
+            self.plate.remove_range(object, range);
+            self.tree = None;
+            self.reset_drafts(None);
+        }
+    }
+
     fn object_settings(&mut self, ui: &mut egui::Ui) {
         let (Some(index), Ok(plate)) = (self.plate.selected, &self.current) else {
             return;
@@ -1165,7 +1986,16 @@ impl App {
                     self.pick_project(ui.ctx());
                 }
                 if ui
-                    .add(egui::Button::new("Save project…").shortcut_text("Ctrl+S"))
+                    .add(egui::Button::new("Save project").shortcut_text("Ctrl+S"))
+                    .on_hover_text(
+                        "Save to the project opened or saved last; asks where the first time",
+                    )
+                    .clicked()
+                {
+                    self.save_project_now();
+                }
+                if ui
+                    .add(egui::Button::new("Save project as…").shortcut_text("Ctrl+Shift+S"))
                     .on_hover_text("Models, placements and settings in one 3MF file")
                     .clicked()
                 {
@@ -1205,6 +2035,7 @@ impl App {
             for (tab, icon, name) in [
                 (Tab::Plate, Icon::Prepare, "Prepare"),
                 (Tab::Preview, Icon::Preview, "Preview"),
+                (Tab::Device, Icon::Printer, "Device"),
             ] {
                 if main_tab(ui, icon, name, self.tab == tab).clicked() {
                     self.tab = tab;
@@ -1411,7 +2242,7 @@ impl App {
                                     continue;
                                 }
                                 if icon == Icon::Delete {
-                                    self.plate.remove_selected();
+                                    self.plate.remove_selected_all();
                                 } else if let Some(item) = self.plate.selected_mut() {
                                     let placement = &mut item.placement;
                                     match icon {
@@ -1875,6 +2706,12 @@ impl App {
             return;
         };
         let (s, size) = (item.placement.scale, item.model.size);
+        let selected = self.plate.selected_indices().len();
+        let count = if selected > 1 {
+            format!("{selected} objects selected\n")
+        } else {
+            String::new()
+        };
         egui::Area::new(egui::Id::unique("object_info"))
             .pivot(Align2::LEFT_BOTTOM)
             .fixed_pos(canvas.left_bottom() + Vec2::new(72.0, -12.0))
@@ -1891,7 +2728,7 @@ impl App {
                     })
                     .show(ui, |ui| {
                         let text = format!(
-                            "Object name: {}\nSize: {:.2} × {:.2} × {:.2} mm\nVolume: {:.2} mm³\nTriangles: {}",
+                            "{count}Object name: {}\nSize: {:.2} × {:.2} × {:.2} mm\nVolume: {:.2} mm³\nTriangles: {}",
                             item.model.name,
                             size[0] * s,
                             size[1] * s,
@@ -1937,7 +2774,7 @@ impl App {
             .add(egui::Button::new("Delete").shortcut_text("Del"))
             .clicked()
         {
-            self.plate.remove_selected();
+            self.plate.remove_selected_all();
             ui.close();
         }
         ui.menu_button("Move to plate", |ui| {
@@ -2026,7 +2863,15 @@ impl App {
             return;
         }
         if command && pressed(egui::Key::S) {
-            self.save_project_as();
+            if shift {
+                self.save_project_as();
+            } else {
+                self.save_project_now();
+            }
+            return;
+        }
+        // The Device tab has no plate to edit.
+        if self.tab == Tab::Device {
             return;
         }
         // Copy and paste arrive as events; Ctrl+C and Ctrl+V are not keys.
@@ -2057,7 +2902,7 @@ impl App {
             return;
         }
         if pressed(egui::Key::Delete) || pressed(egui::Key::Backspace) {
-            self.plate.remove_selected();
+            self.plate.remove_selected_all();
         }
         if pressed(egui::Key::Escape) {
             if self.cut.is_some() {
@@ -2065,7 +2910,9 @@ impl App {
             } else if self.face_mode {
                 self.face_mode = false;
             } else {
-                self.plate.selected = None;
+                self.plate.clear_selection();
+                self.tree = None;
+                self.reset_drafts(None);
             }
         }
         if !command && pressed(egui::Key::A) && !self.plate.items.is_empty() {
@@ -2089,6 +2936,30 @@ impl App {
         }
     }
 
+    /// The Device tab: sends the G-code of the shown plate to a printer.
+    fn device_page(&mut self, ui: &mut egui::Ui) {
+        let model_name = self.plate.items.first().map_or("model", |item| &item.model.name);
+        let file = plates::output_name(
+            model_name,
+            self.plates.current() + 1,
+            self.plates.count(),
+            false,
+        );
+        let gcode = self
+            .sliced
+            .as_ref()
+            .map(|sliced| (sliced.result.output.gcode.as_bytes(), file));
+        let current = self.slice_is_current();
+        let messages = self.device.show(ui, gcode, current);
+        for message in messages {
+            match message {
+                device::Message::Info(text) => self.note(Level::Info, text),
+                device::Message::Warning(text) => self.note(Level::Warning, text),
+                device::Message::Error(text) => self.note(Level::Error, text),
+            }
+        }
+    }
+
     /// The 3D view: the models on the plate, or the toolpaths up to the
     /// chosen layer in the preview.
     fn show_3d(&mut self, ui: &mut egui::Ui) {
@@ -2101,16 +2972,38 @@ impl App {
             .enumerate()
             .map(|(index, item)| {
                 let fits = check_placement(&item.model, &item.placement, settings).is_ok();
-                let selected = self.plate.selected == Some(index);
+                let selected = self.plate.is_selected(index);
                 (&*item.model, item.placement, selected, fits)
             })
             .collect();
         let layer = (self.tab == Tab::Preview && self.sliced.is_some()).then_some(self.layer);
+        let chosen = match self.tree {
+            Some(TreeChoice::Volume { object, volume }) => Some((object, volume)),
+            _ => None,
+        };
+        let volumes = self
+            .plate
+            .items
+            .iter()
+            .enumerate()
+            .flat_map(|(index, item)| {
+                item.volumes.iter().enumerate().map(move |(volume, mesh)| {
+                    let selected = chosen == Some((index, volume));
+                    (
+                        index,
+                        &mesh.mesh,
+                        mesh_matrix(&mesh.transform, &mesh.mesh),
+                        volume_color(mesh.kind, selected),
+                    )
+                })
+            })
+            .collect();
         let scene = Scene {
             bed,
             height: settings.max_print_height,
             serial: self.plate.serial,
             models,
+            volumes,
             layer,
             moves: self.moves,
             face_mode: self.face_mode && self.tab == Tab::Plate,
@@ -2129,23 +3022,36 @@ impl App {
         }
         match event {
             Event::None => {}
-            Event::Select(index) => self.plate.selected = index,
+            Event::Select(index) => {
+                let (command, shift) =
+                    ui.input(|i| (i.modifiers.command || i.modifiers.ctrl, i.modifiers.shift));
+                match index {
+                    Some(index) if command || shift => self.plate.toggle_selected(index),
+                    Some(index) => {
+                        self.plate.select_only(index);
+                        self.last_row = Some(index);
+                    }
+                    None => self.plate.clear_selection(),
+                }
+                self.tree = None;
+                self.reset_drafts(None);
+            }
             Event::Face(index, triangle) => self.lay_on_face(index, triangle),
             Event::Turn(index, degrees) => {
-                self.plate.selected = Some(index);
+                self.plate.select_only(index);
                 if let Some(item) = self.plate.items.get_mut(index) {
                     item.placement.rotation_deg = degrees;
                 }
             }
             Event::Scale(index, scale) => {
-                self.plate.selected = Some(index);
+                self.plate.select_only(index);
                 if let Some(item) = self.plate.items.get_mut(index) {
                     let (min, max) = SCALE_RANGE;
                     item.placement.scale = scale.clamp(min, max);
                 }
             }
             Event::Move(index, [dx, dy]) => {
-                self.plate.selected = Some(index);
+                self.plate.select_only(index);
                 if let Some(item) = self.plate.items.get_mut(index) {
                     let center = &mut item.placement.center;
                     center[0] = (center[0] + dx).clamp(0.0, bed[0]);
@@ -2153,6 +3059,20 @@ impl App {
                 }
             }
         }
+    }
+}
+
+/// The colour a volume is drawn in: by its kind, or white while the object
+/// tree edits it.
+fn volume_color(kind: VolumeKind, selected: bool) -> [u8; 3] {
+    if selected {
+        return theme::VOLUME_SELECTED;
+    }
+    match kind {
+        VolumeKind::Modifier => theme::VOLUME_MODIFIER,
+        VolumeKind::Negative => theme::VOLUME_NEGATIVE,
+        VolumeKind::SupportBlocker => theme::VOLUME_BLOCKER,
+        VolumeKind::SupportEnforcer => theme::VOLUME_ENFORCER,
     }
 }
 
@@ -2188,6 +3108,66 @@ fn color_scale(ui: &mut egui::Ui, lo: f64, hi: f64, unit: &str) {
             );
         });
     });
+}
+
+/// The fields that move, turn and scale a part or volume inside its object;
+/// returns whether one of them changed.
+fn transform_editor(ui: &mut egui::Ui, id: &str, transform: &mut MeshTransform) -> bool {
+    let mut changed = false;
+    egui::Grid::new(id)
+        .num_columns(4)
+        .spacing([8.0, 3.0])
+        .show(ui, |ui| {
+            ui.label(RichText::new("Offset").small().color(theme::TEXT_WEAK));
+            for axis in 0..3 {
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut transform.offset[axis])
+                            .speed(0.2)
+                            .suffix(" mm"),
+                    )
+                    .on_hover_text(["X in mm", "Y in mm", "Z in mm"][axis])
+                    .changed();
+            }
+            ui.end_row();
+            ui.label(RichText::new("Rotate").small().color(theme::TEXT_WEAK));
+            for axis in 0..3 {
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut transform.rotation_deg[axis])
+                            .speed(1.0)
+                            .suffix("°"),
+                    )
+                    .on_hover_text(["Around X", "Around Y", "Around Z"][axis])
+                    .changed();
+            }
+            ui.end_row();
+            ui.label(RichText::new("Scale").small().color(theme::TEXT_WEAK));
+            let (min, max) = SCALE_RANGE;
+            let mut percent = transform.scale * 100.0;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut percent)
+                        .speed(1.0)
+                        .range(min * 100.0..=max * 100.0)
+                        .suffix(" %"),
+                )
+                .changed()
+            {
+                transform.scale = percent / 100.0;
+                changed = true;
+            }
+            ui.end_row();
+        });
+    if ui
+        .small_button("Reset transform")
+        .on_hover_text("Back to where the part or volume came from")
+        .clicked()
+    {
+        *transform = MeshTransform::default();
+        changed = true;
+    }
+    changed
 }
 
 /// The parts of a pill-shaped button: the label and the round chevron on
@@ -2313,6 +3293,18 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| self.side_panel(ui));
             });
+        let usage = self.plate.extruder_usage();
+        filament_window(
+            &ctx,
+            &mut self.filament_window,
+            &mut self.editor,
+            &self.base,
+            &mut self.common,
+            &self.overrides,
+            self.current.as_ref().ok(),
+            &usage,
+            &mut self.filament_drafts,
+        );
         let save = profile_window(
             &ctx,
             &mut self.profile_dialog,
@@ -2338,6 +3330,12 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::CANVAS))
             .show(ui, |ui| {
+                if self.tab == Tab::Device {
+                    let canvas = ui.available_rect_before_wrap();
+                    self.device_page(ui);
+                    self.notifications(&ctx, canvas, 0.0);
+                    return;
+                }
                 egui::Panel::top("plates")
                     .resizable(false)
                     .exact_size(30.0)
@@ -2392,5 +3390,40 @@ impl eframe::App for App {
         if !ctx.input(|i| i.pointer.any_down()) {
             self.plates.settle(&self.plate);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use slicer_ui::plate::Model;
+
+    #[test]
+    fn quick_save_writes_to_the_project_it_remembered() {
+        let mut app = App::new(&[], None);
+        let model = Model::from_mesh("cube", Mesh::cuboid(10.0, 10.0, 2.0)).unwrap();
+        app.plate.add(model, &app.base);
+        let path =
+            std::env::temp_dir().join(format!("spaghetti-quick-save-{}.3mf", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        app.write_project(&path);
+        assert!(
+            app.notes.iter().all(|note| note.level != Level::Error),
+            "{:?}",
+            app.notes
+        );
+        assert_eq!(app.project_path.as_deref(), Some(path.as_path()));
+        let bytes = platform::read(&path).unwrap();
+        assert!(is_project(&bytes));
+        assert_eq!(load_project(&bytes).unwrap().0.plates[0].items.len(), 1);
+
+        // Ctrl+S goes to the same file again, without a dialog.
+        std::fs::remove_file(&path).unwrap();
+        app.save_project_now();
+        assert!(path.exists());
+        std::fs::remove_file(&path).unwrap();
     }
 }

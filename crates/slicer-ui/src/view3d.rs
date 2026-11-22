@@ -45,6 +45,11 @@ pub struct Scene<'a> {
     /// Every model on the plate, where it sits, whether it is selected and
     /// whether it fits the printer.
     pub models: Vec<(&'a Model, Placement, bool, bool)>,
+    /// Meshes that are not printed (modifiers, negative volumes, support
+    /// blockers and enforcers): the index of the model they belong to, the
+    /// mesh in that model's coordinates, its transform inside the object,
+    /// and the colour to draw it in.
+    pub volumes: Vec<(usize, &'a slicer_core::Mesh, Mat4, [u8; 3])>,
     /// Show the toolpaths up to and including this layer instead of the
     /// model.
     pub layer: Option<usize>,
@@ -394,6 +399,19 @@ impl View3d {
             } else {
                 Vec::new()
             },
+            volumes: if pickable {
+                scene
+                    .volumes
+                    .iter()
+                    .filter_map(|(item, _, transform, color)| {
+                        matrices
+                            .get(*item)
+                            .map(|model| (multiply(model, transform), rgb(*color)))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
             layer: scene.layer,
             moves: scene.moves,
             plate: rgb([theme::BED.r(), theme::BED.g(), theme::BED.b()]),
@@ -537,6 +555,13 @@ impl View3d {
                     .map(|(model, ..)| mesh_triangles(&model.mesh))
                     .collect(),
             );
+            gpu.pending_volumes = Some(
+                scene
+                    .volumes
+                    .iter()
+                    .map(|(_, mesh, ..)| mesh_triangles(mesh))
+                    .collect(),
+            );
         }
     }
 }
@@ -551,6 +576,8 @@ struct Frame {
     light: [f32; 3],
     /// Model matrix and colour of every model shown, in plate order.
     models: Vec<(Mat4, [f32; 3])>,
+    /// Model matrix and colour of every volume shown, in scene order.
+    volumes: Vec<(Mat4, [f32; 3])>,
     layer: Option<usize>,
     moves: Option<usize>,
     plate: [f32; 3],
@@ -566,9 +593,11 @@ struct Gpu {
     plate: Option<Buffers>,
     grid: Option<Buffers>,
     models: Vec<Buffers>,
+    volumes: Vec<Buffers>,
     paths: Option<Buffers>,
     pending_bed: Option<(Triangles, Lines)>,
     pending_models: Option<Vec<Triangles>>,
+    pending_volumes: Option<Vec<Triangles>>,
     pending_paths: Option<Strands>,
 }
 
@@ -590,6 +619,7 @@ struct Program {
     color: Option<glow::UniformLocation>,
     light: Option<glow::UniformLocation>,
     dim: Option<glow::UniformLocation>,
+    alpha: Option<glow::UniformLocation>,
 }
 
 struct Programs {
@@ -613,10 +643,11 @@ void main() {
 const SHADED_FRAGMENT: &str = "
 uniform vec3 u_color;
 uniform vec3 u_light;
+uniform float u_alpha;
 VARYING vec3 v_normal;
 void main() {
     float light = abs(dot(normalize(v_normal), u_light));
-    FRAG_COLOR = vec4(u_color * (0.3 + 0.7 * light), 1.0);
+    FRAG_COLOR = vec4(u_color * (0.3 + 0.7 * light), u_alpha);
 }
 ";
 
@@ -721,6 +752,7 @@ impl Program {
                 color: uniform("u_color"),
                 light: uniform("u_light"),
                 dim: uniform("u_dim"),
+                alpha: uniform("u_alpha"),
             })
         }
     }
@@ -889,19 +921,35 @@ impl Gpu {
             let shaded = &programs.shaded;
             gl.use_program(Some(shaded.program));
             gl.uniform_3_f32_slice(shaded.light.as_ref(), &frame.light);
-            let solid = |buffers: Option<&Buffers>, model: &Mat4, color: &[f32; 3]| {
+            let solid = |buffers: Option<&Buffers>, model: &Mat4, color: &[f32; 3], alpha: f32| {
                 if let Some(buffers) = buffers {
                     let mvp = multiply(&frame.view_projection, model);
                     gl.uniform_matrix_4_f32_slice(shaded.mvp.as_ref(), false, &mvp);
                     gl.uniform_matrix_4_f32_slice(shaded.model.as_ref(), false, model);
                     gl.uniform_3_f32_slice(shaded.color.as_ref(), color);
+                    gl.uniform_1_f32(shaded.alpha.as_ref(), alpha);
                     let count = usize::try_from(buffers.count).unwrap_or(0);
                     buffers.draw(gl, glow::TRIANGLES, 0..count);
                 }
             };
-            solid(self.plate.as_ref(), &identity, &frame.plate);
+            solid(self.plate.as_ref(), &identity, &frame.plate, 1.0);
             for (buffers, (model, color)) in self.models.iter().zip(&frame.models) {
-                solid(Some(buffers), model, color);
+                solid(Some(buffers), model, color, 1.0);
+            }
+            // Volumes are drawn through the model, so that a modifier or a
+            // negative volume inside it stays visible.
+            if !frame.volumes.is_empty() {
+                gl.enable(glow::BLEND);
+                gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+                gl.enable(glow::CULL_FACE);
+                gl.cull_face(glow::BACK);
+                gl.disable(glow::DEPTH_TEST);
+                for (buffers, (model, color)) in self.volumes.iter().zip(&frame.volumes) {
+                    solid(Some(buffers), model, color, 0.3);
+                }
+                gl.enable(glow::DEPTH_TEST);
+                gl.disable(glow::CULL_FACE);
+                gl.disable(glow::BLEND);
             }
 
             let lines = &programs.lines;
@@ -952,6 +1000,14 @@ impl Gpu {
             }
             for model in &models {
                 self.models.push(Buffers::triangles(gl, model)?);
+            }
+        }
+        if let Some(volumes) = self.pending_volumes.take() {
+            for old in self.volumes.drain(..) {
+                old.delete(gl);
+            }
+            for volume in &volumes {
+                self.volumes.push(Buffers::triangles(gl, volume)?);
             }
         }
         if let Some(paths) = self.pending_paths.take() {

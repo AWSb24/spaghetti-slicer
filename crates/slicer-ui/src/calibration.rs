@@ -45,7 +45,7 @@ impl PlateCalibration {
                 models.push(Arc::clone(&item.model));
             }
         }
-        plate.selected = None;
+        plate.clear_selection();
         Ok(Self {
             calibration,
             models,
@@ -114,6 +114,7 @@ mod tests {
 
     use super::*;
     use crate::job::{SliceRequest, slice};
+    use crate::plate::PlateOwnSettings;
 
     #[test]
     fn test_models_replace_the_plate_and_slice_to_calibration_gcode() {
@@ -137,7 +138,7 @@ mod tests {
         let request = SliceRequest {
             objects: plate.meshes(),
             settings: sliced_with,
-            object_settings: Vec::new(),
+            own: PlateOwnSettings::default(),
         };
         let mut result = slice(&request, &AtomicBool::new(false), &Progress::new()).unwrap();
         assert!(!result.output.gcode.contains("M104 S210\n"));

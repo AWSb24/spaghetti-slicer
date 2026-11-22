@@ -197,7 +197,7 @@ impl<S> Plates<S> {
             return false;
         }
         let moved = plate.items.remove(item);
-        plate.selected = None;
+        plate.clear_selection();
         plate.serial += 1;
         let target = &mut self.slots[to].plate;
         target.items.push(moved);
@@ -292,8 +292,12 @@ impl<S> Plates<S> {
                     let serial = before.as_ref().map_or(0, |slot| slot.plate.serial + 1);
                     let mut plate = recorded.clone();
                     plate.serial = plate.serial.max(serial);
+                    plate.multi.retain(|&i| i < plate.items.len());
                     if plate.selected.is_some_and(|i| i >= plate.items.len()) {
-                        plate.selected = None;
+                        plate.selected = plate.multi.last().copied();
+                    }
+                    if plate.selected.is_none() {
+                        plate.multi.clear();
                     }
                     Slot {
                         id: *id,

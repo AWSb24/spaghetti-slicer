@@ -41,6 +41,16 @@ pub const MODEL_SELECTED: [u8; 3] = [0x5e, 0xd1, 0xc4];
 pub const MODEL: [u8; 3] = [0xd8, 0xd8, 0xdc];
 /// A model that does not fit the printer.
 pub const MODEL_OUTSIDE: [u8; 3] = [0xe6, 0x4b, 0x4b];
+/// A modifier volume in the 3D view.
+pub const VOLUME_MODIFIER: [u8; 3] = [0xf0, 0xa0, 0x30];
+/// A negative volume in the 3D view.
+pub const VOLUME_NEGATIVE: [u8; 3] = [0xe6, 0x4b, 0x4b];
+/// A support blocker in the 3D view.
+pub const VOLUME_BLOCKER: [u8; 3] = [0x4a, 0x90, 0xe0];
+/// A support enforcer in the 3D view.
+pub const VOLUME_ENFORCER: [u8; 3] = [0x5e, 0xd1, 0x84];
+/// The volume the object tree edits.
+pub const VOLUME_SELECTED: [u8; 3] = [0xff, 0xff, 0xff];
 
 /// Applies the theme; called once at start.
 pub fn apply(ctx: &egui::Context) {

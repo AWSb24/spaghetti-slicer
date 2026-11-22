@@ -598,6 +598,26 @@ impl<'a> Package<'a> {
         name: &str,
         limit: u64,
     ) -> Result<Option<String>, ThreeMfError> {
+        let wanted = name.trim_start_matches('/').to_string();
+        let Some(bytes) = self.read_bytes(name, limit)? else {
+            return Ok(None);
+        };
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|e| ThreeMfError::Xml {
+                part: wanted,
+                message: e.to_string(),
+            })
+    }
+
+    /// Reads a part as bytes, for parts that are not text such as meshes
+    /// in an application's own folder; fails with
+    /// [`ThreeMfError::TooLarge`] for a part of more than `limit` bytes.
+    pub(crate) fn read_bytes(
+        &mut self,
+        name: &str,
+        limit: u64,
+    ) -> Result<Option<Vec<u8>>, ThreeMfError> {
         let wanted = name.trim_start_matches('/');
         let Some(actual) = self
             .archive
@@ -619,12 +639,7 @@ impl<'a> Package<'a> {
         if bytes.len() as u64 > limit {
             return Err(ThreeMfError::TooLarge);
         }
-        String::from_utf8(bytes)
-            .map(Some)
-            .map_err(|e| ThreeMfError::Xml {
-                part: wanted.to_string(),
-                message: e.to_string(),
-            })
+        Ok(Some(bytes))
     }
 
     fn load(&mut self, name: &str) -> Result<(), ThreeMfError> {
