@@ -548,6 +548,57 @@ pub struct Settings {
     /// Temperature of the nozzle and the bed before the print, for the
     /// time estimate of heating.
     pub ambient_temp: f64,
+    /// Highest speed of the X axis in mm/s (Marlin `M203 X`); 0 for no
+    /// limit. The time estimate slows every move so that its share along X
+    /// stays within it.
+    pub max_speed_x: f64,
+    /// Highest speed of the Y axis in mm/s (`M203 Y`); 0 for no limit.
+    pub max_speed_y: f64,
+    /// Highest speed of the Z axis in mm/s (`M203 Z`, Klipper
+    /// `max_z_velocity`); 0 for no limit.
+    pub max_speed_z: f64,
+    /// Highest speed of the filament in mm/s (`M203 E`, Klipper
+    /// `max_extrude_only_velocity`, there only for moves of the filament
+    /// alone); 0 for no limit.
+    pub max_speed_e: f64,
+    /// Highest acceleration of the X axis in mm/s² (`M201 X`); 0 for no
+    /// limit. The time estimate lowers the acceleration of every move so
+    /// that its share along X stays within it.
+    pub max_accel_x: f64,
+    /// Highest acceleration of the Y axis in mm/s² (`M201 Y`); 0 for no
+    /// limit.
+    pub max_accel_y: f64,
+    /// Highest acceleration of the Z axis in mm/s² (`M201 Z`, Klipper
+    /// `max_z_accel`); 0 for no limit.
+    pub max_accel_z: f64,
+    /// Highest acceleration of the filament in mm/s² (`M201 E`, Klipper
+    /// `max_extrude_only_accel`, there only for moves of the filament
+    /// alone); 0 for no limit.
+    pub max_accel_e: f64,
+    /// Highest acceleration of moves that extrude, in mm/s² (`M204 P`); 0
+    /// for no limit beyond `acceleration`.
+    pub max_accel_extruding: f64,
+    /// Highest acceleration of moves without extrusion, in mm/s² (`M204
+    /// T`); 0 for no limit beyond `acceleration`.
+    pub max_accel_travel: f64,
+    /// With `flavor = klipper`: the speed in mm/s at which the printer
+    /// takes a 90° corner at `acceleration` (Klipper's
+    /// `square_corner_velocity`); the time estimate takes the corners of
+    /// Klipper with it instead of `jerk`.
+    pub square_corner_velocity: f64,
+    /// With `flavor = klipper`: the share of every move that is at least
+    /// travelled at its top speed (Klipper's `minimum_cruise_ratio`); short
+    /// moves reach a lower top speed. 0 turns it off.
+    pub minimum_cruise_ratio: f64,
+    /// With `flavor = marlin`: the junction deviation in mm (`M205 J`); the
+    /// time estimate takes corners with it instead of `jerk`. 0 keeps
+    /// `jerk`.
+    pub junction_deviation: f64,
+    /// With `flavor = marlin`: writes the machine limits above
+    /// (`max_speed_*`, `max_accel_*`, `acceleration`, `jerk` or
+    /// `junction_deviation`) as `M201`, `M203`, `M204` and `M205` before
+    /// the start G-code, so the printer runs as the estimate assumes.
+    pub emit_machine_limits: bool,
 
     // Retraction
     /// Filament length pulled back before a travel move; 0 disables retraction.
@@ -685,6 +736,20 @@ impl Default for Settings {
             nozzle_heat_rate: 0.0,
             bed_heat_rate: 0.0,
             ambient_temp: 25.0,
+            max_speed_x: 0.0,
+            max_speed_y: 0.0,
+            max_speed_z: 0.0,
+            max_speed_e: 0.0,
+            max_accel_x: 0.0,
+            max_accel_y: 0.0,
+            max_accel_z: 0.0,
+            max_accel_e: 0.0,
+            max_accel_extruding: 0.0,
+            max_accel_travel: 0.0,
+            square_corner_velocity: 5.0,
+            minimum_cruise_ratio: 0.5,
+            junction_deviation: 0.0,
+            emit_machine_limits: false,
             retraction_length: 0.8,
             retraction_speed: 35.0,
             retraction_min_travel: 1.5,
@@ -1320,6 +1385,29 @@ impl Settings {
             ("nozzle_heat_rate", self.nozzle_heat_rate, 0.0, 100.0),
             ("bed_heat_rate", self.bed_heat_rate, 0.0, 100.0),
             ("ambient_temp", self.ambient_temp, -20.0, 80.0),
+            ("max_speed_x", self.max_speed_x, 0.0, 2000.0),
+            ("max_speed_y", self.max_speed_y, 0.0, 2000.0),
+            ("max_speed_z", self.max_speed_z, 0.0, 2000.0),
+            ("max_speed_e", self.max_speed_e, 0.0, 2000.0),
+            ("max_accel_x", self.max_accel_x, 0.0, 100_000.0),
+            ("max_accel_y", self.max_accel_y, 0.0, 100_000.0),
+            ("max_accel_z", self.max_accel_z, 0.0, 100_000.0),
+            ("max_accel_e", self.max_accel_e, 0.0, 100_000.0),
+            (
+                "max_accel_extruding",
+                self.max_accel_extruding,
+                0.0,
+                100_000.0,
+            ),
+            ("max_accel_travel", self.max_accel_travel, 0.0, 100_000.0),
+            (
+                "square_corner_velocity",
+                self.square_corner_velocity,
+                0.0,
+                100.0,
+            ),
+            ("minimum_cruise_ratio", self.minimum_cruise_ratio, 0.0, 0.99),
+            ("junction_deviation", self.junction_deviation, 0.0, 1.0),
             ("retraction_length", self.retraction_length, 0.0, 20.0),
             ("retraction_speed", self.retraction_speed, 1.0, 200.0),
             (

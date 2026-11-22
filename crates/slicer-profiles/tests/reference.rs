@@ -87,6 +87,7 @@ fn settings_reference_is_current() {
                 | "avoid_crossing_walls"
                 | "fuzzy_skin"
                 | "arc_fitting"
+                | "emit_machine_limits"
                 | "label_objects"
                 | "sequential_print"
                 | "arrange_outlines"

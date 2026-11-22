@@ -1,12 +1,15 @@
-//! Time estimate of what the writer does not move itself: the start and
-//! end G-code, and the waits for the heaters.
+//! Time estimate of what the writer does not move itself: the start, end
+//! and tool change G-code, and the waits for the heaters.
 //!
 //! The custom G-code is read after its placeholders are replaced. Moves
 //! (`G0`, `G1`, `G2`, `G3`) go through the same motion model as the
-//! layers ([`move_times`]), with the feed rate their `F` words give
-//! (`travel_speed` before the first one); `G4` waits `P` milliseconds or
-//! `S` seconds, `G28` takes `homing_time`. The printer comes to rest
-//! before every `G4`, `G28` and wait for a heater.
+//! layers ([`move_times`], with the limits of the axes and the corners of
+//! [`Machine`]), with the feed rate their `F` words give (`travel_speed`
+//! before the first one, in tool change G-code the feed rate of the
+//! writer); `G4` waits `P` milliseconds or `S` seconds, `G28` takes
+//! `homing_time`. The printer comes to rest before every `G4`, `G28` and
+//! wait for a heater. Tool change G-code starts where the writer left the
+//! nozzle.
 //!
 //! Heaters follow their targets at `nozzle_heat_rate` and `bed_heat_rate`
 //! (°C per second, the same up and down) from `ambient_temp`, also while
@@ -23,7 +26,21 @@
 use slicer_core::Point;
 use slicer_profiles::Settings;
 
-use crate::{Move, move_times};
+use crate::{Machine, Move, move_times};
+
+/// What G-code [`Estimator::run`] reads, and where its time goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Part {
+    /// Start or end G-code: moves, dwells and homing count in
+    /// [`Estimator::motion`].
+    StartEnd,
+    /// Tool change G-code: moves, dwells and homing count in
+    /// [`Estimator::toolchange`].
+    ToolChange,
+    /// Commands of the writer: only temperatures and tool selections
+    /// count.
+    Silent,
+}
 
 /// Pieces an arc (`G2`/`G3`) is divided into for its length and corners.
 const ARC_PIECES: usize = 32;
@@ -67,6 +84,9 @@ impl Heater {
 /// The state of the printer as far as the estimate needs it.
 pub(crate) struct Estimator<'a> {
     settings: &'a Settings,
+    machine: Machine,
+    /// What is being read.
+    part: Part,
     /// The nozzle of every extruder that a command named so far.
     nozzles: Vec<Heater>,
     bed: Heater,
@@ -80,9 +100,10 @@ pub(crate) struct Estimator<'a> {
     feed: f64,
     /// Moves since the printer last came to rest.
     run: Vec<Move>,
-    /// Seconds of moves, dwells and homing of the custom G-code read with
-    /// `count`.
+    /// Seconds of moves, dwells and homing of the start and end G-code.
     pub(crate) motion: f64,
+    /// Seconds of moves, dwells and homing of the tool change G-code.
+    pub(crate) toolchange: f64,
     /// Seconds spent waiting for heaters.
     pub(crate) heating: f64,
 }
@@ -96,6 +117,8 @@ impl<'a> Estimator<'a> {
         };
         Self {
             settings,
+            machine: Machine::of(settings),
+            part: Part::Silent,
             nozzles: vec![cold],
             bed: cold,
             tool: 0,
@@ -104,8 +127,25 @@ impl<'a> Estimator<'a> {
             feed: settings.travel_speed,
             run: Vec::new(),
             motion: 0.0,
+            toolchange: 0.0,
             heating: 0.0,
         }
+    }
+
+    /// The feed rate of moves without `F` from now on, in mm/s.
+    pub(crate) fn set_feed(&mut self, feed: f64) {
+        self.feed = feed;
+    }
+
+    /// Lets `seconds` of moves, dwells or homing pass, counted for the
+    /// part being read.
+    fn spend(&mut self, seconds: f64) {
+        match self.part {
+            Part::StartEnd => self.motion += seconds,
+            Part::ToolChange => self.toolchange += seconds,
+            Part::Silent => {}
+        }
+        self.pass(seconds);
     }
 
     /// Lets `seconds` pass for the heaters.
@@ -128,13 +168,16 @@ impl<'a> Estimator<'a> {
         self.relative = false;
     }
 
-    /// Reads G-code `text`. With `count` its moves, dwells and homing take
-    /// time ([`Estimator::motion`]); without, only its temperature
-    /// commands and tool selections count.
-    // ponytail: the tool change G-code runs without `count`: its moves and
-    // dwells are left out (the writer does not know where it leaves the
-    // nozzle either); waits for heaters in it count.
-    pub(crate) fn run(&mut self, text: &str, count: bool) {
+    /// Reads G-code `text` of `part`. Its moves, dwells and homing take
+    /// time ([`Estimator::motion`], [`Estimator::toolchange`]) unless it is
+    /// [`Part::Silent`]; temperature commands and tool selections always
+    /// count.
+    // ponytail: the travel of the writer back from where the tool change
+    // G-code left the nozzle is not timed (the writer does not know where
+    // that is).
+    pub(crate) fn run(&mut self, text: &str, part: Part) {
+        self.part = part;
+        let count = part != Part::Silent;
         for line in text.lines() {
             let code = line.split(';').next().unwrap_or_default().trim();
             let mut words = code.split_whitespace().filter_map(word);
@@ -161,16 +204,13 @@ impl<'a> Estimator<'a> {
                         let seconds =
                             value('P').map_or(0.0, |p| p / 1000.0) + value('S').unwrap_or(0.0);
                         self.rest();
-                        self.motion += seconds.max(0.0);
-                        self.pass(seconds.max(0.0));
+                        self.spend(seconds.max(0.0));
                     }
                 }
                 'G' if is(28.0) => {
                     if count {
                         self.rest();
-                        let seconds = self.settings.homing_time;
-                        self.motion += seconds;
-                        self.pass(seconds);
+                        self.spend(self.settings.homing_time);
                     }
                     let all = !['X', 'Y', 'Z'].iter().any(|&a| value(a).is_some());
                     for (axis, name) in ['X', 'Y', 'Z'].iter().enumerate() {
@@ -268,12 +308,9 @@ impl<'a> Estimator<'a> {
         if self.run.is_empty() {
             return;
         }
-        let seconds: f64 = move_times(&self.run, self.settings.acceleration, self.settings.jerk)
-            .iter()
-            .sum();
+        let seconds: f64 = move_times(&self.run, &self.machine).iter().sum();
         self.run.clear();
-        self.motion += seconds;
-        self.pass(seconds);
+        self.spend(seconds);
     }
 
     /// Takes the feed rate of an `F` word and returns where the move goes.
@@ -296,20 +333,23 @@ impl<'a> Estimator<'a> {
         let [dx, dy, dz] = [0, 1, 2].map(|i| to[i] - self.position[i]);
         let flat = (dx * dx + dy * dy).sqrt();
         let length = (flat * flat + dz * dz).sqrt();
-        let (length, direction) = if length > 0.0 {
+        let (length, direction, axes) = if length > 0.0 {
             let direction = if flat > 0.0 {
                 [dx / flat, dy / flat]
             } else {
                 [0.0, 0.0]
             };
-            (length, direction)
+            let axes = [dx / length, dy / length, dz / length, e / length];
+            (length, direction, axes)
         } else {
-            (e.abs(), [0.0, 0.0])
+            let alone = if e < 0.0 { -1.0 } else { 1.0 };
+            (e.abs(), [0.0, 0.0], [0.0, 0.0, 0.0, alone])
         };
         self.position = to;
         if length > 0.0 {
             self.run.push(Move {
                 direction,
+                axes,
                 length,
                 speed: self.feed,
                 tool: self.tool,
@@ -439,7 +479,7 @@ mod tests {
 
     fn time(text: &str, settings: &Settings) -> (f64, f64) {
         let mut estimate = Estimator::new(settings);
-        estimate.run(text, true);
+        estimate.run(text, Part::StartEnd);
         (estimate.motion, estimate.heating)
     }
 
@@ -521,14 +561,14 @@ mod tests {
             ..settings()
         };
         let mut estimate = Estimator::new(&rates);
-        estimate.run("G1 X100 F600\nG4 S5\nG28\nT1\nM109 S45", false);
+        estimate.run("G1 X100 F600\nG4 S5\nG28\nT1\nM109 S45", Part::Silent);
         assert_eq!(estimate.motion, 0.0);
         assert_eq!(estimate.tool, 1);
         assert!((estimate.heating - 10.0).abs() < 1e-9);
         // Time passing heats too.
-        estimate.run("M104 T0 S45", false);
+        estimate.run("M104 T0 S45", Part::Silent);
         estimate.pass(4.0);
-        estimate.run("M109 T0 S45", false);
+        estimate.run("M109 T0 S45", Part::Silent);
         assert!(
             (estimate.heating - 16.0).abs() < 1e-9,
             "{}",

@@ -29,8 +29,9 @@ pub struct Stats {
     /// Filament consumed, in grams.
     pub filament_weight_g: f64,
     /// Estimated print time in seconds: the moves of the layers with
-    /// acceleration and slowing down at corners (`times`), the start and
-    /// end G-code (`time_start_end_s`) and the waits for heaters
+    /// acceleration, slowing down at corners and the limits of the axes
+    /// (`times`), the start and end G-code (`time_start_end_s`), the tool
+    /// change G-code (`time_toolchange_s`) and the waits for heaters
     /// (`time_heating_s`). The G-code header and the `prediction` of a
     /// `.gcode.3mf` give this figure. Not yet compared with a real print.
     pub print_time_s: f64,
@@ -42,6 +43,11 @@ pub struct Stats {
     /// start and end G-code, the tool change G-code and the layers; 0
     /// without `nozzle_heat_rate` and `bed_heat_rate`.
     pub time_heating_s: f64,
+    /// Of `print_time_s`, the seconds the moves and dwells (`G4`) of the
+    /// tool change G-code take, all tool changes together. 0, and left out
+    /// of JSON, without them.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub time_toolchange_s: f64,
     /// The same figures for every extruder the print uses, with more than
     /// one extruder (`extruder_count`); empty otherwise.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -56,7 +62,8 @@ pub struct Stats {
     pub flush_weight_g: f64,
     /// Estimated seconds per line type, in the order the types first
     /// appear; travel, retraction and Z moves are under `None`. They add up
-    /// to `print_time_s` without `time_start_end_s` and `time_heating_s`.
+    /// to `print_time_s` without `time_start_end_s`, `time_toolchange_s`
+    /// and `time_heating_s`.
     /// Not written to the file or to JSON.
     #[serde(skip)]
     pub times: Vec<(Option<PathKind>, f64)>,
@@ -275,6 +282,9 @@ struct Move {
     /// Unit vector in the XY plane; zero for moves along Z or of the
     /// filament only.
     direction: Point,
+    /// How far X, Y, Z and the filament move per millimetre of `length`,
+    /// with their signs: for the limits per axis and Klipper's corners.
+    axes: [f64; 4],
     /// Distance in millimetres.
     length: f64,
     /// Requested speed in mm/s.
@@ -285,52 +295,265 @@ struct Move {
     kind: Option<PathKind>,
 }
 
-/// Time in seconds the moves take when the printer starts and ends at rest,
-/// changes its speed by at most `acceleration` (mm/s²) and may change its
-/// velocity at once by at most `jerk` (mm/s) where two moves meet.
-#[cfg(test)]
-fn planned_time(moves: &[Move], acceleration: f64, jerk: f64) -> f64 {
-    move_times(moves, acceleration, jerk).iter().sum()
+/// How the printer takes corners, for the time estimate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Corners {
+    /// The velocity changes at once by at most this much (mm/s): `jerk`.
+    Jerk(f64),
+    /// The printer goes round a circle that touches both moves and passes
+    /// this far (mm) from the corner, as fast as the acceleration allows:
+    /// Marlin's junction deviation and Klipper's square corner velocity.
+    Deviation(f64),
 }
 
-/// Time in seconds every move takes, as for [`planned_time`].
+/// How the printer moves, as far as the time estimate needs it: the
+/// acceleration, the limits per axis and the corners, from the settings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Machine {
+    /// Acceleration of moves that extrude, in mm/s²: `acceleration`, at most
+    /// `max_accel_extruding`.
+    extruding: f64,
+    /// Acceleration of all other moves: `acceleration`, at most
+    /// `max_accel_travel`.
+    travel: f64,
+    /// Highest speed of X, Y, Z and the filament in mm/s; infinite without
+    /// a limit.
+    max_speed: [f64; 4],
+    /// Highest acceleration of X, Y, Z and the filament in mm/s².
+    max_accel: [f64; 4],
+    /// The limits of the filament hold only for moves of the filament
+    /// alone (Klipper's `max_extrude_only_velocity` and `_accel`).
+    filament_alone: bool,
+    corners: Corners,
+    /// The share of the acceleration a move may use to reach its top speed
+    /// without cruising: 1 - `minimum_cruise_ratio` for Klipper, else 1.
+    reach: f64,
+}
+
+impl Machine {
+    /// The printer the settings describe.
+    fn of(settings: &Settings) -> Self {
+        let limit = |value: f64| if value > 0.0 { value } else { f64::INFINITY };
+        let klipper = settings.flavor == Flavor::Klipper;
+        let corners = if klipper {
+            // Klipper's square corner velocity is the speed of a 90° corner
+            // at the acceleration; with v² = a * r ([`Machine::corner`]) and
+            // r = d * sin(45°) / (1 - sin(45°)) = d / (sqrt(2) - 1), that is
+            // a deviation d = v² * (sqrt(2) - 1) / a.
+            // ponytail: the deviation follows `acceleration`, not the
+            // acceleration of the moves at the corner.
+            let v = settings.square_corner_velocity;
+            Corners::Deviation(v * v * (2.0_f64.sqrt() - 1.0) / settings.acceleration)
+        } else if settings.junction_deviation > 0.0 {
+            Corners::Deviation(settings.junction_deviation)
+        } else {
+            Corners::Jerk(settings.jerk)
+        };
+        Self {
+            extruding: settings
+                .acceleration
+                .min(limit(settings.max_accel_extruding)),
+            travel: settings.acceleration.min(limit(settings.max_accel_travel)),
+            max_speed: [
+                settings.max_speed_x,
+                settings.max_speed_y,
+                settings.max_speed_z,
+                settings.max_speed_e,
+            ]
+            .map(limit),
+            max_accel: [
+                settings.max_accel_x,
+                settings.max_accel_y,
+                settings.max_accel_z,
+                settings.max_accel_e,
+            ]
+            .map(limit),
+            filament_alone: klipper,
+            corners,
+            reach: if klipper {
+                1.0 - settings.minimum_cruise_ratio
+            } else {
+                1.0
+            },
+        }
+    }
+
+    /// The speed (mm/s) and acceleration (mm/s²) of move `m`: as asked and
+    /// as `acceleration` says, slowed so that no axis exceeds its limits.
+    /// An axis that moves `share` mm per mm of the move goes `share` times
+    /// as fast as the move and accelerates `share` times as hard.
+    // ponytail: limits per axis, not per motor (CoreXY and delta printers
+    // limit their motors); a retraction accelerates by `max_accel_e` like
+    // the filament of a printing move, without Marlin's own `M204 R`; jerk
+    // is one figure for the whole velocity, not one per axis.
+    fn limits(&self, m: &Move) -> (f64, f64) {
+        let mut speed = m.speed;
+        let mut accel = if m.kind.is_some() {
+            self.extruding
+        } else {
+            self.travel
+        };
+        let alone = m.axes[..3].iter().all(|&a| a == 0.0);
+        for (axis, &share) in m.axes.iter().enumerate() {
+            let share = share.abs();
+            if share <= 0.0 || (axis == 3 && self.filament_alone && !alone) {
+                continue;
+            }
+            speed = speed.min(self.max_speed[axis] / share);
+            accel = accel.min(self.max_accel[axis] / share);
+        }
+        (speed, accel)
+    }
+
+    /// The highest speed (mm/s) where move `a` turns into move `b`, both
+    /// accelerating at `accel` (mm/s²); infinite when the corner does not
+    /// slow the printer.
+    ///
+    /// With a deviation d the printer is thought to go round the circle
+    /// that touches both moves and passes d from the corner, at the speed
+    /// whose centripetal acceleration v² / r is `accel`. With θ the angle
+    /// between the two moves at the corner (180° for going straight on),
+    /// the centre lies r / sin(θ/2) from the corner, so d = r / sin(θ/2) - r
+    /// and r = d * sin(θ/2) / (1 - sin(θ/2)); sin(θ/2) = sqrt((1 + u·w) / 2)
+    /// for the unit directions u of `a` and w of `b`.
+    fn corner(&self, a: &Move, b: &Move, accel: f64) -> f64 {
+        match self.corners {
+            Corners::Jerk(jerk) => {
+                let change = distance(a.direction, b.direction);
+                if change > 1e-9 {
+                    jerk / change
+                } else {
+                    f64::INFINITY
+                }
+            }
+            Corners::Deviation(deviation) => {
+                let (u, w) = (&a.axes, &b.axes);
+                let lu = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
+                let lw = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
+                if lu <= 0.0 || lw <= 0.0 {
+                    // ponytail: the head stands while the filament moves
+                    // alone, so it comes to rest before and after.
+                    return 0.0;
+                }
+                let dot = (u[0] * w[0] + u[1] * w[1] + u[2] * w[2]) / (lu * lw);
+                let half = ((1.0 + dot) / 2.0).clamp(0.0, 1.0);
+                if half >= 1.0 - 1e-12 {
+                    return f64::INFINITY;
+                }
+                let sine = half.sqrt();
+                (accel * deviation * sine / (1.0 - sine)).sqrt()
+            }
+        }
+    }
+}
+
+/// The machine limits of the settings as Marlin commands, for the start of
+/// the G-code (`emit_machine_limits`): `M201` and `M203` with the limits
+/// per axis that are set, `M204` with the accelerations of printing and
+/// travel and `M205` with `jerk` or `junction_deviation`; nothing for
+/// Klipper, whose limits live in `printer.cfg`.
+// ponytail: Klipper's limits are not written (`SET_VELOCITY_LIMIT` could
+// set `square_corner_velocity` and `minimum_cruise_ratio`).
+fn machine_limits(settings: &Settings) -> String {
+    if settings.flavor != Flavor::Marlin {
+        return String::new();
+    }
+    let words = |values: [f64; 4]| {
+        let mut words = String::new();
+        for (letter, value) in ['X', 'Y', 'Z', 'E'].into_iter().zip(values) {
+            if value > 0.0 {
+                let _ = write!(words, " {letter}{value}");
+            }
+        }
+        words
+    };
+    let mut out = String::new();
+    let accel = words([
+        settings.max_accel_x,
+        settings.max_accel_y,
+        settings.max_accel_z,
+        settings.max_accel_e,
+    ]);
+    if !accel.is_empty() {
+        let _ = writeln!(out, "M201{accel} ; max acceleration per axis [mm/s²]");
+    }
+    let speed = words([
+        settings.max_speed_x,
+        settings.max_speed_y,
+        settings.max_speed_z,
+        settings.max_speed_e,
+    ]);
+    if !speed.is_empty() {
+        let _ = writeln!(out, "M203{speed} ; max feed rate per axis [mm/s]");
+    }
+    let machine = Machine::of(settings);
+    let _ = writeln!(
+        out,
+        "M204 P{} T{} ; acceleration of printing and travel [mm/s²]",
+        machine.extruding, machine.travel
+    );
+    let _ = match machine.corners {
+        Corners::Deviation(deviation) => {
+            writeln!(out, "M205 J{deviation} ; junction deviation [mm]")
+        }
+        Corners::Jerk(jerk) => writeln!(out, "M205 X{jerk} Y{jerk} ; jerk [mm/s]"),
+    };
+    out
+}
+
+/// Time in seconds the moves take on `machine` when the printer starts and
+/// ends at rest.
+#[cfg(test)]
+fn planned_time(moves: &[Move], machine: &Machine) -> f64 {
+    move_times(moves, machine).iter().sum()
+}
+
+/// Time in seconds every move takes on `machine`, starting and ending at
+/// rest.
 ///
-/// The speeds where moves meet are limited three ways: by the requested
-/// speeds, by the change of direction, and by what the neighbouring moves can
-/// reach or shed over their length. Each move then accelerates, cruises and
-/// brakes.
-fn move_times(moves: &[Move], acceleration: f64, jerk: f64) -> Vec<f64> {
-    let reachable = |from: f64, m: &Move| (from * from + 2.0 * acceleration * m.length).sqrt();
+/// Every move is slowed to the limits of its axes ([`Machine::limits`]).
+/// The speeds where moves meet are limited three ways: by the speeds of
+/// the moves, by the corner ([`Machine::corner`]), and by what the
+/// neighbouring moves can reach or shed over their length. Each move then
+/// accelerates, cruises and brakes; with Klipper's `minimum_cruise_ratio`
+/// a move reaches only the top speed it would with that share less of its
+/// acceleration, which leaves at least that share of it for cruising.
+fn move_times(moves: &[Move], machine: &Machine) -> Vec<f64> {
+    let limits: Vec<(f64, f64)> = moves.iter().map(|m| machine.limits(m)).collect();
+    let reachable =
+        |from: f64, i: usize| (from * from + 2.0 * limits[i].1 * moves[i].length).sqrt();
     // junction[i] is the speed at the start of move i; both ends are at rest.
     let mut junction = vec![0.0; moves.len() + 1];
     for i in 1..moves.len() {
-        let (a, b) = (&moves[i - 1], &moves[i]);
-        let change = distance(a.direction, b.direction);
-        let corner = if change > 1e-9 {
-            jerk / change
-        } else {
-            f64::INFINITY
-        };
-        junction[i] = a.speed.min(b.speed).min(corner);
+        let ((speed_a, accel_a), (speed_b, accel_b)) = (limits[i - 1], limits[i]);
+        let corner = machine.corner(&moves[i - 1], &moves[i], accel_a.min(accel_b));
+        junction[i] = speed_a.min(speed_b).min(corner);
     }
-    for (i, m) in moves.iter().enumerate() {
-        junction[i + 1] = junction[i + 1].min(reachable(junction[i], m));
+    for i in 0..moves.len() {
+        junction[i + 1] = junction[i + 1].min(reachable(junction[i], i));
     }
-    for (i, m) in moves.iter().enumerate().rev() {
-        junction[i] = junction[i].min(reachable(junction[i + 1], m));
+    for i in (0..moves.len()).rev() {
+        junction[i] = junction[i].min(reachable(junction[i + 1], i));
     }
     moves
         .iter()
+        .zip(&limits)
         .enumerate()
-        .map(|(i, m)| {
+        .map(|(i, (m, &(speed, accel)))| {
             let (start, end) = (junction[i], junction[i + 1]);
             // Highest speed when accelerating from `start` and braking to
             // `end` without cruising.
-            let peak = ((2.0 * acceleration * m.length + start * start + end * end) / 2.0)
-                .sqrt()
-                .min(m.speed);
-            let ramps = (2.0 * peak * peak - start * start - end * end) / (2.0 * acceleration);
-            (2.0 * peak - start - end) / acceleration + (m.length - ramps).max(0.0) / peak
+            let mut peak = ((2.0 * accel * m.length + start * start + end * end) / 2.0).sqrt();
+            // ponytail: the lower top speed of short moves does not lower
+            // the speeds where they meet their neighbours.
+            if machine.reach < 1.0 {
+                let reach = accel * machine.reach;
+                let short = ((2.0 * reach * m.length + start * start + end * end) / 2.0).sqrt();
+                peak = short.max(start).max(end);
+            }
+            let peak = peak.min(speed);
+            let ramps = (2.0 * peak * peak - start * start - end * end) / (2.0 * accel);
+            (2.0 * peak - start - end) / accel + (m.length - ramps).max(0.0) / peak
         })
         .collect()
 }
@@ -366,9 +589,18 @@ struct Writer<'a> {
     /// The points of the line printed last, up to the nozzle, for wiping.
     trail: Vec<Point>,
     /// Temperature commands, tool selections and tool change G-code
-    /// written between the moves, with the number of moves before them,
-    /// for the estimate of heating.
-    commands: Vec<(usize, String)>,
+    /// written between the moves, for the estimate.
+    commands: Vec<Command>,
+}
+
+/// G-code the writer writes between its moves that the estimate reads.
+struct Command {
+    /// The number of moves before it.
+    at: usize,
+    text: String,
+    /// For tool change G-code, whose moves and dwells take time: where the
+    /// nozzle is (XY if known, and Z) and the feed rate in mm/s.
+    toolchange: Option<(Option<Point>, f64, f64)>,
 }
 
 /// How the filament is pulled back before a travel: the retraction, wipe
@@ -458,8 +690,29 @@ impl<'a> Writer<'a> {
     fn command(&mut self, text: String) {
         if !text.is_empty() {
             self.out.push_str(&text);
-            self.commands.push((self.moves.len(), text));
+            self.commands.push(Command {
+                at: self.moves.len(),
+                text,
+                toolchange: None,
+            });
         }
+    }
+
+    /// Writes `text`, the tool change G-code, and keeps it for the
+    /// estimate, which also times its moves and dwells.
+    fn toolchange(&mut self, text: String) {
+        let feed = if self.feed > 0.0 {
+            self.feed / 60.0
+        } else {
+            self.settings.travel_speed
+        };
+        let z = self.nozzle_z.unwrap_or(self.z);
+        self.out.push_str(&text);
+        self.commands.push(Command {
+            at: self.moves.len(),
+            text,
+            toolchange: Some((self.position, z, feed)),
+        });
     }
 
     /// Returns the ` F...` word if the feed rate (mm/s) differs from the
@@ -493,7 +746,7 @@ impl<'a> Writer<'a> {
             let _ = writeln!(self.out, "G1{e}{f}");
             self.retracted[self.tool] = Some(r);
             self.filament[self.tool] -= r.length;
-            self.record([0.0, 0.0], r.length, r.speed, None);
+            self.record([0.0, 0.0, 0.0, -1.0], r.length, r.speed, None);
         }
     }
 
@@ -505,7 +758,7 @@ impl<'a> Writer<'a> {
             let e = self.e_word(r.length);
             let _ = writeln!(self.out, "G1{e}{f}");
             self.filament[self.tool] += r.length;
-            self.record([0.0, 0.0], r.length, r.speed, None);
+            self.record([0.0, 0.0, 0.0, 1.0], r.length, r.speed, None);
         }
     }
 
@@ -520,10 +773,13 @@ impl<'a> Writer<'a> {
         self.tool = tool;
     }
 
-    fn record(&mut self, direction: Point, length: f64, speed: f64, kind: Option<PathKind>) {
+    /// Records a move of `length` mm at `speed` for the time estimate; `axes`
+    /// says how far X, Y, Z and the filament go per mm of it.
+    fn record(&mut self, axes: [f64; 4], length: f64, speed: f64, kind: Option<PathKind>) {
         if length > 0.0 {
             self.moves.push(Move {
-                direction,
+                direction: [axes[0], axes[1]],
+                axes,
                 length,
                 speed,
                 tool: self.tool,
@@ -536,8 +792,9 @@ impl<'a> Writer<'a> {
         let f = self.feed_word(self.settings.travel_speed);
         let _ = writeln!(self.out, "G1 Z{z:.3}{f}");
         if let Some(from) = self.nozzle_z.replace(z) {
+            let up = if z < from { -1.0 } else { 1.0 };
             self.record(
-                [0.0, 0.0],
+                [0.0, 0.0, up, 0.0],
                 (z - from).abs(),
                 self.settings.travel_speed,
                 None,
@@ -579,8 +836,8 @@ impl<'a> Writer<'a> {
         let f = self.feed_word(self.settings.travel_speed);
         let _ = writeln!(self.out, "G0 X{:.3} Y{:.3}{f}", to[0], to[1]);
         self.trail.clear();
-        if let Some(direction) = direction {
-            self.record(direction, length, self.settings.travel_speed, None);
+        if let Some([x, y]) = direction {
+            self.record([x, y, 0.0, 0.0], length, self.settings.travel_speed, None);
         }
         if hop {
             self.move_z(self.land.unwrap_or(self.z));
@@ -608,8 +865,14 @@ impl<'a> Writer<'a> {
         let word = self.e_word(e);
         let _ = writeln!(self.out, "G1 X{:.3} Y{:.3} Z{z:.3}{word}{f}", to[0], to[1]);
         self.count(e, kind);
-        let direction = [(to[0] - from[0]) / length, (to[1] - from[1]) / length];
-        self.record(direction, length, speed, Some(kind));
+        let rise = self.nozzle_z.map_or(0.0, |below| (z - below) / length);
+        let axes = [
+            (to[0] - from[0]) / length,
+            (to[1] - from[1]) / length,
+            rise,
+            filament_per_mm,
+        ];
+        self.record(axes, length, speed, Some(kind));
         self.position = Some(to);
         self.nozzle_z = Some(z);
         self.extend_trail(from, to);
@@ -633,8 +896,13 @@ impl<'a> Writer<'a> {
         let f = self.feed_word(self.settings.travel_speed);
         let _ = writeln!(self.out, "G0 X{:.3} Y{:.3}{f}", to[0], to[1]);
         self.trail.clear();
-        let direction = [(to[0] - from[0]) / length, (to[1] - from[1]) / length];
-        self.record(direction, length, self.settings.travel_speed, None);
+        let axes = [
+            (to[0] - from[0]) / length,
+            (to[1] - from[1]) / length,
+            0.0,
+            0.0,
+        ];
+        self.record(axes, length, self.settings.travel_speed, None);
         self.position = Some(to);
     }
 
@@ -650,8 +918,13 @@ impl<'a> Writer<'a> {
         let word = self.e_word(e);
         let _ = writeln!(self.out, "G1 X{:.3} Y{:.3}{word}{f}", to[0], to[1]);
         self.count(e, kind);
-        let direction = [(to[0] - from[0]) / length, (to[1] - from[1]) / length];
-        self.record(direction, length, speed, Some(kind));
+        let axes = [
+            (to[0] - from[0]) / length,
+            (to[1] - from[1]) / length,
+            0.0,
+            filament_per_mm,
+        ];
+        self.record(axes, length, speed, Some(kind));
         self.position = Some(to);
         self.extend_trail(from, to);
     }
@@ -717,8 +990,13 @@ impl<'a> Writer<'a> {
             self.count(e, kind);
             for pair in run[i..=end].windows(2) {
                 let d = distance(pair[0], pair[1]);
-                let direction = [(pair[1][0] - pair[0][0]) / d, (pair[1][1] - pair[0][1]) / d];
-                self.record(direction, d, speed, Some(kind));
+                let axes = [
+                    (pair[1][0] - pair[0][0]) / d,
+                    (pair[1][1] - pair[0][1]) / d,
+                    0.0,
+                    filament_per_mm,
+                ];
+                self.record(axes, d, speed, Some(kind));
                 self.extend_trail(pair[0], pair[1]);
             }
             self.position = Some(to);
@@ -783,8 +1061,13 @@ impl<'a> Writer<'a> {
             let f = self.feed_word(speed);
             let e = self.e_word(-length * d / total);
             let _ = writeln!(self.out, "G1 X{:.3} Y{:.3}{e}{f}", to[0], to[1]);
-            let direction = [(to[0] - from[0]) / d, (to[1] - from[1]) / d];
-            self.record(direction, d, speed, None);
+            let axes = [
+                (to[0] - from[0]) / d,
+                (to[1] - from[1]) / d,
+                0.0,
+                -length / total,
+            ];
+            self.record(axes, d, speed, None);
             from = to;
         }
         self.retracted[self.tool] = Some(self.retraction);
@@ -939,7 +1222,7 @@ fn write_layer(
                 let values = toolchange_values(context.values, previous, next);
                 let mut block = expand(&settings.toolchange_gcode, "toolchange_gcode", &values)?;
                 let _ = writeln!(block, "T{next}");
-                w.command(block);
+                w.toolchange(block);
                 if context.absolute {
                     w.out.push_str("G92 E0\n");
                     w.e = 0.0;
@@ -1167,7 +1450,7 @@ fn slowdown(
         let mut carry = carry;
         // The fan takes no time; any layer time will do.
         write_layer(&mut trial, &mut carry, layer, index, context, (slow, 0.0))?;
-        let times = move_times(&trial.moves, settings.acceleration, settings.jerk);
+        let times = move_times(&trial.moves, &Machine::of(settings));
         let total: f64 = times.iter().sum();
         let extruding: f64 = trial
             .moves
@@ -1318,6 +1601,9 @@ pub fn write_gcode_with_progress(
         trail: Vec::new(),
         commands: Vec::new(),
     };
+    if settings.emit_machine_limits {
+        w.out.push_str(&machine_limits(settings));
+    }
     w.out.push_str(&start);
     let absolute = settings.extrusion_mode == ExtrusionMode::Absolute;
     w.out.push_str(if absolute {
@@ -1374,7 +1660,7 @@ pub fn write_gcode_with_progress(
         .zip(&w.retracted)
         .map(|(&filament, retracted)| filament + retracted.map_or(0.0, |r| r.length))
         .collect();
-    let times = move_times(&w.moves, settings.acceleration, settings.jerk);
+    let times = move_times(&w.moves, &Machine::of(settings));
     let volume = |length: f64| length * filament_area / 1000.0;
     let extruders = if several {
         (0..used.len())
@@ -1402,16 +1688,23 @@ pub fn write_gcode_with_progress(
     }
     // The start and end G-code, and the heaters through the whole print.
     let mut estimate = estimate::Estimator::new(settings);
-    estimate.run(&start, true);
+    estimate.run(&start, estimate::Part::StartEnd);
     let mut before = 0;
-    for (at, text) in &w.commands {
-        estimate.pass(times[before..*at].iter().sum());
-        before = *at;
-        estimate.run(text, false);
+    for command in &w.commands {
+        estimate.pass(times[before..command.at].iter().sum());
+        before = command.at;
+        match command.toolchange {
+            Some((at, z, feed)) => {
+                estimate.resume(at, z);
+                estimate.set_feed(feed);
+                estimate.run(&command.text, estimate::Part::ToolChange);
+            }
+            None => estimate.run(&command.text, estimate::Part::Silent),
+        }
     }
     estimate.pass(times[before..].iter().sum());
     estimate.resume(w.position, w.z);
-    estimate.run(&end, true);
+    estimate.run(&end, estimate::Part::StartEnd);
     let layer_filaments = slicer_formats::layer_filament_ranges(
         &toolpaths
             .layers
@@ -1426,9 +1719,10 @@ pub fn write_gcode_with_progress(
         filament_length_mm: total,
         filament_volume_cm3: volume(total),
         filament_weight_g: volume(total) * settings.filament_density,
-        print_time_s: moving + estimate.motion + estimate.heating,
+        print_time_s: moving + estimate.motion + estimate.toolchange + estimate.heating,
         time_start_end_s: estimate.motion,
         time_heating_s: estimate.heating,
+        time_toolchange_s: estimate.toolchange,
         extruders,
         flush_volume_cm3: volume(w.tower),
         flush_weight_g: volume(w.tower) * settings.filament_density,
@@ -1459,9 +1753,14 @@ pub fn write_gcode_with_progress(
         stats.filament_volume_cm3
     );
     let _ = writeln!(gcode, "; filament used [g]: {:.2}", stats.filament_weight_g);
+    let toolchanges = if stats.time_toolchange_s > 0.0 {
+        format!(", tool changes {:.0} s", stats.time_toolchange_s)
+    } else {
+        String::new()
+    };
     let _ = writeln!(
         gcode,
-        "; estimated printing time [s]: {:.0} (with acceleration; of that start and end G-code {:.0} s, heating {:.0} s)",
+        "; estimated printing time [s]: {:.0} (with acceleration; of that start and end G-code {:.0} s{toolchanges}, heating {:.0} s)",
         stats.print_time_s, stats.time_start_end_s, stats.time_heating_s
     );
     for e in &stats.extruders {
@@ -2115,38 +2414,40 @@ SET_PRESSURE_ADVANCE ADVANCE=0.04
 
     #[test]
     fn time_estimate_follows_acceleration_and_corners() {
-        let go = |direction, length, speed| Move {
+        let go = |direction: Point, length, speed| Move {
             direction,
+            axes: [direction[0], direction[1], 0.0, 0.0],
             length,
             speed,
             tool: 0,
             kind: None,
         };
+        let machine = Machine::of(&Settings::default());
         let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
         // 100 mm at 50 mm/s with 1000 mm/s²: 0.05 s and 1.25 mm for each
         // ramp, 97.5 mm of cruising.
-        let straight = planned_time(&[go([1.0, 0.0], 100.0, 50.0)], 1000.0, 8.0);
+        let straight = planned_time(&[go([1.0, 0.0], 100.0, 50.0)], &machine);
         assert!(close(straight, 0.05 + 0.05 + 97.5 / 50.0), "{straight}");
         // Too short to reach the speed: accelerate half way, then brake.
-        let short = planned_time(&[go([1.0, 0.0], 1.0, 50.0)], 1000.0, 8.0);
+        let short = planned_time(&[go([1.0, 0.0], 1.0, 50.0)], &machine);
         assert!(close(short, 2.0 * (0.5_f64 / 500.0).sqrt()), "{short}");
         // Cutting a straight line in two changes nothing.
         let halves = [go([1.0, 0.0], 50.0, 50.0), go([1.0, 0.0], 50.0, 50.0)];
-        assert!(close(planned_time(&halves, 1000.0, 8.0), straight));
+        assert!(close(planned_time(&halves, &machine), straight));
         // A right angle is taken at jerk / sqrt(2), which costs time; a
         // full stop costs more.
         let corner = [go([1.0, 0.0], 50.0, 50.0), go([0.0, 1.0], 50.0, 50.0)];
         let stop = [go([1.0, 0.0], 50.0, 50.0), go([-1.0, 0.0], 50.0, 50.0)];
         let (corner, stop) = (
-            planned_time(&corner, 1000.0, 8.0),
-            planned_time(&stop, 1000.0, 8.0),
+            planned_time(&corner, &machine),
+            planned_time(&stop, &machine),
         );
         let slow = 8.0 / 2.0_f64.sqrt();
         let expected = straight + 2.0 * (50.0 - slow) / 1000.0
             - 2.0 * (50.0 * 50.0 - slow * slow) / 2000.0 / 50.0;
         assert!(close(corner, expected), "{corner} {expected}");
         assert!(straight < corner && corner < stop);
-        assert!(close(planned_time(&[], 1000.0, 8.0), 0.0));
+        assert!(close(planned_time(&[], &machine), 0.0));
 
         // The estimate of a real slice is longer than distance over speed.
         let mut settings = Settings::default();
@@ -2158,6 +2459,266 @@ SET_PRESSURE_ADVANCE ADVANCE=0.04
             .stats
             .print_time_s;
         assert!(fast.is_finite() && slow > fast, "{fast} {slow}");
+    }
+
+    fn shift(axes: [f64; 4], length: f64, speed: f64, kind: Option<PathKind>) -> Move {
+        Move {
+            direction: [axes[0], axes[1]],
+            axes,
+            length,
+            speed,
+            tool: 0,
+            kind,
+        }
+    }
+
+    #[test]
+    fn axis_limits_slow_moves_down() {
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+        // Nearly without acceleration a move takes its length over its speed.
+        let mut settings = Settings {
+            acceleration: 1.0e9,
+            ..Settings::default()
+        };
+        let up = [shift([0.0, 0.0, 1.0, 0.0], 10.0, 50.0, None)];
+        assert!(close(planned_time(&up, &Machine::of(&settings)), 0.2));
+        // A Z move limited by `max_speed_z` takes length / limit.
+        settings.max_speed_z = 5.0;
+        let machine = Machine::of(&settings);
+        assert!(close(planned_time(&up, &machine), 2.0));
+        // X and Y moves are not affected by the limit of Z.
+        let across = [shift([0.6, 0.8, 0.0, 0.0], 10.0, 50.0, None)];
+        assert!(close(planned_time(&across, &machine), 0.2));
+        // The most limiting axis counts: 0.6 of the move along X at 10 mm/s
+        // allows 16.7 mm/s.
+        settings.max_speed_x = 10.0;
+        settings.max_speed_y = 100.0;
+        let machine = Machine::of(&settings);
+        assert!(close(planned_time(&across, &machine), 10.0 / (10.0 / 0.6)));
+        // A retraction is a move of the filament alone.
+        settings.max_speed_e = 25.0;
+        let retract = [shift([0.0, 0.0, 0.0, -1.0], 1.0, 35.0, None)];
+        assert!(close(planned_time(&retract, &Machine::of(&settings)), 0.04));
+
+        // Acceleration: 1 mm from rest to rest takes 2 * sqrt(1 / a).
+        let settings = Settings::default();
+        let along_x = [shift([1.0, 0.0, 0.0, 0.0], 1.0, 1000.0, None)];
+        let along_y = [shift([0.0, 1.0, 0.0, 0.0], 1.0, 1000.0, None)];
+        let ramp = |a: f64| 2.0 * (1.0 / a).sqrt();
+        assert!(close(
+            planned_time(&along_x, &Machine::of(&settings)),
+            ramp(1000.0)
+        ));
+        let limited = Settings {
+            max_accel_x: 100.0,
+            ..settings.clone()
+        };
+        let machine = Machine::of(&limited);
+        assert!(close(planned_time(&along_x, &machine), ramp(100.0)));
+        assert!(close(planned_time(&along_y, &machine), ramp(1000.0)));
+        // Half of the move along X accelerates twice as hard as X may.
+        let diagonal = [shift([0.5, 0.75_f64.sqrt(), 0.0, 0.0], 1.0, 1000.0, None)];
+        assert!(close(planned_time(&diagonal, &machine), ramp(200.0)));
+        // Printing and travel have accelerations of their own.
+        let split = Settings {
+            max_accel_extruding: 250.0,
+            max_accel_travel: 400.0,
+            ..settings.clone()
+        };
+        let machine = Machine::of(&split);
+        let print = [shift(
+            [1.0, 0.0, 0.0, 0.05],
+            1.0,
+            1000.0,
+            Some(PathKind::InnerWall),
+        )];
+        assert!(close(planned_time(&print, &machine), ramp(250.0)));
+        assert!(close(planned_time(&along_x, &machine), ramp(400.0)));
+    }
+
+    #[test]
+    fn klipper_takes_corners_at_the_square_corner_velocity() {
+        let klipper = Settings {
+            flavor: Flavor::Klipper,
+            acceleration: 1000.0,
+            square_corner_velocity: 5.0,
+            ..Settings::default()
+        };
+        let machine = Machine::of(&klipper);
+        let go = |x: f64, y: f64| shift([x, y, 0.0, 0.0], 10.0, 100.0, None);
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // A 90° corner at the acceleration: the square corner velocity.
+        let square = machine.corner(&go(1.0, 0.0), &go(0.0, 1.0), 1000.0);
+        assert!(close(square, 5.0), "{square}");
+        // Also at another acceleration of the printer.
+        let fast = Settings {
+            acceleration: 4000.0,
+            ..klipper.clone()
+        };
+        let square = Machine::of(&fast).corner(&go(1.0, 0.0), &go(0.0, -1.0), 4000.0);
+        assert!(close(square, 5.0), "{square}");
+        // Wider corners are faster, sharper ones slower; straight on does not
+        // slow down, turning back stops.
+        let half = 0.5_f64.sqrt();
+        let wide = machine.corner(&go(1.0, 0.0), &go(half, half), 1000.0);
+        let sharp = machine.corner(&go(1.0, 0.0), &go(-half, half), 1000.0);
+        assert!(wide > 5.0 && sharp < 5.0, "{wide} {sharp}");
+        assert_eq!(
+            machine.corner(&go(1.0, 0.0), &go(1.0, 0.0), 1000.0),
+            f64::INFINITY
+        );
+        assert_eq!(machine.corner(&go(1.0, 0.0), &go(-1.0, 0.0), 1000.0), 0.0);
+        // 45° off straight on: sin(67.5°) in r = d * s / (1 - s).
+        let d = 25.0 * (2.0_f64.sqrt() - 1.0) / 1000.0;
+        let s = ((1.0 + half) / 2.0).sqrt();
+        assert!(close(wide, (1000.0 * d * s / (1.0 - s)).sqrt()), "{wide}");
+        // Marlin with junction deviation: v² = a * d / (sqrt(2) - 1) at 90°.
+        let marlin = Settings {
+            junction_deviation: 0.02,
+            ..Settings::default()
+        };
+        let square = Machine::of(&marlin).corner(&go(1.0, 0.0), &go(0.0, 1.0), 1000.0);
+        let expected = (1000.0 * 0.02 / (2.0_f64.sqrt() - 1.0)).sqrt();
+        assert!(close(square, expected), "{square} {expected}");
+        // A corner with the square corner velocity is slower than one with
+        // a jerk of 8 mm/s (taken at 8 / sqrt(2) = 5.7 mm/s).
+        let corner = [go(1.0, 0.0), go(0.0, 1.0)];
+        let jerk = planned_time(&corner, &Machine::of(&Settings::default()));
+        let no_cruise = Settings {
+            minimum_cruise_ratio: 0.0,
+            ..klipper.clone()
+        };
+        assert!(planned_time(&corner, &Machine::of(&no_cruise)) > jerk);
+    }
+
+    #[test]
+    fn klipper_keeps_a_share_of_short_moves_for_cruising() {
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        let klipper = Settings {
+            flavor: Flavor::Klipper,
+            acceleration: 1000.0,
+            minimum_cruise_ratio: 0.5,
+            ..Settings::default()
+        };
+        // A standalone 1.5 mm move cruises for 0.75 mm, as Klipper's
+        // documentation describes the ratio of 0.5: its top speed is what
+        // it reaches at half the acceleration.
+        let short = [shift([1.0, 0.0, 0.0, 0.0], 1.5, 100.0, None)];
+        let peak = (500.0_f64 * 1.5).sqrt();
+        let expected = 2.0 * peak / 1000.0 + 0.75 / peak;
+        let time = planned_time(&short, &Machine::of(&klipper));
+        assert!(close(time, expected), "{time} {expected}");
+        // Without the ratio it accelerates and brakes at once.
+        let off = Settings {
+            minimum_cruise_ratio: 0.0,
+            ..klipper.clone()
+        };
+        let time = planned_time(&short, &Machine::of(&off));
+        assert!(close(time, 2.0 * (1.5_f64 / 1000.0).sqrt()), "{time}");
+        // A long move reaches its speed anyway.
+        let long = [shift([1.0, 0.0, 0.0, 0.0], 100.0, 50.0, None)];
+        let a = planned_time(&long, &Machine::of(&klipper));
+        let b = planned_time(&long, &Machine::of(&off));
+        assert!(close(a, b), "{a} {b}");
+    }
+
+    #[test]
+    fn tool_change_gcode_moves_and_dwells_take_time() {
+        let mut settings = Settings::default();
+        settings.extruder_count = 2;
+        let plain = slice(&two_cubes(), &settings);
+        let changes =
+            plain.gcode.matches("\nT1\n").count() + plain.gcode.matches("\nT0\n").count() - 1;
+        assert!(changes > 0);
+        assert_eq!(plain.stats.time_toolchange_s, 0.0);
+        // Each change: 5 mm up and down at 10 mm/s from rest to rest with
+        // 1000 mm/s² (0.01 s for each ramp of 0.05 mm, 4.9 mm cruising) and
+        // a dwell of half a second.
+        settings.toolchange_gcode = "G91\nG1 Z5 F600\nG4 P500\nG1 Z-5\nG90".into();
+        let output = slice(&two_cubes(), &settings);
+        let stats = &output.stats;
+        let each = 2.0 * (0.02 + 4.9 / 10.0) + 0.5;
+        assert!(
+            (stats.time_toolchange_s - changes as f64 * each).abs() < 1e-9,
+            "{} {changes}",
+            stats.time_toolchange_s
+        );
+        let layers: f64 = stats.times.iter().map(|(_, t)| t).sum();
+        let total =
+            layers + stats.time_start_end_s + stats.time_toolchange_s + stats.time_heating_s;
+        assert!((stats.print_time_s - total).abs() < 1e-6);
+        assert!(
+            (stats.print_time_s - plain.stats.print_time_s - stats.time_toolchange_s).abs() < 1e-6
+        );
+        assert!(output.gcode.contains(&format!(
+            "tool changes {:.0} s, heating",
+            stats.time_toolchange_s
+        )));
+    }
+
+    #[test]
+    fn without_limits_the_estimate_stays_the_same() {
+        let mesh = Mesh::cuboid(20.0, 20.0, 4.0);
+        let plain = slice(&mesh, &Settings::default());
+        // Klipper's settings do not touch a Marlin printer, and limits far
+        // above the speeds and accelerations used change nothing.
+        let settings = Settings {
+            square_corner_velocity: 20.0,
+            minimum_cruise_ratio: 0.9,
+            max_speed_x: 2000.0,
+            max_speed_y: 2000.0,
+            max_speed_z: 2000.0,
+            max_speed_e: 2000.0,
+            max_accel_x: 100_000.0,
+            max_accel_y: 100_000.0,
+            max_accel_z: 100_000.0,
+            max_accel_e: 100_000.0,
+            max_accel_extruding: 100_000.0,
+            max_accel_travel: 100_000.0,
+            ..Settings::default()
+        };
+        let same = slice(&mesh, &settings);
+        assert_eq!(same.stats, plain.stats);
+        assert_eq!(
+            Machine::of(&Settings::default()).corners,
+            Corners::Jerk(8.0)
+        );
+        // A limit that holds back the layer changes makes it longer.
+        let slow_z = Settings {
+            max_speed_z: 1.0,
+            ..Settings::default()
+        };
+        let slow = slice(&mesh, &slow_z).stats;
+        assert!(slow.print_time_s > plain.stats.print_time_s + 1.0);
+    }
+
+    #[test]
+    fn machine_limits_are_written_on_request() {
+        let mesh = Mesh::cuboid(10.0, 10.0, 1.0);
+        let mut settings = Settings::default();
+        let plain = slice(&mesh, &settings);
+        assert!(!plain.gcode.contains("M201") && !plain.gcode.contains("M204"));
+        settings.emit_machine_limits = true;
+        settings.max_speed_z = 5.0;
+        settings.max_speed_e = 25.0;
+        settings.max_accel_x = 500.0;
+        settings.max_accel_extruding = 800.0;
+        let gcode = slice(&mesh, &settings).gcode;
+        let start = gcode.find("M140").unwrap();
+        for line in [
+            "M201 X500 ",
+            "M203 Z5 E25 ",
+            "M204 P800 T1000 ",
+            "M205 X8 Y8 ",
+        ] {
+            let at = gcode.find(line).unwrap_or(usize::MAX);
+            assert!(at < start, "{line}");
+        }
+        settings.junction_deviation = 0.02;
+        assert!(slice(&mesh, &settings).gcode.contains("\nM205 J0.02 "));
+        // Klipper keeps its limits in printer.cfg.
+        settings.flavor = Flavor::Klipper;
+        assert!(!slice(&mesh, &settings).gcode.contains("M201"));
     }
 
     #[test]
