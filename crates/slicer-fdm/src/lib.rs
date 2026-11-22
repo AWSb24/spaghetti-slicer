@@ -1311,7 +1311,13 @@ pub fn generate_plate_with_own_settings(
     // Which travel moves stay over the part depends only on the finished
     // order of a layer, so all cores can work on it again.
     let inside = parallel_map(layers.len(), |index| {
-        let flags = travels_inside(&layers[index], &slices[index]);
+        // Tree supports travel between the pieces of a branch without
+        // retraction (see `travels_inside`).
+        let support = supports
+            .get(index)
+            .filter(|_| settings.support_style == SupportStyle::Tree)
+            .map(|(area, _)| area);
+        let flags = travels_inside(&layers[index], &slices[index], support);
         let routes = if settings.avoid_crossing_walls {
             combed(&layers[index], &slices[index], &flags, settings)
         } else {
@@ -1534,6 +1540,32 @@ fn push_work(piece: Work, position: &mut Point, paths: &mut Vec<Path>) {
                 // Starting where the line starts makes it the nearest end.
                 *position = line[0];
                 push_lines(vec![line], kind, 0.0, position, paths);
+            }
+        }
+        Work::Islands(mut islands, kind, min_length) => {
+            while !islands.is_empty() {
+                // The first of the nearest ones, so ties resolve the same
+                // way on every run.
+                let mut best = (0, f64::INFINITY);
+                for (i, (loops, lines)) in islands.iter().enumerate() {
+                    let ends = lines.iter().flatten();
+                    for &p in loops.iter().flatten().chain(ends) {
+                        let d = distance(*position, p);
+                        if d < best.1 {
+                            best = (i, d);
+                        }
+                    }
+                }
+                let (loops, lines) = islands.remove(best.0);
+                push_loops(
+                    loops,
+                    kind,
+                    min_length,
+                    SeamPosition::Nearest,
+                    position,
+                    paths,
+                );
+                push_lines(lines, kind, 0.0, position, paths);
             }
         }
     }
@@ -2014,7 +2046,15 @@ fn even_out(flags: &mut [bool], lengths: &[f64], hangs: bool) {
     }
 }
 
-fn travels_inside(layer: &Layer, slice: &Shapes) -> Vec<bool> {
+/// Which paths of `layer` are reached by a travel that stays over the part
+/// (`slice`), where retraction is skipped: those inside the part other than
+/// its outer wall. With `support` (the support area of the layer, given for
+/// tree supports) also support lines reached without leaving the support,
+/// such as the lines inside the loop of a branch.
+// ponytail: a support travel is checked as a straight line, not routed
+// along the support; one across the waist of two branches that just
+// merged retracts.
+fn travels_inside(layer: &Layer, slice: &Shapes, support: Option<&Shapes>) -> Vec<bool> {
     // The first path of a layer is reached from the layer below.
     let mut flags = vec![false];
     for pair in layer.paths.windows(2) {
@@ -2027,13 +2067,19 @@ fn travels_inside(layer: &Layer, slice: &Shapes) -> Vec<bool> {
                 | PathKind::Bridge
                 | PathKind::SparseInfill
         );
+        let within = match support {
+            Some(area) if path.kind == PathKind::Support && previous.kind == PathKind::Support => {
+                Some(area)
+            }
+            _ => hidden.then_some(slice),
+        };
         let from = if previous.closed {
             previous.points.first()
         } else {
             previous.points.last()
         };
-        flags.push(match (hidden, from, path.points.first()) {
-            (true, Some(&from), Some(&to)) => polygon::segment_inside(slice, from, to),
+        flags.push(match (within, from, path.points.first()) {
+            (Some(area), Some(&from), Some(&to)) => polygon::segment_inside(area, from, to),
             _ => false,
         });
     }
@@ -2280,6 +2326,10 @@ enum Work {
     /// Line segments printed in the given order and direction, each a path
     /// of its own, and their kind.
     Ordered(Vec<[Point; 2]>, PathKind),
+    /// Islands, each with its loops and the line segments inside them,
+    /// their kind and the shortest loop worth printing. The nearest island
+    /// comes next, its loops first and then its lines.
+    Islands(Vec<(Vec<Contour>, Vec<[Point; 2]>)>, PathKind, f64),
 }
 
 impl Work {
@@ -2290,6 +2340,7 @@ impl Work {
             Work::Lines(lines, ..) | Work::Ordered(lines, ..) => lines.is_empty(),
             Work::Polylines(lines, ..) => lines.is_empty(),
             Work::Centred(lines, ..) => lines.is_empty(),
+            Work::Islands(islands, ..) => islands.is_empty(),
         }
     }
 }
@@ -2363,22 +2414,44 @@ fn shared_work(
         } else {
             simplified(&inner)
         };
-        shared.support.push(Work::Loops(
-            loops,
-            PathKind::Support,
-            width,
-            SeamPosition::Nearest,
-        ));
         // The same direction on every layer, so the lines stack up to walls.
-        let lines = polygon::hatch(
-            &polygon::difference(&inner, dense),
-            settings.support_spacing,
-            HatchDirection::Diagonal45,
-            0.5 * width,
-        );
-        shared
-            .support
-            .push(Work::Lines(lines, PathKind::Support, 0.0));
+        let hatch = |shapes: &Shapes| {
+            polygon::hatch(
+                &polygon::difference(shapes, dense),
+                settings.support_spacing,
+                HatchDirection::Diagonal45,
+                0.5 * width,
+            )
+        };
+        if settings.support_style == SupportStyle::Tree {
+            // Branch by branch, every one with its lines right after its
+            // loop, instead of all loops and then all lines: the many
+            // branches of a tree are toured once, not twice.
+            let islands = inner
+                .iter()
+                .map(|shape| {
+                    let shape = vec![shape.clone()];
+                    let mut own = simplified(&shape);
+                    // Loops given to the interface above stay there.
+                    own.retain(|contour| loops.contains(contour));
+                    (own, hatch(&shape))
+                })
+                .filter(|(own, lines)| !own.is_empty() || !lines.is_empty())
+                .collect();
+            shared
+                .support
+                .push(Work::Islands(islands, PathKind::Support, width));
+        } else {
+            shared.support.push(Work::Loops(
+                loops,
+                PathKind::Support,
+                width,
+                SeamPosition::Nearest,
+            ));
+            shared
+                .support
+                .push(Work::Lines(hatch(&inner), PathKind::Support, 0.0));
+        }
         interface_work(
             &polygon::intersection(&inner, dense),
             index,
@@ -4956,6 +5029,9 @@ mod tests {
         settings.supports = true;
         let normal = length(&generate(&t, &settings).unwrap());
         settings.support_style = SupportStyle::Tree;
+        // Tips as close as the lines of the columns (the default before
+        // `tree_contact_spacing`), so that there are many of them to merge.
+        settings.tree_contact_spacing = 2.5;
         let mut warnings = Diagnostics::new();
         let toolpaths = generate_reporting(&t, &settings, &mut warnings).unwrap();
         assert!(warnings.is_empty(), "{:?}", warnings.codes());
@@ -5004,6 +5080,60 @@ mod tests {
             .filter(|&i| !support(&toolpaths.layers[i]).is_empty())
             .collect();
         assert_eq!(layers, (11..59).collect::<Vec<usize>>());
+    }
+
+    #[test]
+    fn tree_branches_are_printed_one_after_another() {
+        let (t, _) = tee_models();
+        // Travels to support paths that leave the support, and so retract,
+        // on the layers of branches below the interface (layers 0 to 46),
+        // and the branches (one loop each) on them.
+        let count = |settings: &Settings| {
+            let toolpaths = generate(&t, settings).unwrap();
+            let (mut retracted, mut branches, mut inside) = (0, 0, 0);
+            for layer in &toolpaths.layers[..47] {
+                for path in layer.paths.iter().filter(|p| p.kind == PathKind::Support) {
+                    if path.travel_inside {
+                        inside += 1;
+                    } else {
+                        retracted += 1;
+                    }
+                    branches += usize::from(path.closed);
+                }
+            }
+            (retracted, branches, inside)
+        };
+        let tree = Settings {
+            supports: true,
+            support_style: SupportStyle::Tree,
+            ..Settings::default()
+        };
+        // Every branch is entered once, its loop first; its lines follow
+        // without leaving it, but for a few where two branches that just
+        // touch form a waist that the way to the next line crosses.
+        let (retracted, branches, inside) = count(&tree);
+        assert!(
+            inside > 10 * (retracted - branches),
+            "{inside} {retracted} {branches}"
+        );
+        assert!(
+            retracted <= branches + branches / 20,
+            "{retracted} {branches}"
+        );
+        // Tips farther apart: fewer branches, fewer travels.
+        let close = Settings {
+            tree_contact_spacing: 2.5,
+            ..tree.clone()
+        };
+        let (more, ..) = count(&close);
+        assert!(retracted < more, "{retracted} {more}");
+        // Columns keep printing all loops first and then all lines.
+        let normal = Settings {
+            support_style: SupportStyle::Normal,
+            ..tree
+        };
+        let (_, _, inside) = count(&normal);
+        assert_eq!(inside, 0);
     }
 
     /// The T of `supports_stand_under_overhangs`, and the same with a base
@@ -5463,14 +5593,30 @@ mod tests {
             );
             // Nor any gap to the sides beyond what the column carries
             // itself (half a line width): the outermost lines run a line
-            // width from the column (x 105 to 115).
+            // width from the column (x and y 105 to 115). Branches may lean
+            // out of the plate's footprint, so the distance is measured
+            // to the column all round; they may also touch the column
+            // below the interface, so the loop half a line width inside
+            // them comes closer.
             let nearest = toolpaths.layers[..49]
                 .iter()
                 .flat_map(|layer| points_of(layer, &SUPPORT_KINDS))
-                .map(|p| (105.0 - p[0]).max(p[0] - 115.0))
+                .map(|p| {
+                    let dx = (105.0 - p[0]).max(p[0] - 115.0);
+                    let dy = (105.0 - p[1]).max(p[1] - 115.0);
+                    if dx > 0.0 && dy > 0.0 {
+                        (dx * dx + dy * dy).sqrt()
+                    } else {
+                        dx.max(dy)
+                    }
+                })
                 .fold(f64::MAX, f64::min);
+            let least = match style {
+                SupportStyle::Normal => settings.line_width,
+                SupportStyle::Tree => 0.5 * settings.line_width,
+            };
             assert!(
-                (nearest - settings.line_width).abs() < 0.02,
+                nearest > least - 0.02 && nearest < settings.line_width + 0.02,
                 "{style:?} {nearest}"
             );
             // Standing on the base (layers 0 to 9) right on top of it.

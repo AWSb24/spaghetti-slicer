@@ -150,6 +150,31 @@ const MAPPING: &[(&str, &str, Kind)] = &[
         "support_xy_distance",
         Kind::Number,
     ),
+    // Tree supports, by the names in Orca's user documentation. Orca's
+    // branch distance is the distance between neighbouring branches where
+    // they start.
+    // ponytail: the organic style has keys of its own for branch distance,
+    // diameter and angle (`..._organic`); only the plain ones are taken.
+    (
+        "tree_support_branch_angle",
+        "tree_branch_angle",
+        Kind::Number,
+    ),
+    (
+        "tree_support_branch_diameter",
+        "tree_branch_diameter",
+        Kind::Number,
+    ),
+    (
+        "tree_support_tip_diameter",
+        "tree_tip_diameter",
+        Kind::Number,
+    ),
+    (
+        "tree_support_branch_distance",
+        "tree_contact_spacing",
+        Kind::Number,
+    ),
     // Filaments counted from 1, 0 for the default, as our extruders.
     ("support_filament", "support_extruder", Kind::Number),
     (
@@ -532,6 +557,16 @@ mod tests {
         assert_eq!(settings.support_top_z_distance, 0.16);
         assert_eq!(settings.support_bottom_z_distance, 0.2);
         assert_eq!(settings.support_xy_distance, 0.5);
+
+        // Tree supports.
+        let tree = r#"{ "tree_support_branch_angle": "40", "tree_support_branch_diameter": "5",
+            "tree_support_tip_diameter": "0.8", "tree_support_branch_distance": "3" }"#;
+        let tree = import_orca(tree, &mut settings).unwrap();
+        assert!(tree.skipped.is_empty());
+        assert_eq!(settings.tree_branch_angle, 40.0);
+        assert_eq!(settings.tree_branch_diameter, 5.0);
+        assert_eq!(settings.tree_tip_diameter, 0.8);
+        assert_eq!(settings.tree_contact_spacing, 3.0);
 
         // The filaments of supports and their interface.
         let filaments = r#"{ "support_filament": "2", "support_interface_filament": "0" }"#;

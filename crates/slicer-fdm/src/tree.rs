@@ -5,11 +5,13 @@
 //! Own design after the idea of Vanek, Galicia and Benes, "Clever Support:
 //! Efficient Support Structure Generation for Digital Fabrication" (2014):
 //! supports start at sampled points and join on their way down within a
-//! bounded angle. Here every layer moves each branch a bounded step towards
-//! its nearest neighbour, out of the way of the model of the next few
-//! layers and out of the model itself, and merges branches that touch.
-//! Branches start thin and thicken gradually on the way down with the area
-//! they carry.
+//! bounded angle. Here every layer moves each branch a bounded step
+//! (`tree_branch_angle`) towards a partner (branches pair up, closest pairs
+//! first) or else its nearest neighbour, out of the way of the model of the
+//! next few layers and out of the model itself, and merges branches that
+//! touch. Branches start `tree_contact_spacing` apart as thin as
+//! `tree_tip_diameter` and thicken gradually on the way down with the area
+//! they carry, up to `tree_branch_diameter`.
 
 use slicer_core::polygon::{self, distance, sin_cos_degrees};
 use slicer_core::{Contour, Point, Shapes, parallel_map};
@@ -21,16 +23,24 @@ use crate::{MIN_SUPPORT_AREA, tidy_support};
 /// branch.
 const CIRCLE_SEGMENTS: u32 = 32;
 
-/// How far a branch leans towards its neighbour per layer, as a share of
-/// the overhang a layer may have without support of its own.
+/// How far a branch leans towards its neighbour per layer
+/// (`tree_branch_angle`) as a share of how far it may move at most; the
+/// rest is room for getting out of the way of the model. A branch may move
+/// at least as far as a layer may hang over the one below it.
 const LEAN: f64 = 0.8;
 
 /// Branches lean only towards neighbours closer than this, in multiples of
-/// the support spacing; farther ones grow straight down.
+/// `tree_contact_spacing`; farther ones grow straight down.
 const ATTRACTION: f64 = 4.0;
 
-/// Radius of a branch that carries one point, in line widths.
+/// Smallest radius of a branch, and that of a tip without
+/// `tree_tip_diameter`, in line widths: the support loop around it, half a
+/// line width inside, still has room for a line.
 const TIP_RADIUS: f64 = 1.0;
+
+/// Two branches merge when their centres are closer than this share of
+/// the sum of their radii: half-way overlapping.
+const MERGE: f64 = 0.5;
 
 /// How fast a branch thickens to the radius its load asks for after two
 /// branches merged, per layer, as a share of the overhang a layer may have
@@ -42,10 +52,11 @@ const GROWTH: f64 = 0.5;
 /// on the layer where it meets the model. A power of two.
 const LOOK_AHEAD: usize = 16;
 
-/// Radius of the thickest trunk, in line widths.
+/// Radius of the thickest trunk without `tree_branch_diameter`, in line
+/// widths.
 const MAX_RADIUS: f64 = 10.0;
 
-/// Grid points this close to an overhang (in support spacings) that are
+/// Grid points this close to an overhang (in contact spacings) that are
 /// not inside it are moved onto its edge, so that narrow overhangs between
 /// the grid points get contact points too. Just above the half diagonal of
 /// a grid cell, so that every overhang is reached.
@@ -313,6 +324,66 @@ fn towards(from: Point, to: Point, step: f64) -> Point {
     ]
 }
 
+/// Radius of the tip of a branch: half of `tree_tip_diameter`, at least
+/// [`TIP_RADIUS`] line widths, which is also what 0 means.
+pub(crate) fn tip_radius(settings: &Settings) -> f64 {
+    (0.5 * settings.tree_tip_diameter).max(TIP_RADIUS * settings.line_width)
+}
+
+/// For every branch the nearest other one at most `limit` away.
+fn nearest_neighbours(nodes: &[Node], limit: f64) -> Vec<Option<usize>> {
+    (0..nodes.len())
+        .map(|k| {
+            let mut neighbour: Option<(usize, f64)> = None;
+            for (m, other) in nodes.iter().enumerate() {
+                let d = distance(nodes[k].at, other.at);
+                if m != k && d <= limit && neighbour.is_none_or(|(_, best)| d < best) {
+                    neighbour = Some((m, d));
+                }
+            }
+            neighbour.map(|(m, _)| m)
+        })
+        .collect()
+}
+
+/// For every branch the one it leans towards: branches pair up, closest
+/// pairs first, so that two of them always lean towards each other and
+/// meet, instead of a row of evenly spaced branches all following their
+/// neighbour in the same direction. A branch left without a partner leans
+/// towards its nearest neighbour, at most `limit` away.
+// ponytail: greedy pairing, not the best matching, compared all against
+// all on every layer; candidates are the pairs at most twice as far apart
+// as the nearer one's nearest neighbour.
+fn partners(nodes: &[Node], limit: f64) -> Vec<Option<usize>> {
+    let nearest = nearest_neighbours(nodes, limit);
+    // Candidate pairs: every branch with the others at most twice as far
+    // as its nearest one.
+    let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
+    for (k, node) in nodes.iter().enumerate() {
+        let Some(n) = nearest[k] else { continue };
+        let reach = (2.0 * distance(node.at, nodes[n].at)).min(limit);
+        for (m, other) in nodes.iter().enumerate().skip(k + 1) {
+            let d = distance(node.at, other.at);
+            if d <= reach {
+                pairs.push((d, k, m));
+            }
+        }
+    }
+    pairs.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    let mut partner: Vec<Option<usize>> = vec![None; nodes.len()];
+    for (_, k, m) in pairs {
+        if partner[k].is_none() && partner[m].is_none() {
+            partner[k] = Some(m);
+            partner[m] = Some(k);
+        }
+    }
+    partner
+        .into_iter()
+        .zip(nearest)
+        .map(|(paired, near)| paired.or(near))
+        .collect()
+}
+
 /// The branches on every layer, grown from the top down. Every branch
 /// lists the branches of the layer above that it continues.
 // ponytail: a branch that cannot get around the model, even looking
@@ -330,10 +401,18 @@ fn branches(
     let width = settings.line_width;
     let spacing = settings.support_spacing;
     let interface = settings.support_interface_layers as usize;
+    let contact = settings.tree_contact_spacing;
+    let tip = tip_radius(settings);
+    let thickest = match settings.tree_branch_diameter {
+        0.0 => MAX_RADIUS * width,
+        diameter => 0.5 * diameter,
+    }
+    .max(tip);
+    // How far a branch leans per millimetre of height.
+    let (sin, cos) = sin_cos_degrees(settings.tree_branch_angle);
+    let slope = sin / cos;
     // The thickness a branch grows to, by the area it carries.
-    let target = |load: f64| {
-        (TIP_RADIUS * width * (load / (spacing * spacing)).max(1.0).sqrt()).min(MAX_RADIUS * width)
-    };
+    let target = |load: f64| (tip * (load / (spacing * spacing)).max(1.0).sqrt()).min(thickest);
 
     // Where the model is on every layer, and on it and the layers right
     // below it together (doubling the number of layers in every round).
@@ -355,27 +434,21 @@ fn branches(
     for index in (0..count).rev() {
         let outline = &outlines[index];
 
-        // Grow the branches of the layer above one layer down. A branch may
-        // move as far as a layer may hang over the one below it.
+        // Grow the branches of the layer above one layer down. A branch
+        // leans at `tree_branch_angle` and may move as far as a layer may
+        // hang over the one below it, or a quarter more than it leans.
         if index + 1 < count && !nodes.is_empty() {
             let thickness = cut_heights[index + 1] - cut_heights[index];
             let reach = 0.5 * width * thickness / settings.layer_height;
-            let step = LEAN * reach;
+            let step = slope * thickness;
+            let reach = reach.max(step / LEAN);
             let mut grown = Vec::with_capacity(nodes.len());
+            let partner = partners(&nodes, ATTRACTION * contact);
             for (k, node) in nodes.iter().enumerate() {
                 let r = node
                     .radius
                     .max(target(node.load).min(node.radius + GROWTH * reach));
-                let mut neighbour: Option<(Point, f64)> = None;
-                for (m, other) in nodes.iter().enumerate() {
-                    let d = distance(node.at, other.at);
-                    if m != k
-                        && d <= ATTRACTION * spacing
-                        && neighbour.is_none_or(|(_, best)| d < best)
-                    {
-                        neighbour = Some((other.at, d));
-                    }
-                }
+                let neighbour = partner[k].map(|m| (nodes[m].at, distance(node.at, nodes[m].at)));
                 let attracted = match neighbour {
                     Some((other, d)) if d > 0.0 => towards(node.at, other, step.min(0.5 * d)),
                     _ => node.at,
@@ -413,11 +486,12 @@ fn branches(
 
         // New branches start right under the dense interface.
         if let Some(above) = starts.get(index + interface) {
-            for (at, load) in contact_points(above, spacing) {
-                let radius = target(load);
+            for (at, load) in contact_points(above, contact) {
+                // As thin as a tip; it thickens on the way down.
+                let radius = tip;
                 if let Some(at) = outline
                     .escape(at, radius)
-                    .filter(|&p| distance(at, p) <= 0.5 * spacing)
+                    .filter(|&p| distance(at, p) <= 0.5 * contact)
                 {
                     nodes.push(Node {
                         at,
@@ -436,7 +510,7 @@ fn branches(
             let mut j = i + 1;
             while j < nodes.len() {
                 let (a, b) = (&nodes[i], &nodes[j]);
-                if distance(a.at, b.at) < 0.5 * (a.radius + b.radius) {
+                if distance(a.at, b.at) < MERGE * (a.radius + b.radius) {
                     let load = a.load + b.load;
                     let at = [
                         (a.at[0] * a.load + b.at[0] * b.load) / load,
@@ -480,7 +554,22 @@ mod tests {
     /// model `model` on the layers below it, kept clear of like the
     /// supports in `support_areas`.
     fn grow(model: impl Fn(usize) -> Shapes) -> (Vec<Vec<Node>>, Vec<Shapes>, Settings) {
-        let settings = Settings::default();
+        grow_with(
+            model,
+            &Settings {
+                // Many tips to merge: as close as before `tree_contact_spacing`.
+                tree_contact_spacing: 2.5,
+                ..Settings::default()
+            },
+        )
+    }
+
+    /// Like [`grow`] with the given settings.
+    fn grow_with(
+        model: impl Fn(usize) -> Shapes,
+        settings: &Settings,
+    ) -> (Vec<Vec<Node>>, Vec<Shapes>, Settings) {
+        let settings = settings.clone();
         let count = 60;
         let plate = rect(0.0, 0.0, 30.0, 10.0);
         let slices: Vec<Shapes> = (0..count)
@@ -575,5 +664,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn branch_angle_limits_the_lean() {
+        // Nothing in the way below the plate: branches move only to lean
+        // towards each other, at most `tree_branch_angle` from the
+        // vertical on every layer of 0.2 mm.
+        let free = |_| Vec::new();
+        let most = |angle: f64| {
+            let settings = Settings {
+                tree_branch_angle: angle,
+                ..Settings::default()
+            };
+            let (branches, _, _) = grow_with(free, &settings);
+            let mut most: f64 = 0.0;
+            for index in 0..46 {
+                // Branches that merged on this layer moved to the middle.
+                for node in branches[index].iter().filter(|n| n.from.len() == 1) {
+                    let above = &branches[index + 1][node.from[0]];
+                    most = most.max(distance(node.at, above.at));
+                }
+            }
+            most
+        };
+        let tan = |angle: f64| {
+            let (sin, cos) = sin_cos_degrees(angle);
+            sin / cos
+        };
+        let (steep, flat) = (most(20.0), most(60.0));
+        assert!(steep <= 0.2 * tan(20.0) + 1e-9, "{steep}");
+        assert!(flat <= 0.2 * tan(60.0) + 1e-9, "{flat}");
+        assert!(flat > 0.2 * tan(20.0) + 1e-6, "{flat}");
+        // Straight down without any lean.
+        assert!(most(0.0) < 1e-9);
+    }
+
+    #[test]
+    fn tip_and_branch_diameters_set_the_thickness() {
+        let free = |_| Vec::new();
+        let radii = |settings: &Settings| {
+            let (branches, _, _) = grow_with(free, settings);
+            // The tips start on layer 46, right under the two interface
+            // layers; layer 0 holds the trunks on the bed.
+            let tips: Vec<f64> = branches[46].iter().map(|n| n.radius).collect();
+            let thickest = branches
+                .iter()
+                .flatten()
+                .map(|n| n.radius)
+                .fold(0.0, f64::max);
+            (tips, thickest)
+        };
+        // By default two line widths across.
+        let (tips, thickest) = radii(&Settings::default());
+        assert!(!tips.is_empty());
+        assert!(tips.iter().all(|&r| (r - 0.45).abs() < 1e-9), "{tips:?}");
+        assert!(thickest > 0.45);
+        // Thicker tips, and trunks no thicker than 1.5 mm across.
+        let settings = Settings {
+            tree_tip_diameter: 1.2,
+            tree_branch_diameter: 1.5,
+            ..Settings::default()
+        };
+        let (tips, thickest) = radii(&settings);
+        assert!(tips.iter().all(|&r| (r - 0.6).abs() < 1e-9), "{tips:?}");
+        assert!(thickest <= 0.75 + 1e-9 && thickest > 0.6, "{thickest}");
+        // A tip is never thinner than two line widths, which leaves room
+        // for its loop.
+        let settings = Settings {
+            tree_tip_diameter: 0.2,
+            ..Settings::default()
+        };
+        let (tips, _) = radii(&settings);
+        assert!(tips.iter().all(|&r| (r - 0.45).abs() < 1e-9), "{tips:?}");
+    }
+
+    #[test]
+    fn wider_contact_spacing_gives_fewer_tips() {
+        let free = |_| Vec::new();
+        let tips = |spacing: f64| {
+            let settings = Settings {
+                tree_contact_spacing: spacing,
+                ..Settings::default()
+            };
+            let (branches, _, _) = grow_with(free, &settings);
+            branches[46].len()
+        };
+        let (close, wide) = (tips(2.5), tips(5.0));
+        assert!(wide > 0 && 2 * wide <= close, "{wide} {close}");
     }
 }
