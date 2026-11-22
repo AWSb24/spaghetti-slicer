@@ -113,13 +113,13 @@ impl Strands {
         }
     }
 
-    /// Adds the segment from `a` to `b` with its centre at height `z`;
-    /// one without length is left out.
+    /// Adds the segment from `a` to `b` with its centre at the heights `z`
+    /// at `a` and at `b`; one without length is left out.
     fn push(
         &mut self,
         a: [f64; 2],
         b: [f64; 2],
-        z: f64,
+        z: [f64; 2],
         [width, height]: [f64; 2],
         color: [u8; 4],
     ) {
@@ -134,7 +134,7 @@ impl Strands {
         let Ok(base) = u32::try_from(self.positions.len()) else {
             return;
         };
-        for p in [a, b] {
+        for (p, z) in [(a, z[0]), (b, z[1])] {
             for (offset, normal) in [
                 ([side[0] * w, side[1] * w, 0.0], [side[0], side[1], 0.0]),
                 ([0.0, 0.0, h], [0.0, 0.0, 1.0]),
@@ -308,7 +308,9 @@ pub fn bed_grid(bed: [f64; 2], grid: [u8; 4], border: [u8; 4]) -> Lines {
 /// Every extrusion of every layer as a strand, leaving out the kinds in
 /// `hidden`; `color` gives each path's colour from the path, the number of
 /// its layer and the layer. Lines are `line_width` wide unless the path has
-/// its own width, and as high as their layer.
+/// its own width, and as high as their layer. The loops of a layer of vase
+/// mode that rises ([`Layer::rises`]) climb from the height of the layer
+/// below to their own as they go round, like the nozzle.
 pub fn toolpath_strands(
     toolpaths: &Toolpaths,
     line_width: f64,
@@ -318,23 +320,49 @@ pub fn toolpath_strands(
     let mut strands = Strands::default();
     for (index, layer) in toolpaths.layers.iter().enumerate() {
         let z = layer.z - layer.height / 2.0;
+        let rises = layer.rises();
         for path in layer.paths.iter().filter(|p| !hidden.contains(&p.kind)) {
             let [r, g, b] = color(path, index, layer);
             let size = [path.width.unwrap_or(line_width), layer.height];
-            for pair in path.points.windows(2) {
-                strands.push(pair[0], pair[1], z, size, [r, g, b, 255]);
+            let climb = if rises {
+                climb(&path.points, z - layer.height, layer.height)
+            } else {
+                Vec::new()
+            };
+            let at = |i: usize| climb.get(i).copied().unwrap_or(z);
+            for (i, pair) in path.points.windows(2).enumerate() {
+                strands.push(pair[0], pair[1], [at(i), at(i + 1)], size, [r, g, b, 255]);
             }
             if let (true, Some(&first), Some(&last)) = (
                 path.closed && path.points.len() > 2,
                 path.points.first(),
                 path.points.last(),
             ) {
-                strands.push(last, first, z, size, [r, g, b, 255]);
+                let n = path.points.len();
+                strands.push(last, first, [at(n - 1), at(n)], size, [r, g, b, 255]);
             }
         }
         strands.layer_ends.push(strands.indices.len());
     }
     strands
+}
+
+/// Heights of a closed loop through `points` that climbs by `rise` from
+/// `from` as it goes round, in proportion to the length gone: one for every
+/// point and one more for the way back to the first.
+fn climb(points: &[[f64; 2]], from: f64, rise: f64) -> Vec<f64> {
+    let length = |a: [f64; 2], b: [f64; 2]| {
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        (dx * dx + dy * dy).sqrt()
+    };
+    let mut done = vec![0.0];
+    for (i, &p) in points.iter().enumerate() {
+        let next = points[(i + 1) % points.len()];
+        let last = done.last().copied().unwrap_or(0.0);
+        done.push(last + length(p, next));
+    }
+    let total = done.last().copied().unwrap_or(0.0).max(1e-9);
+    done.iter().map(|d| from + rise * d / total).collect()
 }
 
 #[cfg(test)]
@@ -526,6 +554,48 @@ mod tests {
             by_kind,
         );
         assert_eq!(walls_only.segments_per_layer(), [4, 0, 0]);
+    }
+
+    #[test]
+    fn vase_loops_climb_round_the_layer() {
+        let square = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let island = |x: f64| {
+            let points = square.iter().map(|p| [p[0] + x, p[1]]).collect();
+            path(PathKind::OuterWall, points, true)
+        };
+        let mut layer = Layer {
+            z: 1.0,
+            height: 0.2,
+            spiral: true,
+            paths: vec![island(0.0), island(5.0)],
+        };
+        let toolpaths = |layer: &Layer| Toolpaths {
+            layers: vec![layer.clone()],
+            object_settings: Vec::new(),
+            range_settings: Vec::new(),
+        };
+        let centre = |strands: &Strands, segment: usize, end: usize| {
+            // The second corner of each end lies on top of the strand.
+            strands.positions[segment * 8 + end * 4 + 1][2] - 0.1
+        };
+        let strands = toolpath_strands(&toolpaths(&layer), 0.4, &[], |_, _, _| [0; 3]);
+        for island in 0..2 {
+            for side in 0..4 {
+                let segment = island * 4 + side;
+                let (start, end) = (centre(&strands, segment, 0), centre(&strands, segment, 1));
+                // From 0.7 (the middle of the layer below) to 0.9.
+                let expected = 0.7 + 0.05 * side as f32;
+                assert!((start - expected).abs() < 1e-5, "{island} {side} {start}");
+                assert!(
+                    (end - expected - 0.05).abs() < 1e-5,
+                    "{island} {side} {end}"
+                );
+            }
+        }
+        // A layer that does not rise stays flat.
+        layer.paths[1].closed = false;
+        let flat = toolpath_strands(&toolpaths(&layer), 0.4, &[], |_, _, _| [0; 3]);
+        assert!((centre(&flat, 0, 0) - 0.9).abs() < 1e-5);
     }
 
     #[test]
