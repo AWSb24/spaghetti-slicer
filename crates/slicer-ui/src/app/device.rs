@@ -6,12 +6,15 @@
 //! threads or raw sockets for this and explains that instead.
 
 use eframe::egui::{self, RichText};
+#[cfg(not(target_arch = "wasm32"))]
 use web_time::Instant;
 
 use crate::theme;
 
 /// A message the Device tab wants the window to show.
 #[derive(Debug, Clone)]
+// The browser never uploads, so it never makes one.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub enum Message {
     /// What was sent.
     Info(String),
@@ -167,7 +170,7 @@ impl Device {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = (gcode, current, messages);
+            let _ = messages;
             ui.label(
                 RichText::new(
                     "Sending to a printer is available in the desktop app, not in the browser.",
