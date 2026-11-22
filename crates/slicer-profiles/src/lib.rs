@@ -372,9 +372,26 @@ pub struct Settings {
     /// Shape of the supports: straight columns (`normal`) or branches that
     /// merge into trunks (`tree`).
     pub support_style: SupportStyle,
-    /// Distance between the lines of a support. Tree supports also touch
-    /// the surface they carry at points this far apart.
+    /// Distance between the lines of a support. A tree branch that carries
+    /// this much overhang squared is as thick as a tip (see
+    /// `tree_tip_diameter`); one carrying more has as much more cross-section.
     pub support_spacing: f64,
+    /// Tree supports: the steepest a branch leans from the vertical on its
+    /// way down, in degrees from 0 (straight down) to 75. Branches lean
+    /// towards each other at this angle to merge.
+    pub tree_branch_angle: f64,
+    /// Tree supports: diameter of a branch where it touches the surface it
+    /// carries, in millimetres, at least two line widths; 0 means two line
+    /// widths.
+    pub tree_tip_diameter: f64,
+    /// Tree supports: diameter of the thickest trunk, in millimetres, at
+    /// least `tree_tip_diameter`; 0 means 20 line widths.
+    pub tree_branch_diameter: f64,
+    /// Tree supports: distance between the points where branches touch the
+    /// surface they carry, in millimetres. Farther apart there are fewer
+    /// branches, which saves time and material; the dense interface spans
+    /// the gaps between them.
+    pub tree_contact_spacing: f64,
     /// Number of densely filled support layers right under the surface they carry.
     pub support_interface_layers: u32,
     /// Number of densely filled support layers where a support stands on
@@ -695,6 +712,10 @@ impl Default for Settings {
             supports: false,
             support_style: SupportStyle::Normal,
             support_spacing: 2.5,
+            tree_branch_angle: 45.0,
+            tree_tip_diameter: 0.0,
+            tree_branch_diameter: 0.0,
+            tree_contact_spacing: 5.0,
             support_interface_layers: 2,
             support_bottom_interface_layers: 0,
             support_interface_pattern: SupportInterfacePattern::Lines,
@@ -1313,6 +1334,15 @@ impl Settings {
             ("brim_width", self.brim_width, 0.0, 50.0),
             ("infill_angle", self.infill_angle, 0.0, 180.0),
             ("support_spacing", self.support_spacing, 0.5, 20.0),
+            ("tree_branch_angle", self.tree_branch_angle, 0.0, 75.0),
+            ("tree_tip_diameter", self.tree_tip_diameter, 0.0, 20.0),
+            (
+                "tree_branch_diameter",
+                self.tree_branch_diameter,
+                0.0,
+                100.0,
+            ),
+            ("tree_contact_spacing", self.tree_contact_spacing, 0.5, 50.0),
             (
                 "support_bridge_length",
                 self.support_bridge_length,

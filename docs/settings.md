@@ -72,7 +72,11 @@ Numbers are in the unit of the Unit column (empty for counts and factors). A set
 | `elephant_foot_compensation` | 0 | mm | 0 to 0.45 | How far the outline of the first layer is moved inwards, against the first layer squashing out wider than the model (elephant foot). 0 turns it off. |
 | `supports` | false |  | `true`, `false` | Whether to print supports under overhangs and bridges. |
 | `support_style` | normal |  | `normal`, `tree` | Shape of the supports: straight columns (`normal`) or branches that merge into trunks (`tree`). |
-| `support_spacing` | 2.5 | mm | 0.5 to 20 | Distance between the lines of a support. Tree supports also touch the surface they carry at points this far apart. |
+| `support_spacing` | 2.5 | mm | 0.5 to 20 | Distance between the lines of a support. A tree branch that carries this much overhang squared is as thick as a tip (see `tree_tip_diameter`); one carrying more has as much more cross-section. |
+| `tree_branch_angle` | 45 | ° | 0 to 75 | Tree supports: the steepest a branch leans from the vertical on its way down, in degrees from 0 (straight down) to 75. Branches lean towards each other at this angle to merge. |
+| `tree_tip_diameter` | 0 | mm | 0 to 20 | Tree supports: diameter of a branch where it touches the surface it carries, in millimetres, at least two line widths; 0 means two line widths. |
+| `tree_branch_diameter` | 0 | mm | 0 to 100 | Tree supports: diameter of the thickest trunk, in millimetres, at least `tree_tip_diameter`; 0 means 20 line widths. |
+| `tree_contact_spacing` | 5 | mm | 0.5 to 50 | Tree supports: distance between the points where branches touch the surface they carry, in millimetres. Farther apart there are fewer branches, which saves time and material; the dense interface spans the gaps between them. |
 | `support_interface_layers` | 2 |  | 0 to 10 | Number of densely filled support layers right under the surface they carry. |
 | `support_bottom_interface_layers` | 0 |  | 0 to 10 | Number of densely filled support layers where a support stands on the model (bottom interface), so that it leaves a smoother surface there; 0 turns them off. |
 | `support_interface_pattern` | lines |  | `lines`, `concentric`, `grid` | Pattern of the dense interface layers: `lines`, `concentric` or `grid`. |
