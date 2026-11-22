@@ -131,6 +131,12 @@ const MAPPING: &[(&str, &str, Kind)] = &[
     ("skirt_distance", "skirt_distance", Kind::Number),
     ("brim_width", "brim_width", Kind::Number),
     ("brim_type", "brim_width", Kind::BrimType),
+    (
+        "xy_contour_compensation",
+        "xy_contour_compensation",
+        Kind::Number,
+    ),
+    ("xy_hole_compensation", "xy_hole_compensation", Kind::Number),
     ("raft_layers", "raft_layers", Kind::Number),
     ("raft_expansion", "raft_expansion", Kind::Number),
     (

@@ -72,6 +72,8 @@
     ("raft_expansion", "mm"),
     ("raft_contact_distance", "mm"),
     ("elephant_foot_compensation", "mm"),
+    ("xy_contour_compensation", "mm"),
+    ("xy_hole_compensation", "mm"),
     ("supports", ""),
     ("support_style", ""),
     ("support_spacing", "mm"),

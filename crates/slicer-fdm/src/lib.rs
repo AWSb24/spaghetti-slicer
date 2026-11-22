@@ -924,6 +924,7 @@ pub fn generate_plate_with_own_settings(
     // objects with their holes.
     let cuts = negatives::cuts(objects, negative_list, placement, shift, &cut_heights);
     let slices = negatives::apply(slices, &cuts);
+    let slices = compensated(slices, settings);
     progress.advance();
     if stopped() {
         return Err(FdmError::Cancelled);
@@ -943,7 +944,7 @@ pub fn generate_plate_with_own_settings(
             &cut_heights,
         )
         .into_iter()
-        .map(|region| negatives::apply(region, &cuts))
+        .map(|region| compensated(negatives::apply(region, &cuts), settings))
         .collect()
     } else {
         Vec::new()
@@ -1054,7 +1055,7 @@ pub fn generate_plate_with_own_settings(
             .iter()
             .map(|&e| {
                 let own = slice_mesh(&with_extruder(&mesh, e), &cut_heights);
-                negatives::apply(own, &cuts)
+                compensated(negatives::apply(own, &cuts), settings)
             })
             .collect();
         (0..own.len())
@@ -2957,6 +2958,35 @@ fn printed_slice<'a>(
     }
 }
 
+/// `slices` with their outer outlines moved by `xy_contour_compensation`
+/// and their holes grown by `xy_hole_compensation`, every layer on its own
+/// core.
+// ponytail: the plate's values for every object; per object is the upgrade.
+fn compensated(slices: Vec<Shapes>, settings: &Settings) -> Vec<Shapes> {
+    let (outline, hole) = (
+        settings.xy_contour_compensation,
+        settings.xy_hole_compensation,
+    );
+    if outline == 0.0 && hole == 0.0 {
+        return slices;
+    }
+    parallel_map(slices.len(), |index| {
+        let pieces: Shapes = slices[index]
+            .iter()
+            .flat_map(|shape| {
+                let Some((outer, holes)) = shape.split_first() else {
+                    return Shapes::new();
+                };
+                let body = polygon::offset(&vec![vec![outer.clone()]], outline);
+                let cut = polygon::offset(&polygon::from_loops(holes), hole);
+                polygon::difference(&body, &cut)
+            })
+            .collect();
+        // Outlines grown into each other become one.
+        polygon::union(&pieces, &Shapes::new())
+    })
+}
+
 /// The area the centre lines of the infill of a slice go into. They stay
 /// half a width away from the inner edge of the innermost wall, so line
 /// ends and the links between lines do not deposit material twice. The
@@ -3984,6 +4014,48 @@ mod tests {
             }
         }
         mesh
+    }
+
+    #[test]
+    fn xy_compensation_moves_outlines_and_holes() {
+        // Width of the outer walls of a middle layer, largest first.
+        let widths = |settings: &Settings| -> Vec<f64> {
+            let toolpaths = generate(&frame(30.0, 10.0, 4.0), settings).unwrap();
+            let mut widths: Vec<f64> = toolpaths.layers[10]
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::OuterWall)
+                .map(|p| {
+                    let xs = p.points.iter().map(|q| q[0]);
+                    xs.clone().fold(f64::MIN, f64::max) - xs.fold(f64::MAX, f64::min)
+                })
+                .collect();
+            widths.sort_by(|a, b| b.total_cmp(a));
+            widths
+        };
+        let plain = widths(&Settings::default());
+        let moved = widths(&Settings {
+            xy_contour_compensation: -0.1,
+            xy_hole_compensation: 0.2,
+            ..Settings::default()
+        });
+        assert_eq!(plain.len(), 2);
+        assert_eq!(moved.len(), 2);
+        // 0.1 mm smaller on every side outside, 0.2 mm larger in the hole.
+        assert!(
+            (moved[0] - plain[0] + 0.2).abs() < 0.02,
+            "{plain:?} {moved:?}"
+        );
+        assert!(
+            (moved[1] - plain[1] - 0.4).abs() < 0.02,
+            "{plain:?} {moved:?}"
+        );
+        // A hole shrunk by more than half its width closes.
+        let closed = widths(&Settings {
+            xy_hole_compensation: -5.5,
+            ..Settings::default()
+        });
+        assert_eq!(closed.len(), 1);
     }
 
     #[test]

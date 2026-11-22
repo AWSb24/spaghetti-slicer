@@ -378,6 +378,12 @@ pub struct Settings {
     /// the first layer squashing out wider than the model (elephant foot).
     /// 0 turns it off.
     pub elephant_foot_compensation: f64,
+    /// How far the outer outline of every layer moves outwards (negative:
+    /// inwards), against parts printing larger or smaller than modelled.
+    pub xy_contour_compensation: f64,
+    /// How far the holes of every layer grow (negative: shrink), against
+    /// holes printing smaller than modelled.
+    pub xy_hole_compensation: f64,
     /// Whether to print supports under overhangs and bridges.
     pub supports: bool,
     /// Shape of the supports: straight columns (`normal`) or branches that
@@ -730,6 +736,8 @@ impl Default for Settings {
             raft_expansion: 1.5,
             raft_contact_distance: 0.1,
             elephant_foot_compensation: 0.0,
+            xy_contour_compensation: 0.0,
+            xy_hole_compensation: 0.0,
             supports: false,
             support_style: SupportStyle::Normal,
             support_spacing: 2.5,
@@ -1476,6 +1484,13 @@ impl Settings {
                 100.0,
             ),
             ("z_hop", self.z_hop, 0.0, 10.0),
+            (
+                "xy_contour_compensation",
+                self.xy_contour_compensation,
+                -2.0,
+                2.0,
+            ),
+            ("xy_hole_compensation", self.xy_hole_compensation, -2.0, 2.0),
             ("min_layer_time", self.min_layer_time, 0.0, 600.0),
             ("min_print_speed", self.min_print_speed, 1.0, 1000.0),
             ("pressure_advance", self.pressure_advance, 0.0, 2.0),

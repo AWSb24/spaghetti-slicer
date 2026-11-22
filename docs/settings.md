@@ -73,6 +73,8 @@ Numbers are in the unit of the Unit column (empty for counts and factors). A set
 | `raft_expansion` | 1.5 | mm | 0 to 50 | How far the raft reaches beyond the outline of the first layer of the model and its supports. |
 | `raft_contact_distance` | 0.1 | mm | 0 to 1 | Gap between the top of the raft and the first layer of the model, so that the raft comes off. |
 | `elephant_foot_compensation` | 0 | mm | 0 to 0.45 | How far the outline of the first layer is moved inwards, against the first layer squashing out wider than the model (elephant foot). 0 turns it off. |
+| `xy_contour_compensation` | 0 | mm | -2 to 2 | How far the outer outline of every layer moves outwards (negative: inwards), against parts printing larger or smaller than modelled. |
+| `xy_hole_compensation` | 0 | mm | -2 to 2 | How far the holes of every layer grow (negative: shrink), against holes printing smaller than modelled. |
 | `supports` | false |  | `true`, `false` | Whether to print supports under overhangs and bridges. |
 | `support_style` | normal |  | `normal`, `tree` | Shape of the supports: straight columns (`normal`) or branches that merge into trunks (`tree`). |
 | `support_spacing` | 2.5 | mm | 0.5 to 20 | Distance between the lines of a support. A tree branch that carries this much overhang squared is as thick as a tip (see `tree_tip_diameter`); one carrying more has as much more cross-section. |
