@@ -1841,10 +1841,7 @@ mod tests {
     #[test]
     fn part_and_volume_transforms_change_what_is_sliced() {
         let settings = Settings::default();
-        let mut item = Item::new(
-            cube_model(10.0, 10.0, 10.0),
-            Placement::centered(&settings),
-        );
+        let mut item = Item::new(cube_model(10.0, 10.0, 10.0), Placement::centered(&settings));
         item.add_part("second", Mesh::cuboid(10.0, 10.0, 10.0));
         let before = item.model.size[0];
         assert!(item.set_part_transform(

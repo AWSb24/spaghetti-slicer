@@ -143,13 +143,11 @@ impl Device {
             let busy = self.job.is_some();
             let enabled = gcode.is_some() && !busy;
             let label = if busy { "Sending…" } else { "Send G-code" };
-            let button =
-                egui::Button::new(RichText::new(label).color(egui::Color32::WHITE))
-                    .fill(theme::ACCENT);
+            let button = egui::Button::new(RichText::new(label).color(egui::Color32::WHITE))
+                .fill(theme::ACCENT);
             if ui.add_enabled(enabled, button).clicked()
                 && let Some((bytes, file)) = &gcode
-                && let Err(message) =
-                    self.start_send(bytes.to_vec(), file.clone(), ui.ctx())
+                && let Err(message) = self.start_send(bytes.to_vec(), file.clone(), ui.ctx())
             {
                 messages.push(Message::Error(message));
             }
@@ -206,7 +204,6 @@ impl Device {
         }
     }
 }
-
 
 #[cfg(not(target_arch = "wasm32"))]
 impl Device {
@@ -286,4 +283,3 @@ impl Device {
     /// Nothing is uploaded in the browser, so there is never a result.
     fn poll(&mut self, _messages: &mut Vec<Message>) {}
 }
-

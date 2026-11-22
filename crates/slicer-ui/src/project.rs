@@ -602,8 +602,7 @@ pub fn load_orca_project(bytes: &[u8]) -> Result<(Project, Diagnostics), Diagnos
         overrides: String::new(),
     };
     let shared = Settings::default();
-    let objects =
-        parse_3mf_plate_parts(bytes, None, &mut warnings).map_err(|e| e.diagnostic())?;
+    let objects = parse_3mf_plate_parts(bytes, None, &mut warnings).map_err(|e| e.diagnostic())?;
     let mut plate = Plate::default();
     let mut skipped_object_settings = 0;
     for object in objects {
@@ -632,13 +631,17 @@ pub fn load_orca_project(bytes: &[u8]) -> Result<(Project, Diagnostics), Diagnos
         // Meshes of parts are stored on the plate; their object's own
         // coordinates put their centre at the model's centre above the bed.
         let shift = [-center[0], -center[1], -lo[2]];
-        add_orca_volumes(&mut item, object.modifiers, object.negatives, object.support_parts, shift, stored_object);
+        add_orca_volumes(
+            &mut item,
+            object.modifiers,
+            object.negatives,
+            object.support_parts,
+            shift,
+            stored_object,
+        );
         if let Some(stored_object) = stored_object {
-            item.overrides = imported_values(
-                &stored_object.values,
-                &shared,
-                slicer_fdm::OBJECT_SETTINGS,
-            );
+            item.overrides =
+                imported_values(&stored_object.values, &shared, slicer_fdm::OBJECT_SETTINGS);
             skipped_object_settings += stored_object
                 .values
                 .len()
@@ -649,13 +652,9 @@ pub fn load_orca_project(bytes: &[u8]) -> Result<(Project, Diagnostics), Diagnos
                 .map(|range| HeightRange {
                     from: range.min_z,
                     to: range.max_z,
-                    values: imported_values(
-                        &range.values,
-                        &shared,
-                        slicer_fdm::RANGE_SETTINGS,
-                    )
-                    .into_iter()
-                    .collect(),
+                    values: imported_values(&range.values, &shared, slicer_fdm::RANGE_SETTINGS)
+                        .into_iter()
+                        .collect(),
                 })
                 .collect();
         }
@@ -674,7 +673,13 @@ pub fn load_orca_project(bytes: &[u8]) -> Result<(Project, Diagnostics), Diagnos
     }
     plate.clear_selection();
     plate.serial = 1;
-    Ok((Project { plates: vec![plate], settings }, warnings))
+    Ok((
+        Project {
+            plates: vec![plate],
+            settings,
+        },
+        warnings,
+    ))
 }
 
 /// Adds the modifiers, negative volumes and support parts of an Orca
@@ -695,8 +700,8 @@ fn add_orca_volumes(
             VolumeKind::Modifier,
             translated(mesh, shift),
         );
-        if let Some(values) = stored
-            .and_then(|settings| settings.modifiers.iter().find(|m| m.id == id))
+        if let Some(values) =
+            stored.and_then(|settings| settings.modifiers.iter().find(|m| m.id == id))
         {
             volume.values =
                 imported_values(&values.values, &shared, VolumeKind::Modifier.settings())
@@ -1255,7 +1260,7 @@ mod tests {
                     <metadata key="sparse_infill_density" value="40"/>
                 </object>
             </config>"#
-            .into(),
+                .into(),
         ));
         let bytes = slicer_formats::write_project(&package).unwrap();
         assert!(is_orca_project(&bytes));
@@ -1286,10 +1291,7 @@ mod tests {
         );
         let edits = &project.settings.edits;
         assert_eq!(edits.get("layer_height").map(String::as_str), Some("0.16"));
-        assert_eq!(
-            edits.get("infill_density").map(String::as_str),
-            Some("25")
-        );
+        assert_eq!(edits.get("infill_density").map(String::as_str), Some("25"));
         assert_eq!(
             edits.get("filament_colours").map(String::as_str),
             Some("#FF0000")

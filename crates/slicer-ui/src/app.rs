@@ -1714,11 +1714,8 @@ impl App {
     /// opened.
     /// The extruder and size of a part, and its button to remove it.
     fn part_editor(&mut self, ui: &mut egui::Ui, object: usize, part: usize, settings: &Settings) {
-        let Some((name, extruder, triangles, last, object_slot, mut transform)) = self
-            .plate
-            .items
-            .get(object)
-            .and_then(|item| {
+        let Some((name, extruder, triangles, last, object_slot, mut transform)) =
+            self.plate.items.get(object).and_then(|item| {
                 let name = item.part_name(part)?.to_owned();
                 // Only the part's own slot; without one it follows the
                 // object and the mesh, which the menu names as "Object's or
@@ -2938,7 +2935,11 @@ impl App {
 
     /// The Device tab: sends the G-code of the shown plate to a printer.
     fn device_page(&mut self, ui: &mut egui::Ui) {
-        let model_name = self.plate.items.first().map_or("model", |item| &item.model.name);
+        let model_name = self
+            .plate
+            .items
+            .first()
+            .map_or("model", |item| &item.model.name);
         let file = plates::output_name(
             model_name,
             self.plates.current() + 1,
