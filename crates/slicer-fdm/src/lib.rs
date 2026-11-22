@@ -10,6 +10,7 @@ mod negatives;
 mod objects;
 mod plate;
 pub mod preview;
+mod raft;
 mod sequential;
 mod support_volumes;
 mod tree;
@@ -704,6 +705,21 @@ pub fn generate_plate_with_own_settings(
     }
     let stopped = || stop.load(Ordering::Relaxed);
     let negative_list = own.negatives;
+    // A raft takes the skirt and replaces brim and elephant foot
+    // compensation: the model's first layer lies on the raft, not the bed.
+    let raft_settings = settings;
+    let on_raft;
+    let settings = if settings.raft_layers > 0 {
+        on_raft = Settings {
+            skirt_loops: 0,
+            brim_width: 0.0,
+            elephant_foot_compensation: 0.0,
+            ..settings.clone()
+        };
+        &on_raft
+    } else {
+        settings
+    };
     // Vase mode prints one wall and nothing inside or on top, the same for
     // every object.
     let vase;
@@ -838,9 +854,10 @@ pub fn generate_plate_with_own_settings(
         settings.bed_size_y,
         settings.max_print_height,
     ];
-    if (0..3).any(|a| size[a] > volume[a] + 1e-6) {
+    let lift = raft::lift(settings);
+    if (0..3).any(|a| size[a] + if a == 2 { lift } else { 0.0 } > volume[a] + 1e-6) {
         return Err(FdmError::TooLarge {
-            model: size,
+            model: [size[0], size[1], size[2] + lift],
             volume,
         });
     }
@@ -1336,6 +1353,17 @@ pub fn generate_plate_with_own_settings(
                 path.travel_inside = true;
             }
         }
+    }
+    // The raft goes under everything the first layer prints; the layers of
+    // the model and their supports move up onto it.
+    let mut first: Vec<&Shapes> = vec![&slices[0]];
+    first.extend(supports.first().map(|(area, _)| area));
+    first.extend(tower.as_ref().map(|tower| &tower.footprint));
+    if let Some(raft) = raft::build(&first, raft_settings, extruder) {
+        for layer in &mut layers {
+            layer.z += lift;
+        }
+        layers.splice(0..0, raft);
     }
     // Without supports, say where they would be needed.
     // ponytail: where only some objects have supports, what hangs free is

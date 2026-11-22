@@ -131,6 +131,13 @@ const MAPPING: &[(&str, &str, Kind)] = &[
     ("skirt_distance", "skirt_distance", Kind::Number),
     ("brim_width", "brim_width", Kind::Number),
     ("brim_type", "brim_width", Kind::BrimType),
+    ("raft_layers", "raft_layers", Kind::Number),
+    ("raft_expansion", "raft_expansion", Kind::Number),
+    (
+        "raft_contact_distance",
+        "raft_contact_distance",
+        Kind::Number,
+    ),
     ("enable_support", "supports", Kind::Flag),
     // ponytail: Orca's 0 (no gap, for soluble supports) becomes one layer
     // here unless `support_soluble` is set, which has no Orca key of its

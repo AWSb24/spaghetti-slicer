@@ -80,6 +80,7 @@ All three must pass. New behaviour needs a test.
 | Several extruders: a region per extruder (the higher extruder takes overlaps), ordering that starts each layer with the extruder that ended the last one, tool change with `T<n>` and custom G-code, square prime tower shared line by line among the extruders changed to | `T<n>` from the Marlin G-code documentation; everything else own design |
 | Thin walls and gap fill | Centre line by shrinking a region and averaging its two sides; skip test by Steiner's formula for parallel sets; own design |
 | Folded walls in regions one to two lines wide | Morphological opening (shrink, then grow back) of a wall's centre area finds where its loop's sides lie closer than a line; textbook mathematical morphology (Serra), own design |
+| Raft | Adhesion aid as described in slicer user documentation (base, sparse and solid layers under the model, a gap above); layer plan, densities and footprint own design |
 | Desktop app | `eframe`/`egui` (MIT OR Apache-2.0), `rfd` (MIT); layout own design |
 | Layout and colours of the desktop app | Observed as a user (screenshots of running programs, labels, workflows); colours measured by hand; own icons and own drawing; see `docs/decisions/0002-ui-clean-room-reference.md` |
 | 3D view (orbit camera, look-at and perspective matrices, flat shading) | Textbook OpenGL matrices as documented for `gluLookAt`/`gluPerspective`; drawn with `glow`/`egui_glow` (MIT OR Apache-2.0, already used by eframe); own design |

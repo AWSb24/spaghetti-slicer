@@ -69,6 +69,9 @@ Numbers are in the unit of the Unit column (empty for counts and factors). A set
 | `skirt_loops` | 2 |  | 0 to 20 | Number of skirt loops around the first layer. |
 | `skirt_distance` | 4 | mm | 0 to 50 | Distance between skirt and model. |
 | `brim_width` | 0 | mm | 0 to 50 | Width of the brim attached to the first layer; 0 disables it. |
+| `raft_layers` | 0 |  | 0 to 20 | Number of layers of a raft under the model and its supports; 0 prints the model straight on the bed. A raft replaces the brim, the skirt goes around the raft, and the model starts `raft_contact_distance` above the raft. |
+| `raft_expansion` | 1.5 | mm | 0 to 50 | How far the raft reaches beyond the outline of the first layer of the model and its supports. |
+| `raft_contact_distance` | 0.1 | mm | 0 to 1 | Gap between the top of the raft and the first layer of the model, so that the raft comes off. |
 | `elephant_foot_compensation` | 0 | mm | 0 to 0.45 | How far the outline of the first layer is moved inwards, against the first layer squashing out wider than the model (elephant foot). 0 turns it off. |
 | `supports` | false |  | `true`, `false` | Whether to print supports under overhangs and bridges. |
 | `support_style` | normal |  | `normal`, `tree` | Shape of the supports: straight columns (`normal`) or branches that merge into trunks (`tree`). |

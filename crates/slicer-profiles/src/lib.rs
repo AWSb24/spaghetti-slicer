@@ -363,6 +363,17 @@ pub struct Settings {
     pub skirt_distance: f64,
     /// Width of the brim attached to the first layer; 0 disables it.
     pub brim_width: f64,
+    /// Number of layers of a raft under the model and its supports; 0
+    /// prints the model straight on the bed. A raft replaces the brim, the
+    /// skirt goes around the raft, and the model starts
+    /// `raft_contact_distance` above the raft.
+    pub raft_layers: u32,
+    /// How far the raft reaches beyond the outline of the first layer of
+    /// the model and its supports.
+    pub raft_expansion: f64,
+    /// Gap between the top of the raft and the first layer of the model,
+    /// so that the raft comes off.
+    pub raft_contact_distance: f64,
     /// How far the outline of the first layer is moved inwards, against
     /// the first layer squashing out wider than the model (elephant foot).
     /// 0 turns it off.
@@ -715,6 +726,9 @@ impl Default for Settings {
             skirt_loops: 2,
             skirt_distance: 4.0,
             brim_width: 0.0,
+            raft_layers: 0,
+            raft_expansion: 1.5,
+            raft_contact_distance: 0.1,
             elephant_foot_compensation: 0.0,
             supports: false,
             support_style: SupportStyle::Normal,
@@ -1339,6 +1353,14 @@ impl Settings {
             ("skirt_loops", f64::from(self.skirt_loops), 0.0, 20.0),
             ("skirt_distance", self.skirt_distance, 0.0, 50.0),
             ("brim_width", self.brim_width, 0.0, 50.0),
+            ("raft_layers", f64::from(self.raft_layers), 0.0, 20.0),
+            ("raft_expansion", self.raft_expansion, 0.0, 50.0),
+            (
+                "raft_contact_distance",
+                self.raft_contact_distance,
+                0.0,
+                1.0,
+            ),
             ("infill_angle", self.infill_angle, 0.0, 180.0),
             ("support_spacing", self.support_spacing, 0.5, 20.0),
             ("tree_branch_angle", self.tree_branch_angle, 0.0, 75.0),
