@@ -1311,12 +1311,9 @@ pub fn generate_plate_with_own_settings(
     // Which travel moves stay over the part depends only on the finished
     // order of a layer, so all cores can work on it again.
     let inside = parallel_map(layers.len(), |index| {
-        // Tree supports travel between the pieces of a branch without
+        // Supports travel between the pieces of a branch or column without
         // retraction (see `travels_inside`).
-        let support = supports
-            .get(index)
-            .filter(|_| settings.support_style == SupportStyle::Tree)
-            .map(|(area, _)| area);
+        let support = supports.get(index).map(|(area, _)| area);
         let flags = travels_inside(&layers[index], &slices[index], support);
         let routes = if settings.avoid_crossing_walls {
             combed(&layers[index], &slices[index], &flags, settings)
@@ -2048,9 +2045,9 @@ fn even_out(flags: &mut [bool], lengths: &[f64], hangs: bool) {
 
 /// Which paths of `layer` are reached by a travel that stays over the part
 /// (`slice`), where retraction is skipped: those inside the part other than
-/// its outer wall. With `support` (the support area of the layer, given for
-/// tree supports) also support lines reached without leaving the support,
-/// such as the lines inside the loop of a branch.
+/// its outer wall. With `support` (the support area of the layer) also
+/// support lines reached without leaving the support, such as the lines
+/// inside the loop of a branch or column.
 // ponytail: a support travel is checked as a straight line, not routed
 // along the support; one across the waist of two branches that just
 // merged retracts.
@@ -2423,35 +2420,23 @@ fn shared_work(
                 0.5 * width,
             )
         };
-        if settings.support_style == SupportStyle::Tree {
-            // Branch by branch, every one with its lines right after its
-            // loop, instead of all loops and then all lines: the many
-            // branches of a tree are toured once, not twice.
-            let islands = inner
-                .iter()
-                .map(|shape| {
-                    let shape = vec![shape.clone()];
-                    let mut own = simplified(&shape);
-                    // Loops given to the interface above stay there.
-                    own.retain(|contour| loops.contains(contour));
-                    (own, hatch(&shape))
-                })
-                .filter(|(own, lines)| !own.is_empty() || !lines.is_empty())
-                .collect();
-            shared
-                .support
-                .push(Work::Islands(islands, PathKind::Support, width));
-        } else {
-            shared.support.push(Work::Loops(
-                loops,
-                PathKind::Support,
-                width,
-                SeamPosition::Nearest,
-            ));
-            shared
-                .support
-                .push(Work::Lines(hatch(&inner), PathKind::Support, 0.0));
-        }
+        // Piece by piece (a branch of a tree, a column of grid supports),
+        // every one with its lines right after its loop, instead of all
+        // loops and then all lines: the pieces are toured once, not twice.
+        let islands = inner
+            .iter()
+            .map(|shape| {
+                let shape = vec![shape.clone()];
+                let mut own = simplified(&shape);
+                // Loops given to the interface above stay there.
+                own.retain(|contour| loops.contains(contour));
+                (own, hatch(&shape))
+            })
+            .filter(|(own, lines)| !own.is_empty() || !lines.is_empty())
+            .collect();
+        shared
+            .support
+            .push(Work::Islands(islands, PathKind::Support, width));
         interface_work(
             &polygon::intersection(&inner, dense),
             index,
@@ -5127,13 +5112,15 @@ mod tests {
         };
         let (more, ..) = count(&close);
         assert!(retracted < more, "{retracted} {more}");
-        // Columns keep printing all loops first and then all lines.
+        // Columns of grid supports are printed the same way: each entered
+        // once, its loop first, its lines without leaving it.
         let normal = Settings {
             support_style: SupportStyle::Normal,
             ..tree
         };
-        let (_, _, inside) = count(&normal);
-        assert_eq!(inside, 0);
+        let (retracted, columns, inside) = count(&normal);
+        assert!(inside > retracted, "{inside} {retracted}");
+        assert!(retracted <= columns + columns / 20, "{retracted} {columns}");
     }
 
     /// The T of `supports_stand_under_overhangs`, and the same with a base
