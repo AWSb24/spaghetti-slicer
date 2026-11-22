@@ -94,6 +94,7 @@
     ("gantry_height", "mm"),
     ("arrange_outlines", ""),
     ("arrange_rotation", ""),
+    ("arrange_nonconvex", ""),
     ("outer_wall_speed", "mm/s"),
     ("inner_wall_speed", "mm/s"),
     ("infill_speed", "mm/s"),

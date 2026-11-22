@@ -14,14 +14,14 @@ mod sequential;
 mod support_volumes;
 mod tree;
 
-pub use arrange::{Spot, arrange_outlines, arranges_outlines};
+pub use arrange::{Spot, arrange_footprints, arrange_outlines, arranges_outlines};
 pub use negatives::MAX_NEGATIVES;
 pub use objects::{
     HeightRange, MAX_MODIFIERS, MODIFIER_SETTINGS, Modifier, OBJECT_SETTINGS, RANGE_SETTINGS,
     apply_modifier_orca, apply_modifier_toml, apply_object_orca, apply_object_toml,
     apply_range_orca, apply_range_toml, modifier_settings, object_settings, range_settings,
 };
-pub use plate::{ARRANGE_GAP, Placement, arrange, arrange_objects, footprint};
+pub use plate::{ARRANGE_GAP, Placement, arrange, arrange_objects, footprint, top_view};
 pub use support_volumes::{MAX_SUPPORT_VOLUMES, SupportVolume, SupportVolumeKind};
 pub mod progress;
 

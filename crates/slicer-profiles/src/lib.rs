@@ -486,6 +486,14 @@ pub struct Settings {
     /// desktop app adds the turn to their rotation. Packs by outlines even
     /// without `arrange_outlines`.
     pub arrange_rotation: bool,
+    /// Whether arranging packs the objects by their real outlines seen
+    /// from above, not their convex ones, so that L- and U-shapes reach into
+    /// each other and small objects stand in the hollow of large ones; the
+    /// overlap warning then compares the real outlines as well. Packs by
+    /// outlines even without `arrange_outlines`. With `sequential_print`
+    /// the convex outlines stay, as the print head needs its clearance
+    /// around them.
+    pub arrange_nonconvex: bool,
 
     // Speeds
     /// Speed of the outermost wall.
@@ -656,6 +664,7 @@ impl Default for Settings {
             gantry_height: 20.0,
             arrange_outlines: false,
             arrange_rotation: false,
+            arrange_nonconvex: false,
             outer_wall_speed: 40.0,
             inner_wall_speed: 60.0,
             infill_speed: 80.0,
