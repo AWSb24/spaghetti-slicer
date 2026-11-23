@@ -45,7 +45,7 @@ impl ColorBy {
     ) -> Option<f64> {
         match self {
             ColorBy::LineType => None,
-            ColorBy::Speed => Some(slicer_gcode::path_speed(settings, path.kind, index)),
+            ColorBy::Speed => Some(slicer_gcode::speed_of(settings, path, index)),
             ColorBy::LayerHeight => Some(layer.height),
             ColorBy::Width => Some(path.width.unwrap_or(settings.line_width)),
         }

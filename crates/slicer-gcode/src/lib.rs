@@ -14,7 +14,7 @@ use std::fmt::{self, Write};
 use serde::Serialize;
 use slicer_core::Point;
 use slicer_core::polygon::{convex_hull, distance};
-use slicer_fdm::{Layer, NO_OBJECT, PathKind, Progress, Step, Toolpaths};
+use slicer_fdm::{Layer, NO_OBJECT, Path, PathKind, Progress, Step, Toolpaths};
 use slicer_profiles::{ExtrusionMode, Flavor, Settings};
 
 /// Summary of a generated print.
@@ -1449,7 +1449,7 @@ fn write_layer(
             let _ = writeln!(w.out, ";TYPE:{}", label(path.kind));
         }
         // `slow` stretches the speeds of all paths alike.
-        let speed = slowed(path_speed(own, path.kind, index), slow, settings);
+        let speed = slowed(speed_of(own, path, index), slow, settings);
         if let Some(from) = rise_from {
             // Z climbs in proportion to the length gone round.
             let mut corners: Vec<Point> = path.points.clone();
@@ -1712,6 +1712,23 @@ pub fn path_speed(settings: &Settings, kind: PathKind, layer: usize) -> f64 {
     }
 }
 
+/// Speed in mm/s at which `path` is printed on layer `layer` (counted
+/// from 0): that of its kind ([`path_speed`]), for a small wall loop no
+/// faster than `small_perimeter_speed`.
+pub fn speed_of(settings: &Settings, path: &Path, layer: usize) -> f64 {
+    let speed = path_speed(settings, path.kind, layer);
+    let wall = matches!(path.kind, PathKind::OuterWall | PathKind::InnerWall);
+    let small = settings.small_perimeter_speed > 0.0
+        && wall
+        && path.closed
+        && path.length() <= 2.0 * PI * settings.small_perimeter_threshold;
+    if small {
+        speed.min(settings.small_perimeter_speed)
+    } else {
+        speed
+    }
+}
+
 /// Like [`write_gcode`], and reports how far it has got in `progress`,
 /// which is finished at the end.
 pub fn write_gcode_with_progress(
@@ -1937,6 +1954,39 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::field_reassign_with_default)]
     use super::*;
     use slicer_core::Mesh;
+
+    #[test]
+    fn small_wall_loops_print_slower() {
+        let square = |side: f64, kind: PathKind, closed: bool| Path {
+            kind,
+            points: vec![[0.0, 0.0], [side, 0.0], [side, side], [0.0, side]],
+            closed,
+            travel_inside: false,
+            extruder: 0,
+            object: NO_OBJECT,
+            width: None,
+            travel: Vec::new(),
+        };
+        let mut settings = Settings::default();
+        let small = square(5.0, PathKind::OuterWall, true);
+        // Off by default.
+        assert_eq!(speed_of(&settings, &small, 3), settings.outer_wall_speed);
+        settings.small_perimeter_speed = 15.0;
+        // 20 mm round, within a circle of 5 mm radius (31.4 mm).
+        assert_eq!(speed_of(&settings, &small, 3), 15.0);
+        let inner = square(5.0, PathKind::InnerWall, true);
+        assert_eq!(speed_of(&settings, &inner, 3), 15.0);
+        // 40 mm round is not small; open lines and infill are no loops.
+        let large = square(10.0, PathKind::OuterWall, true);
+        assert_eq!(speed_of(&settings, &large, 3), settings.outer_wall_speed);
+        let open = square(5.0, PathKind::OuterWall, false);
+        assert_eq!(speed_of(&settings, &open, 3), settings.outer_wall_speed);
+        let infill = square(5.0, PathKind::SolidInfill, true);
+        assert_eq!(speed_of(&settings, &infill, 3), settings.infill_speed);
+        // Never faster than the wall's own speed.
+        settings.small_perimeter_speed = 500.0;
+        assert_eq!(speed_of(&settings, &small, 3), settings.outer_wall_speed);
+    }
 
     #[test]
     fn top_surfaces_and_gap_infill_have_speeds_of_their_own() {

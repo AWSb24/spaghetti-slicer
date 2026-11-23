@@ -110,6 +110,8 @@
     ("bridge_speed", "mm/s"),
     ("top_surface_speed", "mm/s"),
     ("gap_infill_speed", "mm/s"),
+    ("small_perimeter_speed", "mm/s"),
+    ("small_perimeter_threshold", "mm"),
     ("overhang_speed", "mm/s"),
     ("overhang_speed_full", "mm/s"),
     ("ironing_speed", "mm/s"),

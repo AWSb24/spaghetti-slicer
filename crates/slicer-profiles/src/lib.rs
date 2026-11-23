@@ -547,6 +547,14 @@ pub struct Settings {
     /// Speed of gap infill: lines in gaps too narrow for another wall. 0
     /// prints them at `inner_wall_speed`.
     pub gap_infill_speed: f64,
+    /// Speed of small wall loops, around holes, pins and fine details, so
+    /// that they keep their shape; walls print no faster than this where
+    /// their loop is no longer than a circle of `small_perimeter_threshold`
+    /// radius. 0 turns it off.
+    pub small_perimeter_speed: f64,
+    /// Radius in millimetres of the largest circle whose wall loop counts as
+    /// small (see `small_perimeter_speed`).
+    pub small_perimeter_threshold: f64,
     /// Speed of walls where more than half the line hangs over the edge of
     /// the layer below; these parts of walls are printed as overhang walls
     /// with `overhang_fan_speed`. 0 turns it off: walls keep their speed.
@@ -781,6 +789,8 @@ impl Default for Settings {
             bridge_speed: 30.0,
             top_surface_speed: 0.0,
             gap_infill_speed: 0.0,
+            small_perimeter_speed: 0.0,
+            small_perimeter_threshold: 5.0,
             overhang_speed: 0.0,
             overhang_speed_full: 0.0,
             ironing_speed: 20.0,
@@ -1448,6 +1458,18 @@ impl Settings {
             ("bridge_speed", self.bridge_speed, 1.0, 1000.0),
             ("top_surface_speed", self.top_surface_speed, 0.0, 1000.0),
             ("gap_infill_speed", self.gap_infill_speed, 0.0, 1000.0),
+            (
+                "small_perimeter_speed",
+                self.small_perimeter_speed,
+                0.0,
+                1000.0,
+            ),
+            (
+                "small_perimeter_threshold",
+                self.small_perimeter_threshold,
+                0.0,
+                100.0,
+            ),
             ("bridge_flow", self.bridge_flow, 0.5, 2.0),
             ("bridge_fan_speed", self.bridge_fan_speed, 0.0, 100.0),
             ("fan_layer_time", self.fan_layer_time, 0.0, 600.0),
