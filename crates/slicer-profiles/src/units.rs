@@ -108,6 +108,8 @@
     ("inner_wall_speed", "mm/s"),
     ("infill_speed", "mm/s"),
     ("bridge_speed", "mm/s"),
+    ("top_surface_speed", "mm/s"),
+    ("gap_infill_speed", "mm/s"),
     ("overhang_speed", "mm/s"),
     ("overhang_speed_full", "mm/s"),
     ("ironing_speed", "mm/s"),

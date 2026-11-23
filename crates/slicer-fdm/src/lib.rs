@@ -143,8 +143,11 @@ pub enum PathKind {
     /// Lines in gaps between walls, or between the walls and the infill,
     /// too narrow for another wall.
     GapFill,
-    /// Dense fill of top and bottom surfaces.
+    /// Dense fill inside the part and of bottom surfaces.
     SolidInfill,
+    /// Solid infill with nothing above it: the visible top surface (see
+    /// `Settings::top_surface_speed`).
+    TopSurface,
     /// Solid infill with nothing below it, spanning from side to side.
     Bridge,
     /// Low-density fill of the interior.
@@ -2103,6 +2106,7 @@ fn travels_inside(layer: &Layer, slice: &Shapes, support: Option<&Shapes>) -> Ve
             PathKind::InnerWall
                 | PathKind::GapFill
                 | PathKind::SolidInfill
+                | PathKind::TopSurface
                 | PathKind::Bridge
                 | PathKind::SparseInfill
         );
@@ -2735,12 +2739,17 @@ fn region_work(
     };
     // The bottom surface on the bed and the top surfaces may have a pattern
     // of their own.
-    let (pattern, above) = match index {
-        0 => (settings.bottom_surface_pattern, None),
-        _ => (settings.top_surface_pattern, model.get(index + 1)),
+    // Top surfaces are a line type of their own.
+    let (pattern, above, kind) = match index {
+        0 => (settings.bottom_surface_pattern, None, PathKind::SolidInfill),
+        _ => (
+            settings.top_surface_pattern,
+            model.get(index + 1),
+            PathKind::TopSurface,
+        ),
     };
     let angle = settings.infill_angle + turn;
-    let (solid, surface) = infill::surface(solid, above, pattern, angle, width);
+    let (solid, surface) = infill::surface(solid, above, pattern, angle, width, kind);
     let solid_lines = polygon::hatch(&solid, width, direction, min_length);
     // Joined by straight links; following the boundary instead (as sparse
     // rectilinear infill does) saves a few travels but adds many points.
@@ -3925,7 +3934,8 @@ mod tests {
         let toolpaths = generate(&base, &settings).unwrap();
         // Layer 24 is the last base layer (z = 5.0), layer 15 is deep inside.
         let top_of_base = &toolpaths.layers[24];
-        let solid = extruded_length(top_of_base, PathKind::SolidInfill);
+        let solid = extruded_length(top_of_base, PathKind::SolidInfill)
+            + extruded_length(top_of_base, PathKind::TopSurface);
         let sparse = extruded_length(top_of_base, PathKind::SparseInfill);
         assert!(solid > 1000.0, "{solid}");
         assert!(sparse > 1.0, "{sparse}");
@@ -4509,7 +4519,7 @@ mod tests {
         let top: Vec<Path> = toolpaths.layers[19]
             .paths
             .iter()
-            .filter(|p| p.kind == PathKind::SolidInfill)
+            .filter(|p| p.kind == PathKind::TopSurface)
             .cloned()
             .collect();
         let walls = f64::from(settings.wall_loops);
@@ -4606,7 +4616,7 @@ mod tests {
             toolpaths.layers[index]
                 .paths
                 .iter()
-                .filter(|p| p.kind == PathKind::SolidInfill && p.closed)
+                .filter(|p| p.kind == PathKind::TopSurface && p.closed)
                 .count()
         };
         // Layer 19 is the top of the step.
@@ -5648,6 +5658,32 @@ mod tests {
         let mut mesh = Mesh::cuboid(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
         mesh.translate(lo);
         mesh
+    }
+
+    #[test]
+    fn top_surfaces_are_a_line_type_of_their_own() {
+        // A plate 2 mm thick with a column on it, up to 6 mm.
+        let mut mesh = block([0.0, 0.0, 0.0], [20.0, 20.0, 2.0]);
+        mesh.merge(&block([5.0, 5.0, 2.0], [15.0, 15.0, 6.0]));
+        let toolpaths = generate(&mesh, &Settings::default()).unwrap();
+        let layers = &toolpaths.layers;
+        let top = |index: usize| extruded_length(&layers[index], PathKind::TopSurface);
+        let solid = |index: usize| extruded_length(&layers[index], PathKind::SolidInfill);
+        // The plate's last layer: its top beside the column is surface,
+        // the layer below it solid infill.
+        let plate = layers.iter().rposition(|l| l.z < 2.0 + 1e-6).unwrap();
+        assert!(top(plate) > 0.0 && solid(plate) == 0.0);
+        assert!(top(plate - 1) == 0.0 && solid(plate - 1) > 0.0);
+        // The column's last layer is all surface, the layers below it and
+        // the plate's first layer have none.
+        let last = layers.len() - 1;
+        assert!(top(last) > 0.0 && solid(last) == 0.0);
+        assert!(top(last - 1) == 0.0 && solid(last - 1) > 0.0);
+        assert!(top(0) == 0.0 && solid(0) > 0.0);
+        // As much material as before: the surface only changes the type.
+        let all = |index: usize| top(index) + solid(index);
+        let column = 10.0 * 10.0 - 4.0 * 10.0;
+        assert!(all(last) > 0.5 * column / 0.4, "{}", all(last));
     }
 
     #[test]

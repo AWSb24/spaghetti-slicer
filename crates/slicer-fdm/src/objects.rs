@@ -34,6 +34,8 @@ pub const OBJECT_SETTINGS: &[&str] = &[
     "inner_wall_speed",
     "infill_speed",
     "bridge_speed",
+    "top_surface_speed",
+    "gap_infill_speed",
     "overhang_speed",
     "overhang_speed_full",
     "ironing_speed",
@@ -80,6 +82,8 @@ pub const RANGE_SETTINGS: &[&str] = &[
     "inner_wall_speed",
     "infill_speed",
     "bridge_speed",
+    "top_surface_speed",
+    "gap_infill_speed",
     "overhang_speed",
     "overhang_speed_full",
     "ironing_speed",
@@ -435,6 +439,8 @@ fn with_writer_values(settings: &Settings, values: &Settings) -> Settings {
         inner_wall_speed: values.inner_wall_speed,
         infill_speed: values.infill_speed,
         bridge_speed: values.bridge_speed,
+        top_surface_speed: values.top_surface_speed,
+        gap_infill_speed: values.gap_infill_speed,
         overhang_speed: values.overhang_speed,
         overhang_speed_full: values.overhang_speed_full,
         ironing_speed: values.ironing_speed,
@@ -1235,6 +1241,8 @@ mod tests {
             supports: true,
             outer_wall_speed: 21.0,
             inner_wall_speed: 22.0,
+            top_surface_speed: 26.0,
+            gap_infill_speed: 27.0,
             infill_speed: 23.0,
             bridge_speed: 24.0,
             overhang_speed: 25.0,
@@ -1436,7 +1444,7 @@ mod tests {
         );
         // The top stays solid.
         let top = toolpaths.layers.last().unwrap();
-        assert_eq!(kinds(top, true), [OuterWall, InnerWall, SolidInfill]);
+        assert_eq!(kinds(top, true), [OuterWall, InnerWall, TopSurface]);
     }
 
     #[test]
@@ -1611,7 +1619,10 @@ mod tests {
         assert_eq!(layers[..50], plain.layers[..50]);
         // The top shell keeps its thickness: five layers of 0.2 mm are ten
         // of 0.1 mm.
-        let solid = |layer: &Layer| kinds(layer, true).contains(&PathKind::SolidInfill);
+        let solid = |layer: &Layer| {
+            let kinds = kinds(layer, true);
+            kinds.contains(&PathKind::SolidInfill) || kinds.contains(&PathKind::TopSurface)
+        };
         let count = layers.len();
         assert!(layers[count - 10..].iter().all(solid));
         assert!(kinds(&layers[count - 11], true).contains(&PathKind::SparseInfill));

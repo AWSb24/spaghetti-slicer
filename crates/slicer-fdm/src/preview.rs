@@ -15,6 +15,7 @@ pub fn color(kind: PathKind) -> &'static str {
         PathKind::InnerWall => "#f2b01e",
         PathKind::GapFill => "#e63946",
         PathKind::SolidInfill => "#7b2cbf",
+        PathKind::TopSurface => "#c0392b",
         PathKind::Bridge => "#4c8dff",
         PathKind::SparseInfill => "#2a9d8f",
         PathKind::PrimeTower => "#9d8df1",

@@ -199,6 +199,8 @@ const MAPPING: &[(&str, &str, Kind)] = &[
     ("inner_wall_speed", "inner_wall_speed", Kind::Number),
     ("sparse_infill_speed", "infill_speed", Kind::Number),
     ("bridge_speed", "bridge_speed", Kind::Number),
+    ("top_surface_speed", "top_surface_speed", Kind::Number),
+    ("gap_infill_speed", "gap_infill_speed", Kind::Number),
     ("support_speed", "support_speed", Kind::Number),
     (
         "support_interface_speed",

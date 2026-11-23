@@ -223,6 +223,7 @@ fn label(kind: PathKind) -> &'static str {
         PathKind::InnerWall => "Inner wall",
         PathKind::GapFill => "Gap infill",
         PathKind::SolidInfill => "Solid infill",
+        PathKind::TopSurface => "Top surface",
         PathKind::Bridge => "Bridge",
         PathKind::SparseInfill => "Sparse infill",
         PathKind::PrimeTower => "Prime tower",
@@ -1690,7 +1691,9 @@ pub fn path_speed(settings: &Settings, kind: PathKind, layer: usize) -> f64 {
             settings.overhang_speed_full
         }
         PathKind::OverhangWallFull => settings.overhang_speed,
+        PathKind::GapFill if settings.gap_infill_speed > 0.0 => settings.gap_infill_speed,
         PathKind::InnerWall | PathKind::GapFill => settings.inner_wall_speed,
+        PathKind::TopSurface if settings.top_surface_speed > 0.0 => settings.top_surface_speed,
         PathKind::SupportInterface if settings.support_interface_speed > 0.0 => {
             settings.support_interface_speed
         }
@@ -1698,6 +1701,7 @@ pub fn path_speed(settings: &Settings, kind: PathKind, layer: usize) -> f64 {
             settings.support_speed
         }
         PathKind::SolidInfill
+        | PathKind::TopSurface
         | PathKind::SparseInfill
         | PathKind::Support
         | PathKind::SupportInterface
@@ -1933,6 +1937,24 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::field_reassign_with_default)]
     use super::*;
     use slicer_core::Mesh;
+
+    #[test]
+    fn top_surfaces_and_gap_infill_have_speeds_of_their_own() {
+        let mut settings = Settings::default();
+        // Unset, they keep the speeds of solid infill and inner walls.
+        let top = |s: &Settings| path_speed(s, PathKind::TopSurface, 3);
+        let gap = |s: &Settings| path_speed(s, PathKind::GapFill, 3);
+        assert_eq!(top(&settings), settings.infill_speed);
+        assert_eq!(gap(&settings), settings.inner_wall_speed);
+        settings.top_surface_speed = 35.0;
+        settings.gap_infill_speed = 25.0;
+        assert_eq!(top(&settings), 35.0);
+        assert_eq!(gap(&settings), 25.0);
+        // The first layer keeps its own speed.
+        let first = path_speed(&settings, PathKind::TopSurface, 0);
+        assert_eq!(first, settings.first_layer_speed);
+        assert_eq!(label(PathKind::TopSurface), "Top surface");
+    }
 
     fn slice(mesh: &Mesh, settings: &Settings) -> Output {
         write_gcode(&slicer_fdm::generate(mesh, settings).unwrap(), settings).unwrap()

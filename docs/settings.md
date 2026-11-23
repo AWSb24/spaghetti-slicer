@@ -109,6 +109,8 @@ Numbers are in the unit of the Unit column (empty for counts and factors). A set
 | `inner_wall_speed` | 60 | mm/s | 1 to 1000 | Speed of inner walls. |
 | `infill_speed` | 80 | mm/s | 1 to 1000 | Speed of solid and sparse infill. |
 | `bridge_speed` | 30 | mm/s | 1 to 1000 | Speed of bridges: solid infill with nothing below it. |
+| `top_surface_speed` | 0 | mm/s | 0 to 1000 | Speed of top surfaces: the solid infill with nothing above it, which stays visible ("Top surface" in the G-code). 0 prints them at `infill_speed`. |
+| `gap_infill_speed` | 0 | mm/s | 0 to 1000 | Speed of gap infill: lines in gaps too narrow for another wall. 0 prints them at `inner_wall_speed`. |
 | `overhang_speed` | 0 | mm/s | 0 to 1000 | Speed of walls where more than half the line hangs over the edge of the layer below; these parts of walls are printed as overhang walls with `overhang_fan_speed`. 0 turns it off: walls keep their speed. |
 | `overhang_speed_full` | 0 | mm/s | 0 to 1000 | Speed of walls that hang free entirely, the middle of the line more than half a line width beyond the edge of the layer below; only with `overhang_speed`. 0 turns it off: they print at `overhang_speed`. |
 | `ironing_speed` | 20 | mm/s | 1 to 1000 | Speed of ironing. |

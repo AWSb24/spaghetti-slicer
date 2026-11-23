@@ -629,20 +629,23 @@ pub(crate) fn monotonic(
 }
 
 /// Splits the solid infill of a layer into the surface that gets `pattern`
-/// and the rest, which keeps straight lines: the part with nothing `above`
-/// it, or all of it without anything above (the last layer, and the first
-/// one for its bottom surface). Returns the rest and the work for the
-/// surface. Strips of surface narrower than a line, along sloped sides,
-/// stay with the rest. The lines of the monotonic pattern run along
-/// `angle` degrees like those of the rest.
+/// and is printed as `kind`, and the rest, which keeps straight lines: the
+/// part with nothing `above` it, or all of it without anything above (the
+/// last layer, and the first one for its bottom surface). Returns the rest
+/// and the work for the surface. Strips of surface narrower than a line,
+/// along sloped sides, stay with the rest. The lines of the monotonic and
+/// rectilinear patterns run along `angle` degrees like those of the rest.
+/// A rectilinear surface of solid infill is not split off at all.
 pub(crate) fn surface(
     solid: Shapes,
     above: Option<&Shapes>,
     pattern: SurfacePattern,
     angle: f64,
     width: f64,
+    kind: PathKind,
 ) -> (Shapes, Vec<Work>) {
-    if pattern == SurfacePattern::Rectilinear || solid.is_empty() {
+    let plain = pattern == SurfacePattern::Rectilinear && kind == PathKind::SolidInfill;
+    if plain || solid.is_empty() {
         return (solid, Vec::new());
     }
     let (surface, rest) = match above {
@@ -652,7 +655,9 @@ pub(crate) fn surface(
             let top = polygon::offset(&polygon::offset(&top, -0.5 * width), 0.5 * width);
             // Loops run along the edge of the surface and cover half a
             // line beyond it, where the line ends of the rest reach too.
-            let reach = if pattern == SurfacePattern::Concentric {
+            // Joined straight lines run along it as well, where they link
+            // one line to the next; so do those of the rest.
+            let reach = if pattern != SurfacePattern::Monotonic {
                 polygon::offset(&top, width)
             } else {
                 top.clone()
@@ -660,8 +665,12 @@ pub(crate) fn surface(
             (top, polygon::difference(&solid, &reach))
         }
     };
-    let kind = PathKind::SolidInfill;
     let work = match pattern {
+        SurfacePattern::Rectilinear => {
+            let direction = HatchDirection::degrees(angle);
+            let lines = polygon::hatch(&surface, width, direction, 0.5 * width);
+            vec![Work::Lines(lines, kind, 2.0 * width)]
+        }
         SurfacePattern::Concentric => {
             let (loops, gaps) = concentric(&surface, width, width, true);
             vec![
@@ -669,7 +678,7 @@ pub(crate) fn surface(
                 Work::Centred(gaps, kind),
             ]
         }
-        _ => vec![Work::Ordered(
+        SurfacePattern::Monotonic => vec![Work::Ordered(
             monotonic(&surface, width, angle, 0.5 * width),
             kind,
         )],

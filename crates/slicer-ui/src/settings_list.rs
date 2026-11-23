@@ -81,6 +81,8 @@ pub const PROCESS_TABS: [ProcessTab; 5] = [
                     "inner_wall_speed",
                     "infill_speed",
                     "bridge_speed",
+                    "top_surface_speed",
+                    "gap_infill_speed",
                     "support_speed",
                     "support_interface_speed",
                 ],

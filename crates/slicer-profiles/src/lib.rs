@@ -540,6 +540,13 @@ pub struct Settings {
     pub infill_speed: f64,
     /// Speed of bridges: solid infill with nothing below it.
     pub bridge_speed: f64,
+    /// Speed of top surfaces: the solid infill with nothing above it, which
+    /// stays visible ("Top surface" in the G-code). 0 prints them at
+    /// `infill_speed`.
+    pub top_surface_speed: f64,
+    /// Speed of gap infill: lines in gaps too narrow for another wall. 0
+    /// prints them at `inner_wall_speed`.
+    pub gap_infill_speed: f64,
     /// Speed of walls where more than half the line hangs over the edge of
     /// the layer below; these parts of walls are printed as overhang walls
     /// with `overhang_fan_speed`. 0 turns it off: walls keep their speed.
@@ -772,6 +779,8 @@ impl Default for Settings {
             inner_wall_speed: 60.0,
             infill_speed: 80.0,
             bridge_speed: 30.0,
+            top_surface_speed: 0.0,
+            gap_infill_speed: 0.0,
             overhang_speed: 0.0,
             overhang_speed_full: 0.0,
             ironing_speed: 20.0,
@@ -1437,6 +1446,8 @@ impl Settings {
             ("inner_wall_speed", self.inner_wall_speed, 1.0, 1000.0),
             ("infill_speed", self.infill_speed, 1.0, 1000.0),
             ("bridge_speed", self.bridge_speed, 1.0, 1000.0),
+            ("top_surface_speed", self.top_surface_speed, 0.0, 1000.0),
+            ("gap_infill_speed", self.gap_infill_speed, 0.0, 1000.0),
             ("bridge_flow", self.bridge_flow, 0.5, 2.0),
             ("bridge_fan_speed", self.bridge_fan_speed, 0.0, 100.0),
             ("fan_layer_time", self.fan_layer_time, 0.0, 600.0),
