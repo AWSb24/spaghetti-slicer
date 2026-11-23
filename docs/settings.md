@@ -45,6 +45,7 @@ Numbers are in the unit of the Unit column (empty for counts and factors). A set
 | `adaptive_layer_quality` | 100 | % | 0 to 100 | How closely adaptive layers follow a sloped surface, in percent: 100 keeps the steps on a slope no higher than on a flat surface printed at `min_layer_height`; 0 allows steps as high as `max_layer_height`, so that layers only get thinner to end on flat surfaces. In between, the allowed step height lies in proportion between the two. |
 | `layer_height_max_change` | 0 | % | 0 to 100 | Largest change of the layer height from one layer to the next with adaptive layers or layer heights of height ranges, in percent of the thinner of the two: at 20 a layer is at most 1.2 times as thick or as thin as the one below, so that a change from thick to thin layers is spread over several layers, which get thinner before thin ones are needed, never thicker than asked for. 0 sets no limit. The first layer keeps its own height and is not included. |
 | `line_width` | 0.45 | mm | 0.24 to 1 * | Width of one extruded line. |
+| `first_layer_line_width` | 0 | mm | 0 to 1 * | Width of the lines of the first layer, usually a little wider than `line_width` so that it sticks better; on a raft the width of its lowest layer. 0 prints the first layer at `line_width`. |
 | `wall_loops` | 2 |  | 1 to 50 | Number of wall loops. |
 | `wall_order` | inner_outer |  | `inner_outer`, `outer_inner` | Order in which the walls of a layer are printed. |
 | `seam_position` | rear |  | `rear`, `corner`, `nearest` | Where the walls of a layer start and end. |

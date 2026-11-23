@@ -296,6 +296,10 @@ pub struct Settings {
     pub layer_height_max_change: f64,
     /// Width of one extruded line.
     pub line_width: f64,
+    /// Width of the lines of the first layer, usually a little wider than
+    /// `line_width` so that it sticks better; on a raft the width of its
+    /// lowest layer. 0 prints the first layer at `line_width`.
+    pub first_layer_line_width: f64,
     /// Number of wall loops.
     pub wall_loops: u32,
     /// Order in which the walls of a layer are printed.
@@ -723,6 +727,7 @@ impl Default for Settings {
             adaptive_layer_quality: 100.0,
             layer_height_max_change: 0.0,
             line_width: 0.45,
+            first_layer_line_width: 0.0,
             wall_loops: 2,
             wall_order: WallOrder::InnerOuter,
             seam_position: SeamPosition::Rear,
@@ -1370,6 +1375,12 @@ impl Settings {
                 "line_width",
                 self.line_width,
                 (0.6 * self.nozzle_diameter).max(1.05 * thickest),
+                2.5 * self.nozzle_diameter,
+            ),
+            (
+                "first_layer_line_width",
+                self.first_layer_line_width,
+                0.0,
                 2.5 * self.nozzle_diameter,
             ),
             ("wall_loops", f64::from(self.wall_loops), 1.0, 50.0),

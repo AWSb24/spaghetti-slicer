@@ -29,6 +29,7 @@ pub mod progress;
 
 pub use progress::{Progress, Step};
 
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1098,12 +1099,17 @@ pub fn generate_plate_with_own_settings(
     // What every extruder prints on a layer, in ascending order of the
     // extruders; skirt and brim go first with the lowest one, supports and
     // their interface with theirs.
+    // The first layer may print wider lines (`first_layer_line_width`); on
+    // a raft the raft's lowest layer does instead.
+    let first_width = (settings.first_layer_line_width > 0.0 && settings.raft_layers == 0)
+        .then_some(settings.first_layer_line_width);
     let geometry = parallel_map(slices.len(), |index| {
         if stopped() {
             return (Vec::new(), false);
         }
         progress.advance();
-        let shared = shared_work(&slices, &supports, index, settings, interface_loops);
+        let layer_plate = widened(settings, index, first_width);
+        let shared = shared_work(&slices, &supports, index, &layer_plate, interface_loops);
         let mut groups = vec![(extruder, shared.adhesion)];
         if support_tool == extruder && interface_tool == extruder {
             groups[0].1.extend(shared.support);
@@ -1122,7 +1128,7 @@ pub fn generate_plate_with_own_settings(
         let z = cut_heights[index];
         if regions.is_empty() {
             let lines = lightning_lines(0, index);
-            let layer_settings = single.at(z);
+            let layer_settings = &widened(single.at(z), index, first_width);
             let inside = objects::modifiers_at(&modifiers, 0, index, z, layer_settings);
             let (work, thin) = region_work(
                 &slices,
@@ -1145,7 +1151,7 @@ pub fn generate_plate_with_own_settings(
                 continue;
             }
             let lines = lightning_lines(r, index);
-            let layer_settings = group.at(z);
+            let layer_settings = &widened(group.at(z), index, first_width);
             let inside = objects::modifiers_at(&modifiers, *number, index, z, layer_settings);
             let (work, region_thin) = region_work(
                 region,
@@ -1355,6 +1361,17 @@ pub fn generate_plate_with_own_settings(
             if let Some(Some(route)) = routes.get(index) {
                 path.travel.clone_from(route);
                 path.travel_inside = true;
+            }
+        }
+    }
+    // The writer extrudes the wider lines of the first layer by their width.
+    // The prime tower keeps its lines.
+    // ponytail: sparse infill of modifiers on the first layer (only without
+    // bottom layers) is spaced for `line_width` and printed wider.
+    if let (Some(width), Some(first)) = (first_width, layers.first_mut()) {
+        for path in &mut first.paths {
+            if path.kind != PathKind::PrimeTower && path.width.is_none() {
+                path.width = Some(width);
             }
         }
     }
@@ -2967,6 +2984,18 @@ fn printed_slice<'a>(
     }
 }
 
+/// `settings` with `width` as the line width on the first layer (`index`
+/// 0), unchanged on the others or without `width`.
+fn widened(settings: &Settings, index: usize, width: Option<f64>) -> Cow<'_, Settings> {
+    match width {
+        Some(width) if index == 0 => Cow::Owned(Settings {
+            line_width: width,
+            ..settings.clone()
+        }),
+        _ => Cow::Borrowed(settings),
+    }
+}
+
 /// `slices` with their outer outlines moved by `xy_contour_compensation`
 /// and their holes grown by `xy_hole_compensation`, every layer on its own
 /// core.
@@ -4024,6 +4053,50 @@ mod tests {
             }
         }
         mesh
+    }
+
+    #[test]
+    fn the_first_layer_may_print_wider_lines() {
+        let mesh = Mesh::cuboid(20.0, 20.0, 2.0);
+        let settings = Settings {
+            first_layer_line_width: 0.6,
+            ..Settings::default()
+        };
+        let toolpaths = generate(&mesh, &settings).unwrap();
+        let (first, second) = (&toolpaths.layers[0], &toolpaths.layers[1]);
+        assert!(first.paths.iter().all(|p| p.width == Some(0.6)));
+        assert!(second.paths.iter().all(|p| p.width.is_none()));
+        // The outer wall keeps its outside on the outline: its middle lies
+        // half the wider line inside.
+        let lowest_x = |layer: &Layer| {
+            layer
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::OuterWall)
+                .flat_map(|p| p.points.iter())
+                .map(|p| p[0])
+                .fold(f64::INFINITY, f64::min)
+        };
+        let edge = lowest_x(second) - 0.5 * settings.line_width;
+        assert!((lowest_x(first) - 0.3 - edge).abs() < 0.01);
+        // Fewer, wider lines of infill cover the same area.
+        let plain = generate(&mesh, &Settings::default()).unwrap();
+        let length = |layer: &Layer| extruded_length(layer, PathKind::SolidInfill);
+        let ratio = length(first) / length(&plain.layers[0]);
+        assert!((ratio - 0.45 / 0.6).abs() < 0.05, "{ratio}");
+        // On a raft its lowest layer is the wider one.
+        let rafted = Settings {
+            raft_layers: 2,
+            ..settings.clone()
+        };
+        let toolpaths = generate(&mesh, &rafted).unwrap();
+        assert!(
+            toolpaths.layers[0]
+                .paths
+                .iter()
+                .all(|p| p.width == Some(0.6))
+        );
+        assert!(toolpaths.layers[2].paths.iter().all(|p| p.width.is_none()));
     }
 
     #[test]

@@ -42,7 +42,7 @@ pub(crate) fn build(first: &[&Shapes], settings: &Settings, extruder: u32) -> Op
     if count == 0 {
         return None;
     }
-    let width = settings.line_width;
+    let normal = settings.line_width;
     let all = first
         .iter()
         .fold(Shapes::new(), |all, shapes| polygon::union(&all, shapes));
@@ -60,7 +60,6 @@ pub(crate) fn build(first: &[&Shapes], settings: &Settings, extruder: u32) -> Op
     if footprint.is_empty() {
         return None;
     }
-    let inner = polygon::offset(&footprint, -0.5 * width);
     let solid = (settings.support_interface_layers as usize).clamp(1, count);
     let mut layers = Vec::with_capacity(count);
     let mut z = 0.0;
@@ -72,10 +71,20 @@ pub(crate) fn build(first: &[&Shapes], settings: &Settings, extruder: u32) -> Op
             settings.layer_height
         };
         z += height;
+        // The lowest layer may print wider lines, as the first layer of
+        // the model would without a raft.
+        let wide = index == 0 && settings.first_layer_line_width > 0.0;
+        let width = if wide {
+            settings.first_layer_line_width
+        } else {
+            normal
+        };
+        let inner = polygon::offset(&footprint, -0.5 * width);
         let mut work = Vec::new();
         if index == 0 {
             let skirt_only = Settings {
                 brim_width: 0.0,
+                line_width: width,
                 ..settings.clone()
             };
             adhesion_work(&footprint, None, &skirt_only, &mut work);
@@ -111,6 +120,9 @@ pub(crate) fn build(first: &[&Shapes], settings: &Settings, extruder: u32) -> Op
         let mut from: Option<Point> = None;
         for path in &mut paths {
             path.extruder = extruder;
+            if wide {
+                path.width = Some(width);
+            }
             path.travel_inside = match (from, path.points.first()) {
                 (Some(from), Some(&to)) if path.kind != PathKind::Skirt => {
                     polygon::segment_inside(&footprint, from, to)

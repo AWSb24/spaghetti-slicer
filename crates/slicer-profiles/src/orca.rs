@@ -93,6 +93,11 @@ const MAPPING: &[(&str, &str, Kind)] = &[
         Kind::Number,
     ),
     ("line_width", "line_width", Kind::Number),
+    (
+        "initial_layer_line_width",
+        "first_layer_line_width",
+        Kind::Number,
+    ),
     ("wall_loops", "wall_loops", Kind::Number),
     ("top_shell_layers", "top_layers", Kind::Number),
     ("bottom_shell_layers", "bottom_layers", Kind::Number),

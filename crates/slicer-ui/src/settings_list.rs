@@ -40,7 +40,7 @@ pub const PROCESS_TABS: [ProcessTab; 5] = [
                     "layer_height_max_change",
                 ],
             ),
-            ("Line width", &["line_width"]),
+            ("Line width", &["line_width", "first_layer_line_width"]),
             ("Seam", &["seam_position"]),
             ("Walls", &["wall_order"]),
         ],

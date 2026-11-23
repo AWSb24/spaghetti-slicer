@@ -44,6 +44,7 @@
     ("adaptive_layer_quality", "%"),
     ("layer_height_max_change", "%"),
     ("line_width", "mm"),
+    ("first_layer_line_width", "mm"),
     ("wall_loops", ""),
     ("wall_order", ""),
     ("seam_position", ""),
