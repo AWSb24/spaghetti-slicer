@@ -355,6 +355,10 @@ pub struct Settings {
     pub infill_connect: bool,
     /// How far infill reaches into the innermost wall, in percent of the line width.
     pub infill_overlap: f64,
+    /// Pieces of sparse infill smaller than this many square millimetres
+    /// get solid infill instead: in narrow corners and small parts sparse
+    /// lines carry nothing and cost travels. 0 turns it off.
+    pub min_sparse_infill_area: f64,
     /// Whether top surfaces are ironed: the hot nozzle passes over them
     /// once more with very little material to smooth them.
     pub ironing: bool,
@@ -369,6 +373,12 @@ pub struct Settings {
     pub skirt_loops: u32,
     /// Distance between skirt and model.
     pub skirt_distance: f64,
+    /// Number of layers the skirt goes up, the same loops on every one.
+    pub skirt_height: u32,
+    /// Whether the skirt goes up the whole height of the print as a wall
+    /// against draughts (a draft shield), around everything the print
+    /// covers on any layer.
+    pub draft_shield: bool,
     /// Width of the brim attached to the first layer; 0 disables it.
     pub brim_width: f64,
     /// Number of layers of a raft under the model and its supports; 0
@@ -749,12 +759,15 @@ impl Default for Settings {
             infill_angle: 45.0,
             infill_connect: true,
             infill_overlap: 15.0,
+            min_sparse_infill_area: 0.0,
             ironing: false,
             ironing_type: IroningType::All,
             ironing_flow: 10.0,
             ironing_spacing: 0.1,
             skirt_loops: 2,
             skirt_distance: 4.0,
+            skirt_height: 1,
+            draft_shield: false,
             brim_width: 0.0,
             raft_layers: 0,
             raft_expansion: 1.5,
@@ -1392,8 +1405,15 @@ impl Settings {
             ("bottom_layers", f64::from(self.bottom_layers), 0.0, 1000.0),
             ("infill_density", self.infill_density, 0.0, 100.0),
             ("infill_overlap", self.infill_overlap, 0.0, 50.0),
+            (
+                "min_sparse_infill_area",
+                self.min_sparse_infill_area,
+                0.0,
+                10000.0,
+            ),
             ("skirt_loops", f64::from(self.skirt_loops), 0.0, 20.0),
             ("skirt_distance", self.skirt_distance, 0.0, 50.0),
+            ("skirt_height", f64::from(self.skirt_height), 1.0, 10000.0),
             ("brim_width", self.brim_width, 0.0, 50.0),
             ("raft_layers", f64::from(self.raft_layers), 0.0, 20.0),
             ("raft_expansion", self.raft_expansion, 0.0, 50.0),

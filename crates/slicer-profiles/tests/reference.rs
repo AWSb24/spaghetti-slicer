@@ -94,7 +94,8 @@ fn settings_reference_is_current() {
                 | "arrange_rotation"
                 | "arrange_nonconvex"
                 | "flush_from_colours"
-                | "support_soluble" =>"`true`, `false`".to_string(),
+                | "support_soluble"
+                | "draft_shield" =>"`true`, `false`".to_string(),
                 "thumbnails" => "sizes like `48x48,300x300`, empty for none".to_string(),
                 "filament_colours" => {
                     "colours like `#FF8000,#202020`, one per extruder, empty for none".to_string()

@@ -66,6 +66,7 @@ pub const PROCESS_TABS: [ProcessTab; 5] = [
                     "infill_angle",
                     "infill_connect",
                     "infill_overlap",
+                    "min_sparse_infill_area",
                 ],
             ),
         ],
@@ -119,7 +120,15 @@ pub const PROCESS_TABS: [ProcessTab; 5] = [
     (
         "Others",
         &[
-            ("Skirt", &["skirt_loops", "skirt_distance"]),
+            (
+                "Skirt",
+                &[
+                    "skirt_loops",
+                    "skirt_distance",
+                    "skirt_height",
+                    "draft_shield",
+                ],
+            ),
             ("Brim", &["brim_width"]),
             (
                 "Arrange",

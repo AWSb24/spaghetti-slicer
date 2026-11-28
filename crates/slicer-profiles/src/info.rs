@@ -38,7 +38,7 @@ pub struct SettingInfo {
 
 /// Every unit a setting can have; empty for none.
 pub const UNITS: &[&str] = &[
-    "", "mm", "mm/s", "mm/s²", "mm³", "%", "°C", "°C/s", "°", "s", "g/cm³", "px",
+    "", "mm", "mm²", "mm/s", "mm/s²", "mm³", "%", "°C", "°C/s", "°", "s", "g/cm³", "px",
 ];
 
 /// Every setting in the order of [`Settings`](crate::Settings), generated
@@ -118,6 +118,11 @@ mod tests {
                     Some("°")
                 } else if key.ends_with("_temp") || key.contains("_temp_") {
                     Some("°C")
+                } else if text.starts_with("Number of") {
+                    // `skirt_height` counts layers.
+                    Some("")
+                } else if text.contains("square millimetres") {
+                    Some("mm²")
                 } else if text.contains("in millimetres")
                     || [
                         "_height",
@@ -131,10 +136,7 @@ mod tests {
                     .any(|end| key.ends_with(end))
                 {
                     Some("mm")
-                } else if text.starts_with("Number of")
-                    || text.starts_with("Multiplier")
-                    || text.starts_with("Factor")
-                {
+                } else if text.starts_with("Multiplier") || text.starts_with("Factor") {
                     Some("")
                 } else {
                     None

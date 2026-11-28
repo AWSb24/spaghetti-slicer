@@ -63,12 +63,15 @@ Numbers are in the unit of the Unit column (empty for counts and factors). A set
 | `infill_angle` | 45 | ° | 0 to 180 | Direction of the infill lines in degrees from the X axis; every other layer is turned by 90 degrees. Triangles, the gyroid, honeycomb and cubic keep it on every layer; concentric loops and lightning have no direction. |
 | `infill_connect` | true |  | `true`, `false` | Whether the lines of rectilinear sparse infill are joined into zig-zags along the walls. Saves travel moves and retractions but uses more material (on small areas up to a third more infill). Along solid infill and bridges the lines stay apart. |
 | `infill_overlap` | 15 | % | 0 to 50 | How far infill reaches into the innermost wall, in percent of the line width. |
+| `min_sparse_infill_area` | 0 | mm² | 0 to 10000 | Pieces of sparse infill smaller than this many square millimetres get solid infill instead: in narrow corners and small parts sparse lines carry nothing and cost travels. 0 turns it off. |
 | `ironing` | false |  | `true`, `false` | Whether top surfaces are ironed: the hot nozzle passes over them once more with very little material to smooth them. |
 | `ironing_type` | all |  | `top`, `all` | Which top surfaces are ironed: only the topmost one of every part (`top`) or every one (`all`). |
 | `ironing_flow` | 10 | % | 0 to 100 | Material extruded while ironing, in percent of a normal line. |
 | `ironing_spacing` | 0.1 | mm | 0.01 to 2 | Distance between the lines of ironing. |
 | `skirt_loops` | 2 |  | 0 to 20 | Number of skirt loops around the first layer. |
 | `skirt_distance` | 4 | mm | 0 to 50 | Distance between skirt and model. |
+| `skirt_height` | 1 |  | 1 to 10000 | Number of layers the skirt goes up, the same loops on every one. |
+| `draft_shield` | false |  | `true`, `false` | Whether the skirt goes up the whole height of the print as a wall against draughts (a draft shield), around everything the print covers on any layer. |
 | `brim_width` | 0 | mm | 0 to 50 | Width of the brim attached to the first layer; 0 disables it. |
 | `raft_layers` | 0 |  | 0 to 20 | Number of layers of a raft under the model and its supports; 0 prints the model straight on the bed. A raft replaces the brim, the skirt goes around the raft, and the model starts `raft_contact_distance` above the raft. |
 | `raft_expansion` | 1.5 | mm | 0 to 50 | How far the raft reaches beyond the outline of the first layer of the model and its supports. |

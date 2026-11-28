@@ -128,6 +128,11 @@ const MAPPING: &[(&str, &str, Kind)] = &[
     ("infill_direction", "infill_angle", Kind::Angle),
     ("infill_wall_overlap", "infill_overlap", Kind::Percent),
     (
+        "minimum_sparse_infill_area",
+        "min_sparse_infill_area",
+        Kind::Number,
+    ),
+    (
         "seam_position",
         "seam_position",
         Kind::Choice(&[
@@ -138,6 +143,12 @@ const MAPPING: &[(&str, &str, Kind)] = &[
     ),
     ("skirt_loops", "skirt_loops", Kind::Number),
     ("skirt_distance", "skirt_distance", Kind::Number),
+    ("skirt_height", "skirt_height", Kind::Number),
+    (
+        "draft_shield",
+        "draft_shield",
+        Kind::Choice(&[("disabled", "false"), ("enabled", "true")]),
+    ),
     ("brim_width", "brim_width", Kind::Number),
     ("brim_type", "brim_width", Kind::BrimType),
     (

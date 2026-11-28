@@ -87,7 +87,7 @@ pub(crate) fn build(first: &[&Shapes], settings: &Settings, extruder: u32) -> Op
                 line_width: width,
                 ..settings.clone()
             };
-            adhesion_work(&footprint, None, &skirt_only, &mut work);
+            adhesion_work(&footprint, None, &[], true, &skirt_only, &mut work);
         }
         let top = index + solid >= count;
         let (spacing, kind) = if top {

@@ -1710,7 +1710,8 @@ pub fn path_speed(settings: &Settings, kind: PathKind, layer: usize) -> f64 {
         | PathKind::PrimeTower => settings.infill_speed,
         PathKind::Bridge => settings.bridge_speed,
         PathKind::Ironing => settings.ironing_speed,
-        PathKind::Skirt | PathKind::Brim => settings.first_layer_speed,
+        // Above the first layer: the skirt of `skirt_height` or a draft shield.
+        PathKind::Skirt | PathKind::Brim => settings.outer_wall_speed,
     }
 }
 

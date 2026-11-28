@@ -1105,13 +1105,21 @@ pub fn generate_plate_with_own_settings(
     // a raft the raft's lowest layer does instead.
     let first_width = (settings.first_layer_line_width > 0.0 && settings.raft_layers == 0)
         .then_some(settings.first_layer_line_width);
+    let skirt = Skirt::plan(&slices, &supports, settings);
     let geometry = parallel_map(slices.len(), |index| {
         if stopped() {
             return (Vec::new(), false);
         }
         progress.advance();
         let layer_plate = widened(settings, index, first_width);
-        let shared = shared_work(&slices, &supports, index, &layer_plate, interface_loops);
+        let shared = shared_work(
+            &slices,
+            &supports,
+            index,
+            &layer_plate,
+            interface_loops,
+            &skirt,
+        );
         let mut groups = vec![(extruder, shared.adhesion)];
         if support_tool == extruder && interface_tool == extruder {
             groups[0].1.extend(shared.support);
@@ -2434,6 +2442,7 @@ fn shared_work(
     index: usize,
     settings: &Settings,
     interface_loops: bool,
+    skirt: &Skirt,
 ) -> SharedWork {
     let width = settings.line_width;
     let mut shared = SharedWork {
@@ -2442,10 +2451,15 @@ fn shared_work(
         interface: Vec::new(),
     };
     let support = supports.get(index).filter(|(area, _)| !area.is_empty());
-    if index == 0 {
+    if index < skirt.layers {
+        // Above the first layer the same skirt, without the brim.
+        let first = supports.first().map(|(area, _)| area);
+        let first = first.filter(|area| !area.is_empty());
         adhesion_work(
             &slices[0],
-            support.map(|(area, _)| area),
+            first,
+            &skirt.around,
+            index == 0,
             settings,
             &mut shared.adhesion,
         );
@@ -2749,6 +2763,15 @@ fn region_work(
         modifier_shells(
             slices, heights, index, &fill_area, split, settings, modifiers,
         )
+    };
+    // Small pieces of sparse infill are filled solid.
+    let (solid, sparse) = if settings.min_sparse_infill_area > 0.0 {
+        let (small, sparse): (Shapes, Shapes) = sparse.into_iter().partition(|shape| {
+            polygon::area(std::slice::from_ref(shape)) < settings.min_sparse_infill_area
+        });
+        (polygon::union(&solid, &small), sparse)
+    } else {
+        (solid, sparse)
     };
 
     let turn = if index.is_multiple_of(2) { 0.0 } else { 90.0 };
@@ -3368,10 +3391,48 @@ fn split_bridges(
     )
 }
 
-/// Skirt and brim on the first layer.
+/// How high the skirt goes and what it goes around above the first layer.
+struct Skirt {
+    /// Number of layers with a skirt (`skirt_height`, all with
+    /// `draft_shield`).
+    layers: usize,
+    /// With a draft shield the corners of the convex hull of everything on
+    /// any layer, so that the shield stays outside of what grows wider
+    /// higher up; empty otherwise.
+    around: Vec<Point>,
+}
+
+impl Skirt {
+    fn plan(slices: &[Shapes], supports: &[(Shapes, Shapes)], settings: &Settings) -> Skirt {
+        if !settings.draft_shield || settings.skirt_loops == 0 {
+            return Skirt {
+                layers: settings.skirt_height.max(1) as usize,
+                around: Vec::new(),
+            };
+        }
+        let hulls = parallel_map(slices.len(), |index| {
+            let points: Vec<Point> = outer_contours(&slices[index])
+                .into_iter()
+                .chain(supports.get(index).map_or(Vec::new(), |(a, _)| contours(a)))
+                .flatten()
+                .collect();
+            polygon::convex_hull(&points)
+        });
+        let points: Vec<Point> = hulls.into_iter().flatten().collect();
+        Skirt {
+            layers: slices.len(),
+            around: polygon::convex_hull(&points),
+        }
+    }
+}
+
+/// Skirt and, with `brim`, brim: the skirt around the convex hull of
+/// `slice`, `support` and the points `around`.
 fn adhesion_work(
     slice: &Shapes,
     support: Option<&Shapes>,
+    around: &[Point],
+    brim: bool,
     settings: &Settings,
     work: &mut Vec<Work>,
 ) {
@@ -3393,6 +3454,7 @@ fn adhesion_work(
         .chain(support.into_iter().flatten())
         .flatten()
         .flatten()
+        .chain(around)
         .copied()
         .collect();
     let hull: Shapes = vec![vec![polygon::convex_hull(&points)]];
@@ -3407,6 +3469,9 @@ fn adhesion_work(
             width,
             SeamPosition::Nearest,
         ));
+    }
+    if !brim {
+        return;
     }
     for k in (0..brim_loops).rev() {
         let loops = outer_contours(&polygon::offset(&outlines, (0.5 + k as f64) * width));
@@ -6694,6 +6759,92 @@ mod tests {
             "{repeated} of {}",
             random.len()
         );
+    }
+
+    #[test]
+    fn small_pieces_of_sparse_infill_are_filled_solid() {
+        let mesh = Mesh::cuboid(10.0, 10.0, 4.0);
+        let middle = |settings: &Settings| {
+            let toolpaths = generate(&mesh, settings).unwrap();
+            let layer = &toolpaths.layers[10];
+            (
+                extruded_length(layer, PathKind::SparseInfill),
+                extruded_length(layer, PathKind::SolidInfill),
+            )
+        };
+        let (sparse, solid) = middle(&Settings::default());
+        assert!(sparse > 0.0 && solid == 0.0);
+        // The inside of a 10 mm square is about 72 mm²: larger than 50,
+        // smaller than 100.
+        let limit = |area: f64| Settings {
+            min_sparse_infill_area: area,
+            ..Settings::default()
+        };
+        assert_eq!(middle(&limit(50.0)), (sparse, solid));
+        let (sparse, solid) = middle(&limit(100.0));
+        assert!(sparse == 0.0 && solid > 0.0);
+    }
+
+    #[test]
+    fn the_skirt_may_go_up_or_shield_the_whole_print() {
+        let skirts = |settings: &Settings| -> Vec<Vec<Path>> {
+            let toolpaths = generate(&mushroom(), settings).unwrap();
+            toolpaths
+                .layers
+                .iter()
+                .map(|l| {
+                    l.paths
+                        .iter()
+                        .filter(|p| p.kind == PathKind::Skirt)
+                        .cloned()
+                        .collect()
+                })
+                .collect()
+        };
+        let three = Settings {
+            skirt_height: 3,
+            brim_width: 2.0,
+            ..Settings::default()
+        };
+        let layers = skirts(&three);
+        assert!(layers[..3].iter().all(|s| !s.is_empty()));
+        assert!(layers[3..].iter().all(Vec::is_empty));
+        // The same loops on every layer (each starting where the nozzle
+        // is), the brim on the first only.
+        let reach = |paths: &[Path]| -> [i64; 4] {
+            let points = || paths.iter().flat_map(|p| p.points.iter());
+            let round = |v: f64| (v * 1000.0).round() as i64;
+            [
+                round(points().map(|p| p[0]).fold(f64::MAX, f64::min)),
+                round(points().map(|p| p[0]).fold(f64::MIN, f64::max)),
+                round(points().map(|p| p[1]).fold(f64::MAX, f64::min)),
+                round(points().map(|p| p[1]).fold(f64::MIN, f64::max)),
+            ]
+        };
+        assert_eq!(reach(&layers[0]), reach(&layers[2]));
+        let toolpaths = generate(&mushroom(), &three).unwrap();
+        let brims = |index: usize| {
+            toolpaths.layers[index]
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::Brim)
+                .count()
+        };
+        assert!(brims(0) > 0 && brims(1) == 0);
+        // A draft shield goes all the way up, outside the slab that sticks
+        // out 5 mm beyond the column on both sides.
+        let shield = skirts(&Settings {
+            draft_shield: true,
+            ..Settings::default()
+        });
+        assert!(shield.iter().all(|s| !s.is_empty()));
+        let span = |paths: &[Path]| {
+            let [low, high, ..] = reach(paths);
+            (high - low) as f64 / 1000.0
+        };
+        let plain = skirts(&Settings::default());
+        assert!(span(&shield[0]) > span(&plain[0]) + 9.0);
+        assert_eq!(reach(&shield[0]), reach(&shield[shield.len() - 1]));
     }
 
     #[test]
