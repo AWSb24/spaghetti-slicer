@@ -295,6 +295,9 @@ struct Move {
     tool: usize,
     /// What is extruded; `None` for travel, retraction and Z moves.
     kind: Option<PathKind>,
+    /// Acceleration the G-code set for the move in mm/s², if it set one
+    /// (see [`path_acceleration`]).
+    accel: Option<f64>,
 }
 
 /// How the printer takes corners, for the time estimate.
@@ -320,6 +323,10 @@ struct Machine {
     /// Acceleration of all other moves: `acceleration`, at most
     /// `max_accel_travel`.
     travel: f64,
+    /// The most a move that extrudes and any other move may accelerate
+    /// whatever the G-code asks for: `max_accel_extruding` and
+    /// `max_accel_travel` (both the smaller for Klipper), infinite without.
+    caps: [f64; 2],
     /// Highest speed of the nozzle in mm/s (Klipper's `max_velocity`);
     /// infinite without a limit.
     velocity: f64,
@@ -360,7 +367,12 @@ impl Machine {
             .min(limit(settings.max_accel_extruding));
         let mut travel = settings.acceleration.min(limit(settings.max_accel_travel));
         let mut velocity = f64::INFINITY;
+        let mut caps = [
+            limit(settings.max_accel_extruding),
+            limit(settings.max_accel_travel),
+        ];
         let corners = if klipper {
+            caps = [caps[0].min(caps[1]); 2];
             // Klipper has one acceleration and one speed limit of the
             // nozzle, whatever the direction.
             extruding = extruding.min(travel);
@@ -375,6 +387,7 @@ impl Machine {
         Self {
             extruding,
             travel,
+            caps,
             velocity,
             klipper,
             square_corner: settings.square_corner_velocity,
@@ -507,11 +520,12 @@ impl Machine {
         } else {
             m.speed.min(self.velocity)
         };
-        let mut accel = if m.kind.is_some() {
-            self.extruding
+        let (default, cap) = if m.kind.is_some() {
+            (self.extruding, self.caps[0])
         } else {
-            self.travel
+            (self.travel, self.caps[1])
         };
+        let mut accel = m.accel.map_or(default, |asked| asked.min(cap));
         for (axis, &share) in m.axes.iter().enumerate() {
             let share = share.abs();
             if share <= 0.0 || (axis == 3 && self.klipper && !alone) {
@@ -718,6 +732,8 @@ struct Writer<'a> {
     /// Temperature commands, tool selections and tool change G-code
     /// written between the moves, for the estimate.
     commands: Vec<Command>,
+    /// Acceleration the G-code set last in mm/s², if it set any.
+    accel: Option<f64>,
 }
 
 /// G-code the writer writes between its moves that the estimate reads.
@@ -824,6 +840,21 @@ impl<'a> Writer<'a> {
             land: self.land,
             trail: self.trail.clone(),
             commands: Vec::new(),
+            accel: self.accel,
+        }
+    }
+
+    /// Sets the acceleration to `accel` (mm/s²) where it changes; nothing
+    /// for `None`.
+    fn set_accel(&mut self, accel: Option<f64>) {
+        if let Some(a) = accel
+            && self.accel != accel
+        {
+            let _ = match self.settings.flavor {
+                Flavor::Marlin => writeln!(self.out, "M204 S{a:.0}"),
+                Flavor::Klipper => writeln!(self.out, "SET_VELOCITY_LIMIT ACCEL={a:.0}"),
+            };
+            self.accel = accel;
         }
     }
 
@@ -934,6 +965,7 @@ impl<'a> Writer<'a> {
                 speed,
                 tool: self.tool,
                 kind,
+                accel: self.accel,
             });
         }
     }
@@ -956,6 +988,7 @@ impl<'a> Writer<'a> {
     /// over the part. `inside` says that it does, where a little oozing
     /// does no harm and retraction is skipped.
     fn travel(&mut self, via: &[Point], to: Point, inside: bool) {
+        self.set_accel(travel_acceleration(self.settings));
         if inside {
             for &corner in via {
                 self.go(corner);
@@ -1463,6 +1496,7 @@ fn write_layer(
         }
         // `slow` stretches the speeds of all paths alike.
         let speed = slowed(speed_of(own, path, index), slow, settings);
+        w.set_accel(path_acceleration(settings, path.kind, index));
         if let Some(from) = rise_from {
             // Z climbs in proportion to the length gone round.
             let mut corners: Vec<Point> = path.points.clone();
@@ -1736,6 +1770,62 @@ pub fn path_speed(settings: &Settings, kind: PathKind, layer: usize) -> f64 {
     }
 }
 
+/// Whether the settings ask for accelerations per line type, which are
+/// then written to the G-code.
+fn accelerations_written(settings: &Settings) -> bool {
+    [
+        settings.outer_wall_acceleration,
+        settings.inner_wall_acceleration,
+        settings.top_surface_acceleration,
+        settings.infill_acceleration,
+        settings.bridge_acceleration,
+        settings.travel_acceleration,
+        settings.first_layer_acceleration,
+    ]
+    .iter()
+    .any(|&a| a > 0.0)
+}
+
+/// `value`, or `acceleration` for 0.
+fn or_default(settings: &Settings, value: f64) -> f64 {
+    if value > 0.0 {
+        value
+    } else {
+        settings.acceleration
+    }
+}
+
+/// Acceleration in mm/s² a path of `kind` is printed with on layer `layer`
+/// (counted from 0), if the settings ask for accelerations per line type.
+// ponytail: the plate's accelerations for every object.
+pub fn path_acceleration(settings: &Settings, kind: PathKind, layer: usize) -> Option<f64> {
+    if !accelerations_written(settings) {
+        return None;
+    }
+    if layer == 0 && settings.first_layer_acceleration > 0.0 {
+        return Some(settings.first_layer_acceleration);
+    }
+    let value = match kind {
+        PathKind::OuterWall | PathKind::OverhangWall | PathKind::OverhangWallFull => {
+            settings.outer_wall_acceleration
+        }
+        PathKind::InnerWall | PathKind::GapFill => settings.inner_wall_acceleration,
+        PathKind::TopSurface => settings.top_surface_acceleration,
+        PathKind::SolidInfill | PathKind::SparseInfill | PathKind::BottomSurface => {
+            settings.infill_acceleration
+        }
+        PathKind::Bridge => settings.bridge_acceleration,
+        _ => 0.0,
+    };
+    Some(or_default(settings, value))
+}
+
+/// Acceleration of travel moves in mm/s², if the settings ask for
+/// accelerations per line type.
+fn travel_acceleration(settings: &Settings) -> Option<f64> {
+    accelerations_written(settings).then(|| or_default(settings, settings.travel_acceleration))
+}
+
 /// Speed in mm/s at which `path` is printed on layer `layer` (counted
 /// from 0): that of its kind ([`path_speed`]), for a small wall loop no
 /// faster than `small_perimeter_speed`.
@@ -1790,6 +1880,7 @@ pub fn write_gcode_with_progress(
         land: None,
         trail: Vec::new(),
         commands: Vec::new(),
+        accel: None,
     };
     if settings.emit_machine_limits {
         w.out.push_str(&machine_limits(settings));
@@ -2082,6 +2173,72 @@ mod tests {
 
     fn slice(mesh: &Mesh, settings: &Settings) -> Output {
         write_gcode(&slicer_fdm::generate(mesh, settings).unwrap(), settings).unwrap()
+    }
+
+    #[test]
+    fn line_types_may_accelerate_differently() {
+        let mesh = Mesh::cuboid(20.0, 20.0, 2.0);
+        let plain = Settings::default();
+        let tuned = Settings {
+            outer_wall_acceleration: 500.0,
+            infill_acceleration: 3000.0,
+            travel_acceleration: 5000.0,
+            ..Settings::default()
+        };
+        let (a, b) = (slice(&mesh, &plain), slice(&mesh, &tuned));
+        assert!(!a.gcode.contains("M204") && !a.gcode.contains("ACCEL="));
+        // The acceleration in force for every move, by line type.
+        let mut accel = None;
+        let mut kind = String::new();
+        let mut seen = std::collections::BTreeMap::new();
+        for line in b.gcode.lines() {
+            if let Some(rest) = line.strip_prefix("M204 S") {
+                accel = rest.parse::<f64>().ok();
+            } else if let Some(rest) = line.strip_prefix(";TYPE:") {
+                kind = rest.to_owned();
+            } else if line.starts_with("G1 X") || line.starts_with("G0 X") {
+                let what = if word(line, 'E').is_some_and(|e| e > 0.0) {
+                    kind.clone()
+                } else {
+                    "travel".to_owned()
+                };
+                seen.entry(what).or_insert_with(Vec::new).push(accel);
+            }
+        }
+        let all = |what: &str, want: f64| {
+            let got = &seen[what];
+            assert!(got.iter().all(|&a| a == Some(want)), "{what}: {got:?}");
+        };
+        all("Outer wall", 500.0);
+        all("Sparse infill", 3000.0);
+        all("travel", 5000.0);
+        // Unset types take `acceleration`.
+        all("Inner wall", tuned.acceleration);
+        // Slower walls, faster infill and travel: the estimate follows.
+        let walls_only = Settings {
+            outer_wall_acceleration: 200.0,
+            ..Settings::default()
+        };
+        let c = slice(&mesh, &walls_only);
+        let time = |o: &Output| o.stats.print_time_s;
+        assert!(
+            time(&c) > time(&a) && time(&b) < time(&c),
+            "{} {} {}",
+            time(&a),
+            time(&b),
+            time(&c)
+        );
+        // Klipper sets it with its own command.
+        let klipper = Settings {
+            flavor: Flavor::Klipper,
+            ..tuned
+        };
+        let k = slice(&mesh, &klipper);
+        assert!(k.gcode.contains(
+            "SET_VELOCITY_LIMIT ACCEL=500
+"
+        ));
+        assert!(!k.gcode.contains("M204"));
     }
 
     #[test]
@@ -2716,6 +2873,7 @@ SET_PRESSURE_ADVANCE ADVANCE=0.04
             speed,
             tool: 0,
             kind: None,
+            accel: None,
         };
         let machine = Machine::of(&Settings::default());
         let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
@@ -2764,6 +2922,7 @@ SET_PRESSURE_ADVANCE ADVANCE=0.04
             speed,
             tool: 0,
             kind,
+            accel: None,
         }
     }
 

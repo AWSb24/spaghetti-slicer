@@ -247,6 +247,33 @@ const MAPPING: &[(&str, &str, Kind)] = &[
     ("initial_layer_speed", "first_layer_speed", Kind::Number),
     ("travel_speed", "travel_speed", Kind::Number),
     ("default_acceleration", "acceleration", Kind::Number),
+    (
+        "outer_wall_acceleration",
+        "outer_wall_acceleration",
+        Kind::Number,
+    ),
+    (
+        "inner_wall_acceleration",
+        "inner_wall_acceleration",
+        Kind::Number,
+    ),
+    (
+        "top_surface_acceleration",
+        "top_surface_acceleration",
+        Kind::Number,
+    ),
+    (
+        "sparse_infill_acceleration",
+        "infill_acceleration",
+        Kind::Number,
+    ),
+    ("bridge_acceleration", "bridge_acceleration", Kind::Number),
+    ("travel_acceleration", "travel_acceleration", Kind::Number),
+    (
+        "initial_layer_acceleration",
+        "first_layer_acceleration",
+        Kind::Number,
+    ),
     ("default_jerk", "jerk", Kind::Number),
     // Multiple filaments
     ("flush_volumes_matrix", "flush_volumes", Kind::Table),

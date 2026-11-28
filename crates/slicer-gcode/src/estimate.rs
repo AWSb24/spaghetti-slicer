@@ -377,6 +377,7 @@ impl<'a> Estimator<'a> {
         self.position = to;
         if length > 0.0 {
             self.run.push(Move {
+                accel: None,
                 direction,
                 axes,
                 length,

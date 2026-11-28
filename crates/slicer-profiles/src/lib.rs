@@ -600,8 +600,44 @@ pub struct Settings {
     /// Speed of moves without extrusion.
     pub travel_speed: f64,
     /// Acceleration of the printer in mm/s². Only used to estimate the
-    /// print time; it is not written to the G-code.
+    /// print time; it is not written to the G-code, unless an acceleration
+    /// of a line type below is set and this one stands in for the others.
     pub acceleration: f64,
+    /// Acceleration of outer walls and overhanging walls in mm/s², written to
+    /// the G-code (`M204 S`, Klipper `SET_VELOCITY_LIMIT ACCEL`) where it
+    /// changes; 0 takes `acceleration`. Only with one of these set are
+    /// accelerations written at all.
+    pub outer_wall_acceleration: f64,
+    /// Acceleration of inner walls and gap infill in mm/s², written to the
+    /// G-code (`M204 S`, Klipper `SET_VELOCITY_LIMIT ACCEL`) where it changes;
+    /// 0 takes `acceleration`. Only with one of these set are accelerations
+    /// written at all.
+    pub inner_wall_acceleration: f64,
+    /// Acceleration of top surfaces in mm/s², written to the G-code (`M204 S`,
+    /// Klipper `SET_VELOCITY_LIMIT ACCEL`) where it changes; 0 takes
+    /// `acceleration`. Only with one of these set are accelerations written at
+    /// all.
+    pub top_surface_acceleration: f64,
+    /// Acceleration of sparse and solid infill and the bottom surface in mm/s²,
+    /// written to the G-code (`M204 S`, Klipper `SET_VELOCITY_LIMIT ACCEL`)
+    /// where it changes; 0 takes `acceleration`. Only with one of these set are
+    /// accelerations written at all.
+    pub infill_acceleration: f64,
+    /// Acceleration of bridges in mm/s², written to the G-code (`M204 S`,
+    /// Klipper `SET_VELOCITY_LIMIT ACCEL`) where it changes; 0 takes
+    /// `acceleration`. Only with one of these set are accelerations written at
+    /// all.
+    pub bridge_acceleration: f64,
+    /// Acceleration of travel moves in mm/s², written to the G-code (`M204 S`,
+    /// Klipper `SET_VELOCITY_LIMIT ACCEL`) where it changes; 0 takes
+    /// `acceleration`. Only with one of these set are accelerations written at
+    /// all.
+    pub travel_acceleration: f64,
+    /// Acceleration of everything printed on the first layer in mm/s², written
+    /// to the G-code (`M204 S`, Klipper `SET_VELOCITY_LIMIT ACCEL`) where it
+    /// changes; 0 takes `acceleration`. Only with one of these set are
+    /// accelerations written at all.
+    pub first_layer_acceleration: f64,
     /// Largest speed change in mm/s the printer makes at once, for example
     /// at a corner. Only used to estimate the print time.
     pub jerk: f64,
@@ -835,6 +871,13 @@ impl Default for Settings {
             first_layer_speed: 25.0,
             travel_speed: 150.0,
             acceleration: 1000.0,
+            outer_wall_acceleration: 0.0,
+            inner_wall_acceleration: 0.0,
+            top_surface_acceleration: 0.0,
+            infill_acceleration: 0.0,
+            bridge_acceleration: 0.0,
+            travel_acceleration: 0.0,
+            first_layer_acceleration: 0.0,
             jerk: 8.0,
             homing_time: 10.0,
             nozzle_heat_rate: 0.0,
@@ -1530,6 +1573,48 @@ impl Settings {
             ("first_layer_speed", self.first_layer_speed, 1.0, 1000.0),
             ("travel_speed", self.travel_speed, 1.0, 2000.0),
             ("acceleration", self.acceleration, 10.0, 100_000.0),
+            (
+                "outer_wall_acceleration",
+                self.outer_wall_acceleration,
+                0.0,
+                100_000.0,
+            ),
+            (
+                "inner_wall_acceleration",
+                self.inner_wall_acceleration,
+                0.0,
+                100_000.0,
+            ),
+            (
+                "top_surface_acceleration",
+                self.top_surface_acceleration,
+                0.0,
+                100_000.0,
+            ),
+            (
+                "infill_acceleration",
+                self.infill_acceleration,
+                0.0,
+                100_000.0,
+            ),
+            (
+                "bridge_acceleration",
+                self.bridge_acceleration,
+                0.0,
+                100_000.0,
+            ),
+            (
+                "travel_acceleration",
+                self.travel_acceleration,
+                0.0,
+                100_000.0,
+            ),
+            (
+                "first_layer_acceleration",
+                self.first_layer_acceleration,
+                0.0,
+                100_000.0,
+            ),
             ("jerk", self.jerk, 0.0, 1000.0),
             ("homing_time", self.homing_time, 0.0, 600.0),
             ("nozzle_heat_rate", self.nozzle_heat_rate, 0.0, 100.0),

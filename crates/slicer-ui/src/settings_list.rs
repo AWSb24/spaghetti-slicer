@@ -91,7 +91,20 @@ pub const PROCESS_TABS: [ProcessTab; 5] = [
                 ],
             ),
             ("Travel speed", &["travel_speed"]),
-            ("Acceleration", &["acceleration", "jerk"]),
+            (
+                "Acceleration",
+                &[
+                    "acceleration",
+                    "outer_wall_acceleration",
+                    "inner_wall_acceleration",
+                    "top_surface_acceleration",
+                    "infill_acceleration",
+                    "bridge_acceleration",
+                    "travel_acceleration",
+                    "first_layer_acceleration",
+                    "jerk",
+                ],
+            ),
         ],
     ),
     (
