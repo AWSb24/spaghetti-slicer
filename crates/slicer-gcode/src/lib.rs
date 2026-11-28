@@ -739,8 +739,12 @@ struct Command {
 struct Retraction {
     /// Filament pulled back, in millimetres; 0 for none.
     length: f64,
-    /// Speed of pulling back and pushing forward again, in mm/s.
+    /// Speed of pulling back, in mm/s.
     speed: f64,
+    /// Speed of pushing forward again, in mm/s.
+    restart_speed: f64,
+    /// Filament pushed forward beyond what was pulled back, in millimetres.
+    extra: f64,
     /// Lift of the nozzle during the travel, in millimetres.
     z_hop: f64,
     /// Way back along the line printed last while retracting, in
@@ -754,6 +758,12 @@ impl Retraction {
         Self {
             length: settings.retraction_length,
             speed: settings.retraction_speed,
+            restart_speed: if settings.deretraction_speed > 0.0 {
+                settings.deretraction_speed
+            } else {
+                settings.retraction_speed
+            },
+            extra: settings.retract_restart_extra,
             z_hop: settings.z_hop,
             wipe: settings.wipe_distance,
         }
@@ -888,15 +898,17 @@ impl<'a> Writer<'a> {
         }
     }
 
-    /// Pushes the filament forward again by as much and as fast as it was
-    /// pulled back, whatever the settings of the next path say.
+    /// Pushes the filament forward again by as much as it was pulled back
+    /// and the extra of that retraction, at its restart speed, whatever the
+    /// settings of the next path say.
     fn unretract(&mut self) {
         if let Some(r) = self.retracted[self.tool].take() {
-            let f = self.feed_word(r.speed);
-            let e = self.e_word(r.length);
+            let amount = (r.length + r.extra).max(0.0);
+            let f = self.feed_word(r.restart_speed);
+            let e = self.e_word(amount);
             let _ = writeln!(self.out, "G1{e}{f}");
-            self.filament[self.tool] += r.length;
-            self.record([0.0, 0.0, 0.0, 1.0], r.length, r.speed, None);
+            self.filament[self.tool] += amount;
+            self.record([0.0, 0.0, 0.0, 1.0], amount, r.restart_speed, None);
         }
     }
 
@@ -1617,10 +1629,12 @@ fn slowdown(
 /// Fan speed in percent of layer `index`, which takes `time` seconds: off
 /// for the first `fan_off_layers`, then `fan_speed`, and for layers shorter
 /// than `fan_layer_time` rising in proportion up to `fan_max_speed` at
-/// `min_layer_time`.
+/// `min_layer_time`. Below `full_fan_speed_layer` that much less as the
+/// layer is short of it.
 fn layer_fan(settings: &Settings, index: usize, time: f64) -> f64 {
     let limit = settings.fan_layer_time;
-    if index < settings.fan_off_layers as usize {
+    let off = settings.fan_off_layers as usize;
+    let fan = if index < off {
         0.0
     } else if limit <= 0.0 || time >= limit {
         settings.fan_speed
@@ -1628,6 +1642,13 @@ fn layer_fan(settings: &Settings, index: usize, time: f64) -> f64 {
         let shortest = settings.min_layer_time.min(limit);
         let t = ((limit - time) / (limit - shortest).max(1e-9)).clamp(0.0, 1.0);
         settings.fan_speed + (settings.fan_max_speed - settings.fan_speed) * t
+    };
+    // Layer `full` (counted from 1) is the first at full speed.
+    let full = settings.full_fan_speed_layer as usize;
+    if index >= off && index + 1 < full {
+        fan * (index + 1 - off) as f64 / (full - off) as f64
+    } else {
+        fan
     }
 }
 
@@ -1957,6 +1978,56 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::field_reassign_with_default)]
     use super::*;
     use slicer_core::Mesh;
+
+    #[test]
+    fn the_fan_rises_up_to_its_full_layer() {
+        let mut settings = Settings {
+            fan_off_layers: 1,
+            fan_speed: 90.0,
+            ..Settings::default()
+        };
+        let fans = |s: &Settings| -> Vec<f64> { (0..6).map(|i| layer_fan(s, i, 100.0)).collect() };
+        assert_eq!(fans(&settings), [0.0, 90.0, 90.0, 90.0, 90.0, 90.0]);
+        // Full from layer 4 on: a third more on every layer before it.
+        settings.full_fan_speed_layer = 4;
+        let ramp = fans(&settings);
+        for (got, want) in ramp.iter().zip([0.0, 30.0, 60.0, 90.0, 90.0, 90.0]) {
+            assert!((got - want).abs() < 1e-9, "{ramp:?}");
+        }
+    }
+
+    #[test]
+    fn unretraction_may_be_slower_and_push_more() {
+        let mesh = Mesh::cuboid(20.0, 20.0, 2.0);
+        let plain = Settings::default();
+        let tuned = Settings {
+            deretraction_speed: 20.0,
+            retract_restart_extra: 0.2,
+            ..Settings::default()
+        };
+        let (a, b) = (slice(&mesh, &plain), slice(&mesh, &tuned));
+        // Filament pushed forward without moving, and the feed rate.
+        let pushes = |gcode: &str| -> Vec<(f64, Option<f64>)> {
+            gcode
+                .lines()
+                .filter(|l| l.starts_with("G1") && word(l, 'X').is_none() && word(l, 'Y').is_none())
+                .filter_map(|l| word(l, 'E').filter(|&e| e > 0.0).map(|e| (e, word(l, 'F'))))
+                .collect()
+        };
+        let restarts: Vec<_> = pushes(&a.gcode)
+            .into_iter()
+            .zip(pushes(&b.gcode))
+            .filter(|((e, _), _)| (e - plain.retraction_length).abs() < 1e-6)
+            .collect();
+        assert!(restarts.len() > 3, "{}", restarts.len());
+        for ((e, f), (tuned_e, tuned_f)) in &restarts {
+            assert!((tuned_e - e - 0.2).abs() < 1e-6, "{tuned_e}");
+            assert_eq!(*f, Some(plain.retraction_speed * 60.0));
+            assert_eq!(*tuned_f, Some(1200.0));
+        }
+        let more = b.stats.filament_length_mm - a.stats.filament_length_mm;
+        assert!((more - 0.2 * restarts.len() as f64).abs() < 1e-3, "{more}");
+    }
 
     #[test]
     fn small_wall_loops_print_slower() {

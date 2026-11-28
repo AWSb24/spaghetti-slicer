@@ -95,6 +95,8 @@ More print options, all off by default (see `docs/settings.md`):
 - `ironing = true` passes over every top surface once more with 10 % of the material (`ironing_flow`), lines `ironing_spacing` apart at `ironing_speed`; with `ironing_type = top` only the topmost surface of every part, the top of its last layer.
 - `avoid_crossing_walls = true` sends travel moves round holes and notches inside the part instead of over open air, which also saves their retraction.
 - `fuzzy_skin = true` gives the outer wall a rough texture: its points are moved in and out at random by up to half of `fuzzy_skin_thickness`, one every `fuzzy_skin_point_distance`, the same on every run. The first layer stays smooth.
+- `full_fan_speed_layer = 4` lets the fan rise evenly over the layers after `fan_off_layers` and reach full speed on layer 4 (counted from 1), so that the first layers cool gently.
+- `deretraction_speed = 20` pushes the filament forward again after a retraction at 20 mm/s instead of `retraction_speed`; `retract_restart_extra = 0.1` pushes 0.1 mm more than was pulled back, against a thin start of the next line (negative values push less).
 - `wipe_distance = 2` retracts while going back 2 mm along the line just printed.
 - `arc_fitting = true` writes runs of short lines that lie on a circle within `arc_tolerance` (0.01 mm) as one `G2`/`G3` arc; the G-code of Benchy shrinks from 2.49 to 1.66 MB. Klipper needs `[gcode_arcs]` in `printer.cfg`.
 - `fan_layer_time = 30` turns the fan up on layers that take less than 30 seconds, the shorter the more, up to `fan_max_speed` at `min_layer_time`.

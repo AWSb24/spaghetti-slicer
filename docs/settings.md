@@ -27,6 +27,7 @@ Numbers are in the unit of the Unit column (empty for counts and factors). A set
 | `bed_temp_first_layer` | 60 | °C | 0 to 200 | Bed temperature on the first layer. |
 | `fan_speed` | 100 | % | 0 to 100 | Part cooling fan speed in percent. |
 | `fan_off_layers` | 1 |  | 0 or more | Number of initial layers printed with the fan off. |
+| `full_fan_speed_layer` | 0 |  | 0 to 10000 | Layer, counted from 1, from which the fan runs at full speed: on the layers between `fan_off_layers` and this one it rises evenly, so that the first layers cool gently. 0 turns the fan full on right after `fan_off_layers`. |
 | `bridge_fan_speed` | 100 | % | 0 to 100 | Part cooling fan speed in percent while printing bridges. |
 | `fan_layer_time` | 0 | s | 0 to 600 | Layers that take less than this many seconds get more fan than `fan_speed`, the more the shorter they are, up to `fan_max_speed` at `min_layer_time` (or at no time at all without it). 0 turns it off. |
 | `fan_max_speed` | 100 | % | 0 to 100 | Fan speed in percent for the shortest layers, see `fan_layer_time`. |
@@ -147,6 +148,8 @@ Numbers are in the unit of the Unit column (empty for counts and factors). A set
 | `emit_machine_limits` | false |  | `true`, `false` | Writes the machine limits above before the start G-code, so the printer runs as the estimate assumes: for Marlin `max_speed_*`, `max_accel_*`, `acceleration`, `jerk` or `junction_deviation` as `M201`, `M203`, `M204` and `M205`; for Klipper the speed limit of the nozzle, the acceleration, `square_corner_velocity` and `minimum_cruise_ratio` as `SET_VELOCITY_LIMIT` (the limits of Z and of the filament stay those of `printer.cfg`). Limits that the start G-code itself sets hold for the estimate from there on. |
 | `retraction_length` | 0.8 | mm | 0 to 20 | Filament length pulled back before a travel move; 0 disables retraction. |
 | `retraction_speed` | 35 | mm/s | 1 to 200 | Speed of retraction and unretraction. |
+| `deretraction_speed` | 0 | mm/s | 0 to 200 | Speed of pushing the filament forward again after a retraction; 0 takes `retraction_speed`. |
+| `retract_restart_extra` | 0 | mm | -2 to 10 | Filament pushed forward after a retraction beyond what was pulled back, in millimetres, against a thin start of the next line; negative values push less. |
 | `retraction_min_travel` | 1.5 | mm | 0 to 100 | Travel moves shorter than this do not retract. |
 | `z_hop` | 0 | mm | 0 to 10 | Nozzle lift during retracted travel moves; 0 disables it. |
 | `wipe_distance` | 0 | mm | 0 to 20 | Before a travel, the nozzle goes back this far along the line just printed while it retracts, wiping off what oozes; 0 turns it off. |

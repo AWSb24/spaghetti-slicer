@@ -74,6 +74,7 @@ const MAPPING: &[(&str, &str, Kind)] = &[
         "fan_off_layers",
         Kind::Number,
     ),
+    ("full_fan_speed_layer", "full_fan_speed_layer", Kind::Number),
     (
         "filament_retraction_length",
         "retraction_length",
@@ -82,6 +83,22 @@ const MAPPING: &[(&str, &str, Kind)] = &[
     (
         "filament_retraction_speed",
         "retraction_speed",
+        Kind::Number,
+    ),
+    ("deretraction_speed", "deretraction_speed", Kind::Number),
+    (
+        "filament_deretraction_speed",
+        "deretraction_speed",
+        Kind::Number,
+    ),
+    (
+        "retract_restart_extra",
+        "retract_restart_extra",
+        Kind::Number,
+    ),
+    (
+        "filament_retract_restart_extra",
+        "retract_restart_extra",
         Kind::Number,
     ),
     ("filament_z_hop", "z_hop", Kind::Number),

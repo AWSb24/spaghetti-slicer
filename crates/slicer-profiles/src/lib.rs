@@ -221,6 +221,11 @@ pub struct Settings {
     pub fan_speed: f64,
     /// Number of initial layers printed with the fan off.
     pub fan_off_layers: u32,
+    /// Layer, counted from 1, from which the fan runs at full speed: on the
+    /// layers between `fan_off_layers` and this one it rises evenly, so
+    /// that the first layers cool gently. 0 turns the fan full on right
+    /// after `fan_off_layers`.
+    pub full_fan_speed_layer: u32,
     /// Part cooling fan speed in percent while printing bridges.
     pub bridge_fan_speed: f64,
     /// Layers that take less than this many seconds get more fan than
@@ -679,6 +684,13 @@ pub struct Settings {
     pub retraction_length: f64,
     /// Speed of retraction and unretraction.
     pub retraction_speed: f64,
+    /// Speed of pushing the filament forward again after a retraction; 0
+    /// takes `retraction_speed`.
+    pub deretraction_speed: f64,
+    /// Filament pushed forward after a retraction beyond what was pulled
+    /// back, in millimetres, against a thin start of the next line;
+    /// negative values push less.
+    pub retract_restart_extra: f64,
     /// Travel moves shorter than this do not retract.
     pub retraction_min_travel: f64,
     /// Nozzle lift during retracted travel moves; 0 disables it.
@@ -723,6 +735,7 @@ impl Default for Settings {
             bed_temp_first_layer: 60.0,
             fan_speed: 100.0,
             fan_off_layers: 1,
+            full_fan_speed_layer: 0,
             bridge_fan_speed: 100.0,
             fan_layer_time: 0.0,
             fan_max_speed: 100.0,
@@ -843,6 +856,8 @@ impl Default for Settings {
             emit_machine_limits: false,
             retraction_length: 0.8,
             retraction_speed: 35.0,
+            deretraction_speed: 0.0,
+            retract_restart_extra: 0.0,
             retraction_min_travel: 1.5,
             z_hop: 0.0,
             wipe_distance: 0.0,
@@ -1545,6 +1560,19 @@ impl Settings {
             ("junction_deviation", self.junction_deviation, 0.0, 1.0),
             ("retraction_length", self.retraction_length, 0.0, 20.0),
             ("retraction_speed", self.retraction_speed, 1.0, 200.0),
+            ("deretraction_speed", self.deretraction_speed, 0.0, 200.0),
+            (
+                "retract_restart_extra",
+                self.retract_restart_extra,
+                -2.0,
+                10.0,
+            ),
+            (
+                "full_fan_speed_layer",
+                f64::from(self.full_fan_speed_layer),
+                0.0,
+                10000.0,
+            ),
             (
                 "retraction_min_travel",
                 self.retraction_min_travel,
