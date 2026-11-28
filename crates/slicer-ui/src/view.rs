@@ -119,6 +119,7 @@ pub fn path_color(kind: PathKind) -> [u8; 3] {
         PathKind::GapFill => [0xff, 0xff, 0xff],
         PathKind::SolidInfill => [0x96, 0x54, 0xcc],
         PathKind::TopSurface => [0xd6, 0x3c, 0x3c],
+        PathKind::BottomSurface => [0x6a, 0x3d, 0x9a],
         PathKind::Bridge => [0x4d, 0x80, 0xba],
         PathKind::SparseInfill => [0xb0, 0x30, 0x29],
         PathKind::PrimeTower => [0xc1, 0xbe, 0x63],

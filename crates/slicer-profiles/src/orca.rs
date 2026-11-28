@@ -130,7 +130,11 @@ const MAPPING: &[(&str, &str, Kind)] = &[
     (
         "seam_position",
         "seam_position",
-        Kind::Choice(&[("back", "rear"), ("nearest", "nearest")]),
+        Kind::Choice(&[
+            ("back", "rear"),
+            ("nearest", "nearest"),
+            ("random", "random"),
+        ]),
     ),
     ("skirt_loops", "skirt_loops", Kind::Number),
     ("skirt_distance", "skirt_distance", Kind::Number),

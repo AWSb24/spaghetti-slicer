@@ -48,7 +48,7 @@ Numbers are in the unit of the Unit column (empty for counts and factors). A set
 | `first_layer_line_width` | 0 | mm | 0 to 1 * | Width of the lines of the first layer, usually a little wider than `line_width` so that it sticks better; on a raft the width of its lowest layer. 0 prints the first layer at `line_width`. |
 | `wall_loops` | 2 |  | 1 to 50 | Number of wall loops. |
 | `wall_order` | inner_outer |  | `inner_outer`, `outer_inner` | Order in which the walls of a layer are printed. |
-| `seam_position` | rear |  | `rear`, `corner`, `nearest` | Where the walls of a layer start and end. |
+| `seam_position` | rear |  | `rear`, `corner`, `nearest`, `random` | Where the walls of a layer start and end. |
 | `avoid_crossing_walls` | false |  | `true`, `false` | Whether travel moves go round holes and notches inside the part instead of crossing them over open air, which also spares their retraction. |
 | `fuzzy_skin` | false |  | `true`, `false` | Whether the outer wall gets a rough, textured surface: its points are moved in and out at random. |
 | `fuzzy_skin_thickness` | 0.3 | mm | 0 to 2 | How far fuzzy skin moves the points of the outer wall, in and out together. |

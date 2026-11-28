@@ -95,6 +95,10 @@ pub enum SeamPosition {
     /// Wherever the nozzle happens to be closest; shortest travel, but the
     /// seams are scattered.
     Nearest,
+    /// At a different place along every loop on every layer, chosen at
+    /// random but the same on every run, so that the marks spread over the
+    /// whole surface instead of forming a line.
+    Random,
 }
 
 /// Shape of the supports.

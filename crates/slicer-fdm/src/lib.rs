@@ -144,8 +144,10 @@ pub enum PathKind {
     /// Lines in gaps between walls, or between the walls and the infill,
     /// too narrow for another wall.
     GapFill,
-    /// Dense fill inside the part and of bottom surfaces.
+    /// Dense fill inside the part.
     SolidInfill,
+    /// Solid infill of the first layer, on the bed or the raft.
+    BottomSurface,
     /// Solid infill with nothing above it: the visible top surface (see
     /// `Settings::top_surface_speed`).
     TopSurface,
@@ -2123,6 +2125,7 @@ fn travels_inside(layer: &Layer, slice: &Shapes, support: Option<&Shapes>) -> Ve
             PathKind::InnerWall
                 | PathKind::GapFill
                 | PathKind::SolidInfill
+                | PathKind::BottomSurface
                 | PathKind::TopSurface
                 | PathKind::Bridge
                 | PathKind::SparseInfill
@@ -2716,6 +2719,16 @@ fn region_work(
                 .map(|(number, contour)| fuzz(contour, index, number, settings))
                 .collect();
         }
+        if settings.seam_position == SeamPosition::Random {
+            loops = loops
+                .into_iter()
+                .enumerate()
+                .map(|(number, contour)| {
+                    let at = noise(index as u64, k as u64, number as u64 + SEAM_SEED);
+                    starting_at(contour, at)
+                })
+                .collect();
+        }
         work.push(Work::Loops(loops, kind, width, settings.seam_position));
         if k == 0 && !thin_lines.is_empty() {
             work.push(Work::Centred(std::mem::take(&mut thin_lines), kind));
@@ -2756,17 +2769,32 @@ fn region_work(
     };
     // The bottom surface on the bed and the top surfaces may have a pattern
     // of their own.
-    // Top surfaces are a line type of their own.
-    let (pattern, above, kind) = match index {
-        0 => (settings.bottom_surface_pattern, None, PathKind::SolidInfill),
-        _ => (
-            settings.top_surface_pattern,
+    // Bottom and top surfaces are line types of their own. Above the first
+    // layer whatever has nothing below it is a bridge (see `split_bridges`).
+    let angle = settings.infill_angle + turn;
+    let (solid, bottom) = match index {
+        0 => infill::surface(
+            solid,
+            None,
+            settings.bottom_surface_pattern,
+            angle,
+            width,
+            PathKind::BottomSurface,
+        ),
+        _ => (solid, Vec::new()),
+    };
+    work.extend(bottom);
+    let (solid, surface) = match index {
+        0 => (solid, Vec::new()),
+        _ => infill::surface(
+            solid,
             model.get(index + 1),
+            settings.top_surface_pattern,
+            angle,
+            width,
             PathKind::TopSurface,
         ),
     };
-    let angle = settings.infill_angle + turn;
-    let (solid, surface) = infill::surface(solid, above, pattern, angle, width, kind);
     let solid_lines = polygon::hatch(&solid, width, direction, min_length);
     // Joined by straight links; following the boundary instead (as sparse
     // rectilinear infill does) saves a few travels but adds many points.
@@ -2956,6 +2984,37 @@ fn fuzz(contour: &[Point], layer: usize, number: usize, settings: &Settings) -> 
 
 /// A number from 0 to 1 that looks random but depends only on the three
 /// inputs (SplitMix64 on their mix).
+/// Keeps the random seams apart from the random points of fuzzy skin.
+const SEAM_SEED: u64 = 1 << 32;
+
+/// `contour` turned to start at the point `share` (0 to 1) of the way
+/// round it, with a corner put there if none is.
+fn starting_at(mut contour: Contour, share: f64) -> Contour {
+    let n = contour.len();
+    let wanted = share * line_length(&contour, true);
+    let mut walked = 0.0;
+    for j in 0..n {
+        let (a, b) = (contour[j], contour[(j + 1) % n]);
+        let step = distance(a, b);
+        if walked + step > wanted && step > 0.0 {
+            let t = (wanted - walked) / step;
+            let at = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+            // Close to a corner the corner itself will do.
+            if distance(at, a) < PATH_RESOLUTION {
+                contour.rotate_left(j);
+            } else if distance(at, b) < PATH_RESOLUTION {
+                contour.rotate_left((j + 1) % n);
+            } else {
+                contour.insert(j + 1, at);
+                contour.rotate_left(j + 1);
+            }
+            return contour;
+        }
+        walked += step;
+    }
+    contour
+}
+
 fn noise(a: u64, b: u64, c: u64) -> f64 {
     let mut x = a
         .wrapping_mul(0x9e37_79b9_7f4a_7c15)
@@ -3647,6 +3706,8 @@ fn push_loops(
                 }
             }
             SeamPosition::Nearest => best.1,
+            // The loop starts where `region_work` turned it to.
+            SeamPosition::Random => 0,
         };
         points.rotate_left(start);
         let path = Path {
@@ -3790,7 +3851,7 @@ mod tests {
             kinds
         };
         use PathKind::*;
-        assert_eq!(kinds(0), [Skirt, InnerWall, OuterWall, SolidInfill]);
+        assert_eq!(kinds(0), [Skirt, InnerWall, OuterWall, BottomSurface]);
         assert_eq!(kinds(3), [InnerWall, OuterWall, SolidInfill]);
         assert_eq!(kinds(4), [InnerWall, OuterWall, SparseInfill]);
         assert_eq!(kinds(94), [InnerWall, OuterWall, SparseInfill]);
@@ -4081,7 +4142,7 @@ mod tests {
         assert!((lowest_x(first) - 0.3 - edge).abs() < 0.01);
         // Fewer, wider lines of infill cover the same area.
         let plain = generate(&mesh, &Settings::default()).unwrap();
-        let length = |layer: &Layer| extruded_length(layer, PathKind::SolidInfill);
+        let length = |layer: &Layer| extruded_length(layer, PathKind::BottomSurface);
         let ratio = length(first) / length(&plain.layers[0]);
         assert!((ratio - 0.45 / 0.6).abs() < 0.05, "{ratio}");
         // On a raft its lowest layer is the wider one.
@@ -5752,7 +5813,7 @@ mod tests {
         let last = layers.len() - 1;
         assert!(top(last) > 0.0 && solid(last) == 0.0);
         assert!(top(last - 1) == 0.0 && solid(last - 1) > 0.0);
-        assert!(top(0) == 0.0 && solid(0) > 0.0);
+        assert!(top(0) == 0.0 && extruded_length(&layers[0], PathKind::BottomSurface) > 0.0);
         // As much material as before: the surface only changes the type.
         let all = |index: usize| top(index) + solid(index);
         let column = 10.0 * 10.0 - 4.0 * 10.0;
@@ -6575,6 +6636,64 @@ mod tests {
         slab.translate([-5.0, 0.0, 4.0]);
         mesh.merge(&slab);
         mesh
+    }
+
+    #[test]
+    fn the_first_layer_is_bottom_surface() {
+        let toolpaths = generate(&mushroom(), &Settings::default()).unwrap();
+        let layers = &toolpaths.layers;
+        let bottom = |index: usize| extruded_length(&layers[index], PathKind::BottomSurface);
+        let solid = |index: usize| extruded_length(&layers[index], PathKind::SolidInfill);
+        // The first layer is bottom surface whole, the next ones are solid
+        // infill.
+        assert!(bottom(0) > 50.0 && solid(0) == 0.0);
+        assert!(bottom(1) == 0.0 && solid(1) > 0.0);
+        // What hangs free higher up is a bridge.
+        let slab = layers.iter().position(|l| l.z > 4.0 + 1e-6).unwrap();
+        assert_eq!(bottom(slab), 0.0);
+        assert!(extruded_length(&layers[slab], PathKind::Bridge) > 50.0);
+    }
+
+    #[test]
+    fn random_seams_spread_over_the_surface() {
+        // Where the outer wall of a 20 mm square starts, layer by layer.
+        let starts = |seam: SeamPosition| -> Vec<Point> {
+            let settings = Settings {
+                seam_position: seam,
+                ..Settings::default()
+            };
+            let toolpaths = generate(&Mesh::cuboid(20.0, 20.0, 4.0), &settings).unwrap();
+            toolpaths
+                .layers
+                .iter()
+                .filter_map(|l| l.paths.iter().find(|p| p.kind == PathKind::OuterWall))
+                .map(|p| p.points[0])
+                .collect()
+        };
+        let random = starts(SeamPosition::Random);
+        assert_eq!(random, starts(SeamPosition::Random));
+        let rear = starts(SeamPosition::Rear);
+        assert!(rear.windows(2).all(|w| distance(w[0], w[1]) < 1e-9));
+        // Spread over all four sides, rarely twice in the same place.
+        let sides: std::collections::BTreeSet<(i64, i64)> = random
+            .iter()
+            .map(|p| {
+                (
+                    (p[0] - 110.0).signum() as i64,
+                    (p[1] - 110.0).signum() as i64,
+                )
+            })
+            .collect();
+        assert!(sides.len() >= 3, "{sides:?}");
+        let repeated = random
+            .windows(2)
+            .filter(|w| distance(w[0], w[1]) < 1e-9)
+            .count();
+        assert!(
+            repeated <= random.len() / 4,
+            "{repeated} of {}",
+            random.len()
+        );
     }
 
     #[test]

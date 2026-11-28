@@ -224,6 +224,7 @@ fn label(kind: PathKind) -> &'static str {
         PathKind::GapFill => "Gap infill",
         PathKind::SolidInfill => "Solid infill",
         PathKind::TopSurface => "Top surface",
+        PathKind::BottomSurface => "Bottom surface",
         PathKind::Bridge => "Bridge",
         PathKind::SparseInfill => "Sparse infill",
         PathKind::PrimeTower => "Prime tower",
@@ -1702,6 +1703,7 @@ pub fn path_speed(settings: &Settings, kind: PathKind, layer: usize) -> f64 {
         }
         PathKind::SolidInfill
         | PathKind::TopSurface
+        | PathKind::BottomSurface
         | PathKind::SparseInfill
         | PathKind::Support
         | PathKind::SupportInterface

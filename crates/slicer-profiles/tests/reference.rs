@@ -73,7 +73,7 @@ fn settings_reference_is_current() {
                     "`rectilinear`, `monotonic`, `concentric`".to_string()
                 }
                 "wall_order" => "`inner_outer`, `outer_inner`".to_string(),
-                "seam_position" => "`rear`, `corner`, `nearest`".to_string(),
+                "seam_position" => "`rear`, `corner`, `nearest`, `random`".to_string(),
                 "support_style" => "`normal`, `tree`".to_string(),
                 "support_interface_pattern" => "`lines`, `concentric`, `grid`".to_string(),
                 "ironing_type" => "`top`, `all`".to_string(),
